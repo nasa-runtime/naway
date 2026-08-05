@@ -1,0 +1,138 @@
+// Naway gRPC 边缘模式(V8)对外 wire 契约。
+//
+// 本文件是**从既有实现反推**的,不是另起炉灶的设计稿:回执消息的字段号与
+// proto3 省零语义由 `src/dataplane/edge_hub.rs` 的手写编码器决定,并由
+// `tests/unit/edge_hub.rs` 的 `edge_proto_matches_wire_contract` 用例
+// 逐字段锁死。**改这里必须同时改那两处,否则用例会失败。**
+//
+// 为什么网关不引 prost:§25.2.2「业务 payload 不解析」——网关只校验 gRPC framing
+// 与压缩位,不反序列化 FramePush。只有两个回执消息是网关自己产生的,它们是平坦的
+// varint-only 结构,手写编码比拉进整套 codegen 更小也更可审查。本文件供**接入方**
+// 生成各语言 SDK 使用。
+
+syntax = "proto3";
+
+package naway.edge.v1;
+
+option go_package = "github.com/naway/edge/v1;edgev1";
+option java_package = "com.naway.edge.v1";
+option java_multiple_files = true;
+
+// ── 路由与身份都不在消息体里 ────────────────────────────────────────────────
+//
+// group / 定向 target / action 一律通过 **gRPC metadata** 传递(默认头名可在 route
+// 上改):
+//
+//   x-naway-edge-action : subscribe | publish | push   (v1 的二次确认;真正决定
+//                                                       action 的是精确 :path)
+//   x-naway-group       : 群播/订阅的 group
+//   x-naway-target-user : 定向 push 的目标 user
+//
+// **租户与用户身份不接受客户端自报**:tenant/user 一律取自已验证 principal 的 claim
+// (JWT claim,或非 JWT 认证下的已认证 consumer)。客户端放在 metadata 或消息体里的
+// 任何身份字段都不会被采信。能碰哪个 group 由 route 的 `grpc_edge.authz` 策略决定,
+// 越权返回 PERMISSION_DENIED(7)。兼容旧配置时 authz 整段缺省仍表示不限制 scope;
+// 生产 route 必须显式配置 authz,配置块存在后才是 deny-by-default。
+//
+// 每个方法的 `:path` 由 route 配置,下面的注释给出默认形态。
+
+service NawayEdge {
+  // 终端订阅。客户端发送**恰好一个** SubReq 后 half-close 请求侧,网关自响应并挂起
+  // 服务端流。请求体多于一条消息或未 EOS 一律拒绝。
+  rpc Subscribe(SubReq) returns (stream FramePush);
+
+  // 后端群播一条消息给 group 全体订阅者。
+  rpc Publish(FramePush) returns (PublishSummary);
+
+  // 后端以长流持续群播。网关逐条散出,并按 route 的四门(生命周期/累计消息数/
+  // 每秒速率/累计字节)优雅轮转,到界返回聚合 summary,发布方凭 messages 续传。
+  rpc PublishStream(stream FramePush) returns (PublishSummary);
+
+  // 后端定向单播给某个 user 的全部在线 session(默认 multi-session)。
+  rpc Push(FramePush) returns (PushSummary);
+}
+
+// 订阅请求。
+//
+// 刻意为空:订阅所需的 group 走 metadata、身份走已验证 principal,把它们放进消息体
+// 就意味着网关必须解析业务 payload 才能路由,与「业务 payload 不解析」的不变量冲突。
+// 业务如需携带自定义订阅参数,可自行扩展字段——**网关不会读取它们**。
+message SubReq {}
+
+// 散出的业务帧。
+//
+// **网关不反序列化本消息**,只做 gRPC framing 与压缩位校验,并按原样零拷贝散出。
+// 因此这里给出的是建议形状,业务可自定义;唯一的硬约束是:同一 route 上
+// **订阅响应类型与发布请求类型必须是同一个 wire message**,升级时遵守 protobuf
+// 兼容规则(只增字段、不改字段号、不改类型)。
+//
+// 由于产品语义是 at-most-once 且无离线堆积、无终端 ACK(见 架构规范 §25.2.2b),
+// 需要不丢的业务应当在 payload 里自带单调 seq / event_id,由客户端发现空洞后
+// 向后端补拉——网关不做重传。
+message FramePush {
+  bytes payload = 1;
+}
+
+// 群播回执。
+//
+// **计量口径(§25.2.8)**:所有计数止于「已进入散出队列」,**没有任何字段表示终端
+// 已收到**——这也是本消息刻意不使用 `delivered` 这类命名的原因。
+//
+// proto3 省零语义:值为 0 的字段不上 wire。解析方必须把「字段缺失」当作 0,
+// 不能把缺失当成「未知」。
+message PublishSummary {
+  // 本地实际入队的订阅流份数。
+  uint64 accepted = 1;
+  // 本帧未能入队的份数:队满按策略丢弃(drop_new / 已关环)与 queue_refs 预算拒绝之和。
+  uint64 dropped = 2;
+  // 本次因慢消费被主动断流的成员数。
+  uint64 closed_slow = 3;
+  // 已处理的消息条数。unary Publish 恒为 1;PublishStream 到界轮转时返回本段实际
+  // 处理条数,发布方凭它判断进度并续传。
+  uint64 messages = 4;
+  // 跨节点:peer 侧实际接受入队的份数。同样不代表终端已消费。
+  uint64 peers_accepted = 5;
+  // 跨节点:明确拒绝(预算耗尽/记录非法)的 peer 数。
+  uint64 peers_rejected = 6;
+  // 跨节点:断线或在 ack deadline 内没有回执的 peer 数。网关**不自动重试**。
+  uint64 peers_unknown = 7;
+}
+
+// 定向单播回执。
+//
+// 字段号与 PublishSummary **共用同一套编号空间**且语义一一对应,便于两种回执共用
+// 解析逻辑与监控看板。2/3/4 在 push 语义下无意义,故**保留不用**——不要在这里
+// 复用这三个编号表达别的含义。
+message PushSummary {
+  // 目标 user 的在线 session 中实际入队的份数(多端在线时可能大于 1;
+  // 目标完全不在线时为 0,且这不是错误)。
+  uint64 accepted = 1;
+  reserved 2, 3, 4;
+  // 跨节点:peer 侧实际入队份数。
+  uint64 peers_accepted = 5;
+  // 跨节点:明确拒绝的 peer 数。
+  uint64 peers_rejected = 6;
+  // 跨节点:断线或无回执的 peer 数。
+  uint64 peers_unknown = 7;
+}
+
+// Redis Pub/Sub 集群传输的公开 wire envelope。
+// Naway 只解析这些路由字段；message 是序列化后的 FramePush protobuf message，
+// 不含 5 字节 gRPC 前缀，FramePush.payload 内的业务 protobuf 永远保持 opaque。
+message RedisFanoutEnvelope {
+  uint32 protocol_version = 1;
+  string cluster_id = 2;
+
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    PUBLISH = 1;
+    PUSH = 2;
+  }
+
+  Action action = 3;
+  string tenant = 4;
+  string scope = 5;
+  bytes message = 6;
+  // Naway 经 gRPC 接入后转发时填写；业务直接 PUBLISH 时必须留空，使所有节点消费。
+  string origin_node_id = 7;
+}

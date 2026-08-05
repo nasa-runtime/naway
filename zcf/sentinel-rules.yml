@@ -1,0 +1,25 @@
+# Sentinel 流量防护规则。flow 空 = 无额外限流/并发规则。
+schema_version: 1
+
+# 示例:
+# flow:
+#   - id: demo_ip_qps
+#     enabled: true
+#     route: demo
+#     key: ip
+#     rate: 100r/s
+#     burst: 50
+#   - id: demo_ip_conn
+#     route: demo
+#     key: ip
+#     limit: 100
+#   - id: demo_failures
+#     route: demo
+#     failure_threshold: 5
+#     window_ms: 10000
+#     min_requests: 5
+#     break_ms: 30000
+#     fallback_status: 503
+#     fallback_body: circuit_open
+flow: []
+degrade: []

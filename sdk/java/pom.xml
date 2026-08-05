@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.naway</groupId>
+  <artifactId>naway-edge-client</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+  <name>Naway gRPC Edge Client</name>
+  <description>Naway gRPC 边缘模式(V8)Java 客户端 SDK</description>
+
+  <url>https://github.com/nasa-runtime/naway</url>
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+    <license>
+      <name>MIT License</name>
+      <url>https://opensource.org/license/mit</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+  <developers>
+    <developer>
+      <id>nasa-runtime</id>
+      <name>Naway contributors</name>
+      <organization>nasa-runtime</organization>
+      <organizationUrl>https://github.com/nasa-runtime</organizationUrl>
+      <roles><role>maintainer</role></roles>
+    </developer>
+  </developers>
+  <scm>
+    <connection>scm:git:https://github.com/nasa-runtime/naway.git</connection>
+    <developerConnection>scm:git:ssh://git.com/nasa-runtime/naway.git</developerConnection>
+    <url>https://github.com/nasa-runtime/naway</url>
+    <tag>HEAD</tag>
+  </scm>
+  <issueManagement>
+    <system>GitHub</system>
+    <url>https://github.com/nasa-runtime/naway/issues</url>
+  </issueManagement>
+
+  <!--
+    刻意不使用 protobuf-maven-plugin 做代码生成:
+    1. 业务 payload 对网关是不透明字节(§25.2.2「业务 payload 不解析」),SDK 收发
+       byte[] 即可,使用方用自己的 protobuf 库编解码;
+    2. 需要类型的只有两个回执消息,它们是平坦 varint 结构,手写 marshaller 比引入
+       protoc 插件(要下载与平台绑定的 protoc/protoc-gen-grpc-java 二进制)更可复现;
+    3. 与 Rust SDK 口径一致,两侧解析同一份 wire 契约。
+    契约本身仍以 proto/naway/edge/v1/edge.proto 为准,并由网关侧的
+    edge_proto_matches_wire_contract 用例锁死字段号。
+  -->
+
+  <properties>
+    <maven.compiler.source>11</maven.compiler.source>
+    <maven.compiler.target>11</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <grpc.version>1.62.2</grpc.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-api</artifactId>
+      <version>${grpc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-stub</artifactId>
+      <version>${grpc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-core</artifactId>
+      <version>${grpc.version}</version>
+      <scope>runtime</scope>
+    </dependency>
+    <!-- 传输层:使用方可换成 grpc-okhttp;这里给出默认可用的一种。 -->
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-netty-shaded</artifactId>
+      <version>${grpc.version}</version>
+      <scope>runtime</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.2</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>

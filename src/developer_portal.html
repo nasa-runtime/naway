@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Nate Developer Portal</title>
+  <link rel="stylesheet" href="/developer/app.css">
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">GATEWAY · V7</p>
+      <h1>Developer Portal</h1>
+      <p>浏览当前配置快照发布的 API 契约，并提交待审批的 API key 申请。</p>
+    </header>
+    <section aria-labelledby="catalog-heading">
+      <h2 id="catalog-heading">API Catalog</h2>
+      <p id="catalog-status" role="status">正在载入…</p>
+      <div id="catalogs" class="catalogs"></div>
+    </section>
+    <section aria-labelledby="application-heading">
+      <h2 id="application-heading">申请 API key</h2>
+      <p>这里只创建 pending 申请；网关不会在浏览器响应中签发 secret。</p>
+      <form id="application-form">
+        <label>Catalog <select id="catalog-id" required></select></label>
+        <label>Applicant ID <input id="applicant-id" maxlength="128" required></label>
+        <label>Display name <input id="display-name" maxlength="128"></label>
+        <label>Requested plan <input id="requested-plan" maxlength="64"></label>
+        <label>Portal token <input id="portal-token" type="password" autocomplete="off" required></label>
+        <button type="submit">提交申请</button>
+      </form>
+      <pre id="application-result" role="status"></pre>
+    </section>
+  </main>
+  <script src="/developer/app.js" defer></script>
+</body>
+</html>

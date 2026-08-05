@@ -1,0 +1,93 @@
+[package]
+name = "naway"
+version = "0.1.0"
+edition = "2021"
+publish = false
+authors = ["Naway contributors"]
+license = "Apache-2.0 OR MIT"
+description = "高性能、资源有界的 Rust 流量与业务网关，支持原生 gRPC 边缘散出与多种集群传输。"
+repository = "https://github.com/nasa-runtime/naway"
+homepage = "https://github.com/nasa-runtime/naway"
+documentation = "https://github.com/nasa-runtime/naway/tree/main/docs"
+readme = "README.md"
+keywords = ["gateway", "grpc", "reverse-proxy", "redis", "service-mesh"]
+categories = ["network-programming", "web-programming::http-server"]
+
+[[bin]]
+name = "local_a2_benchmark"
+path = "tests/support/local_a2_benchmark.rs"
+
+[[bin]]
+name = "local_edge_benchmark"
+path = "tests/support/local_edge_benchmark.rs"
+
+[features]
+default = []
+# Compile the real nacos-sdk transport through the nasa facade. Without this
+# feature the Nacos API is present, but enabling discovery at runtime fails fast.
+nacos-sdk = ["nasa/nacos-sdk"]
+# Enable Redis-backed runtime state primitives used by V3 Sentinel shared limiters.
+redis-runtime = ["nasa/redis"]
+# Enable the optional V5 native Kafka access-log sink through the nasa facade.
+# HTTP/Elasticsearch/Loki sinks do not require this feature.
+log-kafka = ["nasa/kafka"]
+# V8 gRPC edge mode gate (架构规范 §25.2 / 验收记录 V8). V8-0R..V8-3 compile the
+# route contract, Subscribe/local fan-out and static relay data plane. Later Nacos,
+# probe/directory and mTLS stages still fail fast. Without this feature, enabling an
+# edge route or relay fails at snapshot build and ordinary L7 remains untouched (A10).
+grpc-edge = []
+
+[dependencies]
+# —— 数据面(hyper 反向代理)——
+anyhow = "1"
+arc-swap = "1"                        # 单快照原子换版(无感热更)
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2"] } # V5 admin server；路由声明/类型优先走 nasa::web 门面
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] } # V5 gzip/br 流式编解码；不聚合响应 body
+bytes = "1"
+casbin = { version = "2.20.0", default-features = false, features = ["glob", "ip", "runtime-tokio"] } # V7 内嵌 RBAC/ABAC；模型/策略构建后只读
+crossbeam-utils = "0.8"                # 热指标 CachePadded 条带计数，避免 Tokio worker 争用同一 cache line
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"                         # 长流连接表分片并发；避免 gRPC 短流注册/注销争用单全局锁
+globset = "0.4"                       # 接口守卫 path glob
+getrandom = "0.2"                     # WS client→upstream Close 帧按 RFC 6455 生成不可预测 mask
+http = "1"
+http-body-util = "0.1"
+httpdate = "1"                           # V5 cache 条件请求解析 RFC HTTP-date，不自造不完整日期语法
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "tokio", "http1", "http2"] }
+instant-acme = { version = "0.8.5", features = ["rcgen"] } # RFC 8555 HTTP-01/DNS-01 签发与续期
+jsonschema = { version = "0.48.1", default-features = false } # V5 build-time JSON Schema validator；关闭网络/文件 resolver，拒绝外部 $ref
+libc = "0.2"                          # `-s reload` 向运行进程发 SIGHUP
+notify = "6"                          # 本地配置文件监听热更
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] } # V5 W3C context + server/client span API
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] } # V5 head sampling + bounded batch processor
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] } # V5 OTLP/HTTP protobuf exporter
+parking_lot = "0.12"                  # 上游 client cache 共享读快路径；短临界区不占 Tokio 异步锁
+percent-encoding = "2"                # OpenAPI path parameter percent-decode；不同于 query，不把 `+` 错当空格
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] } # V5/V7 后台 HTTP sink/发现；stream 用于有界响应读取
+rustls-pemfile = "2"                  # TLS cert/key PEM 解析
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"                      # 配置 tree(nasa::yml 产出 serde_json::Value)
+sha2 = "0.10"                         # V5 cache key 增量摘要；避免把 Vary/header 原值写进 L1/Redis key
+socket2 = { version = "0.6", features = ["all"] } # V7 SO_REUSEPORT 两阶段 listener 热切换
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"                 # TLS 监听 + ALPN
+tower-service = "0.3"
+tracing = "0.1"                       # 日志宏(info!/warn!/...);全局订阅初始化用 nasa::log
+tracing-opentelemetry = { version = "0.33", default-features = false } # V5 tracing/OTel 同栈桥接；与 opentelemetry 0.32 配套
+form_urlencoded = "1"                 # V5 schema 慢路径 query percent-decoding；Cow 复用无转义片段
+futures = "0.3"                       # 仅用于快照构建期驱动 Casbin 的字符串 adapter future
+x509-parser = "0.18"                  # 控制面解析证书 notAfter，避免无条件重复下单
+wasmtime = { version = "46.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] } # V7 Proxy-Wasm 沙箱；无 WASI/文件/网络权限
+
+# —— 复用 nasa-runtime-rust 生态（线上版本；yml 解析走 nasa::yml，日志走 nasa::log）——
+# crates.io 版本固定为 1.0.0。Nacos discovery API 在 V2-B 定型；
+# 真实传输用 gateway feature `nacos-sdk` 打开,避免默认本地构建强拉 SDK。V4 数据面 HMAC/JWT 验签
+# 复用 nasa::crypto,不在 gateway 内自造密码学实现。
+nasa = { version = "1.0.0", features = ["yml", "log", "base", "nacos", "crypto", "cache", "web"] }
+
+[dev-dependencies]
+rcgen = "0.12"
+tokio = { version = "1", features = ["full", "test-util"] } # start_paused 时钟仅测试形态启用
+wat = "1"                            # V7 进程级 Proxy-Wasm 回归测试动态生成最小标准模块

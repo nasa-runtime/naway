@@ -1,0 +1,32 @@
+# 接口级拦截(独立于路由表)。配「某接口对外禁止服务」,网关在管线最前一步命中即直接返回下面的 response。
+# 改这个文件即时生效(热更);集群模式下这份配置进 Nacos 统一下发,全网无感生效(见 架构规范 §8/§9/§11)。
+# 配置 schema 版本(§6);缺省按 v1 处理并告警。
+schema_version: 1
+
+# 未单独配 response 的规则用的默认响应。
+default_response:
+  status: 503
+  headers:
+    Content-Type: "application/json"
+  body: '{"code":50300,"msg":"该接口已暂停对外服务"}'
+
+rules:
+  # 示例:export 接口彻底下线,直接返回 403。
+  - id: close_export
+    enabled: true
+    match:
+      path: "/api/export/**" # glob:** 多段 / * 单段
+      methods: [GET, POST] # 省略 = 所有方法
+    response:
+      status: 403
+      headers:
+        Content-Type: "application/json"
+        X-Blocked-By: "nate"
+      body: '{"code":40301,"msg":"export 接口已下线"}'
+
+  # 示例:维护期禁写(默认关闭,应急时改 enabled: true;用 default_response)。
+  - id: maintenance_writes
+    enabled: false
+    match:
+      path: "/api/**"
+      methods: [POST, PUT, DELETE, PATCH]
