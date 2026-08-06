@@ -370,6 +370,29 @@ impl Body for UpstreamResponseBody {
 
 type DirectH2cSender = hyper::client::conn::http2::SendRequest<BoxBody>;
 
+/// direct h2c 每请求上传 task 的轻量 executor。
+///
+/// Hyper 会把 `H2ClientFuture` 按值交给 executor；默认 `TokioExecutor` 随后又把这个较大的
+/// future 搬进 Tokio task storage。先装箱可让 task 构造只移动一个指针，request body 的取消、
+/// DATA/trailer 与 flow-control 仍由同一个 future 驱动。
+#[derive(Clone, Copy, Debug, Default)]
+struct BoxedH2ClientExecutor;
+
+impl<Fut> hyper::rt::Executor<Fut> for BoxedH2ClientExecutor
+where
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    /// 业务作用：把 Hyper 的上游 H2 上传 future 交给 Tokio，并避免 task 建立时复制整块状态机。
+    ///
+    /// 参数说明：`future` 是 Hyper 为单个 H2 request body 创建的可取消上传任务。
+    ///
+    /// 返回：无返回值；任务在当前 Tokio runtime 异步执行，完成或取消时释放 Box 与 task storage。
+    fn execute(&self, future: Fut) {
+        tokio::spawn(Box::pin(future));
+    }
+}
+
 struct DirectH2cConnection {
     sender: DirectH2cSender,
     activity: Arc<H2cConnectionActivity>,
@@ -386,7 +409,7 @@ impl DirectH2cState {
         let mut connector = self.connector.clone();
         std::future::poll_fn(|cx| connector.poll_ready(cx)).await?;
         let io = connector.call(uri).await?;
-        let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
+        let mut builder = hyper::client::conn::http2::Builder::new(BoxedH2ClientExecutor);
         builder
             .initial_stream_window_size(Some(self.policy.h2_initial_stream_window_bytes))
             .initial_connection_window_size(Some(self.policy.h2_initial_connection_window_bytes));

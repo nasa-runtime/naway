@@ -405,9 +405,9 @@ pub struct GatewayProxy {
     #[cfg(feature = "grpc-edge")]
     edge_hub: Arc<crate::edge_hub::EdgeHub>,
     /// V8-3 集群中继句柄:仅 `grpc_edge_cluster.mode=relay` 时由 main 启动后注入;
-    /// 单机恒空,publish 路径零额外分支成本(OnceLock get 一次原子读)。
+    /// 单机恒空；ArcSwapOption 允许 reload 原子交换 relay generation。
     #[cfg(feature = "grpc-edge")]
-    edge_relay: std::sync::OnceLock<Arc<crate::edge_relay::EdgeRelay>>,
+    edge_relay: Arc<arc_swap::ArcSwapOption<crate::edge_relay::EdgeRelay>>,
     /// Redis Pub/Sub 集群总线；与 edge_relay 在配置构建期严格互斥。
     #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
     edge_redis_bus: std::sync::OnceLock<Arc<crate::edge_redis_bus::EdgeRedisBus>>,
@@ -691,7 +691,7 @@ impl GatewayProxy {
             #[cfg(feature = "grpc-edge")]
             edge_hub: crate::edge_hub::EdgeHub::new(),
             #[cfg(feature = "grpc-edge")]
-            edge_relay: std::sync::OnceLock::new(),
+            edge_relay: Arc::new(arc_swap::ArcSwapOption::empty()),
             #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
             edge_redis_bus: std::sync::OnceLock::new(),
             #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
@@ -813,17 +813,27 @@ impl GatewayProxy {
 
     /// 使用连接级预编码客户端 IP header 的 Hyper service 入口。
     ///
+    /// 业务作用：复用已验证连接地址的预编码 header 启动完整请求管线，同时仍在每个 stream
+    /// 重新执行 trusted XFF 边界校验，避免 H2 多租户复用越权继承客户端身份。
+    ///
+    /// 参数说明：`req` 是原始下游请求；`conn` 是已验证连接元数据；`downstream_proto` 与
+    /// `proxy_id` 固化入口；`client_ip_header` 只能由同一 `conn` 构造。
+    ///
+    /// 返回：始终返回一个下游响应；业务失败转换为对应 4xx/5xx，不向 Hyper 连接层传播错误。
+    ///
     /// 该入口供 accept loop 使用；保留 [`Self::handle`] 让已有嵌入方无需构造缓存。缓存只能由
     /// [`ConnectionClientIpHeader::new`] 从同一 `ConnInfo` 创建，入口仍在可信 XFF 解析之后核对
-    /// 最终 IP，不能让连接级优化越过每请求信任边界。
-    pub async fn handle_with_connection_ip_header(
+    /// 最终 IP，不能让连接级优化越过每请求信任边界。强制跨 crate 内联只用于让 main 在 Box
+    /// 分配目标中直接构造约 10KiB 的状态机，避免先按值返回到栈上再整块搬运；不改变 poll 边界。
+    #[inline(always)]
+    pub fn handle_with_connection_ip_header(
         self: Arc<Self>,
         req: Request<Incoming>,
         conn: ConnInfo,
         downstream_proto: &'static str,
         proxy_id: Arc<str>,
         client_ip_header: ConnectionClientIpHeader,
-    ) -> Result<Response<BoxBody>, Infallible> {
+    ) -> impl Future<Output = Result<Response<BoxBody>, Infallible>> + Send {
         self.handle_inner(
             req,
             conn,
@@ -831,9 +841,15 @@ impl GatewayProxy {
             proxy_id,
             Some(client_ip_header),
         )
-        .await
     }
 
+    /// 业务作用：在单一不可变 Snapshot 上执行请求信任边界、治理、路由、流式上游转发与
+    /// 响应收尾，保证 reload 不会让同一请求混用两个配置版本。
+    ///
+    /// 参数说明：`req`/`conn` 是下游请求与可信连接元数据；`downstream_proto`/`proxy_id`
+    /// 标识入口；`connection_client_ip_header` 是可选的同连接预编码客户端地址。
+    ///
+    /// 返回：所有分支都生成一个响应；拒绝、超时和上游失败被稳定映射为响应并完成指标/审计。
     async fn handle_inner(
         self: Arc<Self>,
         mut req: Request<Incoming>,
@@ -930,7 +946,9 @@ impl GatewayProxy {
         );
         // HTTP-01 必须先于 80→443 redirect/ACL/黑名单短路，否则 CA 无法取到验证 token。
         // 只有 worker 已发布的精确 token 才绕过，未知 challenge path 仍走正常安全管线。
-        let acme_challenge = self.acme_http01.response(&parts);
+        // ACME/redirect 响应只在极少数请求命中；装箱让两个 128B Response 不再常驻整个异步
+        // 状态机，未命中热路径只保留空指针且不分配。
+        let acme_challenge = self.acme_http01.response(&parts).map(Box::new);
         if acme_challenge.is_none() && self.blacklist.is_blocked(client_ip) {
             self.metrics.inc_blacklist_denied();
             let resp = text_status(403, "forbidden");
@@ -988,15 +1006,15 @@ impl GatewayProxy {
             proxy_runtime
                 .redirect_https
                 .as_ref()
-                .map(|redirect| https_redirect_response(&parts, redirect))
+                .map(|redirect| Box::new(https_redirect_response(&parts, redirect)))
         } else {
             None
         };
         // 1. ★接口级拦截★:命中即直接返回配置的 response,零上游成本(§8)。
         let mut resp = if let Some(challenge) = acme_challenge {
-            challenge
+            *challenge
         } else if let Some(redirect) = https_redirect {
-            redirect
+            *redirect
         } else if !path_valid {
             text_status(400, "invalid path")
         } else if let Some((resp, rule_id)) = self.interface_disable.check(&parts) {
@@ -1063,14 +1081,14 @@ impl GatewayProxy {
                 long_connection_consumer = route.authenticated_long_connection_consumer(&parts);
             }
             if route.x_accel_redirect || route.error_pages.iter().any(ErrorPagePolicy::is_reroute) {
-                internal_reroute_parts = Some(parts.clone());
+                internal_reroute_parts = Some(Box::new(parts.clone()));
             }
             if route
                 .response_headers
                 .iter()
                 .any(ResponseHeaderOp::needs_request_context)
             {
-                response_filter_parts = Some(parts.clone());
+                response_filter_parts = Some(Box::new(parts.clone()));
             }
 
             if !route.permits_ip(client_ip) || !route.permits_referer(&parts) {
@@ -1248,6 +1266,7 @@ impl GatewayProxy {
                     snap.version,
                     proxy_runtime,
                 )
+                .await
             } else if let Some(edge_action) = route
                 .grpc_edge
                 .as_ref()
@@ -1371,8 +1390,10 @@ impl GatewayProxy {
                     }
                 }
             } else if route.llm.is_some() {
-                match self
-                    .forward_llm(LlmForwardRequest {
+                // LLM 分支的 future 约 8KiB，且只有显式 LLM route 会执行；在冷分支装箱可避免
+                // 它把所有普通 HTTP/gRPC 请求的统一 service future 撑大，普通转发不新增分配。
+                match Box::pin(
+                    self.forward_llm(LlmForwardRequest {
                         snap: &snap,
                         proxy: proxy_runtime,
                         route: &route,
@@ -1386,8 +1407,9 @@ impl GatewayProxy {
                         downstream_proto,
                         request_id: &request_id,
                         trace: &server_trace,
-                    })
-                    .await
+                    }),
+                )
+                .await
                 {
                     LlmForwardOutcome::Upstream(response) => {
                         upstream_circuit_outcome = Some(circuit_success(response.status()));
@@ -1462,7 +1484,7 @@ impl GatewayProxy {
             if route.x_accel_redirect {
                 if let Some(target) = x_accel_redirect_target(&resp) {
                     let upstream_trace = resp.extensions().get::<forward::UpstreamTrace>().cloned();
-                    match internal_reroute_parts.as_ref() {
+                    match internal_reroute_parts.as_deref() {
                         Some(original_parts) => {
                             match self
                                 .serve_internal_reroute(InternalRerouteRequest {
@@ -1505,7 +1527,7 @@ impl GatewayProxy {
                 }
                 ErrorPageAction::Reroute(target) => {
                     let upstream_trace = resp.extensions().get::<forward::UpstreamTrace>().cloned();
-                    let Some(original_parts) = internal_reroute_parts.as_ref() else {
+                    let Some(original_parts) = internal_reroute_parts.as_deref() else {
                         resp = text_status(500, "internal reroute context unavailable");
                         break;
                     };
@@ -1552,7 +1574,7 @@ impl GatewayProxy {
                     &mut resp,
                     route,
                     request_origin.as_ref(),
-                    response_filter_parts.as_ref(),
+                    response_filter_parts.as_deref(),
                     client_ip,
                     downstream_proto,
                     &request_id,
@@ -1588,7 +1610,7 @@ impl GatewayProxy {
                             proxy_runtime,
                             matched,
                             &mut resp,
-                            &request_head,
+                            request_head.as_ref(),
                             &request_id,
                             &server_trace,
                         )
@@ -1604,7 +1626,7 @@ impl GatewayProxy {
                 if let Some(chain) = &matched.wasm_plugins {
                     let end_of_stream = resp.body().is_end_stream();
                     match chain
-                        .execute_response(&mut resp, request_head, end_of_stream)
+                        .execute_response(&mut resp, *request_head, end_of_stream)
                         .await
                     {
                         Ok(execution) => {
@@ -2789,6 +2811,9 @@ impl GatewayProxy {
 
     /// 执行 V7 外部 HTTP request_headers 插件链。
     ///
+    /// 业务作用：在请求进入上游前按顺序提交外部插件 head 变更，并仅为配置了 response
+    /// phase 的链保存 allowlist 快照；失败模式保持插件级 fail-open/fail-closed 契约。
+    ///
     /// 链内每个插件先完整解析/校验 delta，再原子修改当前 head；fail-open 只丢弃本插件，
     /// 不会泄漏半套变更。业务 body 始终留在 `ForwardBody`，此函数只编码 allowlist head。
     #[allow(clippy::too_many_arguments)]
@@ -2801,7 +2826,7 @@ impl GatewayProxy {
         downstream_proto: &'static str,
         request_id: &str,
         trace: &crate::telemetry::ServerTrace,
-        response_snapshot: &mut Option<crate::external_plugin::ExternalRequestHeadSnapshot>,
+        response_snapshot: &mut Option<Box<crate::external_plugin::ExternalRequestHeadSnapshot>>,
     ) -> Option<Response<BoxBody>> {
         let Some(chain) = &route.external_plugins else {
             return None;
@@ -2851,7 +2876,9 @@ impl GatewayProxy {
                 }
             }
         }
-        *response_snapshot = chain.capture_request_head(parts, downstream_proto);
+        *response_snapshot = chain
+            .capture_request_head(parts, downstream_proto)
+            .map(Box::new);
         None
     }
 
@@ -2912,18 +2939,44 @@ impl GatewayProxy {
         None
     }
 
-    /// 调用一条外部插件并在同一 deadline 内读取、解析整个小响应。
-    #[allow(clippy::too_many_arguments)]
-    /// V8:边缘订阅索引句柄(main 启动期注入 admin,供 /metrics 渲染低基数 gauge)。
+    /// 业务作用：向启动接线与管理面暴露进程唯一 EdgeHub，使数据面与 metrics 读取同一份事实。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回共享 Hub 句柄，不复制订阅索引。
     #[cfg(feature = "grpc-edge")]
     pub fn grpc_edge_hub(&self) -> Arc<crate::edge_hub::EdgeHub> {
         self.edge_hub.clone()
     }
 
-    /// V8-3:注入集群中继句柄(main 在 relay 启动后调用;幂等,只首次生效)。
+    /// 业务作用：在热更提交点原子发布当前集群中继 generation，使后续请求不再进入旧代。
+    ///
+    /// 参数说明：`relay` 是已完成 listener/成员计划准备的候选代。
+    ///
+    /// 返回：无返回值；原子交换后旧代排干由 reload 提交路径负责。
     #[cfg(feature = "grpc-edge")]
     pub fn attach_edge_relay(&self, relay: Arc<crate::edge_relay::EdgeRelay>) {
-        let _ = self.edge_relay.set(relay);
+        self.edge_relay.store(Some(relay));
+    }
+
+    /// 业务作用：向管理面与 reload 暴露 relay 原子 slot，保证观测、发布和回滚共享同一权威。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回 slot 的共享句柄，调用方不得绕过准备阶段写入未就绪 relay。
+    #[cfg(feature = "grpc-edge")]
+    pub fn edge_relay_slot(&self) -> Arc<arc_swap::ArcSwapOption<crate::edge_relay::EdgeRelay>> {
+        self.edge_relay.clone()
+    }
+
+    /// 业务作用：读取当前已发布 relay generation，供启动接线和低频控制路径执行一致语义。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：已发布时返回 relay；单机或 Redis bus 模式返回 `None`。
+    #[cfg(feature = "grpc-edge")]
+    pub fn current_edge_relay(&self) -> Option<Arc<crate::edge_relay::EdgeRelay>> {
+        self.edge_relay.load_full()
     }
 
     /// 注入 Redis Pub/Sub 集群总线；配置构建保证它与 relay 不会同时存在。
@@ -2943,20 +2996,19 @@ impl GatewayProxy {
         let _ = self.edge_directory.set(directory);
     }
 
-    /// V8 gRPC 边缘模式分发(§25.2.3 四重门:精确方法 + 平面 allowed_actions +
-    /// 元数据校验 + 已验证身份;全部通过才登记 session 并自响应)。
+    /// 业务作用：执行 WS 桥接握手与订阅登记，让浏览器复用 native edge 的身份、授权和 fencing 语义。
     ///
-    /// V8-1/V8-2 已实现 Subscribe/publish/push；edge 端点绝不静默退化成普通转发，
-    /// 否则边缘契约会泄漏给后端。进入本函数的前提是
-    /// route 启用 edge 且精确 `:path` 命中,鉴权/限流/熔断等通用闸门已在管线前段执行。
-    #[allow(clippy::too_many_arguments)]
-    /// V8-8:WS 桥接握手 + 订阅登记。
+    /// 参数说明：`route`/`parts` 提供已匹配配置与请求 head，`downstream_upgrade` 转移升级权；
+    /// `client_ip`/`consumer` 是可信身份上下文，`snapshot_version`/`proxy_runtime` 提供治理登记。
+    ///
+    /// 返回：成功返回 101 并启动有界桥接；任一握手、授权、claim 或预算门失败返回对应 4xx/5xx，
+    /// 且不会留下订阅或连接注册残影。
     ///
     /// 相位序与 native subscribe 完全一致(§25.2.3):鉴权已由上游 auth chain 执行,
     /// 这里只做 ①WS 升级头合法性 ②group 来自 query ③身份仅取已验证 principal
     /// ④EdgeHub 准入登记 ⑤101 + 后台桥接循环。任何失败都发生在登记之前。
     #[allow(clippy::too_many_arguments)]
-    fn handle_edge_ws_bridge(
+    async fn handle_edge_ws_bridge(
         &self,
         route: &Arc<Route>,
         parts: &Parts,
@@ -3031,15 +3083,36 @@ impl GatewayProxy {
                     return text_status(403, "edge ws bridge scope is not allowed for principal");
                 }
             }
-            let subscription =
-                match self
-                    .edge_hub
-                    .subscribe(plan, tenant, principal.clone(), Arc::from(group))
+            let single_token = if let Some(relay) = self.edge_relay.load_full().filter(|relay| {
+                relay.session_mode() == crate::config::model::GrpcEdgeSessionModeCfg::SingleSession
+            }) {
+                match relay
+                    .claim_single_session(tenant.clone(), principal.clone())
+                    .await
                 {
-                    Ok(subscription) => subscription,
-                    // 预算耗尽:HTTP 语义下用 503,浏览器据此退避重连。
-                    Err(err) => return text_status(503, err.reason()),
-                };
+                    Ok(token) => Some(token),
+                    Err(reason) => return text_status(503, reason),
+                }
+            } else {
+                None
+            };
+            let subscription_result = match single_token {
+                Some(token) => self.edge_hub.subscribe_single(
+                    plan,
+                    tenant,
+                    principal.clone(),
+                    Arc::from(group),
+                    token,
+                ),
+                None => self
+                    .edge_hub
+                    .subscribe(plan, tenant, principal.clone(), Arc::from(group)),
+            };
+            let subscription = match subscription_result {
+                Ok(subscription) => subscription,
+                // 预算耗尽:HTTP 语义下用 503,浏览器据此退避重连。
+                Err(err) => return text_status(503, err.reason()),
+            };
             let Some(accept) = bridge::accept_key(&client_key) else {
                 return text_status(400, "edge ws bridge key is invalid");
             };
@@ -3083,6 +3156,13 @@ impl GatewayProxy {
         }
     }
 
+    /// 业务作用：分发 native gRPC edge Subscribe/Publish/PublishStream/Push，并在四重门后自响应。
+    ///
+    /// 参数说明：`route`/`action`/`parts` 是精确方法匹配结果，`forward_body` 提供有界请求流；
+    /// `grpc_request`/`client_ip`/`consumer` 是协议和可信身份上下文，版本/runtime 用于治理登记。
+    ///
+    /// 返回：成功返回合法 gRPC response/trailer；协议、授权、预算、mesh 或 fencing 失败映射为固定状态，
+    /// edge 端点绝不静默退化成普通上游转发。
     #[allow(clippy::too_many_arguments)]
     async fn handle_grpc_edge(
         &self,
@@ -3337,12 +3417,34 @@ impl GatewayProxy {
                     // 已读出的 frame 弃用即可。准入 + 登记(EdgeHub 索引 + §6.1 注册表),
                     // 然后自响应。
                     let hub = self.edge_hub.clone();
-                    let subscription = match hub.subscribe(
-                        plan,
-                        tenant.clone(),
-                        principal.clone(),
-                        Arc::from(scope),
-                    ) {
+                    let single_token = if let Some(relay) =
+                        self.edge_relay.load_full().filter(|relay| {
+                            relay.session_mode()
+                                == crate::config::model::GrpcEdgeSessionModeCfg::SingleSession
+                        }) {
+                        match relay
+                            .claim_single_session(tenant.clone(), principal.clone())
+                            .await
+                        {
+                            Ok(token) => Some(token),
+                            Err(reason) => return grpc_edge_status("14", reason),
+                        }
+                    } else {
+                        None
+                    };
+                    let subscription_result = match single_token {
+                        Some(token) => hub.subscribe_single(
+                            plan,
+                            tenant.clone(),
+                            principal.clone(),
+                            Arc::from(scope),
+                            token,
+                        ),
+                        None => {
+                            hub.subscribe(plan, tenant.clone(), principal.clone(), Arc::from(scope))
+                        }
+                    };
+                    let subscription = match subscription_result {
                         Ok(subscription) => subscription,
                         Err(err) => return grpc_edge_status("8", err.reason()),
                     };
@@ -3391,22 +3493,37 @@ impl GatewayProxy {
                     // 空组不是错误(订阅天然竞态),诚实回 accepted=0。集群模式再向全部
                     // peers 中继同一份 payload(引用计数,零复制),固定 deadline 聚合回执。
                     let group: Arc<str> = Arc::from(scope);
-                    let peer_broadcast = self.broadcast_publish_across_cluster(
-                        tenant.clone(),
-                        group.clone(),
-                        frame.clone(),
-                    );
-                    let outcome = match self
-                        .edge_hub
-                        .publish_group(&plan.limits, tenant, group, frame, reassembled)
-                        .await
+                    let (outcome, peers) = if let Some(relay) = self
+                        .edge_relay
+                        .load_full()
+                        .filter(|relay| relay.group_owner_enabled())
                     {
-                        Ok(outcome) => outcome,
-                        Err(err) => return grpc_edge_status("8", err.reason()),
-                    };
-                    let peers = match peer_broadcast {
-                        Some(pending) => pending.await,
-                        None => crate::edge_relay::PeerBroadcastSummary::default(),
+                        match relay
+                            .publish_group_owned(&plan.limits, tenant, group, frame, reassembled)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(reason) => return grpc_edge_status("14", reason),
+                        }
+                    } else {
+                        let peer_broadcast = self.broadcast_publish_across_cluster(
+                            tenant.clone(),
+                            group.clone(),
+                            frame.clone(),
+                        );
+                        let outcome = match self
+                            .edge_hub
+                            .publish_group(&plan.limits, tenant, group, frame, reassembled)
+                            .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(err) => return grpc_edge_status("8", err.reason()),
+                        };
+                        let peers = match peer_broadcast {
+                            Some(pending) => pending.await,
+                            None => crate::edge_relay::PeerBroadcastSummary::default(),
+                        };
+                        (outcome, peers)
                     };
                     // PublishSummary(§25.2.8 诚实口径):accepted=入队份数(绝不叫
                     // delivered,入队≠终端已消费);dropped=本帧未入队份数(drop_new/
@@ -3446,7 +3563,7 @@ impl GatewayProxy {
                     // broadcast-probe 全体未命中(§25.2.7):目标不在线不是错误,但必须
                     // 可观测——gw_edge_probe_miss_total 是 V8-4 验收项。
                     if outcome.accepted == 0 && peers.accepted_copies == 0 {
-                        if let Some(relay) = self.edge_relay.get() {
+                        if let Some(relay) = self.edge_relay.load_full() {
                             relay.note_probe_miss();
                         }
                     }
@@ -3487,7 +3604,7 @@ impl GatewayProxy {
         if let Some(bus) = self.edge_redis_bus.get() {
             return bus.broadcast_push(&tenant, &user, frame).await;
         }
-        let Some(relay) = self.edge_relay.get() else {
+        let Some(relay) = self.edge_relay.load_full() else {
             return crate::edge_relay::PeerBroadcastSummary::default();
         };
         #[cfg(feature = "redis-runtime")]
@@ -3537,8 +3654,7 @@ impl GatewayProxy {
                 bus.broadcast_publish(&tenant, &group, frame).await
             }));
         }
-        self.edge_relay.get().map(|relay| {
-            let relay = relay.clone();
+        self.edge_relay.load_full().map(|relay| {
             Box::pin(async move { relay.broadcast_publish(tenant, group, frame).await })
                 as futures::future::BoxFuture<'static, crate::edge_relay::PeerBroadcastSummary>
         })
@@ -3654,18 +3770,44 @@ impl GatewayProxy {
                 let delta = reassembled_total - reported_reassembly;
                 reported_reassembly = reassembled_total;
                 // 集群模式:同一 payload 引用先留一份给中继,再 move 进本地散出。
-                let peer_broadcast = self.broadcast_publish_across_cluster(
-                    tenant.clone(),
-                    group.clone(),
-                    frame.clone(),
-                );
-                let outcome = match self
-                    .edge_hub
-                    .publish_group(&plan.limits, tenant.clone(), group.clone(), frame, delta)
-                    .await
+                let (outcome, peer_broadcast) = if let Some(relay) = self
+                    .edge_relay
+                    .load_full()
+                    .filter(|relay| relay.group_owner_enabled())
                 {
-                    Ok(outcome) => outcome,
-                    Err(err) => return grpc_edge_status("8", err.reason()),
+                    match relay
+                        .publish_group_owned(
+                            &plan.limits,
+                            tenant.clone(),
+                            group.clone(),
+                            frame,
+                            delta,
+                        )
+                        .await
+                    {
+                        Ok((outcome, peers)) => {
+                            peer_copies += peers.accepted_copies;
+                            peers_rejected += u64::from(peers.peers_rejected);
+                            peers_unknown += u64::from(peers.peers_unknown);
+                            (outcome, None)
+                        }
+                        Err(reason) => return grpc_edge_status("14", reason),
+                    }
+                } else {
+                    let peer_broadcast = self.broadcast_publish_across_cluster(
+                        tenant.clone(),
+                        group.clone(),
+                        frame.clone(),
+                    );
+                    let outcome = match self
+                        .edge_hub
+                        .publish_group(&plan.limits, tenant.clone(), group.clone(), frame, delta)
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(err) => return grpc_edge_status("8", err.reason()),
+                    };
+                    (outcome, peer_broadcast)
                 };
                 messages += 1;
                 total_bytes += frame_len;
@@ -6934,6 +7076,9 @@ fn enforce_casbin_authorization(
 
 /// 执行 V7 Proxy-Wasm request head 链，并在成功后为 response phase 捕获请求 head。
 ///
+/// 业务作用：在上游转发前提交沙箱插件的原子 head 变更，并为后续 response phase 保存
+/// 有界请求快照；任何 fail-closed 错误都在进入上游前终止。
+///
 /// 失败模式是 plugin 级的：fail-open 已在沙箱链内丢弃该 plugin 的未提交变更；
 /// 能到达这里的 `Err` 必定是 fail-closed，因此返回 500，不让未执行的安全插件被绕过。
 async fn enforce_wasm_request_headers(
@@ -6941,7 +7086,7 @@ async fn enforce_wasm_request_headers(
     parts: &mut Parts,
     scheme: &str,
     end_of_stream: bool,
-    response_snapshot: &mut Option<crate::wasm::WasmRequestHeadSnapshot>,
+    response_snapshot: &mut Option<Box<crate::wasm::WasmRequestHeadSnapshot>>,
     metrics: &Metrics,
 ) -> Option<Response<BoxBody>> {
     let Some(chain) = &route.wasm_plugins else {
@@ -6957,7 +7102,7 @@ async fn enforce_wasm_request_headers(
                 Some(local)
             } else {
                 metrics.inc_wasm_execution(WasmExecutionMetric::Continue);
-                *response_snapshot = chain.capture_request_head(parts, scheme);
+                *response_snapshot = chain.capture_request_head(parts, scheme).map(Box::new);
                 None
             }
         }

@@ -64,6 +64,9 @@ const MAX_PUBLISH_STREAM_RATE_CAP: u64 = 1_000_000;
 const MAX_PUBLISH_STREAM_TOTAL_BYTES_CAP: u64 = 1_099_511_627_776;
 /// `full_mesh_max_nodes` 可配置的硬上限;§25.2.2 的建议基线是 32。
 const MAX_FULL_MESH_NODES_CAP: usize = 256;
+/// §25.2.2 的全网状建议基线。**在 interest 路由落地之前这也是实际可用上限**:
+/// 超过它就必须靠 interest 收敛流量,而那套机制尚未实现,盲广播会按 O(N²) 打爆网络。
+const RECOMMENDED_FULL_MESH_NODES: usize = 32;
 /// V8-7 目录租约 TTL 下界(ms):续租按 TTL/3 触发,过短会让在线 session 频繁抖动。
 const MIN_DIRECTORY_TTL_MS: u64 = 3_000;
 /// V8-7 目录租约 TTL 上界(ms):崩溃节点的脏条目最多滞留这么久。
@@ -220,9 +223,7 @@ impl AuthzPattern {
 
 /// 已编译的 route 级发布/订阅授权策略(§25.2.3 相位 4 之后执行)。
 ///
-/// `None`(整段缺省)与「存在但某 action 列表为空」是**两种不同**语义:前者不限制,
-/// 后者全拒。这个区分由 [`GrpcEdgePlan::authz`] 的 `Option` 承载,本结构内一律是
-/// deny-by-default。
+/// enabled route 的授权段由构建器强制存在；结构内一律 deny-by-default。
 pub struct GrpcEdgeAuthzPlan {
     /// 允许 subscribe 的 group 模式;空 = 该 action 全拒。
     pub subscribe_groups: Vec<AuthzPattern>,
@@ -335,8 +336,8 @@ pub struct GrpcEdgePlan {
     pub publish_stream: GrpcEdgePublishStreamPlan,
     /// V8-8:WS 桥接入口路径(None=不开桥)。
     pub ws_bridge_path: Option<Box<str>>,
-    /// V8-9:发布/订阅授权策略。**None = 整段缺省 = 不限制 group**(保持既有行为);
-    /// Some = 该 route 转入 deny-by-default,只放行显式列出的模式。
+    /// V8-9:发布/订阅授权策略。edge route 必须显式配置；每 action 独立
+    /// deny-by-default，刻意公开时也必须写 `*`。
     pub authz: Option<GrpcEdgeAuthzPlan>,
 }
 
@@ -1003,18 +1004,23 @@ impl GrpcEdgeClusterPlan {
                  the ingress aggregates peer enqueue-acks within this fixed deadline"
             );
         }
-        if cfg.ordering == GrpcEdgeOrderingCfg::GroupOwner {
+        // interest 路由至今未实现:`interest_route` 只进计划,relay 运行时从不查询它,
+        // 无论集群多大都是 O(nodes × message_bytes) 盲广播。`auto` 是默认值不能直接拒
+        // (会打断所有既有配置),但**不能让配置在需要它才成立的规模下静默通过**——
+        // 那等于承诺一个不存在的自动收敛能力,而代价是真的把网络打爆。
+        // 门设在 §25.2.2 的建议基线 32:小于等于它,盲广播是被明确接受的基线行为。
+        if cfg.interest_route == GrpcEdgeInterestRouteCfg::BroadcastAll
+            && cfg.full_mesh_max_nodes > RECOMMENDED_FULL_MESH_NODES
+        {
             bail!(
-                "grpc_edge_cluster.ordering=group_owner is reserved for V8-5 and is not \
-                 implemented; use ordering=ingress_fifo or best_effort"
+                "grpc_edge_cluster.interest_route=broadcast_all cannot exceed the \
+                 {RECOMMENDED_FULL_MESH_NODES}-node payload-broadcast baseline; use \
+                 interest_route=auto or reduce full_mesh_max_nodes (got {})",
+                cfg.full_mesh_max_nodes
             );
         }
-        if cfg.session_mode == GrpcEdgeSessionModeCfg::SingleSession {
-            bail!(
-                "grpc_edge_cluster.session_mode=single_session is not implemented; V8-3 only \
-                 provides multi_session local indexing and must not pretend to kick old sessions"
-            );
-        }
+        // relay 模式实现 group_owner 与 single_session；两者在 mesh 不完整时运行期
+        // fail-closed，不能退化成乱序或多会话。Redis 两种总线仍在各自分支显式拒绝。
         // V8-7:目录是可选加速面,值校验与 feature 门同款"先值后 feature"。
         let session_directory = match cfg.session_registry {
             GrpcEdgeSessionRegistryCfg::None => None,
@@ -1392,16 +1398,16 @@ fn build_authz_pattern(path: &str, raw: &str) -> Result<AuthzPattern> {
 
 /// 编译 route 级授权策略。
 ///
-/// 业务作用:把 §25.2.3 的「你能碰哪个 group」定型为构建期产物。整段缺省时返回 None
-/// (不限制,保持既有部署行为);存在时逐条编译,该 route 即转入 deny-by-default。
+/// 业务作用:把 §25.2.3 的「你能碰哪个 group」定型为构建期产物。enabled route
+/// 缺少本段直接拒绝；存在时逐条编译并执行 deny-by-default。
 ///
 /// 参数说明:
 /// - `route_id`: 报错定位用。
-/// - `cfg`: 原始策略段;None 表示未声明。
+/// - `cfg`: 原始策略段；None 是不安全的缺失配置。
 /// - `allow_subscribe` / `allow_publish` / `allow_push`: 本 route 实际开放的 action,
 ///   用于拒绝"给一个本 route 根本不允许的 action 写规则"这种自相矛盾配置。
 ///
-/// 返回:未声明返回 Ok(None);声明且全部合法返回 Ok(Some(plan));任一模式非法返回 Err。
+/// 返回:声明且全部合法返回 Ok(Some(plan));缺失或任一模式非法返回 Err。
 fn build_authz(
     route_id: &str,
     cfg: Option<&crate::config::model::GrpcEdgeAuthzCfg>,
@@ -1410,7 +1416,9 @@ fn build_authz(
     allow_push: bool,
 ) -> Result<Option<GrpcEdgeAuthzPlan>> {
     let Some(cfg) = cfg else {
-        return Ok(None);
+        bail!(
+            "route `{route_id}` grpc_edge.enabled=true requires an explicit grpc_edge.authz +             block (deny-by-default); use per-action patterns, or write `*` explicitly for an +             intentionally public action"
+        );
     };
     let compile = |field: &str, raw: &[String]| -> Result<Vec<AuthzPattern>> {
         raw.iter()

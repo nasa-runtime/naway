@@ -1,5 +1,5 @@
 # gateway 主配置(SCG 风格)。改这个文件,进程 notify 自动热加载;或 `gateway -s reload` 手动触发。
-# 配置 schema 版本(gateway.md §6):便于长期演进期迁移;缺省按 v1 处理并告警。
+# 配置 schema 版本用于长期演进期迁移；缺省按 v1 处理并告警。
 schema_version: 1
 
 server:

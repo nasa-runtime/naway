@@ -7,6 +7,12 @@
 // 保留别名可避免把品牌重命名错误扩大成公共 Rust 类型/API 的破坏性迁移。
 extern crate naway as gateway;
 
+// Linux 生产数据面的 HTTP/H2 请求会创建大量短命协议对象；mimalloc 避免 glibc arena 在
+// 多 Tokio worker 下形成额外锁竞争和长期 RSS 滞留。macOS/Windows 开发环境仍使用系统分配器。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::IoSlice;
@@ -709,6 +715,13 @@ fn downstream_connection_config(
     DownstreamConnectionConfig { server, timeouts }
 }
 
+/// 业务作用：把一条已准入的下游连接交给共享 Hyper server，并把连接预算、活跃指标、
+/// 可信客户端地址缓存和 Upgrade 生命周期绑定到同一个可取消 task。
+///
+/// 参数说明：`stream` 是已完成监听层握手的 IO；`conn`/`proxy_id`/`downstream_proto` 标识
+/// 本连接的可信入口上下文；`state`/`config` 提供数据面与同版 server；`slot` 持有连接预算。
+///
+/// 返回：无返回值；函数成功 spawn 连接驱动，连接结束、超时或 task 取消时通过 Drop 归还预算。
 fn spawn_downstream_connection<I>(
     stream: I,
     conn: ConnInfo,
@@ -747,13 +760,16 @@ fn spawn_downstream_connection<I>(
                 req.extensions_mut()
                     .insert(request_connection_lifetime.clone());
             }
-            proxy.clone().handle_with_connection_ip_header(
+            // Hyper 会把 service future 直接嵌进每个 H2Stream task；该请求状态机约 14KiB，若
+            // 保持内联，建流时会在栈与 task storage 间重复整块复制。这里只装箱 future 本身，
+            // 请求/响应 body 仍按 Bytes 零拷贝流转，取消时 Drop 该 Box 仍同步取消原状态机。
+            Box::pin(proxy.clone().handle_with_connection_ip_header(
                 req,
                 conn,
                 downstream_proto,
                 proxy_id.clone(),
                 request_client_ip_header.clone(),
-            )
+            ))
         });
         // Builder 按 listener/Snapshot 共享且在 serve 阶段只读。连接 future 借用 `server`，本 task
         // 持有 Arc 直到正常结束或 Upgrade 完成，避免任何自引用或悬空借用。
@@ -2860,6 +2876,8 @@ async fn main() -> Result<()> {
     );
     #[cfg(feature = "grpc-edge")]
     admin_state_for_edge.attach_edge_hub(proxy.grpc_edge_hub());
+    #[cfg(feature = "grpc-edge")]
+    admin_state_for_edge.attach_edge_relay_slot(proxy.edge_relay_slot());
     // 集群传输随初始快照启动。relay 与 Redis Pub/Sub 已在配置构建期严格互斥，
     // 这里按 mode 只启动其中一条链路，避免重复散出。
     #[cfg(feature = "grpc-edge")]
@@ -2882,7 +2900,6 @@ async fn main() -> Result<()> {
                             .context("start grpc edge Nacos membership")?;
                     }
                     proxy.attach_edge_relay(relay.clone());
-                    admin_state_for_edge.attach_edge_relay(relay.clone());
                     // SessionDirectory 只属于 relay 定向寻址；Redis bus 模式不启动它。
                     #[cfg(feature = "redis-runtime")]
                     if let Some(directory_cfg) = plan_session_directory {

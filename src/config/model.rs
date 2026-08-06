@@ -830,6 +830,18 @@ pub struct AdminAuthCfg {
     /// CLI/服务间请求通常不带这两个浏览器来源头，不受影响。
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// 是否允许本节点用**自己这份 admin 凭据**去抓取同集群其它节点的 `/metrics`(C5)。
+    ///
+    /// 默认 **false**,必须显式开启。为什么不默认开:
+    /// - 它让 admin 从"只被访问"变成"会主动外连",是**攻击面的实质变化**——被打穿的
+    ///   admin 可以借它探测内网,必须由运维明示接受;
+    /// - 它假设集群各节点**同构配置**(同一份凭据)。该假设在自动化部署下通常成立,
+    ///   但不成立时抓取只会 401、不会静默串权,失败如实计入响应而不是伪造零值。
+    ///
+    /// 凭据只从进程内已解析的配置取,**不接受请求携带的任何凭证**——否则控制面就成了
+    /// 一个可被借用的跳板(调用方带什么凭据,网关就拿什么去连内网别的机器)。
+    #[serde(default)]
+    pub allow_cluster_metrics_scrape: bool,
 }
 
 impl Default for AdminAuthCfg {
@@ -842,6 +854,7 @@ impl Default for AdminAuthCfg {
             realm: default_admin_auth_realm(),
             allow_healthz_unauthenticated: true,
             allowed_origins: Vec::new(),
+            allow_cluster_metrics_scrape: false,
         }
     }
 }
@@ -1333,10 +1346,9 @@ pub struct GrpcEdgeCfg {
     /// 长度与字符集,于是同一租户内**任何已认证用户都能订阅任意 group、任何已认证
     /// 服务都能向任意 group 发布**。这一段回答「你能碰哪个 group」。
     ///
-    /// 语义刻意做成两态,不搞"智能推导":
-    /// - **整段缺省** = 维持既有行为(不限制 group),已部署配置不会因升级被打断;
-    /// - **整段存在** = 该 route 转入 **deny-by-default**,只有显式列出的模式放行,
-    ///   未列出的 action 一律拒绝(空列表 = 全拒,不是"不限制")。
+    /// enabled route 必须显式声明本段；缺失会在构建期拒绝，避免升级后继续沿用
+    /// 隐式全放行。只有显式列出的模式放行，未列出的 action 一律拒绝；
+    /// 空列表 = 全拒。确需公开放行也必须写出 "*"，让意图可审计。
     #[serde(default)]
     pub authz: Option<GrpcEdgeAuthzCfg>,
 }
@@ -1636,11 +1648,11 @@ pub struct GrpcEdgeClusterCfg {
     #[serde(default)]
     pub interest_route: GrpcEdgeInterestRouteCfg,
     /// 顺序承诺(§25.2.6):默认仅"同 publisher stream → 同 ingress → 同目标队列"FIFO;
-    /// `group_owner` 才承诺跨发布者的 group 严格序(V8-5)。
+    /// `group_owner` 通过确定性 owner + 分片串行锁承诺跨发布者的 group 严格序。
     #[serde(default)]
     pub ordering: GrpcEdgeOrderingCfg,
     /// 用户会话语义(§25.2.7):默认多端在线,probe 等全部节点到 deadline;
-    /// `single_session` 必须显式配置并由登录流程踢旧 session。
+    /// `single_session` 必须显式配置；relay owner 以全 mesh fencing token 踢旧 session。
     #[serde(default)]
     pub session_mode: GrpcEdgeSessionModeCfg,
     /// 定向单播指路条。`none` = broadcast-probe(默认,零外部依赖);
@@ -1859,10 +1871,11 @@ impl Default for GrpcEdgeRelayQueueCfg {
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GrpcEdgeInterestRouteCfg {
-    /// 小集群广播;超 full-mesh 门后启用 interest 路由(V8-5),缺失/过期 fail-open。
+    /// 自动传播各节点当前 tenant/group 兴趣，只向明确有兴趣的 peer 发送业务 payload。
+    /// hint 未就绪、版本断档或过期时 fail-open 广播，优化面不参与正确性。
     #[default]
     Auto,
-    /// 显式永远广播;仅小集群,与 full_mesh_max_nodes 联合校验。
+    /// 显式声明永远向全部 peer 广播；仅允许小集群使用。
     BroadcastAll,
 }
 

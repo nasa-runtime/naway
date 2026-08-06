@@ -77,7 +77,7 @@ pub struct AdminState {
     edge_hub: std::sync::OnceLock<Arc<crate::edge_hub::EdgeHub>>,
     /// V8-3:集群中继运行时(仅 /metrics 渲染读取);单机部署保持未注入。
     #[cfg(feature = "grpc-edge")]
-    edge_relay: std::sync::OnceLock<Arc<crate::edge_relay::EdgeRelay>>,
+    edge_relay: std::sync::OnceLock<Arc<arc_swap::ArcSwapOption<crate::edge_relay::EdgeRelay>>>,
     /// Redis Pub/Sub 集群总线观测；配置保证与 relay 互斥。
     #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
     edge_redis_bus: std::sync::OnceLock<Arc<crate::edge_redis_bus::EdgeRedisBus>>,
@@ -127,9 +127,16 @@ impl AdminState {
         let _ = self.edge_hub.set(hub);
     }
 
-    /// V8-3:挂接集群中继;仅 /metrics 渲染读取。一次性注入,后到者忽略。
+    /// 业务作用：把数据面 relay generation slot 挂到管理面，使 metrics 始终读取热换代后的当前代。
+    ///
+    /// 参数说明：`relay` 是 Proxy 与 reload 共同持有的原子 relay slot。
+    ///
+    /// 返回：无返回值；只接受首次注入，重复调用不会替换已共享的 slot。
     #[cfg(feature = "grpc-edge")]
-    pub fn attach_edge_relay(&self, relay: Arc<crate::edge_relay::EdgeRelay>) {
+    pub fn attach_edge_relay_slot(
+        &self,
+        relay: Arc<arc_swap::ArcSwapOption<crate::edge_relay::EdgeRelay>>,
+    ) {
         let _ = self.edge_relay.set(relay);
     }
 
@@ -462,6 +469,7 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
         (&Method::POST, "/admin/config/rollback") => rollback_config(&request, &state).await,
         // 集群配置版本收敛视图(§14.2):从 Nacos 反查本网关成员,聚合各节点已注册的 gateway.version。
         (&Method::GET, "/admin/cluster/consistency") => cluster_consistency(&state).await,
+        (&Method::GET, "/admin/cluster/metrics") => cluster_metrics(&state).await,
         (&Method::GET, "/api/cluster/rollout") => cluster_rollout_status(&state).await,
         (&Method::POST, "/admin/long-connections/close") => {
             close_long_connections(&request, &state)
@@ -619,6 +627,9 @@ fn admin_permission(method: &Method, path: &str) -> Option<(AdminResource, Admin
             Some((AdminResource::Config, AdminAction::Rollback))
         }
         (&Method::GET, "/admin/cluster/consistency") => {
+            Some((AdminResource::Cluster, AdminAction::Read))
+        }
+        (&Method::GET, "/admin/cluster/metrics") => {
             Some((AdminResource::Cluster, AdminAction::Read))
         }
         (&Method::POST, "/admin/long-connections/close") => {
@@ -908,6 +919,8 @@ async fn rollback_config(req: &AdminRequestParts, state: &AdminState) -> Respons
 enum NacosRollbackOutcome {
     /// 远端配置已等于目标版本,无需发布(幂等)。
     AlreadyMatches,
+    /// 原子 bundle dataId 原先不存在，首次发布成功。
+    Created(String),
     /// 远端已偏离本节点线上版本(有人先改了),携带漂移的 dataId 列表 → 前端 rebase。
     Drifted(Vec<String>),
     /// 旧兼容模式中需改动的 dataId 多于一个,拒绝用多次单 dataId CAS 冒充事务。
@@ -963,7 +976,8 @@ async fn rollback_config_nacos(state: &AdminState, target_version: u64) -> Respo
         }
     };
     // Nacos I/O 卸载到专用线程执行(nacos-sdk future 非 Send),仅回送 Send 的判定结果。
-    let outcome = run_nacos_rollback_offloaded(nacos, target_version, target, baseline).await;
+    let outcome =
+        run_nacos_rollback_offloaded(nacos, target_version, target, baseline, false).await;
     let record = |status: &str| {
         state.config_history.record_control_event(
             "nacos-rollback",
@@ -980,6 +994,14 @@ async fn rollback_config_nacos(state: &AdminState, target_version: u64) -> Respo
                 "ok": true,
                 "rollback_version": target_version,
                 "status": "remote already matches target version; nothing to publish",
+            }),
+        ),
+        Ok(NacosRollbackOutcome::Created(data_id)) => json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({
+                "ok": false,
+                "data_id": data_id,
+                "error": "rollback must not initialize a missing Nacos bundle",
             }),
         ),
         Ok(NacosRollbackOutcome::Drifted(ids)) => {
@@ -1046,11 +1068,13 @@ async fn rollback_config_nacos(state: &AdminState, target_version: u64) -> Respo
 /// - `target_version`: 目标归档版本号,写入原子 bundle 的审计版本。
 /// - `target`: 目标归档版本三文件原文。
 /// - `baseline`: 当前线上版本三文件原文,用于并发漂移判定。
+/// - `allow_initial_publish`: 原子 bundle 不存在时是否允许首次发布；仅集群发布入口可开启。
 async fn run_nacos_rollback_offloaded(
     nacos: crate::config::model::NacosConfigSourceCfg,
     target_version: u64,
     target: crate::config_history::ArchivedDocs,
     baseline: crate::config_history::ArchivedDocs,
+    allow_initial_publish: bool,
 ) -> anyhow::Result<NacosRollbackOutcome> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let spawned = std::thread::Builder::new()
@@ -1073,6 +1097,7 @@ async fn run_nacos_rollback_offloaded(
                 target_version,
                 &target,
                 &baseline,
+                allow_initial_publish,
             ));
             let _ = tx.send(result);
         });
@@ -1093,11 +1118,13 @@ async fn run_nacos_rollback_offloaded(
 /// - `target_version`: 目标归档版本号。
 /// - `target`: 目标归档版本三文件原文。
 /// - `baseline`: 当前线上版本三文件原文(并发漂移基线)。
+/// - `allow_initial_publish`: 缺少原子 bundle 时是否允许初始化。
 async fn nacos_rollback_once(
     nacos: &crate::config::model::NacosConfigSourceCfg,
     target_version: u64,
     target: &crate::config_history::ArchivedDocs,
     baseline: &crate::config_history::ArchivedDocs,
+    allow_initial_publish: bool,
 ) -> anyhow::Result<NacosRollbackOutcome> {
     let props = crate::reload::nacos_config_props(nacos);
     let client = nasa::config::nacos::NacosConfigClient::connect(&props)
@@ -1106,10 +1133,30 @@ async fn nacos_rollback_once(
     let group = nacos.group.as_str();
     if !nacos.bundle_data_id.trim().is_empty() {
         let data_id = nacos.bundle_data_id.trim();
-        let (remote_content, remote_md5) = client
-            .fetch_with_md5(data_id, group)
+        let remote = client
+            .fetch_optional_with_md5(data_id, group)
             .await
             .map_err(|e| anyhow::anyhow!("fetch {data_id} failed: {e}"))?;
+        let Some((remote_content, remote_md5)) = remote else {
+            if !allow_initial_publish {
+                anyhow::bail!(
+                    "Nacos atomic bundle {data_id} does not exist; rollback cannot initialize it"
+                );
+            }
+            let content = crate::reload::encode_atomic_nacos_bundle(
+                format!("initial-{target_version}"),
+                target,
+            )?;
+            return if client
+                .publish_initial(data_id, group, &content, "json")
+                .await
+                .map_err(|e| anyhow::anyhow!("nacos initial atomic bundle publish failed: {e}"))?
+            {
+                Ok(NacosRollbackOutcome::Created(data_id.to_string()))
+            } else {
+                Ok(NacosRollbackOutcome::CasConflict(data_id.to_string()))
+            };
+        };
         let remote = crate::reload::parse_atomic_nacos_bundle(&remote_content)
             .map_err(|e| anyhow::anyhow!("parse remote atomic bundle {data_id} failed: {e:#}"))?;
 
@@ -1429,6 +1476,251 @@ async fn cluster_consistency(state: &AdminState) -> Response<BoxBody> {
     }
 }
 
+/// C5:聚合集群各节点的流量指标(QPS / 5xx / 活跃连接)。
+///
+/// 业务作用:集群页此前只能看"版本与指纹是否收敛",看不到"哪个节点在扛流量、哪个在报错"。
+/// 本端点用**本节点自己的 admin 凭据**去抓同集群其它节点的 `/metrics`,把三项低基数
+/// 计数汇总成一张表。
+///
+/// 安全边界(三条,缺一不可):
+/// 1. **必须显式开启** `admin.auth.allow_cluster_metrics_scrape`。它让 admin 从"只被访问"
+///    变成"会主动外连",是攻击面的实质变化,不能默认打开。
+/// 2. **凭据只从进程内已解析的配置取**,绝不透传调用方请求里的任何凭证——否则控制面
+///    就成了可被借用的跳板(调用方带什么凭据,网关就拿什么去连内网别的机器)。
+/// 3. **只抓 Nacos 自注册成员表里的地址**,不接受调用方指定目标;抓取范围因此受限于
+///    "本网关自己注册进去的那些实例",不能被诱导去连任意主机。
+///
+/// 单节点失败(超时/401/解析不了)只标记该行 `ok=false` 并带 reason,**不伪造零值**——
+/// 把抓不到显示成 0 会让运维以为那个节点没流量,比看不到更糟。
+///
+/// # 参数
+/// - `state`: 管理面共享状态(取快照、凭据与成员表)。
+///
+/// # 返回
+/// 200 + 每节点一行指标;未开启开关返回 409 并说明原因;成员发现失败返回 502。
+async fn cluster_metrics(state: &AdminState) -> Response<BoxBody> {
+    let (nacos, auth) = {
+        let snap = state.snap.load();
+        (snap.discovery.nacos.clone(), snap.admin_auth.clone())
+    };
+    if !auth.allow_cluster_metrics_scrape {
+        return json(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "ok": false,
+                "error": "set admin.auth.allow_cluster_metrics_scrape=true to let this node scrape \
+                          peer /metrics with its own admin credential",
+            }),
+        );
+    }
+    let Some(service) = crate::discovery::self_register_service_name(&nacos) else {
+        return json(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "ok": false,
+                "error": "cluster metrics requires discovery.nacos.self_register.enabled",
+            }),
+        );
+    };
+    let instances = match run_gateway_discover_offloaded(nacos, service.clone()).await {
+        Ok(instances) => instances,
+        Err(e) => {
+            return json(
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({"ok": false, "error": e.to_string()}),
+            )
+        }
+    };
+    // 逐节点并发抓取:成员数受 full-mesh 上限约束(<=32),不需要额外限流;
+    // 每个请求各自带硬超时,慢节点不拖垮整张表。
+    let mut tasks = Vec::new();
+    for inst in instances {
+        let Some(admin_listen) = inst.metadata.get("gateway.admin_listen").cloned() else {
+            continue;
+        };
+        let node_id = inst
+            .metadata
+            .get("gateway.node_id")
+            .cloned()
+            .unwrap_or_else(|| format!("{}:{}", inst.ip, inst.port));
+        let header = cluster_scrape_auth_header(&auth);
+        tasks.push(tokio::spawn(async move {
+            scrape_node_metrics(node_id, admin_listen, header).await
+        }));
+    }
+    let mut nodes = Vec::new();
+    for task in tasks {
+        if let Ok(row) = task.await {
+            nodes.push(row);
+        }
+    }
+    nodes.sort_by(|a, b| a["node_id"].as_str().cmp(&b["node_id"].as_str()));
+    let reachable = nodes
+        .iter()
+        .filter(|n| n["ok"].as_bool().unwrap_or(false))
+        .count();
+    json(
+        StatusCode::OK,
+        serde_json::json!({
+            "ok": true,
+            "service": service,
+            "nodes": nodes,
+            "reachable": reachable,
+            "total": nodes.len(),
+        }),
+    )
+}
+
+/// 构造抓取用的 Authorization 头。
+///
+/// 业务作用：只从本节点已验证配置派生 peer metrics 抓取凭据，禁止把调用方凭据透传成内网跳板。
+///
+/// 参数说明：`auth` 是当前快照中已经解析的管理面认证配置。
+///
+/// 返回：优先返回 Bearer，其次返回 Basic；未配置或 Bearer 非 UTF-8 时返回 `None`，由对端如实拒绝。
+fn cluster_scrape_auth_header(auth: &crate::config::AdminAuthRuntimeCfg) -> Option<String> {
+    if let Some(token) = auth.bearer_token.as_deref() {
+        return std::str::from_utf8(token)
+            .ok()
+            .map(|token| format!("Bearer {token}"));
+    }
+    // 运行态里 basic_expected 已是 `user:password` 原始字节,直接编码即可,
+    // 不需要也不应该再从明文配置里重新取一遍。
+    if let Some(expected) = auth.basic_expected.as_deref() {
+        return Some(format!("Basic {}", basic_base64(expected)));
+    }
+    None
+}
+
+/// 标准 base64 编码(Basic 认证用)。
+///
+/// 业务作用：为管理面 peer metrics 抓取生成 RFC 7617 Basic 凭据编码，默认 feature 下也可用。
+///
+/// 参数说明：`bytes` 是已经拼成 `user:password` 的运行态凭据字节。
+///
+/// 返回：返回带标准 `=` padding 的 Base64 文本，不记录或缓存明文。
+///
+/// 不复用 `edge_ws_bridge` 里那份:那个模块受 `grpc-edge` feature 门控,而集群指标
+/// 抓取在默认构建下也要可用——跨 feature 借用会让默认形态编译不过。
+fn basic_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(triple >> 18) as usize & 0x3f] as char);
+        out.push(TABLE[(triple >> 12) as usize & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(triple >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[triple as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// 抓取单个节点的 `/metrics` 并提取三项流量指标。
+///
+/// 业务作用：在硬连接/响应体上限内读取一个已发现成员的低基数流量事实，供集群页定位热点与 5xx。
+///
+/// 参数说明：`node_id`/`admin_listen` 标识成员与受限目标，`auth_header` 是本节点派生的可选凭据。
+///
+/// 返回：成功返回三项指标；任意网络、协议或解析失败返回 `ok=false` 与低基数原因，绝不伪造零值。
+///
+/// 失败一律返回 `ok=false` + 低基数 reason,**不返回零值**:把抓不到显示成"没流量"
+/// 会让运维得出完全相反的结论。
+async fn scrape_node_metrics(
+    node_id: String,
+    admin_listen: String,
+    auth_header: Option<String>,
+) -> serde_json::Value {
+    let fail = |reason: &str| {
+        serde_json::json!({
+            "node_id": node_id,
+            "admin_listen": admin_listen,
+            "ok": false,
+            "reason": reason,
+        })
+    };
+    let Ok(addr) = admin_listen.parse::<std::net::SocketAddr>() else {
+        return fail("admin_listen is not a socket address");
+    };
+    // 硬超时:成员表里的节点可能已经死了但 Nacos 还没摘除,不能让集群页跟着挂住。
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await;
+    let stream = match connect {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(_)) => return fail("connect refused"),
+        Err(_) => return fail("connect timeout"),
+    };
+    let handshake = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream));
+    let (mut sender, conn) = match handshake.await {
+        Ok(pair) => pair,
+        Err(_) => return fail("http handshake failed"),
+    };
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let mut builder = http::Request::builder()
+        .uri("/metrics")
+        .header(http::header::HOST, admin_listen.as_str());
+    if let Some(value) = auth_header.as_deref() {
+        builder = builder.header(http::header::AUTHORIZATION, value);
+    }
+    let Ok(request) = builder.body(http_body_util::Full::<bytes::Bytes>::default()) else {
+        return fail("build request failed");
+    };
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_millis(2000),
+        sender.send_request(request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => return fail("request failed"),
+        Err(_) => return fail("request timeout"),
+    };
+    if response.status() == StatusCode::UNAUTHORIZED {
+        // 明确区分"凭据不通"与"连不上":前者说明集群配置不同构,运维要改的是配置。
+        return fail("unauthorized (peer admin credential differs)");
+    }
+    if !response.status().is_success() {
+        return fail("peer returned non-2xx");
+    }
+    use http_body_util::BodyExt as _;
+    // /metrics 是纯文本且低基数,但仍要设上界:对端异常时不能让控制面被拖爆内存。
+    let limited = http_body_util::Limited::new(response.into_body(), 1024 * 1024);
+    let Ok(collected) = limited.collect().await else {
+        return fail("metrics body too large or truncated");
+    };
+    let text = String::from_utf8_lossy(&collected.to_bytes()).into_owned();
+    let read = |name: &str| -> Option<u64> {
+        text.lines().find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .and_then(|rest| rest.trim().parse().ok())
+        })
+    };
+    serde_json::json!({
+        "node_id": node_id,
+        "admin_listen": admin_listen,
+        "ok": true,
+        "requests_total": read("gw_requests_total"),
+        "responses_5xx_total": read("gw_responses_5xx_total"),
+        "active_connections": read("gw_active_connections"),
+    })
+}
+
 /// 把「反查本网关 Nacos 成员」卸载到专用 current-thread runtime 线程执行,oneshot 回送成员实例。
 ///
 /// WHY:与 R2 回滚同因——nacos-sdk future 非 `Send`,admin 连接在多线程 runtime 经 `tokio::spawn` 处理。
@@ -1683,6 +1975,14 @@ fn metrics(state: &AdminState) -> Response<BoxBody> {
         );
         body.push_str("# TYPE gw_edge_queue_refs gauge\n");
         body.push_str(&format!("gw_edge_queue_refs {}\n", hub.queue_refs()));
+        body.push_str(
+            "# HELP gw_edge_runtime_schedule_pause_max_us Maximum observed Tokio scheduling pause in microseconds.\n",
+        );
+        body.push_str("# TYPE gw_edge_runtime_schedule_pause_max_us gauge\n");
+        body.push_str(&format!(
+            "gw_edge_runtime_schedule_pause_max_us {}\n",
+            hub.runtime_schedule_pause_max_us()
+        ));
         let (publish_total, publish_rejected, dropped_frames, reassembly_bytes) =
             hub.publish_counters();
         body.push_str(
@@ -1706,7 +2006,7 @@ fn metrics(state: &AdminState) -> Response<BoxBody> {
     }
     // V8-3 集群中继低基数观测(§25.2.6:peer 明细只进有界日志,不作 label)。
     #[cfg(feature = "grpc-edge")]
-    if let Some(relay) = state.edge_relay.get() {
+    if let Some(relay) = state.edge_relay.get().and_then(|slot| slot.load_full()) {
         let snapshot = relay.metrics();
         body.push_str("# HELP gw_edge_relay_peers_connected Handshaked live relay peer links.\n");
         body.push_str("# TYPE gw_edge_relay_peers_connected gauge\n");
@@ -1727,6 +2027,18 @@ fn metrics(state: &AdminState) -> Response<BoxBody> {
         body.push_str(&format!(
             "gw_edge_relay_sent_total {}\n",
             snapshot.sent_total
+        ));
+        body.push_str("# HELP gw_edge_relay_interest_filtered_total Peer payload copies skipped by confirmed group-interest hints.\n");
+        body.push_str("# TYPE gw_edge_relay_interest_filtered_total counter\n");
+        body.push_str(&format!(
+            "gw_edge_relay_interest_filtered_total {}\n",
+            snapshot.interest_filtered_total
+        ));
+        body.push_str("# HELP gw_edge_relay_interest_ready_peers Peers with a complete non-expired interest snapshot.\n");
+        body.push_str("# TYPE gw_edge_relay_interest_ready_peers gauge\n");
+        body.push_str(&format!(
+            "gw_edge_relay_interest_ready_peers {}\n",
+            snapshot.interest_ready_peers
         ));
         body.push_str(
             "# HELP gw_edge_relay_failed_total Relay records rejected or targeting down peers.\n",
@@ -2420,9 +2732,14 @@ async fn publish_cluster_config(
             serde_json::json!({"ok": false, "error": error}),
         );
     }
-    let outcome =
-        run_nacos_rollback_offloaded(nacos, current_version.saturating_add(1), target, baseline)
-            .await;
+    let outcome = run_nacos_rollback_offloaded(
+        nacos,
+        current_version.saturating_add(1),
+        target,
+        baseline,
+        true,
+    )
+    .await;
     let record = |status: &str| {
         state.config_history.record_control_event(
             "admin-cluster-publish",
@@ -2441,6 +2758,21 @@ async fn publish_cluster_config(
                 "note": "remote bundle already equals the submitted config",
             }),
         ),
+        Ok(NacosRollbackOutcome::Created(data_id)) => {
+            record("initial_published");
+            let rollout = state.rollouts.start(current_version, &data_id);
+            json(
+                StatusCode::ACCEPTED,
+                serde_json::json!({
+                    "ok": true,
+                    "status": "initialized",
+                    "rollout_id": rollout,
+                    "base_version": current_version,
+                    "data_id": data_id,
+                    "note": "initial bundle published to Nacos; poll /api/cluster/rollout until all enabled nodes converge",
+                }),
+            )
+        }
         Ok(NacosRollbackOutcome::Published(data_id)) => {
             record("cas_published");
             let rollout = state.rollouts.start(current_version, &data_id);

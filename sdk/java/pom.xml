@@ -35,7 +35,7 @@
   </developers>
   <scm>
     <connection>scm:git:https://github.com/nasa-runtime/naway.git</connection>
-    <developerConnection>scm:git:ssh://git.com/nasa-runtime/naway.git</developerConnection>
+    <developerConnection>scm:git:ssh://git@github.com/nasa-runtime/naway.git</developerConnection>
     <url>https://github.com/nasa-runtime/naway</url>
     <tag>HEAD</tag>
   </scm>

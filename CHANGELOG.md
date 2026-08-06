@@ -4,6 +4,53 @@
 
 ## [Unreleased]
 
+### gRPC/H2 90% 硬门与 V8-6 最终回归（2026-08-06）
+
+- Linux `perf` 将 gRPC 每请求主要额外成本定位到 Hyper H2 task 构造时搬运大 future：下游 service future 在 H2 stream 边界装箱，低频 ACME/redirect/LLM/external/Wasm 状态只在命中分支分配，上游 `H2ClientFuture` 由专用 executor 装箱后再交给 Tokio。请求/响应 DATA、trailer、取消、flow-control、连接预算和全部治理 timeout 保持不变。
+- profiler 中 glibc `__memcpy_generic` 从原始 `31.26%` 收敛到 `7.42%`。正式门使用 Linux Docker、`7×400000`、8 条下游 H2 连接、总并发 64、三方交错和固定 `ratio >= 0.90`：Naway `38227.65 RPS`（CV `0.0575`），Envoy `42274.27 RPS`（CV `0.0286`），比例 `0.9043`，脚本判定 **PASS**；七轮均无 cgroup throttling，Naway 中位 CPU `99.93µs/request`。
+- 当前 release 的 V8-6 正式回归 **PASS**：100k 成员与 64KiB 档零丢；10k stream 五轮中位 `525195 deliveries/s`、CV `0.0594`；最大调度停顿 `208908µs`；正式波次 drain 后 RSS `136276KiB → 82812KiB`、FD `14 → 14`。慢消费者 RSS 增长约 10.5MiB，三节点三档 peer copies 精确且 rejected/unknown 为 0。
+- 最终确定性门为 401 passed、0 failed、22 个外部 live 用例按环境门 ignored；全 feature/target Clippy 以 `-D warnings` 通过。Java SDK SCM developer URL 已修正，跟踪文件不再引用内部恢复/架构草稿文件。
+
+### 下游连接拓扑扫描:h2 锁"争用"排除为 gRPC 剩余差距主因（2026-08-05 晚）
+
+发布判断里最后一个未确立项(h2 每连接锁占 gRPC 对 Envoy 剩余 19~22% 差距的比例)**已确立:争用成分 ≈ 0**。纯测量轮,无源码改动。
+
+- **设计**:总并发恒 64,只改下游连接数 c=1/4/16/64(h2 server 锁每连接一把,c=1 时 64 流挤一把锁、争用最大;c=64 零跨流争用),nginx/envoy 同轮交错对照,5 轮×400k,配对符号检验。
+- **两个决定性形状**:①争用最大点 c=1 恰是 naway 相对最好的点(对 envoy **1.03**、3/5 打平,锁争用假说预测这里输得最狠);②争用稀释 4×/16× 后差距不收窄(0.838→0.867,0/5)。⇒ 结合 08-04 上游 shard 扫描(16 分片已饱和),**锁争用在上下游两侧都被排除**;剩余 ~13-16% 是与连接拓扑无关的**每请求成本**(p50 一致地 envoy 2.7ms vs naway 3.2~3.3ms)。
+- **方法学警示**:预设判据"锁是瓶颈⇒吞吐随连接数上升"在 naway 单曲线上是成立的(+44%),但 envoy 升得更陡(+71%)——单连接钉单核是共性形状;**没有对照曲线这轮会做实一个错误归因**。nginx 单连接不吃亏(17.2k)同时排除了压测客户端瓶颈。
+- **口径如实**:测量期机器非静默(用户明确选择带噪声跑),绝对值整体压低一成多,结论只建立在噪声稳健的配对比值上;c=64 块 nginx/envoy CV 超 0.15,按 A2 口径判 INCONCLUSIVE 未采用。§4.3 主攻方向由"锁粒度细化"修正为"h2/hyper 每请求路径成本";锁的非争用固定开销仍需真 profiler 分离(A4/Instruments 路径)。
+- 报告:`target/a2-down-{1,4,16,64}.jsonl`;沙箱终端跑基准的三个环境卡点是 buildx 写 `~/.docker`、daemon 代理导致 frontend 镜像拉取失败，以及本机代理拦截 `benchmark.local` TLS 探测形成假 502。
+
+### E1 `interest_route=auto` 运行时闭环（2026-08-05）
+
+- EdgeHub 在 tenant/group 首成员加入、末成员离开时产生兴趣变更；新 peer 建链先接收 `reset/up/ready` 全量快照，随后按 revision 增量更新并每 10 秒心跳。控制队列或 ACK 异常会拆链，revision 断档、未 ready 或 30 秒过期一律 fail-open 广播，优化提示永不决定消息正确性。
+- 热路径不解析业务 protobuf，只查询由已验证 header/身份得到的 tenant/group 稳定摘要；摘要碰撞只会多发，不会漏发。`interest_route=auto` 允许超过 32 节点，显式 `broadcast_all` 仍受 32 节点全量 payload 广播门限制。
+- 新增 `gw_edge_relay_interest_filtered_total` 与 `gw_edge_relay_interest_ready_peers`；协议/config 单测和三节点真实 socket 用例证明无兴趣 peer 被过滤、订阅变化后恢复投递。
+
+### C5 节点级流量指标进集群页 + watcher 用例环境适配（2026-08-05）
+
+- **C5 完成**:新增 `GET /admin/cluster/metrics`,用**本节点自己的 admin 凭据**抓取同集群成员的 `/metrics`,聚合每节点的 `gw_requests_total` / `gw_responses_5xx_total` / `gw_active_connections`;Console 新增「节点流量」面板。
+- **三条安全边界,缺一不可**:
+  1. **必须显式开启** `admin.auth.allow_cluster_metrics_scrape`(默认 false)。它让 admin 从"只被访问"变成"**会主动外连**",是攻击面的实质变化——被打穿的 admin 可以借它探测内网。
+  2. **凭据只从进程内已解析的运行态取**,绝不透传调用方请求里的任何凭证。否则控制面就成了可被借用的跳板:调用方带什么凭据,网关就拿什么去连内网别的机器。
+  3. **只抓 Nacos 自注册成员表里的地址**,不接受调用方指定目标。
+  单节点失败(超时/401/非 2xx)标 `ok=false` + 低基数 reason,**不伪造零值**——把抓不到显示成"没流量"比看不到更糟。响应体设 1 MiB 上界。契约单测锁死凭据来源、bearer 优先与 base64 标准编码。
+- **6 个依赖文件 watcher 的热更用例改为环境探测后跳过**。它们在本机恒定失败,**排查中我判断反复了三次**:先误判"沙箱限制"(方向对但无证据)→ 又因一次单线程恰好全绿改判"并发争用"→ 最后写独立探针程序在系统 temp / scratchpad / 项目目录各试 10 次,**全部 0/10 收不到 rename 事件**,才定性为环境能力缺失。**结论是靠受控实验定的,不是靠反复跑测试猜的**;同样的换版逻辑经 SIGHUP 触发一切正常(实测 v1→v2)。用运行时探测跳过而非 `#[ignore]`——后者会让支持 watcher 的正常环境也默认不跑。
+- 门禁:fmt + clippy(all-features)干净,三形态 **353 / 388 / 395 passed,0 failed**。
+
+### A3 10k WS 四阶段容量矩阵 + 连接内存泄漏判据（2026-08-05）
+
+发布判断里两个未完成缺口之一(A3)已完成。
+
+- **容器口径 10k 容量矩阵**:naway **10000 条 WS 全部建立**,四阶段容器 RSS 28.1 → 220.0 → 228.7 → 224.9 MiB,**每连接 ≈19.7 KiB**,peak 323 MiB(nginx 344 MiB)。**Envoy 在同一配置下建到 9940 条即开始返 503**——其自身日志确认未配置连接数上限,naway 与 nginx 都建满。
+- **新增原生两轮泄漏判据** `tests/scripts/a3_ws_capacity_leak.sh`:容器矩阵只能看到"关闭后 RSS 几乎不降",**分不开「allocator 不归还 OS」与「真泄漏」**。连跑两轮建满/全关后结论明确——**每轮全关后 RSS 都回到基线(驻留 ≈0),NO LEAK**,连接内存完整归还 OS。
+- **三处会让判据假通过的坑,已修并写进注释**:
+  1. **空跑保护**:首版因 `ws` 子命令没有 `--path` 参数导致 0 连接建立,判据却给出 "NO LEAK" 绿灯。现在峰值不显著高于基线即直接失败——**在空数据上给绿灯比漏判更危险**。
+  2. **判据修正**:只看"第二轮峰值增幅"会把采样噪声误判成泄漏(实测两轮峰值差 13.7%,而两轮全关后都精确回到基线 17.0 MiB)。改以**驻留**为主判据——那才是泄漏的物理证据;峰值靠固定间隔轮询,是否采到最高点带随机性。
+  3. **原生跑法上限 ≈8000 条**:客户端/网关/上游共享同一台机的临时端口,macOS `net.inet.ip.portrange` 仅 16384 个而每条 WS 隧道占**两个**,10k 必然撞墙(实测 8080 条即 502)。**那是内核限制不是 naway 的容量上限**;两轮之间还须等端口离开 TIME_WAIT。
+- **两个读表警告**:①nginx 的四阶段 RSS 采的是 master 进程(全程 6.4 MiB 不动),承载连接的是 worker,该列**只有 peak 可比**;②`A2_RESOURCE_RECOVERY_DELAYS` 默认为空,不设就没有回收采样点,`after_close` 立即采会看起来像"完全不回收"。
+- 配合 Dockerfile 迁到 `scripts/`,修 3 处路径引用(`a2_compare.sh` ×2、`p1_artifact_gates.sh` ×1);**P1 五门复测全过**(二进制 34.42 MiB、ready 1110 ms、idle RSS 21.83 MiB、smoke ok、镜像 49.0 MiB)。
+
 ### Redis Stream 裁剪责任划分：naway 永不裁剪 + trim-gap 检测（2026-08-05）
 
 **产品决定:stream 裁剪完全归业务侧,naway 不做。**本轮把这条决定固化并补上它的必要配套。
@@ -88,7 +135,7 @@ Codex 复审提出 7 条,其中 4 条是我的真错(FramePush 信封不兼容�
 补上 gRPC 边缘架构四项缺口中的安全项。此前相位 4 只解决了"你是谁"——身份一律取自已验证 principal(JWT claim 或已认证 consumer),客户端自报 header 永不作数——但 `group`/`target` 是**客户端给的**,只过了长度与字符集校验,于是**同一租户内任何已认证用户都能订阅任意 group、任何已认证服务都能向任意 group 发布**。
 
 - 新增 route 级 `grpc_edge.authz`,三个 action 各自独立:`subscribe_groups` / `publish_groups` / `push_targets`。判定点在**相位 4 之后、任何订阅登记/散出/入队之前**,拒绝时返回 `7 PERMISSION_DENIED` 且**不回显 group**——否则"存在但无权"与"不存在"可被区分开。
-- **两态语义,不做智能推导**:整段缺省 = 不限制(既有部署升级后行为不变);整段存在 = 该 route 转入 **deny-by-default**,**空列表 = 全拒而不是不限制**——漏写一个 action 绝不能静默变成完全开放。给本 route 未开放的 action 写规则直接构建期报错(静默忽略会让人以为策略生效了)。
+- **全局 deny-by-default**:edge route 必须显式配置 `authz`;块内每个 action 独立判定，**空列表 = 全拒**，刻意公开也必须写 `*`。给本 route 未开放的 action 写规则直接构建期报错。
 - 模式语法:字面量、末尾 `*`、`%{user}` / `%{tenant}`(均取自已验证身份)。构建期编译成片段,运行期**逐段比较、零分配、不拼接字符串**。`*` 只允许收尾——中置等于引入回溯匹配,既有代价又难审查。
 - **踩到并封死一个真实的静默陷阱**:变量前缀刻意用 `%{}` 而非全仓通用的 `${}`。gateway.yml 加载器会先把 `${NAME}` 按环境变量解析,实测把 `user.${user}` 静默替换成了 `user.tour`(本机登录用户名)——**同一份授权配置在不同机器上放行范围不同,且毫无提示**。现在模式里出现 `${` 会在构建期直接报错并提示改用 `%{}`,并有专门的回归用例锁死。
 - **WS 桥接同步覆盖**:桥接只换传输外壳,少这一段就等于留一条绕过 group 策略的旁路(HTTP 语义下返回 403)。
@@ -258,12 +305,12 @@ Codex 复审提出 7 条,其中 4 条是我的真错(FramePush 信封不兼容�
 - **live 验证(2026-08-03,source.md 本机 docker 后端)**:全部 6 个 ignored live 用例对真实后端跑通——V8-7 目录命中(Redis `127.0.0.1:6379`,断言命中时无关 peer 零 probe + 断开租约归零)、V8-5 Nacos 成员 watch 与自注册发现(`127.0.0.1:8848`)、Redis 跨节点 HTTP/语义缓存与流式 RSS 有界。V8 链路不再只有 mock 证据。
 - 门禁:fmt + clippy 四组合(默认/grpc-edge/grpc-edge+redis-runtime/all-features)`-D warnings` 干净;三形态 t4 全量 0 failed(default 335 / grpc-edge 367 / all 368);A2.4 默认路径三轮 48.4k/44.0k/46.7k RPS 对基线 48.0k(首轮紧接三套全量测试后测得 33.7k 属机器争用，静置复测恢复;按 A2 的 CV 口径记录，正式判定固定 Linux)。
 
-### V8-6 gRPC 边缘模式：性能与资源门首轮基线（2026-08-03；发布阻塞链就此闭合）
+### V8-6 gRPC 边缘模式：性能与资源门首轮基线（2026-08-03；最终 Linux 门见 2026-08-06 条目）
 
 - 新增压测入口：`tests/support/local_edge_benchmark.rs`（fanout/slow/subscribe/publish 四模式独立 h2 客户端，5B 前缀增量收帧 + summary varint 解析，订阅者按 200 API key 轮转分摊 user）+ `tests/scripts/v8_edge_fanout_probe.sh`（三场景驱动；资源断言是硬门：快读者零丢、每档端态 payload/queue_refs/active_streams 三归零、慢消费者 RSS 增长上界、三节点收满 + relay 计数精确、mesh 收敛）。
 - 本机参考基线（release，Apple Silicon macOS；正式门固定 Linux）：64B 阶梯零丢——1 订阅端到端 867k msg/s；100 订阅 3.52M 投递/s；1000 订阅 320k 投递/s；10000 订阅 265k 投递/s；1000×1KiB 393k 投递/s。慢消费者 20k×1KiB 突发 RSS 增长 9.4MiB（门 <64MiB），丢帧如实。三节点 2000 record 广播 peer_copies 恰 1,000,000、rejected/unknown 0、远端各收满 50 万、relay_sent 恰 4000。A2.4 默认路径 48.6k RPS p99 2.93ms vs 基线 48.0k/4.76ms，无回归（≤3% 门 PASS）。
-- 基准口径（验收记录 V8-6 行留档）：队列配到容下整段突发测无损容量；丢弃语义由慢消费者场景/集成/单测覆盖。Linux 正式门待补档目（100k 成员、64KiB 载荷、CPU/调度停顿、放大率多档、10k 流容量 CV 多轮）。
-- V8-7（Redis SessionDirectory）/V8-8（WS 桥接）为计划内【非阻塞，可延期】项，未实现；`session_registry=redis` 构建期明确拒绝，不静默退化。
+- 基准口径：队列配到容下整段突发测无损容量；丢弃语义由慢消费者场景/集成/单测覆盖。Linux 正式门现已覆盖 100k 成员、64KiB 载荷、CPU/调度停顿、放大率多档、10k 流容量五轮 CV 与 RSS/FD drain，并在 2026-08-06 当前 release 上通过。
+- V8-7 Redis SessionDirectory 与 V8-8 WS 桥接均已完成，真实 Redis/三节点和 native gRPC↔WS 同字节回归由各自独立用例覆盖。
 
 ### V8-3b/V8-4/V8-5 gRPC 边缘模式：relay mTLS、broadcast-probe 定向单播、Nacos 成员 watch（2026-08-03，Codex 实现 + 审查修复；feature `grpc-edge` 门控）
 

@@ -192,6 +192,8 @@ pub async fn apply_reload(
             let old_topology = old.listen_topology();
             let old_admin_listen = old.admin_listen.clone();
             let old_edge_cluster = old.grpc_edge_cluster.clone();
+            #[cfg(feature = "grpc-edge")]
+            let old_edge_nacos = old.discovery.nacos.clone();
             let old_runtime_state = rate_limiter_config_signature(&old.runtime_state);
             let old_dynamic_store = dynamic_store_config_signature(&old.runtime_state);
             let old_circuit_stats = circuit_stats_config_signature(&old.runtime_state);
@@ -221,20 +223,26 @@ pub async fn apply_reload(
                 return false;
             }
             let new_topology = new_snap.listen_topology();
-            if !same_edge_relay_topology(
+            let edge_relay_changed = !same_edge_relay_topology(
                 old_edge_cluster.as_deref(),
                 new_snap.grpc_edge_cluster.as_deref(),
-            ) {
+            );
+            if edge_relay_changed
+                && !edge_relay_hot_reload_compatible(
+                    old_edge_cluster.as_deref(),
+                    new_snap.grpc_edge_cluster.as_deref(),
+                )
+            {
                 tracing::error!(
                     trigger,
-                    "gRPC edge relay topology change rejected; restart required"
+                    "gRPC edge cluster transport mode or identity change rejected; restart required"
                 );
                 history.record_rejected(
                     trigger,
                     cfg_path,
                     old_version,
                     next,
-                    "grpc_edge_cluster runtime topology change requires restart",
+                    "grpc_edge_cluster mode/cluster_id/node_id/membership change requires restart",
                 );
                 return false;
             }
@@ -555,8 +563,45 @@ pub async fn apply_reload(
             };
             let routes = new_snap.router.len();
             let guards = new_snap.interface_guard.rule_count();
+            #[cfg(feature = "grpc-edge")]
+            let prepared_edge_relay = if edge_relay_changed {
+                match prepare_edge_relay_reload(
+                    runtime,
+                    old_edge_cluster
+                        .as_ref()
+                        .expect("compatible change has current relay"),
+                    new_snap
+                        .grpc_edge_cluster
+                        .as_ref()
+                        .expect("compatible change has candidate relay")
+                        .clone(),
+                    old_edge_nacos,
+                    new_snap.discovery.nacos.clone(),
+                )
+                .await
+                {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        tracing::error!(trigger, error = %error, "gRPC edge relay prepare failed; old generation restored");
+                        history.record_rejected(
+                            trigger,
+                            cfg_path,
+                            old_version,
+                            next,
+                            format!("grpc_edge_cluster hot reload prepare failed: {error:#}"),
+                        );
+                        return false;
+                    }
+                }
+            } else {
+                None
+            };
             let new_snap = Arc::new(new_snap);
             snap.store(new_snap.clone()); // ★唯一的原子换版点(无锁、纳秒级)★
+            #[cfg(feature = "grpc-edge")]
+            if let Some(prepared) = prepared_edge_relay {
+                prepared.commit();
+            }
             if let Some(prepared) = prepared_listener_topology {
                 // prepare 已完成所有可能失败的 bind/TLS 构建；commit 只启动新 accept task，
                 // 再通知旧 task 停 accept。旧 task 已交出的连接各自持有 IO/快照继续 drain。
@@ -1338,4 +1383,119 @@ fn same_edge_relay_topology(
         (Some(current), Some(candidate)) => current.same_runtime_topology(candidate),
         _ => false,
     }
+}
+
+/// 业务作用：判定 relay 候选能否在进程内热换代，防止身份/成员事实源变化绕过显式迁移。
+///
+/// 参数说明：`current`/`candidate` 是当前与候选集群计划。
+///
+/// 返回：两侧均为 relay 且 cluster/node/membership 权威不变时返回 `true`。
+///
+/// relay hot swap 只允许同一逻辑成员换运行参数；改变 mode/集群身份/成员事实源会
+/// 同时改变连接所有权和外部依赖，仍要求显式重启迁移。
+fn edge_relay_hot_reload_compatible(
+    current: Option<&crate::grpc_edge::GrpcEdgeClusterPlan>,
+    candidate: Option<&crate::grpc_edge::GrpcEdgeClusterPlan>,
+) -> bool {
+    use crate::config::model::GrpcEdgeClusterModeCfg;
+    matches!((current, candidate), (Some(current), Some(candidate))
+        if current.mode == GrpcEdgeClusterModeCfg::Relay
+            && candidate.mode == GrpcEdgeClusterModeCfg::Relay
+            && current.cluster_id == candidate.cluster_id
+            && current.node_id == candidate.node_id
+            && current.membership == candidate.membership)
+}
+
+#[cfg(feature = "grpc-edge")]
+struct PreparedEdgeRelayReload {
+    old: Arc<crate::edge_relay::EdgeRelay>,
+    candidate: Arc<crate::edge_relay::EdgeRelay>,
+    proxy: Arc<crate::proxy::GatewayProxy>,
+}
+
+#[cfg(feature = "grpc-edge")]
+impl PreparedEdgeRelayReload {
+    /// 业务作用：原子发布已准备的 relay 候选，再异步排干旧代，保持“先可用后切换”的提交顺序。
+    ///
+    /// 参数说明：无；`self` 已持有完成 bind/成员任务准备的候选和当前旧代。
+    ///
+    /// 返回：无返回值；提交后新请求只见候选，旧代最多保留一个 ACK deadline 结算在途。
+    fn commit(self) {
+        // 候选已完成所有可失败准备，必须先原子发布再排干旧代；反序会制造无 relay 窗口。
+        self.proxy.attach_edge_relay(self.candidate);
+        tokio::spawn(self.old.drain_and_shutdown());
+    }
+}
+
+#[cfg(feature = "grpc-edge")]
+/// 业务作用：在不发布半完成状态的前提下准备 relay 热换代，并在任一失败点恢复旧代权威。
+///
+/// 参数说明：`runtime` 提供当前 Proxy；`old_plan`/`candidate_plan` 是换代两侧计划；
+/// `old_nacos`/`candidate_nacos` 用于分别恢复或启动成员事实源。
+///
+/// 返回：候选 listener 与成员任务全部就绪时返回可提交对象；失败时恢复旧 transport 后返回错误。
+async fn prepare_edge_relay_reload(
+    runtime: &ReloadRuntime,
+    old_plan: &Arc<crate::grpc_edge::GrpcEdgeClusterPlan>,
+    candidate_plan: Arc<crate::grpc_edge::GrpcEdgeClusterPlan>,
+    old_nacos: crate::config::model::NacosDiscoveryCfg,
+    candidate_nacos: crate::config::model::NacosDiscoveryCfg,
+) -> anyhow::Result<PreparedEdgeRelayReload> {
+    use crate::config::model::GrpcEdgeMembershipCfg;
+
+    let proxy = runtime
+        .proxy
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("relay hot reload requires a running data plane"))?
+        .clone();
+    let old = proxy
+        .current_edge_relay()
+        .ok_or_else(|| anyhow::anyhow!("active relay generation is missing"))?;
+    let same_listener = old_plan.relay_listen == candidate_plan.relay_listen;
+    if same_listener {
+        // 同地址候选只有在旧 accept/dial 暂停并释放 listener 后才能 bind；既有链路继续持有，
+        // 候选失败时可先恢复旧权威再返回，避免把集群留在半完成保护态。
+        old.pause_transport().await;
+    }
+
+    let candidate =
+        match crate::edge_relay::EdgeRelay::start(candidate_plan.clone(), proxy.grpc_edge_hub())
+            .await
+        {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                // 候选尚未发布；先把 Hub 的控制权和旧 transport 恢复，再把失败交给 reload 回滚。
+                old.activate_interest();
+                if same_listener {
+                    old.resume_transport()
+                        .await
+                        .context("restore old relay transport")?;
+                    if old_plan.membership == GrpcEdgeMembershipCfg::Nacos {
+                        old.start_nacos_membership(old_nacos)
+                            .context("restore old relay Nacos membership")?;
+                    }
+                }
+                return Err(error).context("start candidate relay generation");
+            }
+        };
+    if candidate_plan.membership == GrpcEdgeMembershipCfg::Nacos {
+        if let Err(error) = candidate.start_nacos_membership(candidate_nacos) {
+            // 成员事实源未就绪的候选不能发布；先清候选资源，再完整恢复旧代控制权与 watcher。
+            candidate.shutdown_now().await;
+            old.activate_interest();
+            if same_listener {
+                old.resume_transport()
+                    .await
+                    .context("restore old relay transport")?;
+                old.start_nacos_membership(old_nacos)
+                    .context("restore old relay Nacos membership")?;
+            }
+            return Err(error).context("start candidate relay Nacos membership");
+        }
+    }
+    Ok(PreparedEdgeRelayReload {
+        old,
+        candidate,
+        proxy,
+    })
 }

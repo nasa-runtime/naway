@@ -39,6 +39,24 @@ pub enum RelayAction {
     Publish,
     /// 定向单播:scope = 目标 user(V8-4 broadcast-probe 使用)。
     Push,
+    /// E1 控制面：清空并开始指定 revision 的兴趣快照。
+    InterestReset,
+    /// E1 控制面：指定 tenant/group 当前有本地订阅。
+    InterestUp,
+    /// E1 控制面：指定 tenant/group 当前无本地订阅。
+    InterestDown,
+    /// E1 控制面：快照完成或心跳，允许接收方使用该 hint。
+    InterestReady,
+    /// group_owner 入口把 payload 定向交给 owner；owner 串行化后再发最终 Publish。
+    PublishToOwner,
+    /// single_session claim 请求，revision 是新 fencing token。
+    SessionClaim,
+    /// owner 发往全 mesh 的 fence，关闭所有不匹配 token 的旧连接。
+    SessionFence,
+    /// session 关闭后发往 owner 的释放请求。
+    SessionReleaseRequest,
+    /// owner 发往全 mesh 的幂等 fence 释放。
+    SessionRelease,
 }
 
 /// enqueue-ack 结果(§25.2.6:ack 只表示"peer 接受进本地 fanout",绝不叫 delivered)。
@@ -80,6 +98,8 @@ pub struct RelayData {
     pub tenant: Box<str>,
     /// group id(publish)或目标 user(push)。
     pub scope: Box<str>,
+    /// E1 interest 控制 revision；业务 Publish/Push 恒为 0。
+    pub revision: u64,
     /// 原样业务 gRPC 帧 `[5B prefix + body]`;同 chunk 到达时是零拷贝 slice。
     pub payload: Bytes,
 }
@@ -93,6 +113,10 @@ pub struct RelayAck {
     pub outcome: RelayAckOutcome,
     /// peer 本地入队份数(观测用;RejectedOverload/Invalid 恒 0)。
     pub copies: u64,
+    /// owner 二跳执行中明确拒绝的下游 peer 数。
+    pub rejected: u64,
+    /// owner 二跳执行中断线或超时的下游 peer 数。
+    pub unknown: u64,
 }
 
 /// 解码产出的一条完整 record。
@@ -191,13 +215,35 @@ pub fn encode_hello(hello: &RelayHello) -> Bytes {
     record.freeze()
 }
 
-/// 编码业务散出 record:头段自有、payload 共享(§25.2 少拷贝散出)。
+/// 业务作用：编码普通业务散出 record，保持头段自有、payload 跨 peer 共享的少拷贝契约。
+///
+/// 参数说明：`seq` 是事件序号，`action` 是 Publish/Push，`tenant`/`scope` 是已验证路由键，
+/// `payload` 是不透明 gRPC 帧。
+///
+/// 返回：返回可分段写出的 wire record；业务动作 revision 恒为 0。
 pub fn encode_data(
     seq: u64,
     action: RelayAction,
     tenant: &str,
     scope: &str,
     payload: Bytes,
+) -> EncodedRelayData {
+    encode_data_with_revision(seq, action, tenant, scope, payload, 0)
+}
+
+/// 业务作用：统一编码业务与 interest/session 控制 record，并把 fencing revision 固化进 wire 元数据。
+///
+/// 参数说明：`seq`/`action` 标识事件，`tenant`/`scope` 是作用域，`payload` 是共享帧，
+/// `revision` 仅控制动作非零。
+///
+/// 返回：返回头/载荷分离的编码结果；调用方仍负责语义组合校验。
+fn encode_data_with_revision(
+    seq: u64,
+    action: RelayAction,
+    tenant: &str,
+    scope: &str,
+    payload: Bytes,
+    revision: u64,
 ) -> EncodedRelayData {
     let mut meta = BytesMut::new();
     put_varint_field(&mut meta, 1, seq);
@@ -207,10 +253,20 @@ pub fn encode_data(
         match action {
             RelayAction::Publish => 1,
             RelayAction::Push => 2,
+            RelayAction::InterestReset => 3,
+            RelayAction::InterestUp => 4,
+            RelayAction::InterestDown => 5,
+            RelayAction::InterestReady => 6,
+            RelayAction::PublishToOwner => 7,
+            RelayAction::SessionClaim => 8,
+            RelayAction::SessionFence => 9,
+            RelayAction::SessionReleaseRequest => 10,
+            RelayAction::SessionRelease => 11,
         },
     );
     put_len_delimited(&mut meta, 3, tenant.as_bytes());
     put_len_delimited(&mut meta, 4, scope.as_bytes());
+    put_varint_field(&mut meta, 5, revision);
     // 上 wire 即已被中继一跳(§25.2.6:ingress hop=0,发 peer 后 hop=1)。
     let mut head = fixed_header(KIND_DATA, 1, meta.len(), payload.len());
     head.extend_from_slice(&meta);
@@ -234,6 +290,8 @@ pub fn encode_ack(ack: &RelayAck) -> Bytes {
         },
     );
     put_varint_field(&mut meta, 3, ack.copies);
+    put_varint_field(&mut meta, 4, ack.rejected);
+    put_varint_field(&mut meta, 5, ack.unknown);
     let mut record = fixed_header(KIND_ACK, 0, meta.len(), 0);
     record.extend_from_slice(&meta);
     record.freeze()
@@ -468,6 +526,15 @@ fn parse_body(
             let action = match fields.varint(2) {
                 1 => RelayAction::Publish,
                 2 => RelayAction::Push,
+                3 => RelayAction::InterestReset,
+                4 => RelayAction::InterestUp,
+                5 => RelayAction::InterestDown,
+                6 => RelayAction::InterestReady,
+                7 => RelayAction::PublishToOwner,
+                8 => RelayAction::SessionClaim,
+                9 => RelayAction::SessionFence,
+                10 => RelayAction::SessionReleaseRequest,
+                11 => RelayAction::SessionRelease,
                 _ => return Err(RelayDecodeError::BadMetadata),
             };
             let tenant = fields.text(3)?;
@@ -480,6 +547,7 @@ fn parse_body(
                 action,
                 tenant,
                 scope,
+                revision: fields.varint(5),
                 // payload 是 body 的尾部子 slice:快路径下与网络 chunk 共享存储。
                 payload: body.slice(metadata_len..),
             }))
@@ -499,6 +567,8 @@ fn parse_body(
                 seq,
                 outcome,
                 copies: fields.varint(3),
+                rejected: fields.varint(4),
+                unknown: fields.varint(5),
             }))
         }
         _ => Err(RelayDecodeError::BadKind),
@@ -640,7 +710,7 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use parking_lot::Mutex;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant as TokioInstant;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -661,6 +731,9 @@ const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const PASSIVE_REPROBE_INTERVAL: Duration = Duration::from_secs(60);
 /// 出线 chunk 通道深度(head+payload 各一发;背压经 H2 流控传导)。
 const OUTBOUND_CHANNEL_CHUNKS: usize = 64;
+const INTEREST_EVENT_CAPACITY: usize = 1_024;
+const INTEREST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const INTEREST_HINT_TTL: Duration = Duration::from_secs(30);
 
 /// 单条 record 在单个 peer 上的最终结果(§25.2.6 回执口径,绝不叫 delivered)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -669,6 +742,10 @@ pub enum PeerRecordOutcome {
     Accepted {
         /// peer 本地入队份数。
         copies: u64,
+        /// owner 二跳聚合中的明确拒绝数。
+        rejected: u64,
+        /// owner 二跳聚合中的断线/超时数。
+        unknown: u64,
     },
     /// 过载拒绝(本端 relay 队列 drop_new 或 peer 预算耗尽)。
     RejectedOverload,
@@ -712,6 +789,10 @@ pub struct RelayMetricsSnapshot {
     pub dedup_total: u64,
     /// broadcast-probe 全体未命中次数(§25.2.7;目标不在线不是错误,但要可观测)。
     pub probe_miss_total: u64,
+    /// 因 peer 明确无 group 兴趣而跳过的 payload 份数。
+    pub interest_filtered_total: u64,
+    /// 当前 hint 已就绪且未过期的 peer 数。
+    pub interest_ready_peers: usize,
 }
 
 /// mpsc 支撑的流式 body:请求(拨号侧)与响应(受话侧)共用;sender 落地即 EOS。
@@ -749,6 +830,15 @@ struct QueuedRecord {
     ack_tx: oneshot::Sender<PeerRecordOutcome>,
 }
 
+/// 已解码、等待串行应用的入站 DATA。permit 按 record 的保守驻留字节收费，worker
+/// 处理完自动归还；因此入站和出站都服从同一份 relay_queue 双维配置，不存在写死 1024
+/// 条且最多可滞留 16 GiB payload 的隐藏预算。
+struct InboundRecord {
+    data: RelayData,
+    reassembled: u64,
+    _bytes: OwnedSemaphorePermit,
+}
+
 /// 在途等待回执的 record。
 struct PendingAck {
     deadline: TokioInstant,
@@ -766,15 +856,26 @@ struct RelayQueue {
     bytes: usize,
 }
 
+#[derive(Default)]
+struct RemoteInterestState {
+    revision: u64,
+    ready: bool,
+    last_refresh: Option<TokioInstant>,
+    /// tenant/group 的 64 位稳定摘要；碰撞只会多发 payload，不会漏发。
+    groups: HashSet<u64>,
+}
+
 /// 一条已握手的 peer 链路(唯一双向 stream 的本端句柄)。
 struct PeerLink {
     node_id: Box<str>,
     peer_boot_id: u64,
     generation: u64,
     outbound: mpsc::Sender<Bytes>,
+    inbound: mpsc::Sender<InboundRecord>,
     queue: Mutex<RelayQueue>,
     queue_notify: Notify,
     in_flight: Mutex<RelayInFlight>,
+    remote_interest: Mutex<RemoteInterestState>,
     closed: AtomicBool,
     closed_notify: Notify,
 }
@@ -806,8 +907,14 @@ struct Watermark {
     last_seq: u64,
 }
 
+enum InterestCommand {
+    Changed(Arc<str>, Arc<str>),
+    Sync(Box<str>),
+}
+
 /// 静态 peers 中继运行时。进程一份,持有与数据面相同的 [`EdgeHub`];
-/// 接收侧只做本地散出(hop=1),结构上不存在二次 relay 路径。
+/// 普通 Publish/Push 接收侧只做本地散出；仅 group_owner owner 与 session owner
+/// 控制动作允许一次受控二段 fanout，wire 上每条 record 仍恒为 hop=1，不形成环。
 pub struct EdgeRelay {
     plan: Arc<GrpcEdgeClusterPlan>,
     hub: Arc<EdgeHub>,
@@ -820,6 +927,7 @@ pub struct EdgeRelay {
     /// Some 时:握手校验成员资格、reconcile 定向关停出集链路并回收其水位线。
     desired_nodes: Mutex<Option<HashSet<Box<str>>>>,
     dial_tasks: Mutex<HashMap<SocketAddr, tokio::task::JoinHandle<()>>>,
+    accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     membership_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     peer_count: AtomicUsize,
     links: Mutex<HashMap<Box<str>, Arc<PeerLink>>>,
@@ -832,10 +940,18 @@ pub struct EdgeRelay {
     dedup_total: AtomicU64,
     /// V8-4 broadcast-probe 全体未命中计数(本地 + 全部 peers 入队皆 0)。
     probe_miss_total: AtomicU64,
+    interest_filtered_total: AtomicU64,
+    interest_tx: mpsc::Sender<InterestCommand>,
+    ordering_shards: Vec<tokio::sync::Mutex<()>>,
+    session_shards: Vec<tokio::sync::Mutex<()>>,
 }
 
 impl EdgeRelay {
-    /// 绑定 relay listener、为每个静态 peer 启动拨号任务,返回运行时句柄。
+    /// 业务作用：绑定 relay listener、启动 interest/拨号任务并发布可用的集群传输 generation。
+    ///
+    /// 参数说明：`plan` 是已校验集群计划，`hub` 是与数据面共享的本地订阅索引。
+    ///
+    /// 返回：全部启动步骤成功时返回 relay；bind 或成员对账失败则不发布半完成 transport。
     ///
     /// bind 失败即启动失败(relay 是发布阻塞面,静默降级会把集群裂成孤岛)。
     pub async fn start(
@@ -848,6 +964,7 @@ impl EdgeRelay {
                 anyhow::anyhow!("bind relay listener {}: {error}", plan.relay_listen)
             })?;
         let fingerprint = config_fingerprint(&plan);
+        let (interest_tx, interest_rx) = mpsc::channel(INTEREST_EVENT_CAPACITY);
         let relay = Arc::new(Self {
             boot_id: random_boot_id(),
             fingerprint,
@@ -856,6 +973,7 @@ impl EdgeRelay {
             desired_peers: Mutex::new(HashSet::new()),
             desired_nodes: Mutex::new(None),
             dial_tasks: Mutex::new(HashMap::new()),
+            accept_task: Mutex::new(None),
             membership_task: Mutex::new(None),
             peer_count: AtomicUsize::new(0),
             links: Mutex::new(HashMap::new()),
@@ -867,16 +985,110 @@ impl EdgeRelay {
             unknown_total: AtomicU64::new(0),
             dedup_total: AtomicU64::new(0),
             probe_miss_total: AtomicU64::new(0),
+            interest_filtered_total: AtomicU64::new(0),
+            interest_tx,
+            ordering_shards: (0..1_024).map(|_| tokio::sync::Mutex::new(())).collect(),
+            session_shards: (0..1_024).map(|_| tokio::sync::Mutex::new(())).collect(),
             plan,
             hub,
         });
-        tokio::spawn(accept_loop(relay.clone(), listener));
+        relay.hub.attach_interest_relay(Arc::downgrade(&relay));
+        tokio::spawn(interest_worker(relay.clone(), interest_rx));
+        *relay.accept_task.lock() = Some(tokio::spawn(accept_loop(relay.clone(), listener)));
         relay.reconcile_peers(relay.plan.static_peers.clone())?;
         Ok(relay)
     }
 
-    /// /metrics 快照。
+    /// 业务作用：先停止 listener、拨号与成员发现，阻止旧代获得新流量，同时保留既有链路排干。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；所有 transport task 已取消并完成结算后才返回。
+    pub async fn pause_transport(self: &Arc<Self>) {
+        let accept_task = { self.accept_task.lock().take() };
+        if let Some(task) = accept_task {
+            task.abort();
+            let _ = task.await;
+        }
+        let tasks = self
+            .dial_tasks
+            .lock()
+            .drain()
+            .map(|(_, task)| task)
+            .collect::<Vec<_>>();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        let membership_task = { self.membership_task.lock().take() };
+        if let Some(task) = membership_task {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// 业务作用：同地址候选启动失败时恢复旧代 accept/dial/interest transport，保持热更回滚可用。
+    ///
+    /// 参数说明：无；复用旧代已校验计划。
+    ///
+    /// 返回：成功恢复返回 `Ok`；listener 无法重绑时返回错误，调用方不得宣称回滚完成。
+    pub async fn resume_transport(self: &Arc<Self>) -> anyhow::Result<()> {
+        let listener = TcpListener::bind(self.plan.relay_listen)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("rebind relay listener {}: {error}", self.plan.relay_listen)
+            })?;
+        *self.accept_task.lock() = Some(tokio::spawn(accept_loop(self.clone(), listener)));
+        self.reconcile_peers(self.plan.static_peers.clone())?;
+        self.hub.attach_interest_relay(Arc::downgrade(self));
+        Ok(())
+    }
+
+    /// 业务作用：热换代提交后停止旧 transport，等待一个 ACK deadline 再关闭旧链路，避免半完成回执。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；返回时旧代已不再接受、拨号或持有开放链路。
+    pub async fn drain_and_shutdown(self: Arc<Self>) {
+        self.pause_transport().await;
+        tokio::time::sleep(self.ack_deadline()).await;
+        self.close_all_links();
+    }
+
+    /// 业务作用：候选 generation 尚未发布且构建失败时立即释放 transport，避免泄漏未授权并行代。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；不等待 ACK，因为候选从未承载业务。
+    pub async fn shutdown_now(self: &Arc<Self>) {
+        self.pause_transport().await;
+        self.close_all_links();
+    }
+
+    /// 业务作用：热更回滚时重新把 Hub 的 interest 权威指向旧 generation。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；后续 group 变化只投递给当前恢复代。
+    pub fn activate_interest(self: &Arc<Self>) {
+        self.hub.attach_interest_relay(Arc::downgrade(self));
+    }
+
+    /// 业务作用：生成 relay 的低基数 metrics 快照，并只把未过期且 ready 的 interest peer 计为可用。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回当前 gauge/counter 副本，不持有 relay 锁到渲染阶段。
     pub fn metrics(&self) -> RelayMetricsSnapshot {
+        let now = TokioInstant::now();
+        let interest_ready_peers = self
+            .links
+            .lock()
+            .values()
+            .filter(|link| interest_hint_ready(&link.remote_interest.lock(), now))
+            .count();
         RelayMetricsSnapshot {
             connected_peers: self.connected_peers.load(Ordering::Relaxed),
             queued_records: self.queued_records.load(Ordering::Relaxed),
@@ -885,6 +1097,35 @@ impl EdgeRelay {
             unknown_total: self.unknown_total.load(Ordering::Relaxed),
             dedup_total: self.dedup_total.load(Ordering::Relaxed),
             probe_miss_total: self.probe_miss_total.load(Ordering::Relaxed),
+            interest_filtered_total: self.interest_filtered_total.load(Ordering::Relaxed),
+            interest_ready_peers,
+        }
+    }
+
+    /// 业务作用：接收 EdgeHub 的 group 空/非空边界变化，并把它串行化进 interest revision 控制流。
+    ///
+    /// 参数说明：`tenant`/`group` 是发生变化的已验证本地索引键。
+    ///
+    /// 返回：无返回值；有界控制队列过载时拆链，
+    /// 让对端立即丢弃 hint 并在重连快照完成前 fail-open。
+    pub(crate) fn interest_changed(&self, tenant: Arc<str>, group: Arc<str>) {
+        if self
+            .interest_tx
+            .try_send(InterestCommand::Changed(tenant, group))
+            .is_err()
+        {
+            self.close_all_links();
+        }
+    }
+
+    /// 业务作用：立即使当前全部 peer hint/业务链路失效，迫使重连前统一 fail-open 或 fail-closed 门生效。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；各链路残余队列由既有 teardown 路径结算。
+    fn close_all_links(&self) {
+        for link in self.links.lock().values() {
+            link.close();
         }
     }
 
@@ -1034,7 +1275,230 @@ impl EdgeRelay {
         group: Arc<str>,
         payload: Bytes,
     ) -> impl Future<Output = PeerBroadcastSummary> + Send + 'static {
-        self.broadcast(RelayAction::Publish, tenant, group, payload, None)
+        self.broadcast(RelayAction::Publish, tenant, group, payload, None, 0)
+    }
+
+    /// 业务作用：向入口暴露当前 generation 是否启用 group-owner 严格顺序门。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：配置为 `group_owner` 时返回 `true`。
+    pub fn group_owner_enabled(&self) -> bool {
+        self.plan.ordering == crate::config::model::GrpcEdgeOrderingCfg::GroupOwner
+    }
+
+    /// 业务作用：向 native gRPC 与 WS 订阅入口暴露当前 generation 的 session 语义。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回已校验的 multi-session 或 single-session 模式。
+    pub fn session_mode(&self) -> crate::config::model::GrpcEdgeSessionModeCfg {
+        self.plan.session_mode
+    }
+
+    /// 业务作用：复验所有期望 peer 都已建链，作为强顺序与 single-session 禁止降级的权威门。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：当前链路数与期望成员数完全一致时返回 `true`。
+    fn full_mesh_ready(&self) -> bool {
+        self.links.lock().len() == self.peer_count.load(Ordering::Acquire)
+    }
+
+    /// 业务作用：用确定性 rendezvous 在当前完整成员集中选择 group/user owner。
+    ///
+    /// 参数说明：`tenant`/`scope` 是已经过身份门的业务作用域。
+    ///
+    /// 返回：返回所有节点一致的 owner node_id；成员集合不完整时调用方必须先拒绝。
+    fn owner_for(&self, tenant: &str, scope: &str) -> Box<str> {
+        let links = self.links.lock();
+        let mut nodes = links.keys().map(|node| node.as_ref()).collect::<Vec<_>>();
+        nodes.push(self.plan.node_id.as_ref());
+        nodes.sort_unstable();
+        nodes
+            .into_iter()
+            .max_by_key(|node| rendezvous_score(tenant, scope, node))
+            .map(Box::from)
+            .expect("owner candidate always contains self")
+    }
+
+    /// 业务作用：把 group publish 定向到确定 owner，并在 owner 固定分片内排定本地与 peer fanout 顺序。
+    ///
+    /// 参数说明：`limits` 是本地散出预算，`tenant`/`group` 是作用域，`payload` 是不透明帧，
+    /// `reassembled` 是本次跨 DATA 重组计量。
+    ///
+    /// 返回：完整 mesh 下返回本地/远端聚合；失权、过载或二段回执不完整时失败且不退化乱序。
+    pub async fn publish_group_owned(
+        self: &Arc<Self>,
+        limits: &crate::grpc_edge::GrpcEdgeLimitsPlan,
+        tenant: Arc<str>,
+        group: Arc<str>,
+        payload: Bytes,
+        reassembled: u64,
+    ) -> Result<(crate::edge_hub::LocalFanoutOutcome, PeerBroadcastSummary), &'static str> {
+        if !self.group_owner_enabled() || !self.full_mesh_ready() {
+            return Err("group-owner-mesh-unavailable");
+        }
+        let owner = self.owner_for(&tenant, &group);
+        if owner.as_ref() != self.plan.node_id.as_ref() {
+            let summary = self
+                .broadcast(
+                    RelayAction::PublishToOwner,
+                    tenant,
+                    group,
+                    payload,
+                    Some(HashSet::from([owner])),
+                    0,
+                )
+                .await;
+            if summary.peers_rejected != 0 || summary.peers_unknown != 0 {
+                return Err("group-owner-publish-failed");
+            }
+            return Ok((crate::edge_hub::LocalFanoutOutcome::default(), summary));
+        }
+        let shard = rendezvous_score(&tenant, &group, "") as usize % self.ordering_shards.len();
+        let _guard = self.ordering_shards[shard].lock().await;
+        let local = self
+            .hub
+            .publish_group(
+                limits,
+                tenant.clone(),
+                group.clone(),
+                payload.clone(),
+                reassembled,
+            )
+            .await
+            .map_err(|_| "group-owner-local-overload")?;
+        let peers = self.broadcast_publish(tenant, group, payload).await;
+        Ok((local, peers))
+    }
+
+    /// 业务作用：在确定性 user owner 上串行化 single-session claim，并在全 mesh fence 后发布 token。
+    ///
+    /// 参数说明：`tenant`/`user` 是已验证登录身份。
+    ///
+    /// 返回：全网 fence 成功返回非零 token；mesh 不完整或任一 peer 拒绝/未知时失败，禁止新订阅登记。
+    pub async fn claim_single_session(
+        self: &Arc<Self>,
+        tenant: Arc<str>,
+        user: Arc<str>,
+    ) -> Result<u64, &'static str> {
+        if self.plan.session_mode != crate::config::model::GrpcEdgeSessionModeCfg::SingleSession
+            || !self.full_mesh_ready()
+        {
+            return Err("single-session-mesh-unavailable");
+        }
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let token = self.boot_id.rotate_left(17) ^ seq;
+        if token == 0 {
+            return Err("single-session-token-exhausted");
+        }
+        let owner = self.owner_for(&tenant, &user);
+        if owner.as_ref() == self.plan.node_id.as_ref() {
+            self.apply_session_claim(tenant, user, token).await?;
+        } else {
+            let result = self
+                .broadcast(
+                    RelayAction::SessionClaim,
+                    tenant,
+                    user,
+                    Bytes::new(),
+                    Some(HashSet::from([owner])),
+                    token,
+                )
+                .await;
+            if result.peers_rejected != 0 || result.peers_unknown != 0 {
+                return Err("single-session-claim-failed");
+            }
+        }
+        Ok(token)
+    }
+
+    /// 业务作用：在本节点作为 user owner 时提交本地 fence，再广播全网 fence 并聚合二段回执。
+    ///
+    /// 参数说明：`tenant`/`user` 标识用户，`token` 是本次 claim 的新权威版本。
+    ///
+    /// 返回：全部成员确认后成功；owner 变化、mesh 缺失或回执不完整时返回失败。
+    async fn apply_session_claim(
+        self: &Arc<Self>,
+        tenant: Arc<str>,
+        user: Arc<str>,
+        token: u64,
+    ) -> Result<(), &'static str> {
+        if !self.full_mesh_ready()
+            || self.owner_for(&tenant, &user).as_ref() != self.plan.node_id.as_ref()
+        {
+            return Err("single-session-owner-unavailable");
+        }
+        let shard = rendezvous_score(&tenant, &user, "") as usize % self.session_shards.len();
+        let _guard = self.session_shards[shard].lock().await;
+        self.hub
+            .fence_single_session(tenant.clone(), user.clone(), token);
+        let summary = self
+            .broadcast(
+                RelayAction::SessionFence,
+                tenant,
+                user,
+                Bytes::new(),
+                None,
+                token,
+            )
+            .await;
+        if summary.peers_rejected != 0
+            || summary.peers_unknown != 0
+            || summary.peers_accepted != summary.peers_total
+        {
+            return Err("single-session-fence-failed");
+        }
+        Ok(())
+    }
+
+    /// 业务作用：把订阅 Drop 转换成非阻塞的 owner release 流程，避免在析构路径等待网络。
+    ///
+    /// 参数说明：`tenant`/`user` 标识会话，`token` 是待释放的 fencing 版本。
+    ///
+    /// 返回：无返回值；后台释放只删除匹配 token，迟到消息不能伤及新会话。
+    pub(crate) fn session_closed(self: &Arc<Self>, tenant: Arc<str>, user: Arc<str>, token: u64) {
+        let relay = self.clone();
+        tokio::spawn(async move { relay.release_single_session(tenant, user, token).await });
+    }
+
+    /// 业务作用：把 single-session release 送到确定 owner，并由 owner 幂等释放本地及全 mesh fence。
+    ///
+    /// 参数说明：`tenant`/`user` 标识用户，`token` 是关闭会话的权威版本。
+    ///
+    /// 返回：无返回值；失败保持 fence，比错误开放并发会话更安全，后续换代可回收。
+    async fn release_single_session(
+        self: &Arc<Self>,
+        tenant: Arc<str>,
+        user: Arc<str>,
+        token: u64,
+    ) {
+        let owner = self.owner_for(&tenant, &user);
+        if owner.as_ref() == self.plan.node_id.as_ref() {
+            self.hub.release_session_fence(&tenant, &user, token);
+            let _ = self
+                .broadcast(
+                    RelayAction::SessionRelease,
+                    tenant,
+                    user,
+                    Bytes::new(),
+                    None,
+                    token,
+                )
+                .await;
+        } else {
+            let _ = self
+                .broadcast(
+                    RelayAction::SessionReleaseRequest,
+                    tenant,
+                    user,
+                    Bytes::new(),
+                    Some(HashSet::from([owner])),
+                    token,
+                )
+                .await;
+        }
     }
 
     /// 向全部 peers 广播一条定向 Push record；无 Redis 指路条时这是 V8-4 的有界探测路径。
@@ -1044,7 +1508,7 @@ impl EdgeRelay {
         user: Arc<str>,
         payload: Bytes,
     ) -> impl Future<Output = PeerBroadcastSummary> + Send + 'static {
-        self.broadcast(RelayAction::Push, tenant, user, payload, None)
+        self.broadcast(RelayAction::Push, tenant, user, payload, None, 0)
     }
 
     /// V8-7:按指路条给出的节点集**定向** push,不打扰其余 peers。
@@ -1059,10 +1523,15 @@ impl EdgeRelay {
         payload: Bytes,
         targets: HashSet<Box<str>>,
     ) -> impl Future<Output = PeerBroadcastSummary> + Send + 'static {
-        self.broadcast(RelayAction::Push, tenant, user, payload, Some(targets))
+        self.broadcast(RelayAction::Push, tenant, user, payload, Some(targets), 0)
     }
 
-    /// 广播一个 hop=1 record，并在固定 deadline 内聚合各 peer 的本地 enqueue-ack。
+    /// 业务作用：按显式 targets 或安全可用的 interest hint 选择 peer，广播 hop=1 record 并聚合 enqueue ACK。
+    ///
+    /// 参数说明：`action`/`tenant`/`scope`/`payload` 描述业务或控制事件；`targets` 限定节点集；
+    /// `revision` 只用于 interest/session 控制权威。
+    ///
+    /// 返回：返回可取消的聚合 future；断链、超时和拒绝分别诚实计入 unknown/rejected，不伪造投递。
     fn broadcast(
         self: &Arc<Self>,
         action: RelayAction,
@@ -1070,18 +1539,11 @@ impl EdgeRelay {
         scope: Arc<str>,
         payload: Bytes,
         targets: Option<HashSet<Box<str>>>,
+        revision: u64,
     ) -> impl Future<Output = PeerBroadcastSummary> + Send + 'static {
         let relay = self.clone();
         async move {
-            let mut summary = PeerBroadcastSummary {
-                // 定向模式的分母是"被寻址的 peer 数",不是全体成员——否则未被寻址的
-                // 节点会被记成 down/unknown,把加速路径伪装成故障。
-                peers_total: match &targets {
-                    Some(targets) => targets.len() as u32,
-                    None => relay.peer_count.load(Ordering::Acquire) as u32,
-                },
-                ..PeerBroadcastSummary::default()
-            };
+            let mut summary = PeerBroadcastSummary::default();
             let seq = relay.next_seq.fetch_add(1, Ordering::Relaxed);
             if seq == 0 {
                 // event id 的 seq=0 在 wire 上非法；极端回绕时拒绝复用旧事件空间。
@@ -1091,7 +1553,10 @@ impl EdgeRelay {
                     .fetch_add(u64::from(summary.peers_total), Ordering::Relaxed);
                 return summary;
             }
-            let encoded = encode_data(seq, action, &tenant, &scope, payload);
+            let encoded =
+                encode_data_with_revision(seq, action, &tenant, &scope, payload, revision);
+            let interest_key = interest_key(&tenant, &scope);
+            let mut filtered = 0usize;
             let links: Vec<Arc<PeerLink>> = {
                 let links = relay.links.lock();
                 match &targets {
@@ -1100,9 +1565,41 @@ impl EdgeRelay {
                         .filter(|(node_id, _)| targets.contains(*node_id))
                         .map(|(_, link)| link.clone())
                         .collect(),
-                    None => links.values().cloned().collect(),
+                    None => links
+                        .values()
+                        .filter(|link| {
+                            if action != RelayAction::Publish
+                                || relay.plan.interest_route
+                                    != crate::config::model::GrpcEdgeInterestRouteCfg::Auto
+                            {
+                                return true;
+                            }
+                            let state = link.remote_interest.lock();
+                            if !interest_hint_ready(&state, TokioInstant::now())
+                                || state.groups.contains(&interest_key)
+                            {
+                                true
+                            } else {
+                                filtered += 1;
+                                false
+                            }
+                        })
+                        .cloned()
+                        .collect(),
                 }
             };
+            summary.peers_total = match &targets {
+                Some(targets) => targets.len() as u32,
+                None => relay
+                    .peer_count
+                    .load(Ordering::Acquire)
+                    .saturating_sub(filtered) as u32,
+            };
+            if filtered > 0 {
+                relay
+                    .interest_filtered_total
+                    .fetch_add(filtered as u64, Ordering::Relaxed);
+            }
             // 已配置但当前无链路的 peer:断线不盲重试,立即按 FAIL 计(§25.2.6)。
             let down = (summary.peers_total as usize).saturating_sub(links.len()) as u32;
             summary.peers_unknown += down;
@@ -1196,7 +1693,13 @@ impl EdgeRelay {
         Ok(ack_rx)
     }
 
-    /// 注册链路:同 node_id 已存在时,新 boot/更高 generation 原子替换旧连接
+    /// 业务作用：原子发布通过握手的新 peer 链路，并在发布后触发该节点的 interest 全量同步。
+    ///
+    /// 参数说明：`link` 是已完成身份、成员和配置指纹校验的链路。
+    ///
+    /// 返回：新代成功替换/插入时返回 `true`；陈旧代或成员表超限返回 `false` 且不发布。
+    ///
+    /// 同 node_id 已存在时,新 boot/更高 generation 原子替换旧连接
     /// (§25.2.6 连接去重),否则判定本次为陈旧连接拒绝。
     fn register_link(&self, link: Arc<PeerLink>) -> bool {
         let mut links = self.links.lock();
@@ -1216,7 +1719,16 @@ impl EdgeRelay {
             }
             self.connected_peers.fetch_add(1, Ordering::Relaxed);
         }
-        links.insert(link.node_id.clone(), link);
+        let node_id = link.node_id.clone();
+        links.insert(node_id.clone(), link);
+        drop(links);
+        if self
+            .interest_tx
+            .try_send(InterestCommand::Sync(node_id))
+            .is_err()
+        {
+            self.close_all_links();
+        }
         true
     }
 
@@ -1259,8 +1771,19 @@ impl EdgeRelay {
         }
     }
 
-    /// 接收侧处理一条 data record:水位线去重 → 本地散出(hop=1,不再 relay)→ 回执。
-    async fn handle_inbound_data(&self, link: &Arc<PeerLink>, data: RelayData, reassembled: u64) {
+    /// 业务作用：在已注册链路上校验、去重并执行业务/interest/session record，再发送诚实 ACK。
+    ///
+    /// 参数说明：`link` 是当前注册代，`data` 是完整 record，`reassembled` 是跨 DATA 重组计量。
+    ///
+    /// 返回：无返回值；失权链路立即停止，语义无效/水位超限拒绝，成功副作用后才推进水位线。
+    ///
+    /// 执行顺序：水位线去重 → 本地或受控二段动作(hop=1,不形成环)→ ACK。
+    async fn handle_inbound_data(
+        self: &Arc<Self>,
+        link: &Arc<PeerLink>,
+        data: RelayData,
+        reassembled: u64,
+    ) {
         if link.is_closed()
             || !self
                 .links
@@ -1270,14 +1793,34 @@ impl EdgeRelay {
         {
             return;
         }
-        let semantic_valid = valid_grpc_payload(&data.payload)
-            && valid_runtime_id(&data.tenant, self.plan.fanout_limits.max_id_bytes)
-            && valid_runtime_id(&data.scope, self.plan.fanout_limits.max_id_bytes);
+        let interest_control = matches!(
+            data.action,
+            RelayAction::InterestReset
+                | RelayAction::InterestUp
+                | RelayAction::InterestDown
+                | RelayAction::InterestReady
+        );
+        let session_control = matches!(
+            data.action,
+            RelayAction::SessionClaim
+                | RelayAction::SessionFence
+                | RelayAction::SessionReleaseRequest
+                | RelayAction::SessionRelease
+        );
+        let semantic_valid = valid_runtime_id(&data.tenant, self.plan.fanout_limits.max_id_bytes)
+            && valid_runtime_id(&data.scope, self.plan.fanout_limits.max_id_bytes)
+            && if interest_control || session_control {
+                data.revision > 0 && data.payload.is_empty()
+            } else {
+                data.revision == 0 && valid_grpc_payload(&data.payload)
+            };
         if !semantic_valid {
             let ack = RelayAck {
                 seq: data.seq,
                 outcome: RelayAckOutcome::RejectedInvalid,
                 copies: 0,
+                rejected: 0,
+                unknown: 0,
             };
             if link.outbound.send(encode_ack(&ack)).await.is_err() {
                 link.close();
@@ -1304,6 +1847,8 @@ impl EdgeRelay {
                 seq: data.seq,
                 outcome: RelayAckOutcome::RejectedInvalid,
                 copies: 0,
+                rejected: 0,
+                unknown: 0,
             };
             if link.outbound.send(encode_ack(&ack)).await.is_err() {
                 link.close();
@@ -1317,41 +1862,127 @@ impl EdgeRelay {
                 seq: data.seq,
                 outcome: RelayAckOutcome::Accepted,
                 copies: 0,
+                rejected: 0,
+                unknown: 0,
             }
         } else {
+            let interest_applied = interest_control.then(|| apply_interest_control(link, &data));
             let RelayData {
                 seq,
                 action,
                 tenant,
                 scope,
+                revision,
                 payload,
             } = data;
-            let outcome = match action {
-                RelayAction::Publish => {
+            let outcome: Result<(u64, u64, u64), RelayAckOutcome> = match action {
+                RelayAction::Publish => self
+                    .hub
+                    .publish_group(
+                        &self.plan.fanout_limits,
+                        shared(tenant),
+                        shared(scope),
+                        payload,
+                        reassembled,
+                    )
+                    .await
+                    .map(|fanned| (u64::from(fanned.accepted), 0, 0))
+                    .map_err(|_| RelayAckOutcome::RejectedOverload),
+                RelayAction::Push => self
+                    .hub
+                    .push_user(
+                        &self.plan.fanout_limits,
+                        shared(tenant),
+                        shared(scope),
+                        payload,
+                        reassembled,
+                    )
+                    .await
+                    .map(|fanned| (u64::from(fanned.accepted), 0, 0))
+                    .map_err(|_| RelayAckOutcome::RejectedOverload),
+                RelayAction::PublishToOwner => {
+                    if !self.group_owner_enabled()
+                        || !self.full_mesh_ready()
+                        || self.owner_for(&tenant, &scope).as_ref() != self.plan.node_id.as_ref()
+                    {
+                        Err(RelayAckOutcome::RejectedInvalid)
+                    } else {
+                        let tenant = shared(tenant);
+                        let group = shared(scope);
+                        let shard = rendezvous_score(&tenant, &group, "") as usize
+                            % self.ordering_shards.len();
+                        let _guard = self.ordering_shards[shard].lock().await;
+                        match self
+                            .hub
+                            .publish_group(
+                                &self.plan.fanout_limits,
+                                tenant.clone(),
+                                group.clone(),
+                                payload.clone(),
+                                reassembled,
+                            )
+                            .await
+                        {
+                            Ok(local) => {
+                                let peers = self.broadcast_publish(tenant, group, payload).await;
+                                Ok((
+                                    u64::from(local.accepted) + peers.accepted_copies,
+                                    u64::from(peers.peers_rejected),
+                                    u64::from(peers.peers_unknown),
+                                ))
+                            }
+                            Err(_) => Err(RelayAckOutcome::RejectedOverload),
+                        }
+                    }
+                }
+                RelayAction::SessionClaim => self
+                    .apply_session_claim(shared(tenant), shared(scope), revision)
+                    .await
+                    .map(|()| (0, 0, 0))
+                    .map_err(|_| RelayAckOutcome::RejectedOverload),
+                RelayAction::SessionFence => {
                     self.hub
-                        .publish_group(
-                            &self.plan.fanout_limits,
+                        .fence_single_session(shared(tenant), shared(scope), revision);
+                    Ok((0, 0, 0))
+                }
+                RelayAction::SessionReleaseRequest => {
+                    self.hub.release_session_fence(&tenant, &scope, revision);
+                    let peers = self
+                        .broadcast(
+                            RelayAction::SessionRelease,
                             shared(tenant),
                             shared(scope),
-                            payload,
-                            reassembled,
+                            Bytes::new(),
+                            None,
+                            revision,
                         )
-                        .await
+                        .await;
+                    Ok((
+                        0,
+                        u64::from(peers.peers_rejected),
+                        u64::from(peers.peers_unknown),
+                    ))
                 }
-                RelayAction::Push => {
-                    self.hub
-                        .push_user(
-                            &self.plan.fanout_limits,
-                            shared(tenant),
-                            shared(scope),
-                            payload,
-                            reassembled,
-                        )
-                        .await
+                RelayAction::SessionRelease => {
+                    self.hub.release_session_fence(&tenant, &scope, revision);
+                    Ok((0, 0, 0))
                 }
+                RelayAction::InterestReset
+                | RelayAction::InterestUp
+                | RelayAction::InterestDown
+                | RelayAction::InterestReady => Ok((0, 0, 0)),
+            };
+            let outcome = if let Some(applied) = interest_applied {
+                if applied {
+                    Ok((0, 0, 0))
+                } else {
+                    Err(RelayAckOutcome::RejectedInvalid)
+                }
+            } else {
+                outcome
             };
             match outcome {
-                Ok(fanned) => {
+                Ok((copies, rejected, unknown)) => {
                     self.watermarks.lock().insert(
                         link.node_id.clone(),
                         Watermark {
@@ -1362,13 +1993,17 @@ impl EdgeRelay {
                     RelayAck {
                         seq,
                         outcome: RelayAckOutcome::Accepted,
-                        copies: u64::from(fanned.accepted),
+                        copies,
+                        rejected,
+                        unknown,
                     }
                 }
-                Err(_budget) => RelayAck {
+                Err(outcome) => RelayAck {
                     seq,
-                    outcome: RelayAckOutcome::RejectedOverload,
+                    outcome,
                     copies: 0,
+                    rejected: 0,
+                    unknown: 0,
                 },
             }
         };
@@ -1396,9 +2031,15 @@ fn valid_runtime_id(value: &str, max: usize) -> bool {
 
 fn tally(relay: &EdgeRelay, summary: &mut PeerBroadcastSummary, outcome: PeerRecordOutcome) {
     match outcome {
-        PeerRecordOutcome::Accepted { copies } => {
+        PeerRecordOutcome::Accepted {
+            copies,
+            rejected,
+            unknown,
+        } => {
             summary.peers_accepted += 1;
             summary.accepted_copies += copies;
+            summary.peers_rejected = summary.peers_rejected.saturating_add(rejected as u32);
+            summary.peers_unknown = summary.peers_unknown.saturating_add(unknown as u32);
         }
         PeerRecordOutcome::RejectedOverload | PeerRecordOutcome::RejectedInvalid => {
             summary.peers_rejected += 1;
@@ -1440,6 +2081,259 @@ fn secret_matches(expected: &str, presented: &[u8]) -> bool {
 }
 
 // ── 链路任务 ──
+
+/// 业务作用：为 tenant/group 生成稳定低成本摘要，供 peer interest 集快速过滤业务广播。
+///
+/// 参数说明：`tenant`/`group` 是已验证作用域；分隔字节防止拼接歧义。
+///
+/// 返回：返回稳定 64 位摘要；碰撞只会多发，不可用于授权或漏发判断。
+fn interest_key(tenant: &str, group: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in tenant
+        .as_bytes()
+        .iter()
+        .chain(std::iter::once(&0xff))
+        .chain(group.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 业务作用：计算 group/user 在指定节点上的 rendezvous 分数，保证所有成员独立选出同一 owner。
+///
+/// 参数说明：`tenant`/`scope` 是业务键，`node` 是候选 node_id。
+///
+/// 返回：返回稳定 64 位分数，仅用于确定性排序，不承担密码学或授权用途。
+fn rendezvous_score(tenant: &str, scope: &str, node: &str) -> u64 {
+    let mut hash = interest_key(tenant, scope);
+    for byte in node.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 业务作用：复验 peer interest 快照已完成且未过期，禁止用缺证据或陈旧 hint 做漏发过滤。
+///
+/// 参数说明：`state` 是 peer 快照状态，`now` 是同一 Tokio 单调时钟采样。
+///
+/// 返回：ready 且最后刷新不超过 TTL 时返回 `true`，否则调用方必须 fail-open 广播。
+fn interest_hint_ready(state: &RemoteInterestState, now: TokioInstant) -> bool {
+    state.ready
+        && state
+            .last_refresh
+            .is_some_and(|seen| now.saturating_duration_since(seen) <= INTEREST_HINT_TTL)
+}
+
+/// 业务作用：按 revision 应用 peer 的 reset/up/down/ready 控制流，并在断档时立即撤销 hint 权威。
+///
+/// 参数说明：`link` 持有远端快照，`data` 是已通过 wire 与字段边界校验的控制 record。
+///
+/// 返回：识别为 interest 控制动作时返回 `true`；其它动作返回 `false` 交给业务分支处理。
+fn apply_interest_control(link: &PeerLink, data: &RelayData) -> bool {
+    let now = TokioInstant::now();
+    let mut state = link.remote_interest.lock();
+    match data.action {
+        RelayAction::InterestReset => {
+            if data.revision < state.revision {
+                return true;
+            }
+            state.revision = data.revision;
+            state.ready = false;
+            state.groups.clear();
+            state.last_refresh = Some(now);
+            true
+        }
+        RelayAction::InterestUp | RelayAction::InterestDown => {
+            if data.revision < state.revision {
+                return true;
+            }
+            let snapshot_item = !state.ready && data.revision == state.revision;
+            let live_item = state.ready && data.revision == state.revision.saturating_add(1);
+            if !snapshot_item && !live_item {
+                // revision 断档：立即停止使用 hint，直到下次完整快照。
+                state.revision = data.revision;
+                state.ready = false;
+                state.groups.clear();
+                state.last_refresh = Some(now);
+                return true;
+            }
+            if live_item {
+                state.revision = data.revision;
+            }
+            let key = interest_key(&data.tenant, &data.scope);
+            if data.action == RelayAction::InterestUp {
+                state.groups.insert(key);
+            } else {
+                state.groups.remove(&key);
+            }
+            state.last_refresh = Some(now);
+            true
+        }
+        RelayAction::InterestReady => {
+            if data.revision < state.revision {
+                return true;
+            }
+            if data.revision == state.revision {
+                state.ready = true;
+                state.last_refresh = Some(now);
+            } else {
+                state.revision = data.revision;
+                state.ready = false;
+                state.groups.clear();
+                state.last_refresh = Some(now);
+            }
+            true
+        }
+        RelayAction::Publish
+        | RelayAction::Push
+        | RelayAction::PublishToOwner
+        | RelayAction::SessionClaim
+        | RelayAction::SessionFence
+        | RelayAction::SessionReleaseRequest
+        | RelayAction::SessionRelease => false,
+    }
+}
+
+/// 业务作用：把一条 interest 控制 record 发送到指定 peer 集，并要求所有目标在 deadline 内确认。
+///
+/// 参数说明：`relay` 提供 transport；`action`/`tenant`/`group`/`revision` 描述控制变化；
+/// `targets` 是本次必须确认的节点集。
+///
+/// 返回：全部目标确认返回 `true`；任一拒绝、未知或缺席返回 `false`，调用方必须拆链重同步。
+async fn send_interest_control(
+    relay: &Arc<EdgeRelay>,
+    action: RelayAction,
+    tenant: Arc<str>,
+    group: Arc<str>,
+    revision: u64,
+    targets: HashSet<Box<str>>,
+) -> bool {
+    if targets.is_empty() {
+        return true;
+    }
+    let summary = relay
+        .broadcast(action, tenant, group, Bytes::new(), Some(targets), revision)
+        .await;
+    summary.peers_rejected == 0
+        && summary.peers_unknown == 0
+        && summary.peers_accepted == summary.peers_total
+}
+
+/// 业务作用：冻结当前已连接 peer 集，作为一次 interest revision 的明确确认范围。
+///
+/// 参数说明：`relay` 是当前 generation。
+///
+/// 返回：返回 node_id 独立集合，释放 links 锁后可安全等待 ACK。
+fn connected_interest_targets(relay: &EdgeRelay) -> HashSet<Box<str>> {
+    relay.links.lock().keys().cloned().collect()
+}
+
+/// 业务作用：向新建 peer 依次发送 reset、全量 up 与 ready，使增量过滤具备完整基线。
+///
+/// 参数说明：`relay` 是当前代，`node_id` 是唯一目标，`revision` 是快照权威版本。
+///
+/// 返回：全部阶段确认返回 `true`；任一步失败返回 `false`，不得发布半完成快照。
+async fn sync_interest_to_node(relay: &Arc<EdgeRelay>, node_id: Box<str>, revision: u64) -> bool {
+    let targets = HashSet::from([node_id]);
+    if !send_interest_control(
+        relay,
+        RelayAction::InterestReset,
+        Arc::from("_"),
+        Arc::from("_"),
+        revision,
+        targets.clone(),
+    )
+    .await
+    {
+        return false;
+    }
+    for (tenant, group) in relay.hub.group_interests() {
+        if !send_interest_control(
+            relay,
+            RelayAction::InterestUp,
+            tenant,
+            group,
+            revision,
+            targets.clone(),
+        )
+        .await
+        {
+            return false;
+        }
+    }
+    send_interest_control(
+        relay,
+        RelayAction::InterestReady,
+        Arc::from("_"),
+        Arc::from("_"),
+        revision,
+        targets,
+    )
+    .await
+}
+
+/// 业务作用：串行分配 interest revision，发送 group 增量/新 peer 快照，并用心跳维持 hint 新鲜度。
+///
+/// 参数说明：`relay` 是当前代，`rx` 是有界 group 变化与同步命令队列。
+///
+/// 返回：无返回值；队列关闭时退出，revision 回绕或任一确认失败时关闭链路以恢复安全基线。
+async fn interest_worker(relay: Arc<EdgeRelay>, mut rx: mpsc::Receiver<InterestCommand>) {
+    let mut revision = 1u64;
+    let mut heartbeat = tokio::time::interval(INTEREST_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            command = rx.recv() => {
+                let Some(command) = command else { return; };
+                let ok = match command {
+                    InterestCommand::Sync(node_id) => {
+                        sync_interest_to_node(&relay, node_id, revision).await
+                    }
+                    InterestCommand::Changed(tenant, group) => {
+                        let Some(next) = revision.checked_add(1) else {
+                            relay.close_all_links();
+                            revision = 1;
+                            continue;
+                        };
+                        revision = next;
+                        let action = if relay.hub.has_group_interest(&tenant, &group) {
+                            RelayAction::InterestUp
+                        } else {
+                            RelayAction::InterestDown
+                        };
+                        send_interest_control(
+                            &relay,
+                            action,
+                            tenant,
+                            group,
+                            revision,
+                            connected_interest_targets(&relay),
+                        ).await
+                    }
+                };
+                if !ok {
+                    relay.close_all_links();
+                }
+            }
+            _ = heartbeat.tick() => {
+                let ok = send_interest_control(
+                    &relay,
+                    RelayAction::InterestReady,
+                    Arc::from("_"),
+                    Arc::from("_"),
+                    revision,
+                    connected_interest_targets(&relay),
+                ).await;
+                if !ok {
+                    relay.close_all_links();
+                }
+            }
+        }
+    }
+}
 
 /// 发送任务:排空队列写 wire,登记在途,定期 sweep 过期在途为 unknown。
 async fn sender_task(relay: Arc<EdgeRelay>, link: Arc<PeerLink>) {
@@ -1516,6 +2410,30 @@ async fn sender_task(relay: Arc<EdgeRelay>, link: Arc<PeerLink>) {
             for pending in expired {
                 let _ = pending.ack_tx.send(PeerRecordOutcome::Unknown);
             }
+        }
+    }
+}
+
+/// 业务作用：串行执行单条 peer 链路的 DATA 副作用，同时让 wire 读循环持续处理 ACK，避免二跳自锁。
+///
+/// 参数说明：`relay`/`link` 标识当前注册代，`rx` 是受消息数与字节预算约束的入站队列。
+///
+/// 返回：无返回值；链路关闭或通道结束时退出，队列满由读循环拆链而非创建无界 task。
+///
+/// 每条链路唯一的 DATA 串行 worker。wire 读循环只负责解帧和 ACK 结算，因此 owner
+/// 二跳等待同一链路 ACK 时不会自锁；有界通道满即拆链，避免不可信 peer 制造任务洪泛。
+async fn inbound_task(
+    relay: Arc<EdgeRelay>,
+    link: Arc<PeerLink>,
+    mut rx: mpsc::Receiver<InboundRecord>,
+) {
+    loop {
+        tokio::select! {
+            record = rx.recv() => {
+                let Some(record) = record else { return; };
+                relay.handle_inbound_data(&link, record.data, record.reassembled).await;
+            }
+            _ = link.closed_notify.notified() => return,
         }
     }
 }
@@ -1612,11 +2530,16 @@ async fn run_endpoint(
             hello.capabilities
         }
     };
+    // 入站 DATA 与出站 relay queue 使用同一份消息数/字节预算。ACK 仍由读循环直接
+    // 结算，不经过该 worker，避免 owner 二段回执在同一双向链路上自锁。
+    let (inbound_tx, inbound_rx) = mpsc::channel(relay.plan.relay_queue_max_messages);
+    let inbound_bytes = Arc::new(Semaphore::new(relay.plan.relay_queue_max_bytes));
     let link = Arc::new(PeerLink {
         node_id: hello.node_id.clone(),
         peer_boot_id: hello.boot_id,
         generation,
         outbound: out_tx,
+        inbound: inbound_tx,
         queue: Mutex::new(RelayQueue {
             items: VecDeque::new(),
             bytes: 0,
@@ -1626,6 +2549,7 @@ async fn run_endpoint(
             entries: HashMap::new(),
             bytes: 0,
         }),
+        remote_interest: Mutex::new(RemoteInterestState::default()),
         closed: AtomicBool::new(false),
         closed_notify: Notify::new(),
     });
@@ -1637,6 +2561,7 @@ async fn run_endpoint(
         let _ = outcome_tx.send(DialOutcome::Linked(link.clone()));
     }
     tokio::spawn(sender_task(relay.clone(), link.clone()));
+    tokio::spawn(inbound_task(relay.clone(), link.clone(), inbound_rx));
 
     // — 稳态:先消化握手 chunk 里已解出的余帧,再继续同一 decoder/body —
     let mut reported_reassembly = 0u64;
@@ -1647,15 +2572,42 @@ async fn run_endpoint(
                     let total = decoder.reassembled_bytes();
                     let delta = total - reported_reassembly;
                     reported_reassembly = total;
-                    relay.handle_inbound_data(&link, data, delta).await;
+                    // metadata 是少量 varint/string 字段；按固定头 + 原始字符串 + 64B
+                    // protobuf 上界保守计费，宁可略多收费也不能少算 payload。
+                    let resident_bytes = RELAY_FIXED_BYTES
+                        .saturating_add(data.tenant.len())
+                        .saturating_add(data.scope.len())
+                        .saturating_add(64)
+                        .saturating_add(data.payload.len());
+                    let permit = u32::try_from(resident_bytes)
+                        .ok()
+                        .and_then(|bytes| inbound_bytes.clone().try_acquire_many_owned(bytes).ok());
+                    let Some(permit) = permit else {
+                        link.close();
+                        break 'stream;
+                    };
+                    if link
+                        .inbound
+                        .try_send(InboundRecord {
+                            data,
+                            reassembled: delta,
+                            _bytes: permit,
+                        })
+                        .is_err()
+                    {
+                        link.close();
+                        break 'stream;
+                    }
                 }
                 RelayFrame::Ack(ack) => {
                     let pending = link.take_pending(ack.seq);
                     if let Some(pending) = pending {
                         let outcome = match ack.outcome {
-                            RelayAckOutcome::Accepted => {
-                                PeerRecordOutcome::Accepted { copies: ack.copies }
-                            }
+                            RelayAckOutcome::Accepted => PeerRecordOutcome::Accepted {
+                                copies: ack.copies,
+                                rejected: ack.rejected,
+                                unknown: ack.unknown,
+                            },
                             RelayAckOutcome::RejectedOverload => {
                                 PeerRecordOutcome::RejectedOverload
                             }

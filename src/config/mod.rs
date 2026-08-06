@@ -279,6 +279,9 @@ pub struct AdminAuthRuntimeCfg {
     pub realm: String,
     /// 是否允许 `/healthz` 匿名访问。
     pub allow_healthz_unauthenticated: bool,
+    /// C5:是否允许本节点用自己的 admin 凭据抓取同集群其它节点的 `/metrics`。
+    /// 默认 false——它让 admin 从"只被访问"变成"会主动外连",是攻击面的实质变化。
+    pub allow_cluster_metrics_scrape: bool,
     /// 已规范化的浏览器管理面来源 allowlist（scheme + authority）。
     pub allowed_origins: Vec<String>,
     /// 是否启用 principal 级 RBAC；false 保持旧凭据全权兼容模式。
@@ -777,6 +780,7 @@ fn build_admin_auth(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuthRuntim
             basic_expected: None,
             realm: auth.realm.clone(),
             allow_healthz_unauthenticated: auth.allow_healthz_unauthenticated,
+            allow_cluster_metrics_scrape: auth.allow_cluster_metrics_scrape,
             allowed_origins,
             rbac_enabled: false,
             principals: Arc::from([]),
@@ -820,6 +824,7 @@ fn build_admin_auth(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuthRuntim
         basic_expected,
         realm: auth.realm.clone(),
         allow_healthz_unauthenticated: auth.allow_healthz_unauthenticated,
+        allow_cluster_metrics_scrape: auth.allow_cluster_metrics_scrape,
         allowed_origins,
         rbac_enabled: cfg.rbac.enabled,
         principals,
@@ -2568,14 +2573,15 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
 }
 
 fn hash_config_file(hasher: &mut DefaultHasher, path: &Path) -> Result<()> {
-    path.to_string_lossy().hash(hasher);
+    // 集群收敛比较的是配置内容，不是每台机器的部署目录。调用方已经按
+    // main/guard/sentinel/依赖的固定角色顺序喂入文件；把绝对路径也哈希进去会让
+    // 两台内容完全一致、目录不同的节点永久显示 diverged。
     crate::bounded_io::read_file(path, MAX_FINGERPRINT_FILE_BYTES, "config dependency")?
         .hash(hasher);
     Ok(())
 }
 
 fn hash_optional_config_file(hasher: &mut DefaultHasher, path: &Path) -> Result<()> {
-    path.to_string_lossy().hash(hasher);
     match crate::bounded_io::read_optional_file(
         path,
         MAX_FINGERPRINT_FILE_BYTES,

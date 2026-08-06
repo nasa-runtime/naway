@@ -50,17 +50,19 @@ protobuf 内容，业务消息按不透明字节传递，只依据 gRPC metadata
 
 已走通：流式 h1/h2c/TLS/gRPC/WS/WSS 反代、真实 Nacos 发现与网关自注册、Redis 共享运行态、Sentinel 防护、配置 build-then-swap、管理面/RBAC/审计、HTTP L1/L2 缓存、OTel、压缩与 OpenAPI 校验、OpenAI/Anthropic LLM 网关，以及 V7 的 WASM/外部插件、OPA/Casbin、GraphQL、Dubbo/MQTT、TCP/UDP/TLS stream、K8s/Consul/Eureka/DNS 发现和开发者门户。
 
-2026-07-23 自检：全功能集 318 passed、0 failed、13 个外部 live/独立 RSS 用例按默认门禁 ignored；随后按 `source.md` 实跑 Redis 10/10、Nacos 1/1、Kafka 1/1，自包含 A1 协议矩阵 10/10，Pebble DNS-01 真实签发/热装载/清理通过。64 MiB 流式响应 RSS 增长 9 MiB，没有随 payload 线性聚合。10k WebSocket 已在统一 Linux bridge 下由 Naway/NGINX/Envoy 全部建立并保持 10000/10000。
+2026-08-06 最终门禁：`cargo test --all-features -- --test-threads=4` 为 401 passed、0 failed、22 个外部 Redis/Nacos/Kafka/RSS live 用例按环境门 ignored；`cargo clippy --all-features --all-targets -- -D warnings` 零 warning。此前的 Redis、Nacos、Kafka 与 ACME live 验收继续保留独立入口，不用 mock 结果替代外部系统证据。
 
-仍需诚实保留：当前代表性本地 gRPC-H2C 最终稳定轮 Naway 为 NGINX 的 110.24%，但仅为 Envoy 的 75.79%，未达到新的 90% 最低线；1×64 深 multiplex、TLS-H2 和 WS close 后堆页高水位仍在性能 backlog。gRPC 已有 L7 Path/Host/Method 和 header-map 动态 upstream，但声明式 Header predicate 尚未补齐。内置管理页已有 dashboard、RBAC、审计、YML dry-run、历史/回滚和只读集群一致性，尚缺“读取当前 YML → 编辑 → CAS 发布 → 确认本地/集群实际生效”的闭环；core/full 轻量制品也尚未完成量化。后续差距与实施顺序统一记录在公开路线图和变更日志中。
+代表性 gRPC-H2C 正式窗口固定为 Linux Docker、7×400000、8 条下游 H2 连接和总并发 64；Naway 中位数 38227.65 RPS（CV 0.0575），Envoy 42274.27 RPS（CV 0.0286），比例 **90.43%**，达到 90% 硬门。V8-6 当前 release 回归同样通过：100k 成员与 64 KiB 档零丢，10k stream 五轮中位 525195 deliveries/s、CV 0.0594，最大调度停顿 208908µs，drain 后 FD 14→14 且 RSS 低于波次前基线。声明式 gRPC Header predicate、管理页 YML 编辑/CAS 发布/生效确认、relay interest routing、严格 group owner、全网 single-session fence 与可回滚热换代均已闭环。
 
 ## 构建镜像
 
+当前开发树暂时要求同级目录存在 `nasa-runtime-rust`：Nacos 首次原子 bundle 发布依赖尚未进入已发布的 `nanacos 1.0.0`，因此 Cargo 使用带版本约束的 sibling path 联调。公开发布前必须先发布包含这些 API 的兼容 `nanacos`/`nasa` 版本，再移除 path 并通过 `cargo publish --dry-run`；不能把本地路径依赖伪装成可独立发布状态。
+
 ```bash
-./build.sh          # 默认构建 naway 镜像；上下文仍同时纳入源码目录和 nasa-runtime-rust
+./scripts/build.sh  # 默认构建 naway 镜像；上下文仍同时纳入源码目录和 nasa-runtime-rust
 # 把 yml 放宿主 /data/naway，直接启动（挂载到容器同路径，修改 yml 即热更）：
-./start.sh
-# 或指定别的宿主配置目录：NATE_CONFIG_DIR=/your/conf ./start.sh
+./scripts/start.sh
+# 或指定别的宿主配置目录：NATE_CONFIG_DIR=/your/conf ./scripts/start.sh
 ```
 
 ## 源码结构(按模块目录组织)
@@ -80,8 +82,7 @@ src/
 ├── proxy/
 ├── reload/
 ├── routing/             路由:mod.rs(Router)+ predicate.rs(断言解析)
-├── security/
-└── reload/              无感热重载(notify 文件 + SIGHUP)
+└── security/            身份、策略与安全边界
 ```
 
 ## 开源协作

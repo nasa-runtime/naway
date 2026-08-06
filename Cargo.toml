@@ -31,10 +31,9 @@ redis-runtime = ["nasa/redis"]
 # Enable the optional V5 native Kafka access-log sink through the nasa facade.
 # HTTP/Elasticsearch/Loki sinks do not require this feature.
 log-kafka = ["nasa/kafka"]
-# V8 gRPC edge mode gate (架构规范 §25.2 / 验收记录 V8). V8-0R..V8-3 compile the
-# route contract, Subscribe/local fan-out and static relay data plane. Later Nacos,
-# probe/directory and mTLS stages still fail fast. Without this feature, enabling an
-# edge route or relay fails at snapshot build and ordinary L7 remains untouched (A10).
+# V8 gRPC edge mode gate。覆盖统一契约、Subscribe/Publish/Push、静态或 Nacos relay、
+# mTLS、SessionDirectory、interest auto 与 Redis 两类入口；未编此 feature 时，配置 edge
+# route/relay 会在快照构建期 fail-fast，普通 L7 路径不受影响。
 grpc-edge = []
 
 [dependencies]
@@ -56,6 +55,7 @@ httpdate = "1"                           # V5 cache 条件请求解析 RFC HTTP-
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio", "webpki-roots"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "tokio", "http1", "http2"] }
+mimalloc = { version = "0.1.52", default-features = false }
 instant-acme = { version = "0.8.5", features = ["rcgen"] } # RFC 8555 HTTP-01/DNS-01 签发与续期
 jsonschema = { version = "0.48.1", default-features = false } # V5 build-time JSON Schema validator；关闭网络/文件 resolver，拒绝外部 $ref
 libc = "0.2"                          # `-s reload` 向运行进程发 SIGHUP
@@ -81,11 +81,11 @@ futures = "0.3"                       # 仅用于快照构建期驱动 Casbin �
 x509-parser = "0.18"                  # 控制面解析证书 notAfter，避免无条件重复下单
 wasmtime = { version = "46.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] } # V7 Proxy-Wasm 沙箱；无 WASI/文件/网络权限
 
-# —— 复用 nasa-runtime-rust 生态（线上版本；yml 解析走 nasa::yml，日志走 nasa::log）——
-# crates.io 版本固定为 1.0.0。Nacos discovery API 在 V2-B 定型；
-# 真实传输用 gateway feature `nacos-sdk` 打开,避免默认本地构建强拉 SDK。V4 数据面 HMAC/JWT 验签
-# 复用 nasa::crypto,不在 gateway 内自造密码学实现。
-nasa = { version = "1.0.0", features = ["yml", "log", "base", "nacos", "crypto", "cache", "web"] }
+# —— 复用 nasa-runtime-rust 生态（yml 解析走 nasa::yml，日志走 nasa::log）——
+# 当前 path 用于联调尚未发布的 Nacos 首次 bundle API，version 仍锁定兼容基线。
+# 公开发布前必须先发布对应 nanacos/nasa 版本，再移除 path 并执行 cargo publish --dry-run；
+# 不能让 crates.io 制品依赖本机目录。V4 数据面 HMAC/JWT 验签复用 nasa::crypto。
+nasa = { path = "../nasa-runtime-rust/nasa", version = "1.0.0", features = ["yml", "log", "base", "nacos", "crypto", "cache", "web"] }
 
 [dev-dependencies]
 rcgen = "0.12"

@@ -130,6 +130,7 @@ fn close_code(reason: EdgeCloseReason) -> (u16, &'static str) {
         EdgeCloseReason::MaxAge => (1001, "gateway max age"),
         EdgeCloseReason::Idle => (1001, "idle timeout"),
         EdgeCloseReason::SlowConsumer => (1008, "slow consumer"),
+        EdgeCloseReason::SessionReplaced => (1008, "session replaced"),
         EdgeCloseReason::Normal => (1001, "closed"),
     }
 }

@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -281,6 +281,8 @@ pub enum EdgeCloseReason {
     Idle,
     /// close_slow 策略断开慢消费者(→ 14 "gateway slow consumer")。
     SlowConsumer,
+    /// single_session 新登录建立 fence 后替换旧连接(→ 10 "session replaced")。
+    SessionReplaced,
     /// 正常业务收尾(→ 0)。
     Normal,
 }
@@ -295,6 +297,7 @@ impl EdgeCloseReason {
             Self::MaxAge => ("14", "gateway%20max%20age"),
             Self::Idle => ("14", "gateway%20idle"),
             Self::SlowConsumer => ("14", "gateway%20slow%20consumer"),
+            Self::SessionReplaced => ("10", "session%20replaced"),
         };
         (
             HeaderValue::from_static(status),
@@ -591,6 +594,7 @@ pub struct GroupMembers {
 struct UserSession {
     stream_id: u64,
     ring: Arc<EdgeRing>,
+    single_session_token: Option<u64>,
 }
 
 /// 进程常驻的边缘订阅索引(不进 Snapshot;地位同 ConnectionRegistry)。
@@ -600,6 +604,8 @@ pub struct EdgeHub {
     active_groups: AtomicUsize,
     groups: DashMap<EdgeGroupKey, Arc<GroupMembers>>,
     users: DashMap<EdgeUserKey, Mutex<Vec<UserSession>>>,
+    /// single_session 的本地 fencing token。claim 先全网更新 fence，再允许订阅登记。
+    session_fences: DashMap<EdgeUserKey, u64>,
     /// 节点唯一 payload 驻留字节(同一份 payload 全部队列只计一次;lease Drop 归还)。
     payload_bytes: AtomicUsize,
     /// 全节点队列引用总数(QueuedFrame 构造/Drop 自动结算)。
@@ -611,6 +617,14 @@ pub struct EdgeHub {
     publish_rejected_total: AtomicU64,
     dropped_frames_total: AtomicU64,
     reassembly_bytes_total: AtomicU64,
+    /// 10ms 心跳观测到的 Tokio 最大调度超时(微秒)。只在存在 runtime 时启动弱引用
+    /// monitor；它不持有 Hub 生命周期，也不进入每消息热路径。
+    runtime_schedule_pause_max_us: AtomicU64,
+    /// 大规模订阅波次排空后触发一次 glibc trim。小流量不碰 allocator 全局锁；达到
+    /// 10k 活跃流才置位，最后一条流退出时异步执行一次。
+    drain_trim_armed: AtomicBool,
+    /// E1 interest 传播目标；Weak 避免 hub↔relay 强引用环，relay 换代时可替换。
+    interest_relay: parking_lot::RwLock<Weak<crate::edge_relay::EdgeRelay>>,
 }
 
 /// 订阅准入失败;调用方映射 RESOURCE_EXHAUSTED(8)。
@@ -639,14 +653,19 @@ impl EdgeAdmitError {
 }
 
 impl EdgeHub {
-    /// 新建空索引(进程一份,懒创建)。
+    /// 业务作用：创建进程唯一的 edge 订阅索引，并启动不持有 Hub 生命周期的调度停顿观测器。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回可共享的空 Hub；不在 Tokio runtime 内构造时只跳过观测任务，索引仍可用于测试。
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+        let hub = Arc::new(Self {
             next_stream_id: AtomicU64::new(1),
             active_streams: AtomicUsize::new(0),
             active_groups: AtomicUsize::new(0),
             groups: DashMap::new(),
             users: DashMap::new(),
+            session_fences: DashMap::new(),
             payload_bytes: AtomicUsize::new(0),
             queue_refs: AtomicUsize::new(0),
             fanout_jobs: AtomicUsize::new(0),
@@ -654,7 +673,80 @@ impl EdgeHub {
             publish_rejected_total: AtomicU64::new(0),
             dropped_frames_total: AtomicU64::new(0),
             reassembly_bytes_total: AtomicU64::new(0),
+            runtime_schedule_pause_max_us: AtomicU64::new(0),
+            drain_trim_armed: AtomicBool::new(false),
+            interest_relay: parking_lot::RwLock::new(Weak::new()),
+        });
+        // 单测可能在 Tokio runtime 外构造 Hub；此时不启动观测任务。生产 Proxy 在
+        // runtime 内创建，弱引用使任务随 Hub 自动结束，不形成进程常驻泄漏。
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let weak = Arc::downgrade(&hub);
+            handle.spawn(async move {
+                const PERIOD: Duration = Duration::from_millis(10);
+                let mut deadline = TokioInstant::now() + PERIOD;
+                loop {
+                    tokio::time::sleep_until(deadline).await;
+                    let now = TokioInstant::now();
+                    let Some(hub) = weak.upgrade() else {
+                        return;
+                    };
+                    let lag_us = now
+                        .saturating_duration_since(deadline)
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64;
+                    hub.runtime_schedule_pause_max_us
+                        .fetch_max(lag_us, Ordering::Relaxed);
+                    // 从实际唤醒时刻重新排下一拍；大暂停只记一次，不能用追赶循环制造
+                    // 一串无意义的 0 延迟采样。
+                    deadline = now + PERIOD;
+                }
+            });
+        }
+        hub
+    }
+
+    /// 业务作用：绑定当前 relay 的 interest 传播端，使 group 首次出现/消失可刷新远端 hint。
+    ///
+    /// 参数说明：`relay` 是当前 generation 的弱引用，避免 Hub 与 relay 形成强引用环。
+    ///
+    /// 返回：无返回值；热换代会覆盖旧引用，旧代释放后通知自动降级为无操作。
+    pub(crate) fn attach_interest_relay(&self, relay: Weak<crate::edge_relay::EdgeRelay>) {
+        *self.interest_relay.write() = relay;
+    }
+
+    /// 业务作用：为新建 relay 链路生成当前本地 group interest 全量快照。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回 tenant/group 的独立引用列表；快照之后的并发变化由 revision 增量补齐。
+    pub(crate) fn group_interests(&self) -> Vec<(Arc<str>, Arc<str>)> {
+        self.groups
+            .iter()
+            .map(|entry| (entry.key().tenant.clone(), entry.key().group.clone()))
+            .collect()
+    }
+
+    /// 业务作用：复验某个 interest 增量发送时目标 group 是否仍有本地成员，避免发布过期 up/down。
+    ///
+    /// 参数说明：`tenant`/`group` 是已经过身份与长度门的本地索引键。
+    ///
+    /// 返回：仍存在非空 group 时返回 `true`，否则返回 `false`。
+    pub(crate) fn has_group_interest(&self, tenant: &str, group: &str) -> bool {
+        self.groups.contains_key(&EdgeGroupKey {
+            tenant: Arc::from(tenant),
+            group: Arc::from(group),
         })
+    }
+
+    /// 业务作用：把 group 的首成员/末成员状态变化交给当前 relay 控制队列；无 relay 时保持单机语义。
+    ///
+    /// 参数说明：`key` 是发生空/非空边界迁移的 tenant/group 键。
+    ///
+    /// 返回：无返回值；控制队列过载的拆链与 fail-open 由 relay 负责。
+    fn notify_interest(&self, key: &EdgeGroupKey) {
+        if let Some(relay) = self.interest_relay.read().upgrade() {
+            relay.interest_changed(key.tenant.clone(), key.group.clone());
+        }
     }
 
     /// 当前活跃订阅流数(gauge)。
@@ -675,6 +767,15 @@ impl EdgeHub {
     /// 队列引用总数(gauge)。
     pub fn queue_refs(&self) -> usize {
         self.queue_refs.load(Ordering::Relaxed)
+    }
+
+    /// 业务作用：向 V8-6 资源门与管理面暴露进程启动以来 edge runtime 的最大调度停顿。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回微秒计数的单调最大值。
+    pub fn runtime_schedule_pause_max_us(&self) -> u64 {
+        self.runtime_schedule_pause_max_us.load(Ordering::Relaxed)
     }
 
     /// 发布/拒绝/丢帧/重组观测(counter 四元组,/metrics 渲染用)。
@@ -813,9 +914,45 @@ impl EdgeHub {
         user: Arc<str>,
         group: Arc<str>,
     ) -> Result<EdgeSubscription, EdgeAdmitError> {
+        self.subscribe_inner(plan, tenant, user, group, None)
+    }
+
+    /// 业务作用：登记一条已经完成全网 fencing 的 single-session 订阅，并复验 token 仍为当前权威。
+    ///
+    /// 参数说明：`plan` 提供准入预算；`tenant`/`user`/`group` 是已验证作用域；`token` 是 relay claim 结果。
+    ///
+    /// 返回：成功返回可 Drop 的订阅句柄；预算不足或 token 已失权时返回对应准入错误且回滚索引。
+    pub fn subscribe_single(
+        self: &Arc<Self>,
+        plan: &GrpcEdgePlan,
+        tenant: Arc<str>,
+        user: Arc<str>,
+        group: Arc<str>,
+        token: u64,
+    ) -> Result<EdgeSubscription, EdgeAdmitError> {
+        self.subscribe_inner(plan, tenant, user, group, Some(token))
+    }
+
+    /// 业务作用：统一执行 multi-session 与 single-session 的原子准入、索引登记和失败补偿。
+    ///
+    /// 参数说明：`plan` 提供预算/队列策略；`tenant`/`user`/`group` 是已验证键；
+    /// `single_session_token` 为 `Some` 时必须匹配本地 fence。
+    ///
+    /// 返回：全部索引提交后返回订阅句柄；任一门失败则完整回滚并返回低基数错误。
+    fn subscribe_inner(
+        self: &Arc<Self>,
+        plan: &GrpcEdgePlan,
+        tenant: Arc<str>,
+        user: Arc<str>,
+        group: Arc<str>,
+        single_session_token: Option<u64>,
+    ) -> Result<EdgeSubscription, EdgeAdmitError> {
         let limits = &plan.limits;
         if !try_reserve(&self.active_streams, 1, limits.max_streams_per_node) {
             return Err(EdgeAdmitError::Streams);
+        }
+        if self.active_streams.load(Ordering::Relaxed) >= 10_000 {
+            self.drain_trim_armed.store(true, Ordering::Relaxed);
         }
         let group_key = EdgeGroupKey {
             tenant: tenant.clone(),
@@ -829,6 +966,7 @@ impl EdgeHub {
             map_overflow(plan.overflow),
         );
 
+        let first_interest;
         {
             let bucket = match self.groups.entry(group_key.clone()) {
                 Entry::Occupied(entry) => entry.get().clone(),
@@ -845,6 +983,7 @@ impl EdgeHub {
                 }
             };
             let mut members = bucket.members.write();
+            first_interest = members.is_empty();
             if members.len() >= limits.max_members_per_group {
                 // 回滚空组:本次插入建出的空 bucket 不留残影。
                 drop(members);
@@ -859,6 +998,20 @@ impl EdgeHub {
             .entry(user_key.clone())
             .or_insert_with(|| Mutex::new(Vec::with_capacity(2)));
         let mut sessions = sessions_entry.lock();
+        if let Some(token) = single_session_token {
+            if self.session_fences.get(&user_key).map(|fence| *fence) != Some(token) {
+                drop(sessions);
+                drop(sessions_entry);
+                if let Some(bucket) = self.groups.get(&group_key).map(|entry| entry.clone()) {
+                    bucket.members.write().remove(&stream_id);
+                    self.remove_group_if_empty(&group_key);
+                }
+                self.users
+                    .remove_if(&user_key, |_, sessions| sessions.lock().is_empty());
+                self.active_streams.fetch_sub(1, Ordering::Relaxed);
+                return Err(EdgeAdmitError::Sessions);
+            }
+        }
         if sessions.len() >= limits.max_sessions_per_user {
             drop(sessions);
             drop(sessions_entry);
@@ -874,9 +1027,13 @@ impl EdgeHub {
         sessions.push(UserSession {
             stream_id,
             ring: ring.clone(),
+            single_session_token,
         });
         drop(sessions);
         drop(sessions_entry);
+        if first_interest {
+            self.notify_interest(&group_key);
+        }
 
         Ok(EdgeSubscription {
             hub: self.clone(),
@@ -885,25 +1042,76 @@ impl EdgeHub {
             stream_id,
             ring,
             removed: AtomicBool::new(false),
+            single_session_token,
         })
     }
 
-    /// group 若为空则摘除条目(防 group 表被空壳撑大)。
-    fn remove_group_if_empty(&self, key: &EdgeGroupKey) {
-        // DashMap remove_if 在 shard 写锁内执行谓词,与并发 subscribe 的 entry 互斥。
-        if self
-            .groups
-            .remove_if(key, |_, bucket| bucket.members.read().is_empty())
-            .is_some()
-        {
-            self.active_groups.fetch_sub(1, Ordering::Relaxed);
+    /// 业务作用：发布 single-session fencing token，并立即关闭该用户所有非当前 token 的旧连接。
+    ///
+    /// 参数说明：`tenant`/`user` 标识已验证用户，`token` 是 owner 排定的新权威版本。
+    ///
+    /// 返回：无返回值；fence 先发布到本地表，再触发旧 ring 关闭，避免新订阅越过保护态。
+    pub(crate) fn fence_single_session(&self, tenant: Arc<str>, user: Arc<str>, token: u64) {
+        let key = EdgeUserKey { tenant, user };
+        self.session_fences.insert(key.clone(), token);
+        if let Some(sessions) = self.users.get(&key) {
+            let sessions = sessions.lock();
+            for session in sessions.iter() {
+                if session.single_session_token != Some(token) {
+                    session.ring.close(EdgeCloseReason::SessionReplaced);
+                }
+            }
         }
     }
 
+    /// 业务作用：仅在本地已无会话且 token 仍匹配时释放 fence，阻止迟到 release 误伤新登录。
+    ///
+    /// 参数说明：`tenant`/`user` 标识用户，`token` 是待释放的旧会话权威。
+    ///
+    /// 返回：无返回值；条件不满足时保留当前 fence。
+    pub(crate) fn release_session_fence(&self, tenant: &str, user: &str, token: u64) {
+        let key = EdgeUserKey {
+            tenant: Arc::from(tenant),
+            user: Arc::from(user),
+        };
+        let empty = self
+            .users
+            .get(&key)
+            .is_none_or(|sessions| sessions.lock().is_empty());
+        if empty {
+            self.session_fences
+                .remove_if(&key, |_, current| *current == token);
+        }
+    }
+
+    /// 业务作用：在线性化的 DashMap 分片锁内删除空 group，并同步归还 group 基数预算。
+    ///
+    /// 参数说明：`key` 是可能已空的 tenant/group 键。
+    ///
+    /// 返回：实际删除条目时返回 `true`，调用方据此发送唯一的 interest-down 通知。
+    fn remove_group_if_empty(&self, key: &EdgeGroupKey) -> bool {
+        // DashMap remove_if 在 shard 写锁内执行谓词,与并发 subscribe 的 entry 互斥。
+        let removed = self
+            .groups
+            .remove_if(key, |_, bucket| bucket.members.read().is_empty())
+            .is_some();
+        if removed {
+            self.active_groups.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
+    }
+
+    /// 业务作用：幂等摘除订阅的 group/user 索引、归还全部资源，并触发 interest/session 收尾。
+    ///
+    /// 参数说明：`sub` 是正在 Drop 的订阅身份与 ring 句柄。
+    ///
+    /// 返回：无返回值；最后一条大规模流退出时异步触发 allocator drain，不阻塞 Tokio worker。
     fn unsubscribe(&self, sub: &EdgeSubscription) {
         if let Some(bucket) = self.groups.get(&sub.group_key).map(|b| b.clone()) {
             bucket.members.write().remove(&sub.stream_id);
-            self.remove_group_if_empty(&sub.group_key);
+            if self.remove_group_if_empty(&sub.group_key) {
+                self.notify_interest(&sub.group_key);
+            }
         }
         if let Some(sessions) = self.users.get(&sub.user_key) {
             let mut sessions = sessions.lock();
@@ -913,9 +1121,50 @@ impl EdgeHub {
             .remove_if(&sub.user_key, |_, sessions| sessions.lock().is_empty());
         // 立即清空残留帧,让 payload/queue_refs 经 Drop 链即时归还(RST 后不滞留)。
         let _ = sub.ring.drain_remaining();
-        self.active_streams.fetch_sub(1, Ordering::Relaxed);
+        let previous = self.active_streams.fetch_sub(1, Ordering::AcqRel);
+        if previous == 1 && self.drain_trim_armed.swap(false, Ordering::AcqRel) {
+            trim_allocator_after_large_drain();
+        }
+        if let Some(token) = sub.single_session_token {
+            if let Some(relay) = self.interest_relay.read().upgrade() {
+                relay.session_closed(
+                    sub.user_key.tenant.clone(),
+                    sub.user_key.user.clone(),
+                    token,
+                );
+            }
+        }
     }
 }
+
+/// 业务作用：在 Linux GNU 大规模 edge 波次完全排空后异步归还 glibc arena，满足 RSS drain 硬门。
+///
+/// 参数说明：无。
+///
+/// 返回：无返回值；没有 Tokio runtime 时跳过，且不影响逻辑资源归还。
+///
+/// glibc 会把大批短命 ring/body allocation 留在 arena，逻辑 gauge 已归零但容器 RSS
+/// 长期不回落。只在 Linux GNU 且“曾同时存在 ≥10k edge 流并已全部排空”时异步 trim；
+/// 其它平台保持 no-op。spawn_blocking 避免 allocator 全局整理占用 Tokio worker。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_allocator_after_large_drain() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(|| unsafe {
+            let _ = malloc_trim(0);
+        });
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+/// 业务作用：在非 Linux GNU 平台保留统一的 drain 调用点，不改变平台默认分配器行为。
+///
+/// 参数说明：无。
+///
+/// 返回：无返回值。
+fn trim_allocator_after_large_drain() {}
 
 /// 对共享原子预算做严格的 compare-exchange 预留。先 `load` 再 `fetch_add` 会让并发
 /// 发布同时越过上限；硬预算必须保证任一时刻 `current + amount <= max`。
@@ -1138,6 +1387,7 @@ pub struct EdgeSubscription {
     stream_id: u64,
     ring: Arc<EdgeRing>,
     removed: AtomicBool,
+    single_session_token: Option<u64>,
 }
 
 impl EdgeSubscription {

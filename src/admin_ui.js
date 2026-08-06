@@ -267,6 +267,51 @@ async function refreshTopology() {
   }
 }
 
+// ── P0-3 C5 节点流量:各节点 QPS / 5xx / 活跃连接 ──
+//
+// 数据来自本节点用**自己的 admin 凭据**抓取同集群其它节点的 /metrics(需显式开启
+// `admin.auth.allow_cluster_metrics_scrape`)。抓不到的节点显示失败原因而**不显示 0**——
+// 把抓不到画成"没流量"会让运维得出完全相反的结论。
+async function refreshNodeTraffic() {
+  try {
+    const payload = await getJson("/admin/cluster/metrics");
+    const nodes = payload.nodes || [];
+    $("node-traffic-state").textContent = `${payload.reachable}/${payload.total} 可达`;
+    $("node-traffic-state").className =
+      payload.reachable === payload.total ? "muted" : "muted bad";
+    setRows(
+      $("node-traffic"),
+      nodes.map((node) => {
+        if (!node.ok) {
+          return {
+            title: node.node_id,
+            detail: `${node.admin_listen} · ${node.reason}`,
+            state: "抓取失败",
+            tone: "bad",
+          };
+        }
+        const errors = node.responses_5xx_total ?? 0;
+        return {
+          title: node.node_id,
+          detail: `${node.admin_listen} · 累计请求 ${node.requests_total ?? "?"}`
+            + ` · 5xx ${errors}`,
+          state: `${node.active_connections ?? "?"} 活跃`,
+          tone: errors > 0 ? "warn" : "",
+        };
+      }),
+      "集群成员为空",
+    );
+  } catch (error) {
+    // 409 = 开关未开或未启用自注册;两者都是配置问题,不是故障。
+    $("node-traffic-state").textContent = "未启用";
+    setRows(
+      $("node-traffic"),
+      [],
+      "需 discovery.nacos.self_register 与 admin.auth.allow_cluster_metrics_scrape 同时开启",
+    );
+  }
+}
+
 $("config-load").addEventListener("click", loadCurrentConfig);
 $("config-publish").addEventListener("click", publishCurrentConfig);
 $("refresh").addEventListener("click", refresh);
@@ -296,6 +341,7 @@ function refreshAll() {
   refresh();
   refreshCluster();
   refreshTopology();
+  refreshNodeTraffic();
 }
 
 refreshAll();
