@@ -301,23 +301,121 @@ impl Drop for Dns01ChallengeLease {
     }
 }
 
-/// 启动当前初始快照中全部 ACME 续期 worker。
+/// prepare 阶段已完成 provider 与分布式锁初始化、尚未产生后台副作用的 ACME worker 集。
+pub struct PreparedAcmeWorkers {
+    workers: Vec<PreparedAcmeWorker>,
+    http01: Arc<Http01ChallengeStore>,
+}
+
+struct PreparedAcmeWorker {
+    tls: TlsRuntimeCfg,
+    acme: AcmeRuntimeCfg,
+    lock: AcmeLockBackend,
+    dns01: Option<Arc<dyn Dns01Provider>>,
+}
+
+/// 已激活 ACME worker generation；释放 generation 会协作取消仍在执行的签发/续期。
+pub struct AcmeWorkerGeneration {
+    stop: tokio::sync::watch::Sender<bool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl PreparedAcmeWorkers {
+    /// 业务作用：激活已经完整 prepare 的 ACME worker，并把整代任务收口到同一个取消权威。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回持有停止权和任务句柄的 active generation；本步骤不再执行可失败的外部初始化。
+    pub fn activate(self) -> AcmeWorkerGeneration {
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let mut tasks = Vec::with_capacity(self.workers.len());
+        for worker in self.workers {
+            let http01 = self.http01.clone();
+            let shutdown = stop_rx.clone();
+            tasks.push(tokio::spawn(async move {
+                run_acme_worker(
+                    worker.tls,
+                    worker.acme,
+                    worker.lock,
+                    http01,
+                    worker.dns01,
+                    shutdown,
+                )
+                .await;
+            }));
+        }
+        AcmeWorkerGeneration { stop, tasks }
+    }
+
+    /// 业务作用：报告候选 generation 将启动的唯一证书 worker 数，用于启动与换代观测。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：按 cert_file 去重后的 worker 数。
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// 业务作用：判断候选 generation 是否无需启动签发任务，供调用方避免无意义观测。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：没有任何唯一证书目标时返回 true。
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+}
+
+impl AcmeWorkerGeneration {
+    /// 业务作用：报告当前 generation 持有的 ACME worker 数。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：仍受本 generation 停止权管理的任务句柄数。
+    pub fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    /// 业务作用：判断 active generation 是否没有任何签发任务。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：任务句柄为空时返回 true。
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    /// 业务作用：协作停止本代全部 ACME worker，触发 HTTP-01/DNS-01 lease 的取消清理。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；任务在各自 select 边界退出，重复停止保持幂等。
+    pub fn stop(&self) {
+        let _ = self.stop.send(true);
+    }
+}
+
+impl Drop for AcmeWorkerGeneration {
+    /// 业务作用：确保 generation 被热换或进程停机释放时不会遗留无主签发 worker。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；只发送取消事实，不在 Drop 中阻塞等待网络任务。
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// 业务作用：在 listener reload 的 prepare 阶段校验并初始化完整 ACME worker 候选，不启动签发副作用。
 ///
-/// ACME 配置被视为 bootstrap 拓扑的一部分，运行中修改会被 reload 拒绝；这样 worker、HTTP-01 store
-/// 与证书 watcher 不会出现新旧配置撕裂。相同 cert 路径只启动一个 worker。
+/// 参数说明：`tls_configs` 是候选快照的 TLS 集；`runtime_state` 提供可选 Redis 锁连接；`http01` 是共享 challenge 表。
 ///
-/// # 参数
-/// - `tls_configs`: 启动期所有 proxy TLS 配置。
-/// - `runtime_state`: Redis URL/namespace/profile 来源；只有 lock_backend=redis 时使用。
-/// - `http01`: 数据面正在读取的共享 challenge 表。
-///
-/// 返回：实际启动的 worker 数。同一 cert 目标配置冲突、Redis 锁初始化失败时返回
-/// `Err` 阻止带病启动，不把“已配 ACME 但 worker 已停用”伪装成正常。
-pub async fn spawn_acme_workers(
+/// 返回：全部 provider/锁初始化成功时返回可激活候选；冲突目标、provider 或锁失败时拒绝候选并保留旧代。
+pub async fn prepare_acme_workers(
     tls_configs: impl IntoIterator<Item = TlsRuntimeCfg>,
     runtime_state: crate::config::model::RuntimeStateCfg,
     http01: Arc<Http01ChallengeStore>,
-) -> Result<usize> {
+) -> Result<PreparedAcmeWorkers> {
     let mut seen_cert_files = HashMap::new();
     let mut workers = Vec::new();
     for tls in tls_configs {
@@ -344,9 +442,9 @@ pub async fn spawn_acme_workers(
         workers.push((tls, acme, dns01));
     }
 
-    let mut started = 0;
+    let mut prepared = Vec::with_capacity(workers.len());
     for (tls, acme, dns01) in workers {
-        // 启动前先建立锁后端；分布式互斥不可用时必须 fail-fast。
+        // 分布式互斥是签发权威；必须在快照发布前建连复验，不能先上线再让 worker 静默缺席。
         let lock = build_lock_backend(&acme, &runtime_state)
             .await
             .with_context(|| {
@@ -355,16 +453,24 @@ pub async fn spawn_acme_workers(
                     tls.cert_file.display()
                 )
             })?;
-        let http01 = http01.clone();
-        tokio::spawn(async move {
-            run_acme_worker(tls, acme, lock, http01, dns01).await;
+        prepared.push(PreparedAcmeWorker {
+            tls,
+            acme,
+            lock,
+            dns01,
         });
-        started += 1;
     }
-    Ok(started)
+    Ok(PreparedAcmeWorkers {
+        workers: prepared,
+        http01,
+    })
 }
 
-/// 按已编译 challenge 配置创建 DNS provider；HTTP-01 返回 None。
+/// 业务作用：在 worker prepare 阶段验证并构建 DNS-01 provider，避免快照发布后才发现命令不可执行。
+///
+/// 参数说明：`acme` 是已经完成语义校验的 challenge 运行配置。
+///
+/// 返回：HTTP-01 返回 None；DNS-01 返回可调用 provider；文件或权限不满足时拒绝候选。
 fn build_dns01_provider(acme: &AcmeRuntimeCfg) -> Result<Option<Arc<dyn Dns01Provider>>> {
     match acme.challenge {
         AcmeChallenge::Http01 => Ok(None),
@@ -399,13 +505,11 @@ fn build_dns01_provider(acme: &AcmeRuntimeCfg) -> Result<Option<Arc<dyn Dns01Pro
     }
 }
 
-/// 构造单机或 Redis ACME 锁后端。
+/// 业务作用：在 worker prepare 阶段构造单机或 Redis 签发锁，确保候选发布前已具备唯一签发权威。
 ///
-/// # 参数
-/// - `acme`: 已校验 lock/storage 模式的 ACME 配置。
-/// - `runtime_state`: Redis 连接配置来源。
+/// 参数说明：`acme` 是已校验 lock/storage 模式；`runtime_state` 提供 Redis 连接配置。
 ///
-/// 返回：可在整个订单期间持有的锁后端；feature/Redis 配置不满足时返回错误并禁用 worker。
+/// 返回：返回可覆盖整个 order 的锁后端；feature、profile、连接或配置不满足时拒绝候选。
 async fn build_lock_backend(
     acme: &AcmeRuntimeCfg,
     runtime_state: &crate::config::model::RuntimeStateCfg,
@@ -445,53 +549,65 @@ async fn build_lock_backend(
     anyhow::bail!("ACME lock_backend=redis requires gateway feature `redis-runtime`")
 }
 
-/// 单个证书目标的长期检查/续期循环。
+/// 业务作用：运行单个证书目标的检查/续期循环，并在 generation 失权时立即取消在途 order 或退避。
 ///
-/// # 参数
-/// - `tls`: 证书输出路径与 TLS watcher 使用的完整 listener 配置。
-/// - `acme`: ACME 目录、域名与调度策略。
-/// - `lock`: 单机或 Redis 锁后端。
-/// - `http01`: HTTP-01 数据面发布表。
+/// 参数说明：`tls` 指定材料路径；`acme` 描述目录、域名和调度；`lock` 是签发权威；
+/// `http01`/`dns01` 发布 challenge；`shutdown` 表示本 worker generation 已失权。
+///
+/// 返回：无业务返回；收到取消或 channel 关闭时退出，普通签发失败按有界退避继续且保留旧证书。
 async fn run_acme_worker(
     tls: TlsRuntimeCfg,
     acme: AcmeRuntimeCfg,
     lock: AcmeLockBackend,
     http01: Arc<Http01ChallengeStore>,
     dns01: Option<Arc<dyn Dns01Provider>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
-        let tls_for_expiry = tls.clone();
-        let renew_before_days = acme.renew_before_days;
-        let due = tokio::task::spawn_blocking(move || {
-            certificate_needs_renewal(&tls_for_expiry, renew_before_days)
-        })
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|result| result);
-        let delay_ms = match due {
-            Ok(false) => acme.check_interval_ms,
-            Ok(true) => {
-                match issue_with_lock(&tls, &acme, &lock, http01.clone(), dns01.clone()).await {
-                    Ok(true) => {
-                        tracing::info!(cert = %tls.cert_file.display(), domains = ?acme.domains, "ACME certificate issued and installed");
-                        acme.check_interval_ms
-                    }
-                    Ok(false) => {
-                        tracing::debug!(cert = %tls.cert_file.display(), "ACME renewal skipped: another node holds leader lock");
-                        acme.retry_backoff_ms
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %format!("{error:#}"), cert = %tls.cert_file.display(), "ACME issue/renew failed; keeping current certificate");
-                        acme.retry_backoff_ms
+        if *shutdown.borrow() {
+            return;
+        }
+        let cycle = async {
+            let tls_for_expiry = tls.clone();
+            let renew_before_days = acme.renew_before_days;
+            let due = tokio::task::spawn_blocking(move || {
+                certificate_needs_renewal(&tls_for_expiry, renew_before_days)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+            let delay_ms = match due {
+                Ok(false) => acme.check_interval_ms,
+                Ok(true) => {
+                    match issue_with_lock(&tls, &acme, &lock, http01.clone(), dns01.clone()).await {
+                        Ok(true) => {
+                            tracing::info!(cert = %tls.cert_file.display(), domains = ?acme.domains, "ACME certificate issued and installed");
+                            acme.check_interval_ms
+                        }
+                        Ok(false) => {
+                            tracing::debug!(cert = %tls.cert_file.display(), "ACME renewal skipped: another node holds leader lock");
+                            acme.retry_backoff_ms
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %format!("{error:#}"), cert = %tls.cert_file.display(), "ACME issue/renew failed; keeping current certificate");
+                            acme.retry_backoff_ms
+                        }
                     }
                 }
-            }
-            Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), cert = %tls.cert_file.display(), "ACME certificate expiry check failed");
-                acme.retry_backoff_ms
-            }
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), cert = %tls.cert_file.display(), "ACME certificate expiry check failed");
+                    acme.retry_backoff_ms
+                }
+            };
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         };
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        // 失去 generation 权威必须立即取消当前 order/sleep；lease Drop 会撤下已发布 challenge，
+        // 防止旧配置继续写证书或留下 DNS/HTTP 临时事实。
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            _ = cycle => {}
+        }
     }
 }
 

@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex, MutexGuard};
 
 use crate::blacklist::BlacklistCache;
 use crate::config::model::{NacosConfigSourceCfg, ReloadCfg};
@@ -53,23 +53,29 @@ pub struct ReloadHandle {
     tx: mpsc::Sender<ReloadEvent>,
 }
 
-/// Future returned by the asynchronous listener prepare phase. The prepared value owns every
-/// newly bound socket until the reload transaction either commits it or drops it on failure.
+/// listener 异步 prepare 的 Future；返回事务在 commit 或失败 Drop 前独占全部候选 socket。
 pub type PreparedListenerFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn PreparedListenerTopology>>> + Send + 'a>>;
 
 /// 数据面 listener 两阶段切换器。`prepare` 必须只绑定/构建新资源，不停旧 accept；返回成功后
 /// reload worker 才发布快照，随后调用 `commit` 启动新 accept 并停止旧 listener。
 pub trait ListenerTopologyReconciler: Send + Sync {
-    /// Bind and validate every socket required by `candidate` without changing the active acceptors.
-    /// An error aborts reload; dropping the returned transaction closes candidate resources.
+    /// 业务作用：绑定并验证候选快照需要的全部 listener/worker 资源，同时保持在线 acceptor 不变。
+    ///
+    /// 参数说明：`candidate` 是已通过完整配置构建、尚未发布的候选快照。
+    ///
+    /// 返回：成功返回持有候选资源的事务；错误会中止 reload，Drop 事务只释放候选资源。
     fn prepare<'a>(&'a self, candidate: &'a GatewaySnapshot) -> PreparedListenerFuture<'a>;
 }
 
 /// 已成功绑定、尚未发布的 listener 拓扑事务。未 commit 即 Drop 会关闭新 socket，旧 listener
 /// 完全不受影响；commit 本身只做不可失败的 task/stop-channel 交接。
 pub trait PreparedListenerTopology: Send {
-    /// Perform the infallible post-publication handoff: start candidate acceptors, then stop old ones.
+    /// 业务作用：在快照发布后执行不可失败的 generation 交接，先启动候选再停止旧代新增工作。
+    ///
+    /// 参数说明：无；事务自身持有 prepare 完成的全部资源。
+    ///
+    /// 返回：无返回值；消费事务后，候选成为 active，旧连接按既有 drain 规则存续。
     fn commit(self: Box<Self>);
 }
 
@@ -98,9 +104,28 @@ impl ReloadEvent {
     }
 }
 
+/// file/Nacos 与 xDS 共用的进程级 Snapshot 发布串行器。
+#[derive(Default)]
+pub struct SnapshotApplyCoordinator {
+    gate: Mutex<()>,
+}
+
+impl SnapshotApplyCoordinator {
+    /// 业务作用：取得唯一快照写权，保证版本分配、候选构建和 ArcSwap 发布不能被另一控制面穿插。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：持有期间调用方是唯一 Snapshot writer；guard 释放后下一候选才能开始提交。
+    pub async fn lock(&self) -> MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
+}
+
 #[derive(Clone)]
 /// reload 成功后需要 reconcile/换代的常驻运行态句柄集。
 pub struct ReloadRuntime {
+    /// file/Nacos/xDS 共享的唯一快照发布权威。
+    pub apply_coordinator: Arc<SnapshotApplyCoordinator>,
     /// Nacos watch 写入的动态上游事实源。
     pub dynamic_upstreams: Arc<DynamicUpstreamStore>,
     /// 服务订阅与网关自注册协调器。
@@ -123,6 +148,8 @@ pub struct ReloadRuntime {
     pub conn_registry: Arc<ConnectionRegistry>,
     /// 常驻 HTTP 代理运行态；成功换版后回收已失效且无活跃 handle 的 identity entry。
     pub proxy: Option<Arc<crate::proxy::GatewayProxy>>,
+    /// 是否执行 sidecar loopback listener 门禁；该属性由启动 CLI 固定，不能被动态配置关闭。
+    pub sidecar_mode: bool,
     /// data/stream listener 两阶段热切换；纯库测试或 admin-only 模式可为 None。
     pub listener_topology: Option<Arc<dyn ListenerTopologyReconciler>>,
 }
@@ -160,7 +187,11 @@ pub fn spawn(
     ReloadHandle { tx }
 }
 
-/// 统一换版:事务化 build → 原子 store;失败保留旧版并告警。
+/// 业务作用：统一执行事务化 reload，并在发布前复验 bootstrap authority、外部副作用和 listener 准备。
+///
+/// 参数说明：`cfg_path` 是候选配置；`snap/version/runtime/history` 是唯一发布链状态；`trigger` 标识来源。
+///
+/// 返回：候选完整提交返回 true；任一校验/prepare/apply 失败返回 false 并保留旧快照。
 pub async fn apply_reload(
     cfg_path: &std::path::Path,
     snap: &ArcSwap<GatewaySnapshot>,
@@ -169,6 +200,9 @@ pub async fn apply_reload(
     trigger: &str,
     history: &ConfigHistory,
 ) -> bool {
+    // 从版本分配前就取得写权；否则 xDS 与 reload 可能拿到同一 next version，并以最后 store 者
+    // 覆盖对方已经 ACK/审计的快照，破坏“先完整构建、后单点发布”的控制面 fencing。
+    let _apply_guard = runtime.apply_coordinator.lock().await;
     let old_version = version.load(Ordering::Relaxed);
     let Some(next) = old_version.checked_add(1) else {
         tracing::error!(old_version, trigger, "config version space exhausted");
@@ -186,8 +220,22 @@ pub async fn apply_reload(
     });
     match candidate {
         Ok(new_snap) => {
-            // V7 数据面 listen 通过两阶段 SO_REUSEPORT supervisor 热切换；admin.listen 仍是
-            // 独立控制面 bootstrap socket，避免管理面地址在自身 reload 中失联。
+            if runtime.sidecar_mode {
+                // 必须先复验部署边界，再进入候选 socket prepare；否则恶意热更可能短暂绑定公网地址。
+                if let Err(error) = new_snap.validate_sidecar_listeners() {
+                    tracing::error!(trigger, error = %error, "sidecar listener isolation check failed; keeping old snapshot");
+                    history.record_rejected(
+                        trigger,
+                        cfg_path,
+                        old_version,
+                        next,
+                        format!("sidecar listener isolation check failed: {error:#}"),
+                    );
+                    return false;
+                }
+            }
+            // 数据面、admin 与 ACME worker 共用同一两阶段 supervisor：先绑定/建锁，发布后才
+            // 启动候选并撤销旧权威，任何 prepare 失败都保持旧快照和旧 listener 完整可用。
             let old = snap.load();
             let old_topology = old.listen_topology();
             let old_admin_listen = old.admin_listen.clone();
@@ -203,10 +251,38 @@ pub async fn apply_reload(
             let old_telemetry = crate::telemetry::config_signature(&old.telemetry);
             let old_access_log = old.access_log.clone();
             let old_admin_audit = old.admin_audit.clone();
+            let old_control_plane = old.control_plane.clone();
+            #[cfg(feature = "xds-client")]
+            let xds_policy_owned = old.control_plane.xds.enabled
+                && old.control_plane.xds.ownership.routes
+                    == crate::config::model::XdsResourceOwnerCfg::Xds;
+            let mut old_xds_specs = old.upstreams.xds_watch_specs();
+            old_xds_specs.sort_by(|left, right| {
+                left.logical_service
+                    .cmp(&right.logical_service)
+                    .then_with(|| left.cluster_name.cmp(&right.cluster_name))
+            });
             let nacos_bootstrap_violation = (trigger == "nacos-config")
                 .then(|| nacos_bootstrap_change(old.as_ref(), &new_snap))
                 .flatten();
             drop(old);
+            #[cfg(feature = "xds-client")]
+            if xds_policy_owned {
+                // 当前 CDS/RDS generation 与 file bootstrap 合成后才成为 active。overlay merge 尚未
+                // 纳入同一协调事务前，禁止 file/Nacos reload 单独覆盖 ArcSwap 并擦除已 ACK 路由。
+                tracing::error!(
+                    trigger,
+                    "reload rejected while xDS owns routes/clusters; restart required"
+                );
+                history.record_rejected(
+                    trigger,
+                    cfg_path,
+                    old_version,
+                    next,
+                    "reload while xDS owns routes/clusters requires restart",
+                );
+                return false;
+            }
             if let Some(field) = nacos_bootstrap_violation {
                 tracing::error!(
                     trigger,
@@ -219,6 +295,28 @@ pub async fn apply_reload(
                     old_version,
                     next,
                     format!("Nacos dynamic config cannot override bootstrap-layer `{field}`"),
+                );
+                return false;
+            }
+            let mut new_xds_specs = new_snap.upstreams.xds_watch_specs();
+            new_xds_specs.sort_by(|left, right| {
+                left.logical_service
+                    .cmp(&right.logical_service)
+                    .then_with(|| left.cluster_name.cmp(&right.cluster_name))
+            });
+            if new_snap.control_plane != old_control_plane || new_xds_specs != old_xds_specs {
+                // ADS server/identity/trust/budgets 与 EDS owner 映射共同定义一个常驻 authority；
+                // 未实现 task 两阶段换代前绝不能先发布新快照，让旧 stream 写入新 owner 域。
+                tracing::error!(
+                    trigger,
+                    "xDS bootstrap or EDS ownership change rejected; restart required"
+                );
+                history.record_rejected(
+                    trigger,
+                    cfg_path,
+                    old_version,
+                    next,
+                    "control_plane.xds bootstrap/EDS ownership change requires restart",
                 );
                 return false;
             }
@@ -246,47 +344,40 @@ pub async fn apply_reload(
                 );
                 return false;
             }
-            if new_snap.admin_listen != old_admin_listen {
-                tracing::error!(
-                    trigger,
-                    old_admin = %old_admin_listen,
-                    new_admin = %new_snap.admin_listen,
-                    "admin listener topology change rejected; restart required"
-                );
-                history.record_rejected(
-                    trigger,
-                    cfg_path,
-                    old_version,
-                    next,
-                    "admin listener topology change requires restart",
-                );
-                return false;
-            }
-            let prepared_listener_topology = if new_topology != old_topology {
+            let acme_lock_runtime_changed = rate_limiter_config_signature(&new_snap.runtime_state)
+                != old_runtime_state
+                && old_topology
+                    .iter()
+                    .chain(new_topology.iter())
+                    .any(|topology| topology.tls.as_ref().is_some_and(|tls| tls.acme.is_some()));
+            let prepared_listener_topology = if new_topology != old_topology
+                || new_snap.admin_listen != old_admin_listen
+                || acme_lock_runtime_changed
+            {
                 let Some(reconciler) = &runtime.listener_topology else {
                     tracing::error!(
                         trigger,
-                        "data listener topology change rejected; no runtime supervisor"
+                        "listener topology change rejected; no runtime supervisor"
                     );
                     history.record_rejected(
                         trigger,
                         cfg_path,
                         old_version,
                         next,
-                        "data listener topology change requires a running data-plane supervisor",
+                        "listener topology change requires a running listener supervisor",
                     );
                     return false;
                 };
                 match reconciler.prepare(&new_snap).await {
                     Ok(prepared) => Some(prepared),
                     Err(error) => {
-                        tracing::error!(trigger, error = %error, "data listener topology prepare failed; keeping old listeners");
+                        tracing::error!(trigger, error = %error, "listener topology prepare failed; keeping old listeners");
                         history.record_rejected(
                             trigger,
                             cfg_path,
                             old_version,
                             next,
-                            format!("data listener topology prepare failed: {error:#}"),
+                            format!("listener topology prepare failed: {error:#}"),
                         );
                         return false;
                     }

@@ -1,4 +1,4 @@
-//! V8-3 集群中继(架构规范 §25.2.6):RelayRecord v1 编解码与静态 peers 运行时。
+//! 集群中继（架构规范 §25.2.6）：RelayRecord v1 编解码与静态 peers 运行时。
 //!
 //! 本模块随 feature `grpc-edge` 编译,单机(无 `grpc_edge_cluster` 计划)零构造。
 //! wire 协议自带 record 边界(固定头 + 双段长度),不依赖 HTTP/2 DATA 帧边界;
@@ -32,12 +32,12 @@ const _: () = assert!(RELAY_MAX_PAYLOAD_BYTES - 5 == crate::grpc_edge::RELAY_FAN
 
 // ── 帧模型 ──
 
-/// 中继 action(data record 专用；Publish 与 V8-4 Push broadcast-probe 共用该协议)。
+/// 中继 action（data record 专用；Publish 与 Push broadcast-probe 共用该协议）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayAction {
     /// 群播:scope = group id。
     Publish,
-    /// 定向单播:scope = 目标 user(V8-4 broadcast-probe 使用)。
+    /// 定向单播：scope = 目标 user（broadcast-probe 使用）。
     Push,
     /// E1 控制面：清空并开始指定 revision 的兴趣快照。
     InterestReset,
@@ -853,7 +853,60 @@ struct RelayInFlight {
 
 struct RelayQueue {
     items: VecDeque<QueuedRecord>,
+    /// latest_by_key 专用索引；其它策略为 None，不增加正常 relay 热路径成本。
+    latest: Option<RelayLatestQueue>,
     bytes: usize,
+}
+
+/// relay latest_by_key 的有界 key→record 队列；替换保留 key 首次入队顺序。
+struct RelayLatestQueue {
+    order: VecDeque<Bytes>,
+    items: HashMap<Bytes, QueuedRecord>,
+}
+
+impl RelayQueue {
+    /// 业务作用：返回尚未写入 relay wire 的逻辑 record 数，统一 FIFO/keyed 两种存储。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：只统计 queued，不包含已经发送、等待 ACK 的 in-flight record。
+    fn len(&self) -> usize {
+        self.latest
+            .as_ref()
+            .map_or_else(|| self.items.len(), |latest| latest.items.len())
+    }
+
+    /// 业务作用：按队列承诺取出下一条 relay record，并维护 keyed 索引一致性。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：有记录时返回队头；空队列返回 None。
+    fn pop_front(&mut self) -> Option<QueuedRecord> {
+        if let Some(latest) = &mut self.latest {
+            while let Some(key) = latest.order.pop_front() {
+                if let Some(record) = latest.items.remove(&key) {
+                    return Some(record);
+                }
+            }
+            None
+        } else {
+            self.items.pop_front()
+        }
+    }
+
+    /// 业务作用：链路 teardown 时一次性取走全部 queued record，供调用方逐条结算为 Down。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回所有仍在队列中的记录；本队列在返回前已清空。
+    fn drain_all(&mut self) -> Vec<QueuedRecord> {
+        if let Some(latest) = &mut self.latest {
+            latest.order.clear();
+            latest.items.drain().map(|(_, record)| record).collect()
+        } else {
+            self.items.drain(..).collect()
+        }
+    }
 }
 
 #[derive(Default)]
@@ -938,7 +991,7 @@ pub struct EdgeRelay {
     failed_total: AtomicU64,
     unknown_total: AtomicU64,
     dedup_total: AtomicU64,
-    /// V8-4 broadcast-probe 全体未命中计数(本地 + 全部 peers 入队皆 0)。
+    /// broadcast-probe 全体未命中计数（本地 + 全部 peers 入队皆 0）。
     probe_miss_total: AtomicU64,
     interest_filtered_total: AtomicU64,
     interest_tx: mpsc::Sender<InterestCommand>,
@@ -1134,7 +1187,7 @@ impl EdgeRelay {
         self.probe_miss_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 本进程 relay boot 身份(V8-7 目录 field 用它区分重启代际)。
+    /// 本进程 relay boot 身份；目录 field 用它区分重启代际。
     pub fn boot_id(&self) -> u64 {
         self.boot_id
     }
@@ -1230,7 +1283,7 @@ impl EdgeRelay {
         Ok(())
     }
 
-    /// 启动 V8-5 Nacos membership watch，并以 discovered gateway metadata 驱动 peer reconcile。
+    /// 启动 Nacos membership watch，并以 discovered gateway metadata 驱动 peer reconcile。
     pub fn start_nacos_membership(
         self: &Arc<Self>,
         cfg: crate::config::model::NacosDiscoveryCfg,
@@ -1501,7 +1554,7 @@ impl EdgeRelay {
         }
     }
 
-    /// 向全部 peers 广播一条定向 Push record；无 Redis 指路条时这是 V8-4 的有界探测路径。
+    /// 向全部 peers 广播一条定向 Push record；无 Redis 指路条时这是有界探测路径。
     pub fn broadcast_push(
         self: &Arc<Self>,
         tenant: Arc<str>,
@@ -1511,7 +1564,7 @@ impl EdgeRelay {
         self.broadcast(RelayAction::Push, tenant, user, payload, None, 0)
     }
 
-    /// V8-7:按指路条给出的节点集**定向** push,不打扰其余 peers。
+    /// 按指路条给出的节点集**定向** push，不打扰其余 peers。
     ///
     /// `targets` 只是加速提示:目录脏(节点已不在线/已迁移)时本次可能零投递,
     /// 调用方据此回落一次全量 broadcast-probe——正确性不依赖目录(§25.2.7)。
@@ -1652,9 +1705,68 @@ impl EdgeRelay {
         let mut queue = link.queue.lock();
         let in_flight = link.in_flight.lock();
         let over = |queue: &RelayQueue, in_flight: &RelayInFlight| {
-            queue.items.len() + in_flight.entries.len() >= self.plan.relay_queue_max_messages
+            queue.len() + in_flight.entries.len() >= self.plan.relay_queue_max_messages
                 || queue.bytes + in_flight.bytes + record_len > self.plan.relay_queue_max_bytes
         };
+        if self.plan.relay_overflow == crate::config::model::GrpcEdgeOverflowCfg::LatestByKey {
+            let Some(key) = crate::edge_hub::frame_push_coalesce_key(&encoded.payload) else {
+                // 显式 keyed 策略没有 key 时必须拒绝，不能退化成 FIFO 让旧状态滞留。
+                return Err(PeerRecordOutcome::RejectedInvalid);
+            };
+            let RelayQueue {
+                latest: Some(latest),
+                bytes,
+                ..
+            } = &mut *queue
+            else {
+                unreachable!("latest_by_key relay queue owns a latest index")
+            };
+            let mut key_in_order = latest.items.contains_key(&key);
+            if let Some(old) = latest.items.remove(&key) {
+                *bytes -= old.head.len() + old.payload.len();
+                self.queued_records.fetch_sub(1, Ordering::Relaxed);
+                let _ = old.ack_tx.send(PeerRecordOutcome::RejectedOverload);
+            }
+            while latest.items.len() + in_flight.entries.len() >= self.plan.relay_queue_max_messages
+                || *bytes + in_flight.bytes + record_len > self.plan.relay_queue_max_bytes
+            {
+                let Some(old_key) = latest.order.pop_front() else {
+                    break;
+                };
+                if old_key == key {
+                    key_in_order = false;
+                    continue;
+                }
+                if let Some(old) = latest.items.remove(&old_key) {
+                    *bytes -= old.head.len() + old.payload.len();
+                    self.queued_records.fetch_sub(1, Ordering::Relaxed);
+                    let _ = old.ack_tx.send(PeerRecordOutcome::RejectedOverload);
+                }
+            }
+            if latest.items.len() + in_flight.entries.len() >= self.plan.relay_queue_max_messages
+                || *bytes + in_flight.bytes + record_len > self.plan.relay_queue_max_bytes
+            {
+                return Err(PeerRecordOutcome::RejectedOverload);
+            }
+            if !key_in_order {
+                latest.order.push_back(key.clone());
+            }
+            *bytes += record_len;
+            latest.items.insert(
+                key,
+                QueuedRecord {
+                    seq,
+                    head: encoded.head.clone(),
+                    payload: encoded.payload.clone(),
+                    ack_tx,
+                },
+            );
+            drop(in_flight);
+            drop(queue);
+            self.queued_records.fetch_add(1, Ordering::Relaxed);
+            link.queue_notify.notify_one();
+            return Ok(ack_rx);
+        }
         if over(&queue, &in_flight) {
             match self.plan.relay_overflow {
                 // drop_new(默认):拒新保旧 FIFO,诚实回过载。
@@ -1663,8 +1775,7 @@ impl EdgeRelay {
                     return Err(PeerRecordOutcome::RejectedOverload);
                 }
                 // 显式弹旧:被弹 record 立刻按过载结算,绝不静默消失。
-                crate::config::model::GrpcEdgeOverflowCfg::DropOldest
-                | crate::config::model::GrpcEdgeOverflowCfg::LatestByKey => {
+                crate::config::model::GrpcEdgeOverflowCfg::DropOldest => {
                     while over(&queue, &in_flight) {
                         let Some(old) = queue.items.pop_front() else {
                             break;
@@ -1676,6 +1787,9 @@ impl EdgeRelay {
                     if over(&queue, &in_flight) {
                         return Err(PeerRecordOutcome::RejectedOverload);
                     }
+                }
+                crate::config::model::GrpcEdgeOverflowCfg::LatestByKey => {
+                    unreachable!("handled by keyed relay queue")
                 }
             }
         }
@@ -1748,7 +1862,7 @@ impl EdgeRelay {
         let drained: Vec<QueuedRecord> = {
             let mut queue = link.queue.lock();
             queue.bytes = 0;
-            queue.items.drain(..).collect()
+            queue.drain_all()
         };
         let queued = drained.len();
         if queued > 0 {
@@ -2350,7 +2464,7 @@ async fn sender_task(relay: Arc<EdgeRelay>, link: Arc<PeerLink>) {
             if in_flight.entries.len() >= relay.plan.relay_queue_max_messages {
                 None
             } else {
-                let item = queue.items.pop_front();
+                let item = queue.pop_front();
                 if let Some(record) = &item {
                     queue.bytes -= record.head.len() + record.payload.len();
                 }
@@ -2391,7 +2505,7 @@ async fn sender_task(relay: Arc<EdgeRelay>, link: Arc<PeerLink>) {
                 }
             }
         }
-        // sweep:map 尺寸被在途上限钉死,线性扫描代价可控(V8-6 基准后再谈精化)。
+        // map 尺寸被在途上限钉死，线性 sweep 的代价可控且不会随历史连接无限增长。
         let now = TokioInstant::now();
         let expired: Vec<PendingAck> = {
             let in_flight = link.in_flight.lock();
@@ -2542,6 +2656,12 @@ async fn run_endpoint(
         inbound: inbound_tx,
         queue: Mutex::new(RelayQueue {
             items: VecDeque::new(),
+            latest: (relay.plan.relay_overflow
+                == crate::config::model::GrpcEdgeOverflowCfg::LatestByKey)
+                .then(|| RelayLatestQueue {
+                    order: VecDeque::new(),
+                    items: HashMap::new(),
+                }),
             bytes: 0,
         }),
         queue_notify: Notify::new(),

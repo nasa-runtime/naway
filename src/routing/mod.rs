@@ -3,25 +3,32 @@
 pub mod predicate;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use base64::Engine as _;
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use http::request::Parts;
 use http::Method;
 use hyper::StatusCode;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::auth::{basic_authorization_matches, constant_time_eq, escape_header_quote};
 use crate::casbin_auth::CasbinPolicy;
-use crate::config::model::{BffAggregationCfg, FaultInjectionCfg, MockResponseCfg, RouteCfg};
+use crate::config::model::{
+    BffAggregationCfg, FaultInjectionCfg, GatewayRedirectCfg, HedgeCfg, MockResponseCfg, RouteCfg,
+};
 use crate::degraphql::DegraphqlPlan;
 use crate::dubbo::DubboPlan;
+use crate::enterprise_identity::{EnterpriseAuthPolicy, EnterpriseAuthResult};
 use crate::external_plugin::ExternalPluginChain;
 use crate::graphql::GraphqlGuardPolicy;
 use crate::http_cache::HttpCachePolicy;
@@ -48,6 +55,20 @@ const HMAC_UNIX_SECONDS_THRESHOLD: i128 = 10_000_000_000;
 const DEFAULT_JWT_LEEWAY_SECS: i64 = 60;
 /// JWT `leeway_secs` 最大值,避免误配成长期接受过期 token。
 const MAX_JWT_LEEWAY_SECS: i64 = 3600;
+/// 远端 JWKS/discovery 单文档最大字节数。
+const MAX_JWT_METADATA_BYTES: usize = 1024 * 1024;
+/// 单个 JWKS 最大 key 数，避免不可信 IdP 响应扩张快照状态。
+const MAX_JWKS_KEYS: usize = 128;
+/// `kid` 与 identity claim/header 配置的最大长度。
+const MAX_JWT_IDENTITY_BYTES: usize = 256;
+/// compact JWT 默认最大字节数，覆盖常见 OIDC token 且限制请求头解析成本。
+const DEFAULT_JWT_TOKEN_BYTES: usize = 16 * 1024;
+/// compact JWT 可配置硬上限，避免超大 claims/signature 占用数据面内存。
+const MAX_JWT_TOKEN_BYTES: usize = 64 * 1024;
+/// JWKS/OIDC metadata 默认总超时。
+const DEFAULT_JWKS_TIMEOUT_MS: u64 = 1_000;
+/// JWKS/OIDC metadata 最大总超时，避免身份依赖长期占住请求任务。
+const MAX_JWKS_TIMEOUT_MS: u64 = 60_000;
 /// ext_authz 默认外呼超时,单位毫秒。它是 yml filter 的可覆盖默认值,不是不可调硬编码。
 const DEFAULT_EXT_AUTHZ_TIMEOUT_MS: u64 = 500;
 /// ext_authz 允许配置的最大外呼超时,避免鉴权服务拖住主数据面。
@@ -104,12 +125,18 @@ pub struct Route {
     pub strip_prefix: usize,
     /// `rewrite` 前缀改写规则。
     pub rewrite_prefix: Option<RewritePrefix>,
+    /// Gateway API ReplaceFullPath；存在时完整替换 path，但仍保留原 query。
+    pub gateway_rewrite_full_path: Option<String>,
+    /// 是否保留已通过入站校验的原始 Host/authority，不用当次上游实例地址覆盖。
+    pub preserve_host: bool,
     /// 是否透传下游请求头,对应 nginx `proxy_pass_request_headers`。
     pub pass_request_headers: bool,
     /// 是否透传下游请求体,对应 nginx `proxy_pass_request_body`。
     pub pass_request_body: bool,
+    /// V9 有界 hedged request；None 保持单请求/既有 retry 路径，不增加任何 timer 或副本。
+    pub(crate) hedge: Option<HedgePolicy>,
     /// 上游请求头设置规则集合。
-    pub request_headers: Vec<RequestHeaderSet>,
+    pub request_headers: Vec<RequestHeaderOp>,
     /// 下游响应头过滤规则集合。
     pub response_headers: Vec<ResponseHeaderOp>,
     /// V3 `sub_filter` 响应体流式替换规则。存在时仅包当前 route 的响应 body。
@@ -144,9 +171,11 @@ pub struct Route {
     pub(crate) usage_plan: Option<UsagePlanPolicy>,
     /// V6 多模型 LLM 统一协议计划；不存在时普通代理路径没有 JSON/token 处理开销。
     pub(crate) llm: Option<Arc<LlmRoutePolicy>>,
-    /// V8 gRPC 边缘模式已编译计划;None = 普通 L7 透传(默认)。V8-1/V8-2
+    /// gRPC 边缘模式已编译计划；None = 普通 L7 透传（默认）。
     /// 订阅/发布分支读取该计划，静态 relay 由进程级集群计划接线。
     pub(crate) grpc_edge: Option<Arc<crate::grpc_edge::GrpcEdgePlan>>,
+    /// descriptor 驱动 JSON 转码慢路径；None 时 native gRPC 不读取反射计划。
+    pub(crate) grpc_transcoding: Option<Arc<crate::grpc_transcoding::GrpcTranscodingPlan>>,
     /// 上游写成功后要推进 generation 的同 proxy 缓存 route id；最多 8 个，避免控制面 I/O 无界。
     pub(crate) cache_invalidations: Vec<String>,
     /// CORS 策略,命中预检请求时可直接短路。
@@ -167,6 +196,8 @@ pub struct Route {
     pub hmac_auth: Vec<HmacAuthPolicy>,
     /// V4 JWT HS256 鉴权策略集合。多条策略之间视为同一种认证方式的 OR。
     pub jwt_auth: Vec<JwtAuthPolicy>,
+    /// 可选 SAML/LDAP 企业身份策略；同协议策略之间按 OR，作为独立认证方式参与 satisfy。
+    pub(crate) enterprise_auth: Vec<EnterpriseAuthPolicy>,
     /// V4 ext_authz / auth_request 外部鉴权策略集合。多条策略之间视为同一种认证方式的 OR。
     pub ext_authz: Vec<ExtAuthzPolicy>,
     /// V4 多认证策略组合方式,对应 nginx `satisfy any/all` 的数据面鉴权子集。
@@ -189,6 +220,8 @@ pub struct Route {
     pub x_accel_redirect: bool,
     /// route 级固定响应,对应 nginx `return` 风格短路。
     pub direct_response: Option<DirectResponse>,
+    /// Gateway API 动态重定向；按当前请求保留或替换 authority/path/query。
+    pub gateway_redirect: Option<GatewayRedirectPolicy>,
     /// 本地静态文件/SPA 后端。存在时不走上游代理。
     pub static_serve: Option<StaticServe>,
     /// V3 `mirror` 流量镜像规则。当前基础版只镜像 head/空 body,不阻塞主链路。
@@ -197,8 +230,51 @@ pub struct Route {
     pub variables: Arc<VariablePlan>,
     /// SSE/gRPC 响应 idle 覆盖；None 继承 proxy 全局值。
     pub long_stream_idle_timeout_ms: Option<u64>,
+    /// 单次下游请求的总 deadline；None 使用 proxy 既有阶段超时，Some(0) 显式关闭。
+    pub request_timeout_ms: Option<u64>,
+    /// 单次上游 attempt 的总 deadline；None 使用 proxy 既有阶段超时，Some(0) 显式关闭。
+    pub backend_request_timeout_ms: Option<u64>,
     /// SSE/gRPC 响应最长存活时间(ms)；0 不限制。
     pub long_stream_max_lifetime_ms: u64,
+}
+
+/// 构建期已验证的 hedged request 执行计划。
+#[derive(Clone, Copy)]
+pub(crate) struct HedgePolicy {
+    /// 启动第二实例副本前的固定延迟。
+    pub delay: Duration,
+}
+
+impl HedgePolicy {
+    /// 业务作用：把 route hedging 声明收敛为严格有界的执行计划，阻止动态 URI、隐式幂等
+    /// 或多副本扇出进入数据面。
+    ///
+    /// 参数说明：`cfg` 是 route 声明；`route_id` 用于错误定位；`upstream` 是声明的终端 URI。
+    ///
+    /// 返回：安全门全部满足时返回双 attempt 计划，否则拒绝整份候选快照。
+    fn build(cfg: &HedgeCfg, route_id: &str, upstream: &str) -> Result<Self> {
+        anyhow::ensure!(
+            cfg.idempotent,
+            "route `{route_id}` hedge requires explicit idempotent=true"
+        );
+        anyhow::ensure!(
+            cfg.max_attempts == 2,
+            "route `{route_id}` hedge.max_attempts must equal 2"
+        );
+        anyhow::ensure!(
+            (1..=60_000).contains(&cfg.delay_ms),
+            "route `{route_id}` hedge.delay_ms must be within 1..=60000"
+        );
+        anyhow::ensure!(
+            upstream.starts_with("lb://")
+                && upstream.len() > "lb://".len()
+                && !upstream.contains("${"),
+            "route `{route_id}` hedge requires a fixed lb:// service URI"
+        );
+        Ok(Self {
+            delay: Duration::from_millis(cfg.delay_ms),
+        })
+    }
 }
 
 /// 已编译路由表。数据面只顺序匹配断言,不再解析配置字符串。
@@ -298,6 +374,13 @@ impl Router {
             let grpc_edge = crate::grpc_edge::GrpcEdgePlan::build(c.grpc_edge.as_ref(), &c.id)
                 .with_context(|| format!("route `{}` grpc_edge", c.id))?
                 .map(Arc::new);
+            let grpc_transcoding = crate::grpc_transcoding::GrpcTranscodingPlan::build(
+                c.grpc_transcoding.as_ref(),
+                config_dir,
+                c.id.as_str(),
+            )
+            .with_context(|| format!("route `{}` grpc_transcoding", c.id))?
+            .map(Arc::new);
             let bff_aggregation = c
                 .bff_aggregation
                 .as_ref()
@@ -342,14 +425,21 @@ impl Router {
                 })
                 .transpose()
                 .with_context(|| format!("route `{}` serve.static", c.id))?;
+            let gateway_redirect = c
+                .gateway_redirect
+                .as_ref()
+                .map(GatewayRedirectPolicy::build)
+                .transpose()
+                .with_context(|| format!("route `{}` gateway_redirect", c.id))?;
             let terminal_backends = usize::from(!c.uri.trim().is_empty())
                 + usize::from(static_serve.is_some())
                 + usize::from(llm.is_some())
                 + usize::from(bff_aggregation.is_some())
-                + usize::from(mock_response.is_some());
+                + usize::from(mock_response.is_some())
+                + usize::from(gateway_redirect.is_some());
             if terminal_backends != 1 {
                 bail!(
-                    "route `{}` requires exactly one of uri/serve.static/llm/bff_aggregation/mock_response",
+                    "route `{}` requires exactly one of uri/serve.static/llm/bff_aggregation/mock_response/gateway_redirect",
                     c.id
                 );
             }
@@ -358,6 +448,20 @@ impl Router {
                 // 因此必须是 HTTP upstream 后端;llm/serve.static/mock/bff/dubbo 均不兼容。
                 bail!(
                     "route `{}` grpc_edge requires an HTTP upstream `uri` and cannot combine with llm/serve.static/mock_response/bff_aggregation/dubbo",
+                    c.id
+                );
+            }
+            if grpc_transcoding.is_some()
+                && (c.uri.trim().is_empty()
+                    || grpc_edge.is_some()
+                    || dubbo.is_some()
+                    || llm.is_some()
+                    || static_serve.is_some()
+                    || bff_aggregation.is_some()
+                    || mock_response.is_some())
+            {
+                bail!(
+                    "route `{}` grpc_transcoding requires one HTTP upstream and cannot combine with grpc_edge or terminal protocol backends",
                     c.id
                 );
             }
@@ -372,8 +476,30 @@ impl Router {
                     c.id
                 );
             }
+            for (field, timeout) in [
+                ("request_timeout_ms", c.request_timeout_ms),
+                ("backend_request_timeout_ms", c.backend_request_timeout_ms),
+            ] {
+                if let Some(timeout) = timeout {
+                    anyhow::ensure!(
+                        timeout <= 31_536_000_000,
+                        "route `{}` {field} exceeds 365 days",
+                        c.id
+                    );
+                }
+            }
+            if let (Some(request), Some(backend)) =
+                (c.request_timeout_ms, c.backend_request_timeout_ms)
+            {
+                anyhow::ensure!(
+                    request == 0 || backend <= request,
+                    "route `{}` backend_request_timeout_ms cannot exceed request_timeout_ms",
+                    c.id
+                );
+            }
             let mut strip_prefix = 0;
             let mut rewrite_prefix = None;
+            let mut gateway_rewrite_full_path = None;
             let mut pass_request_headers = true;
             let mut pass_request_body = true;
             let mut request_headers = Vec::new();
@@ -393,6 +519,7 @@ impl Router {
             let mut api_keys = Vec::new();
             let mut hmac_auth = Vec::new();
             let mut jwt_auth = Vec::new();
+            let mut enterprise_auth = Vec::new();
             let mut ext_authz = Vec::new();
             let mut satisfy = SatisfyMode::All;
             let mut conditional_returns = Vec::new();
@@ -415,10 +542,14 @@ impl Router {
                 {
                     ParsedFilter::None => {}
                     ParsedFilter::Internal => internal = true,
-                    ParsedFilter::ProxySetHeader(op) => request_headers.push(op),
+                    ParsedFilter::ProxySetHeader(op) => {
+                        request_headers.push(RequestHeaderOp::Set(op))
+                    }
+                    ParsedFilter::GatewayRequestHeader(op) => request_headers.push(op),
                     ParsedFilter::PassRequestHeaders(pass) => pass_request_headers = pass,
                     ParsedFilter::PassRequestBody(pass) => pass_request_body = pass,
                     ParsedFilter::AddHeader(op) => response_headers.push(ResponseHeaderOp::Add(op)),
+                    ParsedFilter::GatewayResponseHeader(op) => response_headers.push(op),
                     ParsedFilter::HideHeader(name) => {
                         response_headers.push(ResponseHeaderOp::Hide(name))
                     }
@@ -461,6 +592,7 @@ impl Router {
                     ParsedFilter::ApiKey(policy) => api_keys.push(policy),
                     ParsedFilter::HmacAuth(policy) => hmac_auth.push(policy),
                     ParsedFilter::JwtAuth(policy) => jwt_auth.push(policy),
+                    ParsedFilter::EnterpriseAuth(policy) => enterprise_auth.push(policy),
                     ParsedFilter::ExtAuthz(policy) => ext_authz.push(policy),
                     ParsedFilter::Satisfy(mode) => satisfy = mode,
                     ParsedFilter::ConditionalReturn(rule) => conditional_returns.push(rule),
@@ -473,8 +605,51 @@ impl Router {
                     ParsedFilter::XAccelRedirect(enabled) => x_accel_redirect = enabled,
                     ParsedFilter::Return(resp) => direct_response = Some(resp),
                     ParsedFilter::RewritePrefix(rewrite) => rewrite_prefix = Some(rewrite),
+                    ParsedFilter::GatewayRewriteFullPath(path) => {
+                        gateway_rewrite_full_path = Some(path)
+                    }
                     ParsedFilter::Mirror(policy) => mirrors.push(policy),
                 }
+            }
+            anyhow::ensure!(
+                gateway_rewrite_full_path.is_none() || rewrite_prefix.is_none(),
+                "route `{}` cannot combine full-path and prefix rewrite",
+                c.id
+            );
+            let mut owned_identity_headers = HashSet::new();
+            for header in jwt_auth
+                .iter()
+                .flat_map(|policy: &JwtAuthPolicy| policy.identity_headers.iter())
+                .map(|mapping| &mapping.header)
+                .chain(
+                    enterprise_auth
+                        .iter()
+                        .flat_map(EnterpriseAuthPolicy::owned_headers),
+                )
+            {
+                if !owned_identity_headers.insert(header.clone()) {
+                    bail!(
+                        "route `{}` assigns enterprise identity header `{header}` more than once",
+                        c.id
+                    );
+                }
+            }
+            let hedge = c
+                .hedge
+                .as_ref()
+                .map(|cfg| HedgePolicy::build(cfg, c.id.as_str(), c.uri.trim()))
+                .transpose()?;
+            if hedge.is_some() && pass_request_body {
+                bail!(
+                    "route `{}` hedge requires ProxyPassRequestBody=false so every duplicate is provably bodyless",
+                    c.id
+                );
+            }
+            if hedge.is_some() && internal {
+                bail!(
+                    "route `{}` internal route cannot enable hedge because internal replay bypasses the public request gate",
+                    c.id
+                );
             }
             cache_invalidations.sort();
             cache_invalidations.dedup();
@@ -489,6 +664,7 @@ impl Router {
                     || !api_keys.is_empty()
                     || !hmac_auth.is_empty()
                     || !jwt_auth.is_empty()
+                    || !enterprise_auth.is_empty()
                     || !ext_authz.is_empty())
             {
                 bail!(
@@ -507,7 +683,7 @@ impl Router {
                 );
             }
             if let (Some(cache), Some(cors)) = (&http_cache, &cors) {
-                if matches!(cors.allow_origin, CorsAllowOrigin::Echo)
+                if cors.allow_origin.varies_by_origin(cors.allow_credentials)
                     && !cache.covers_vary(&http::header::ORIGIN)
                 {
                     bail!(
@@ -605,10 +781,33 @@ impl Router {
                     || !conditional_returns.is_empty()
                     || !mirrors.is_empty()
                     || strip_prefix > 0
-                    || rewrite_prefix.is_some())
+                    || rewrite_prefix.is_some()
+                    || gateway_rewrite_full_path.is_some())
             {
                 bail!(
                     "route `{}` degraphql cannot combine with validation/cache/internal/terminal backends/mirror/path rewrite",
+                    c.id
+                );
+            }
+            if grpc_transcoding.is_some()
+                && (request_validation.is_some()
+                    || graphql_guard.is_some()
+                    || degraphql.is_some()
+                    || http_cache.is_some()
+                    || hedge.is_some()
+                    || internal
+                    || !mirrors.is_empty()
+                    || !pass_request_body
+                    || strip_prefix > 0
+                    || rewrite_prefix.is_some()
+                    || gateway_rewrite_full_path.is_some()
+                    || direct_response.is_some()
+                    || !conditional_returns.is_empty())
+            {
+                // descriptor 转码必须唯一拥有 request/response body 和 RPC path；若先后叠加另一条
+                // 聚合/重写管线，会让 schema、鉴权后的 payload 与真正发往上游的字节失配。
+                bail!(
+                    "route `{}` grpc_transcoding cannot combine with body-owning validation/GraphQL/cache/hedge/mirror/internal/return or path/body rewrite",
                     c.id
                 );
             }
@@ -620,6 +819,7 @@ impl Router {
                     || !mirrors.is_empty()
                     || strip_prefix > 0
                     || rewrite_prefix.is_some()
+                    || gateway_rewrite_full_path.is_some()
                     || !pass_request_body)
             {
                 bail!(
@@ -680,6 +880,7 @@ impl Router {
                 .is_some_and(|policy| policy.requires_identity())
                 && basic_auth.is_none()
                 && jwt_auth.is_empty()
+                && enterprise_auth.is_empty()
                 && !api_keys.iter().any(|policy| policy.consumer.is_some())
             {
                 bail!(
@@ -692,6 +893,7 @@ impl Router {
                 .is_some_and(|policy| policy.requires_identity())
                 && basic_auth.is_none()
                 && jwt_auth.is_empty()
+                && enterprise_auth.is_empty()
                 && !api_keys.iter().any(|policy| policy.consumer.is_some())
             {
                 bail!(
@@ -704,6 +906,7 @@ impl Router {
                 .is_some_and(|policy| policy.require_consumer)
                 && basic_auth.is_none()
                 && jwt_auth.is_empty()
+                && enterprise_auth.is_empty()
                 && !api_keys.iter().any(|policy| policy.consumer.is_some())
             {
                 bail!(
@@ -827,8 +1030,11 @@ impl Router {
                     internal,
                     strip_prefix,
                     rewrite_prefix,
+                    gateway_rewrite_full_path,
+                    preserve_host: c.preserve_host,
                     pass_request_headers,
                     pass_request_body,
+                    hedge,
                     request_headers,
                     response_headers,
                     sub_filters,
@@ -848,6 +1054,7 @@ impl Router {
                     usage_plan,
                     llm,
                     grpc_edge,
+                    grpc_transcoding,
                     cache_invalidations,
                     cors,
                     fallback_headers,
@@ -858,6 +1065,7 @@ impl Router {
                     api_keys,
                     hmac_auth,
                     jwt_auth,
+                    enterprise_auth,
                     ext_authz,
                     satisfy,
                     conditional_returns,
@@ -869,10 +1077,13 @@ impl Router {
                     proxy_intercept_errors,
                     x_accel_redirect,
                     direct_response,
+                    gateway_redirect,
                     static_serve,
                     mirrors,
                     variables: variables.clone(),
                     long_stream_idle_timeout_ms: c.long_stream_idle_timeout_ms,
+                    request_timeout_ms: c.request_timeout_ms,
+                    backend_request_timeout_ms: c.backend_request_timeout_ms,
                     long_stream_max_lifetime_ms: c.long_stream_max_lifetime_ms,
                 }),
             ));
@@ -1014,15 +1225,33 @@ impl Router {
         })
     }
 
-    /// V8:统计启用 gRPC 边缘模式的 route 数。
+    /// 业务作用：统计启用 gRPC 边缘模式的 route 数，供管理面展示快照接线情况。
     ///
-    /// 供管理面快照摘要展示"edge 接线情况"(0 = 纯 L7);同时让快照接线在 V8-0
-    /// 就有真实读取方,不留 dead field。
+    /// 参数说明：无。
+    ///
+    /// 返回：已编译 edge route 数；0 表示当前快照全部走普通 L7。
     pub(crate) fn grpc_edge_route_count(&self) -> usize {
         self.routes
             .iter()
             .filter(|route| route.grpc_edge.is_some())
             .count()
+    }
+
+    /// 业务作用：统计启用 descriptor 转码的 route 与允许 RPC 数量，供快照摘要证明 feature
+    /// 接线而不暴露 service/method 名称。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：`(route 数, method 数)`；未配置时均为零。
+    pub(crate) fn grpc_transcoding_summary(&self) -> (usize, usize) {
+        self.routes.iter().fold((0, 0), |(routes, methods), route| {
+            route
+                .grpc_transcoding
+                .as_ref()
+                .map_or((routes, methods), |plan| {
+                    (routes + 1, methods + plan.method_count())
+                })
+        })
     }
 
     /// 是否有 LLM route 显式要求 Redis 语义缓存；与 HTTP cache 共用 bootstrap Redis 连接。
@@ -1102,7 +1331,8 @@ impl Route {
         let has_api_key = !self.api_keys.is_empty();
         let has_hmac = !self.hmac_auth.is_empty();
         let has_jwt = !self.jwt_auth.is_empty();
-        if !has_basic && !has_api_key && !has_hmac && !has_jwt {
+        let has_enterprise = !self.enterprise_auth.is_empty();
+        if !has_basic && !has_api_key && !has_hmac && !has_jwt && !has_enterprise {
             return SyncAuthState {
                 configured: false,
                 ok: true,
@@ -1116,23 +1346,197 @@ impl Route {
         let api_key_ok = self.api_keys.iter().any(|policy| policy.matches(parts));
         let hmac_ok = self.hmac_auth.iter().any(|policy| policy.matches(parts));
         let jwt_ok = self.jwt_auth.iter().any(|policy| policy.matches(parts));
+        let enterprise_ok = false;
         let ok = match self.satisfy {
             SatisfyMode::All => {
                 (!has_basic || basic_ok)
                     && (!has_api_key || api_key_ok)
                     && (!has_hmac || hmac_ok)
                     && (!has_jwt || jwt_ok)
+                    && (!has_enterprise || enterprise_ok)
             }
             SatisfyMode::Any => {
                 (has_basic && basic_ok)
                     || (has_api_key && api_key_ok)
                     || (has_hmac && hmac_ok)
                     || (has_jwt && jwt_ok)
+                    || (has_enterprise && enterprise_ok)
             }
         };
         SyncAuthState {
             configured: true,
             ok,
+        }
+    }
+
+    /// 业务作用：执行包含远端 JWKS/OIDC 刷新的完整本地认证组合，供数据面在 ext_authz 前冻结可信身份。
+    ///
+    /// 参数说明：`parts` 是尚未接受外部鉴权 header 注入的请求 head，`saml_response` 是可选的
+    /// 标准 HTTP-POST form 凭据，已由代理层按 route 上限提取并保留原 body。
+    ///
+    /// 返回：返回本地认证是否配置及 satisfy 组合结果；远端元数据不可用、过期或 token 非法均按未通过处理。
+    pub(crate) async fn resolved_auth_state(
+        &self,
+        parts: &Parts,
+        saml_response: Option<&str>,
+    ) -> ResolvedAuthState {
+        let has_basic = self.basic_auth.is_some();
+        let has_api_key = !self.api_keys.is_empty();
+        let has_hmac = !self.hmac_auth.is_empty();
+        let has_jwt = !self.jwt_auth.is_empty();
+        let has_enterprise = !self.enterprise_auth.is_empty();
+        if !has_basic && !has_api_key && !has_hmac && !has_jwt && !has_enterprise {
+            return ResolvedAuthState {
+                configured: false,
+                ok: true,
+                consumer: None,
+                jwt_claims: None,
+                identity_headers: Vec::new(),
+            };
+        }
+        let basic_ok = self
+            .basic_auth
+            .as_ref()
+            .is_some_and(|policy| policy.matches(parts));
+        let api_key_ok = self.api_keys.iter().any(|policy| policy.matches(parts));
+        let hmac_ok = self.hmac_auth.iter().any(|policy| policy.matches(parts));
+        let mut verified_jwt = None;
+        for policy in &self.jwt_auth {
+            let Some(token) = policy.token(parts) else {
+                continue;
+            };
+            if let Some(payload) = policy.verified_payload_resolved(token).await {
+                verified_jwt = Some((policy, payload));
+                break;
+            }
+        }
+        let jwt_ok = verified_jwt.is_some();
+        let mut enterprise_consumer = None;
+        let mut enterprise_headers = Vec::new();
+        let mut enterprise_ok = false;
+        for policy in &self.enterprise_auth {
+            match policy.authenticate(parts, saml_response).await {
+                EnterpriseAuthResult::Authenticated { consumer, headers } => {
+                    enterprise_ok = true;
+                    enterprise_consumer = Some(consumer);
+                    enterprise_headers = headers;
+                    break;
+                }
+                EnterpriseAuthResult::Missing | EnterpriseAuthResult::Rejected => {}
+            }
+        }
+        let ok = match self.satisfy {
+            SatisfyMode::All => {
+                (!has_basic || basic_ok)
+                    && (!has_api_key || api_key_ok)
+                    && (!has_hmac || hmac_ok)
+                    && (!has_jwt || jwt_ok)
+                    && (!has_enterprise || enterprise_ok)
+            }
+            SatisfyMode::Any => {
+                (has_basic && basic_ok)
+                    || (has_api_key && api_key_ok)
+                    || (has_hmac && hmac_ok)
+                    || (has_jwt && jwt_ok)
+                    || (has_enterprise && enterprise_ok)
+            }
+        };
+        let consumer = ok
+            .then(|| {
+                verified_jwt
+                    .as_ref()
+                    .and_then(|(_, payload)| bounded_jwt_claim(payload, "sub"))
+                    .or_else(|| {
+                        self.api_keys.iter().find_map(|policy| {
+                            policy
+                                .matches(parts)
+                                .then(|| policy.consumer.clone())
+                                .flatten()
+                        })
+                    })
+                    .or_else(|| {
+                        self.basic_auth.as_ref().and_then(|policy| {
+                            policy.matches(parts).then(|| policy.consumer.clone())
+                        })
+                    })
+            })
+            .flatten()
+            .or_else(|| {
+                (ok && enterprise_ok)
+                    .then_some(enterprise_consumer)
+                    .flatten()
+            });
+        let jwt_claims = ok
+            .then(|| verified_jwt.as_ref().map(|(_, payload)| payload.clone()))
+            .flatten();
+        let mut identity_headers = Vec::new();
+        if ok {
+            if let Some((policy, payload)) = &verified_jwt {
+                for mapping in policy.identity_headers.iter() {
+                    let Some(value) = payload
+                        .get(mapping.claim.as_ref())
+                        .and_then(|value| value.as_str())
+                    else {
+                        continue;
+                    };
+                    if value.is_empty()
+                        || value.len() > MAX_JWT_IDENTITY_BYTES
+                        || value.bytes().any(|byte| byte.is_ascii_control())
+                    {
+                        continue;
+                    }
+                    if let Ok(value) = HeaderValue::from_str(value) {
+                        identity_headers.push((mapping.header.clone(), value));
+                    }
+                }
+            }
+            if enterprise_ok {
+                identity_headers.extend(enterprise_headers);
+            }
+        }
+        ResolvedAuthState {
+            configured: true,
+            ok,
+            consumer,
+            jwt_claims,
+            identity_headers,
+        }
+    }
+
+    /// 业务作用：判断本 route 是否启用标准 SAML HTTP-POST body binding，并汇总一次读取所需硬上限。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：至少一个 body-binding SAML policy 时返回不超过协议上限的最大 form 字节数，否则 None。
+    pub(crate) fn saml_form_body_limit(&self) -> Option<usize> {
+        self.enterprise_auth
+            .iter()
+            .filter_map(EnterpriseAuthPolicy::saml_form_body_limit)
+            .max()
+    }
+
+    /// 业务作用：先删除所有由网关拥有的身份头，再提交认证阶段冻结的可信身份值。
+    ///
+    /// 参数说明：`parts` 是可能已被 ext_authz 修改的请求 head，`identity_headers` 只来自外呼前冻结的本地认证结果。
+    ///
+    /// 返回：无；客户端或 ext_authz 的同名值先被删除，只有已验证 JWT/SAML/LDAP 值会重新注入。
+    pub(crate) fn apply_identity_headers(
+        &self,
+        parts: &mut Parts,
+        identity_headers: &[(HeaderName, HeaderValue)],
+    ) {
+        for policy in &self.jwt_auth {
+            for mapping in policy.identity_headers.iter() {
+                parts.headers.remove(&mapping.header);
+            }
+        }
+        for policy in &self.enterprise_auth {
+            for header in policy.owned_headers() {
+                parts.headers.remove(header);
+            }
+        }
+        for (name, value) in identity_headers {
+            parts.headers.insert(name.clone(), value.clone());
         }
     }
 
@@ -1260,6 +1664,17 @@ impl Route {
     }
 }
 
+/// Gateway API 与 nginx 请求头变更的统一执行操作。
+#[derive(Clone)]
+pub enum RequestHeaderOp {
+    /// 替换全部同名值；对应 nginx `proxy_set_header` 与 Gateway API `set`。
+    Set(RequestHeaderSet),
+    /// 在既有值之后追加一项；对应 Gateway API `add`。
+    Add(RequestHeaderSet),
+    /// 删除全部同名值；对应 Gateway API `remove`。
+    Remove(HeaderName),
+}
+
 /// 请求头设置规则,对应 nginx `proxy_set_header`。
 #[derive(Clone)]
 pub struct RequestHeaderSet {
@@ -1281,6 +1696,8 @@ pub struct ResponseHeaderSet {
 pub enum ResponseHeaderOp {
     /// 追加响应头。
     Add(ResponseHeaderSet),
+    /// 替换全部同名响应头。
+    Set(ResponseHeaderSet),
     /// 移除指定响应头。
     Hide(HeaderName),
     /// 改写上游重定向头。
@@ -1390,7 +1807,7 @@ impl ResponseHeaderOp {
     /// 动态 `add_header` 需要原始请求变量;纯静态响应头操作不让热路径额外 clone `Parts`。
     pub fn needs_request_context(&self) -> bool {
         match self {
-            Self::Add(set) => set.value.static_literal().is_none(),
+            Self::Add(set) | Self::Set(set) => set.value.static_literal().is_none(),
             Self::Hide(_) | Self::ProxyRedirect(_) | Self::CookieRewrite(_) | Self::Dedupe(_) => {
                 false
             }
@@ -1482,9 +1899,9 @@ pub struct CorsPolicy {
     /// Access-Control-Allow-Origin 策略。
     pub allow_origin: CorsAllowOrigin,
     /// Access-Control-Allow-Methods 值。
-    pub allow_methods: String,
+    pub allow_methods: Option<String>,
     /// Access-Control-Allow-Headers 值。
-    pub allow_headers: String,
+    pub allow_headers: Option<String>,
     /// Access-Control-Expose-Headers 值。
     pub expose_headers: Option<String>,
     /// Access-Control-Max-Age 秒数。
@@ -1502,6 +1919,85 @@ pub enum CorsAllowOrigin {
     Echo,
     /// 返回固定 origin。
     Static(String),
+    /// 按 Gateway API 的精确或左侧通配 origin 列表匹配，并回显通过校验的请求 Origin。
+    Gateway(Vec<CorsOriginPattern>),
+}
+
+/// Gateway API CORS origin 的规范化匹配计划。
+#[derive(Clone)]
+pub struct CorsOriginPattern {
+    scheme: String,
+    host: CorsOriginHost,
+    port: u16,
+}
+
+/// Gateway API CORS origin 的主机匹配边界。
+#[derive(Clone)]
+enum CorsOriginHost {
+    Exact(String),
+    WildcardSuffix(String),
+}
+
+impl CorsAllowOrigin {
+    /// 业务作用：为当前请求选择可安全写入 CORS 响应的 origin，Gateway API 列表只回显已匹配值。
+    ///
+    /// 参数说明：`request_origin` 是下游原始 `Origin`；`allow_credentials` 决定通配符能否直接返回。
+    ///
+    /// 返回：匹配时返回响应值；缺少或未授权的 origin 返回 `None`，调用方不得发布 CORS 头。
+    pub(crate) fn response_value(
+        &self,
+        request_origin: Option<&HeaderValue>,
+        allow_credentials: bool,
+    ) -> Option<HeaderValue> {
+        match self {
+            Self::Any if allow_credentials => request_origin.cloned(),
+            Self::Any => Some(HeaderValue::from_static("*")),
+            Self::Echo => request_origin.cloned(),
+            Self::Static(origin) => HeaderValue::from_str(origin).ok(),
+            Self::Gateway(patterns) => {
+                let origin = request_origin?;
+                patterns
+                    .iter()
+                    .any(|pattern| pattern.matches(origin))
+                    .then(|| origin.clone())
+            }
+        }
+    }
+
+    /// 业务作用：判断 CORS 响应是否随请求 `Origin` 变化，供缓存隔离和 `Vary` 发布共用。
+    ///
+    /// 参数说明：`allow_credentials` 决定全 origin 通配符是否必须改为回显。
+    ///
+    /// 返回：动态回显或列表匹配返回 `true`，固定响应返回 `false`。
+    pub(crate) fn varies_by_origin(&self, allow_credentials: bool) -> bool {
+        matches!(self, Self::Echo | Self::Gateway(_))
+            || matches!(self, Self::Any) && allow_credentials
+    }
+}
+
+impl CorsOriginPattern {
+    /// 业务作用：匹配一个规范化 Gateway API origin，避免把路径、用户信息或错误端口当成同源。
+    ///
+    /// 参数说明：`request_origin` 是浏览器提供的原始 `Origin` header。
+    ///
+    /// 返回：scheme、规范化端口与主机规则全部命中时返回 `true`；非法 header 一律不匹配。
+    fn matches(&self, request_origin: &HeaderValue) -> bool {
+        let Ok(raw) = request_origin.to_str() else {
+            return false;
+        };
+        let Ok((scheme, host, port)) = parse_cors_request_origin(raw) else {
+            return false;
+        };
+        if scheme != self.scheme || port != self.port {
+            return false;
+        }
+        match &self.host {
+            CorsOriginHost::Exact(expected) => host == *expected,
+            CorsOriginHost::WildcardSuffix(suffix) => {
+                host.len() > suffix.len() && host.ends_with(suffix)
+            }
+        }
+    }
 }
 
 /// path 前缀改写规则,对应轻量 `rewrite` 子集。
@@ -1511,6 +2007,177 @@ pub struct RewritePrefix {
     pub from: String,
     /// 替换后的目标前缀。
     pub to: String,
+}
+
+/// Gateway API RequestRedirect 的已验证执行计划。
+#[derive(Clone)]
+pub struct GatewayRedirectPolicy {
+    scheme: Option<String>,
+    hostname: Option<String>,
+    port: Option<u16>,
+    status: StatusCode,
+    replace_full_path: Option<String>,
+    replace_prefix_match: Option<String>,
+    matched_prefix: Option<String>,
+}
+
+impl GatewayRedirectPolicy {
+    /// 业务作用：把控制面重定向声明编译为不会产生非法 Location 或歧义 path 变换的计划。
+    ///
+    /// 参数说明：`cfg` 是 Gateway API RequestRedirect 映射后的声明。
+    ///
+    /// 返回：字段组合、scheme、authority、状态码与 path 均合法时返回计划，否则拒绝候选快照。
+    fn build(cfg: &GatewayRedirectCfg) -> Result<Self> {
+        anyhow::ensure!(
+            cfg.scheme
+                .as_deref()
+                .is_none_or(|scheme| matches!(scheme, "http" | "https")),
+            "gateway_redirect.scheme must be http or https"
+        );
+        if let Some(hostname) = cfg.hostname.as_deref() {
+            validate_redirect_hostname(hostname)?;
+        }
+        anyhow::ensure!(
+            cfg.port.is_none_or(|port| port > 0),
+            "gateway_redirect.port cannot be zero"
+        );
+        let status = StatusCode::from_u16(cfg.status_code)
+            .context("gateway_redirect.status_code is invalid")?;
+        anyhow::ensure!(
+            matches!(cfg.status_code, 301 | 302 | 303 | 307 | 308),
+            "gateway_redirect.status_code must be 301, 302, 303, 307, or 308"
+        );
+        anyhow::ensure!(
+            !(cfg.replace_full_path.is_some() && cfg.replace_prefix_match.is_some()),
+            "gateway_redirect path modifier must choose full path or prefix replacement"
+        );
+        anyhow::ensure!(
+            cfg.replace_prefix_match.is_some() == cfg.matched_prefix.is_some(),
+            "gateway_redirect prefix replacement requires matched_prefix"
+        );
+        for (field, value) in [
+            ("replace_full_path", cfg.replace_full_path.as_deref()),
+            ("replace_prefix_match", cfg.replace_prefix_match.as_deref()),
+            ("matched_prefix", cfg.matched_prefix.as_deref()),
+        ] {
+            if let Some(value) = value {
+                anyhow::ensure!(
+                    value.starts_with('/')
+                        && value.len() <= 2048
+                        && !value.bytes().any(|byte| byte <= 0x20 || byte == b'#'),
+                    "gateway_redirect.{field} must be a valid origin path within 2048 bytes"
+                );
+            }
+        }
+        Ok(Self {
+            scheme: cfg.scheme.clone(),
+            hostname: cfg.hostname.clone(),
+            port: cfg.port,
+            status,
+            replace_full_path: cfg.replace_full_path.clone(),
+            replace_prefix_match: cfg.replace_prefix_match.clone(),
+            matched_prefix: cfg.matched_prefix.clone(),
+        })
+    }
+
+    /// 业务作用：基于当前请求生成最终 Location，同时严格保留未被策略覆盖的 path/query 信息。
+    ///
+    /// 参数说明：`parts` 提供规范化 URI 与 authority；`downstream_proto` 是可信监听协议。
+    ///
+    /// 返回：authority 与 Location 可编码时返回状态码和目标；缺失或非法 Host 时拒绝本次重定向。
+    pub fn location(&self, parts: &Parts, downstream_proto: &str) -> Result<(StatusCode, String)> {
+        let inbound_authority = parts
+            .uri
+            .authority()
+            .map(http::uri::Authority::as_str)
+            .or_else(|| {
+                parts
+                    .headers
+                    .get(http::header::HOST)
+                    .and_then(|value| value.to_str().ok())
+            })
+            .context("gateway redirect request has no valid authority")?;
+        let parsed_authority = inbound_authority
+            .parse::<http::uri::Authority>()
+            .context("gateway redirect request authority is invalid")?;
+        let scheme = self.scheme.as_deref().unwrap_or(downstream_proto);
+        anyhow::ensure!(
+            matches!(scheme, "http" | "https"),
+            "gateway redirect downstream scheme is unsupported"
+        );
+        let hostname = self
+            .hostname
+            .as_deref()
+            .unwrap_or_else(|| parsed_authority.host());
+        validate_redirect_hostname(hostname)?;
+        let port = self.port.or_else(|| {
+            self.scheme
+                .is_none()
+                .then(|| parsed_authority.port_u16())
+                .flatten()
+        });
+        let authority = match port {
+            Some(port) => format_authority(hostname, port),
+            None => hostname.to_owned(),
+        };
+        let path = if let Some(replacement) = self.replace_full_path.as_deref() {
+            replacement.to_owned()
+        } else if let (Some(from), Some(to)) = (
+            self.matched_prefix.as_deref(),
+            self.replace_prefix_match.as_deref(),
+        ) {
+            let suffix = parts
+                .uri
+                .path()
+                .strip_prefix(from)
+                .context("gateway redirect path no longer matches compiled prefix")?;
+            format!("{to}{suffix}")
+        } else {
+            parts.uri.path().to_owned()
+        };
+        let query = parts
+            .uri
+            .query()
+            .map(|value| format!("?{value}"))
+            .unwrap_or_default();
+        let location = format!("{scheme}://{authority}{path}{query}");
+        HeaderValue::from_str(&location).context("gateway redirect Location is invalid")?;
+        Ok((self.status, location))
+    }
+}
+
+/// 业务作用：校验重定向目标 hostname，阻断 userinfo、path 与控制字符注入 Location。
+///
+/// 参数说明：`hostname` 是不含端口的 DNS 名、IPv4 或方括号 IPv6。
+///
+/// 返回：可安全组成 HTTP authority 时成功，否则返回错误。
+fn validate_redirect_hostname(hostname: &str) -> Result<()> {
+    anyhow::ensure!(
+        !hostname.is_empty()
+            && hostname.len() <= 253
+            && !hostname
+                .bytes()
+                .any(|byte| byte <= 0x20 || matches!(byte, b'/' | b'@' | b'#' | b'?')),
+        "gateway redirect hostname is invalid"
+    );
+    let authority = format_authority(hostname, 443);
+    authority
+        .parse::<http::uri::Authority>()
+        .context("gateway redirect hostname is not a valid authority")?;
+    Ok(())
+}
+
+/// 业务作用：在不破坏 IPv6 方括号语义的前提下拼出带端口 authority。
+///
+/// 参数说明：`hostname` 已通过目标主机校验；`port` 是非零 TCP 端口。
+///
+/// 返回：返回可供 URI 使用的 authority 文本。
+fn format_authority(hostname: &str, port: u16) -> String {
+    if hostname.contains(':') && !hostname.starts_with('[') {
+        format!("[{hostname}]:{port}")
+    } else {
+        format!("{hostname}:{port}")
+    }
 }
 
 /// 一个已编译 BFF 聚合计划。全部预算在快照构建期固定，执行时不再解析配置字符串。
@@ -1950,21 +2617,87 @@ pub struct HmacAuthPolicy {
     replay_protection: bool,
 }
 
-/// V4 JWT HS256 已编译策略。
-///
-/// 基础版只读取 token header 并校验 HS256 + 常见 claims,不做 JWKS/OIDC 网络拉取。
+/// 已编译 JWT/JWKS/OIDC 策略。
 #[derive(Clone)]
 pub struct JwtAuthPolicy {
-    /// HS256 共享密钥。
-    secret: String,
+    /// 固定算法与 key 来源；header `alg` 必须精确一致。
+    verifier: JwtVerifier,
+    /// 唯一允许的 JWS 算法。
+    algorithm: Algorithm,
     /// token 来源。
     source: JwtTokenSource,
     /// 可选 issuer 精确匹配。
     issuer: Option<String>,
     /// 可选 audience 匹配;payload aud 可为字符串或字符串数组。
     audience: Option<String>,
+    /// 多 audience token 必须精确匹配的 `azp`。
+    authorized_party: Option<String>,
+    /// 可选固定 nonce；适合由上游登录流程把请求 nonce 固化到 route generation 的场景。
+    nonce: Option<String>,
     /// `exp`/`nbf` 允许的时钟偏差,单位秒。
     leeway_secs: i64,
+    /// compact token 最大字节数。
+    max_token_bytes: usize,
+    /// discovery profile 要求 exp/iat/iss/aud/sub，不能退化为只验签 bearer。
+    require_oidc_claims: bool,
+    /// 验证成功后由网关生成的 claim→header 映射。
+    identity_headers: Arc<Vec<JwtIdentityHeader>>,
+    /// 可选 JWE 外层；解密结果必须继续通过本策略的 JWS 与 claims 验证。
+    #[cfg(feature = "enterprise-jwe")]
+    jwe: Option<Arc<JweLayer>>,
+}
+
+#[cfg(feature = "enterprise-jwe")]
+struct JweLayer {
+    decrypter: josekit::jwe::alg::rsaes::RsaesJweDecrypter,
+    max_compact_bytes: usize,
+}
+
+#[derive(Clone)]
+enum JwtVerifier {
+    Hs256(Arc<str>),
+    Static(Arc<DecodingKey>),
+    Remote(Arc<RemoteJwks>),
+}
+
+#[derive(Clone)]
+struct JwtIdentityHeader {
+    claim: Arc<str>,
+    header: HeaderName,
+}
+
+struct RemoteJwks {
+    endpoint: RemoteJwksEndpoint,
+    issuer: Arc<str>,
+    algorithm: Algorithm,
+    client: reqwest::Client,
+    timeout: Duration,
+    min_ttl: Duration,
+    max_ttl: Duration,
+    stale_ttl: Duration,
+    negative_ttl: Duration,
+    state: RwLock<RemoteJwksState>,
+    refresh: AsyncMutex<()>,
+}
+
+enum RemoteJwksEndpoint {
+    Direct(Arc<str>),
+    Discovery(Arc<str>),
+}
+
+struct RemoteJwksState {
+    keys: HashMap<String, Arc<DecodingKey>>,
+    expires_at: Instant,
+    stale_until: Instant,
+    negative: HashMap<String, Instant>,
+    next_retry: Instant,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OidcDiscoveryDocument {
+    issuer: String,
+    jwks_uri: String,
 }
 
 /// V4 ext_authz / nginx auth_request 基础版已编译策略。
@@ -2022,6 +2755,20 @@ pub struct SyncAuthState {
     pub configured: bool,
     /// 同步鉴权组合结果是否通过。
     pub ok: bool,
+}
+
+/// 异步本地认证完成后的请求局部结果。
+pub(crate) struct ResolvedAuthState {
+    /// 是否配置了任一本地认证方式。
+    pub configured: bool,
+    /// satisfy 组合是否通过。
+    pub ok: bool,
+    /// 认证成功后冻结的稳定主体。
+    pub consumer: Option<Arc<str>>,
+    /// 认证成功后冻结的完整 JWT claims。
+    pub jwt_claims: Option<serde_json::Value>,
+    /// SAML/LDAP 成功后待提交的网关身份头。
+    pub identity_headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl BasicAuthPolicy {
@@ -2145,21 +2892,20 @@ impl HmacAuthPolicy {
 }
 
 impl JwtAuthPolicy {
-    /// 判断请求是否携带可接受的 JWT。
+    /// 业务作用：使用当前已缓存 key 同步判断 JWT；静态 key 与热 JWKS 命中不发生网络 I/O。
     ///
-    /// # 参数
-    /// - `parts`: 下游请求 head。
+    /// 参数说明：`parts` 是下游请求 head。
+    ///
+    /// 返回：token 签名、算法与 claims 全部通过时返回 true；远端 key 尚未拉取时返回 false。
     fn matches(&self, parts: &Parts) -> bool {
-        let Some(token) = self.token(parts) else {
-            return false;
-        };
-        self.verify_token(token)
+        self.verified_payload_from_parts(parts).is_some()
     }
 
-    /// 从请求中提取 JWT token。
+    /// 业务作用：从 route 固定 token source 提取 compact JWT，不读取 query/cookie 等未声明位置。
     ///
-    /// # 参数
-    /// - `parts`: 下游请求 head。
+    /// 参数说明：`parts` 是下游请求 head。
+    ///
+    /// 返回：Bearer 或指定 header 中的非空 token；缺失/非法 UTF-8 返回 None。
     fn token<'a>(&self, parts: &'a Parts) -> Option<&'a str> {
         match &self.source {
             JwtTokenSource::Bearer => bearer_token(parts),
@@ -2167,86 +2913,538 @@ impl JwtAuthPolicy {
         }
     }
 
-    /// 校验 JWT HS256 签名与基础 claims。
+    /// 业务作用：从请求执行同步签名与 claims 验证，供认证后身份/claims 提取复用同一信任边界。
     ///
-    /// # 参数
-    /// - `token`: JWT compact serialization。
-    fn verify_token(&self, token: &str) -> bool {
-        self.verified_payload(token).is_some()
+    /// 参数说明：`parts` 是已经完成远端 key 解析的请求 head。
+    ///
+    /// 返回：合法 JWT payload object；缺失 token 或验证失败返回 None。
+    fn verified_payload_from_parts(&self, parts: &Parts) -> Option<serde_json::Value> {
+        self.verified_payload(self.token(parts)?)
     }
 
-    /// 验证 token 并返回 payload；仅长连接登记需读取 `sub`，普通鉴权仍只取 bool。
+    /// 业务作用：使用本地 key 状态验证 compact JWS，并拒绝 token 自带的远端 key 指针。
+    ///
+    /// 参数说明：`token` 是未经信任的 compact serialization。
+    ///
+    /// 返回：算法、签名与 claims 均通过时返回 JSON object；任何错误返回 None。
     fn verified_payload(&self, token: &str) -> Option<serde_json::Value> {
-        let mut parts = token.split('.');
-        let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return None;
+        let token = self.prepare_signed_token(token)?;
+        let token = token.as_ref();
+        let header = self.validate_header(token)?;
+        let payload = match &self.verifier {
+            JwtVerifier::Hs256(secret) => verify_hs256_token(token, secret.as_ref())?,
+            JwtVerifier::Static(key) => self.verify_asymmetric(token, key)?,
+            JwtVerifier::Remote(remote) => {
+                let kid = header.kid.as_deref()?;
+                let key = remote.cached_key(kid)?;
+                self.verify_asymmetric(token, &key)?
+            }
         };
-        if header_b64.is_empty() || payload_b64.is_empty() || signature_b64.is_empty() {
-            return None;
-        }
-        let header = decode_jwt_json(header_b64)?;
-        if header.get("alg").and_then(|value| value.as_str()) != Some("HS256") {
-            return None;
-        }
-        let signature = nasa::crypto::base64_url_decode(signature_b64).ok()?;
-        let signing_input = format!("{header_b64}.{payload_b64}");
-        let signature_hex = hex_lower_bytes(signature.as_slice());
-        if !nasa::crypto::hmac_sha256_verify(&signing_input, &self.secret, &signature_hex) {
-            return None;
-        }
-        let payload = decode_jwt_json(payload_b64)?;
         self.claims_match(&payload).then_some(payload)
     }
 
-    /// 从签名、时效和 iss/aud 均有效的 JWT 中提取有界 `sub`。
+    /// 业务作用：为 remote verifier 执行单飞 refresh/rotation，再复用统一签名与 claims 校验。
+    ///
+    /// 参数说明：`token` 是未经信任的 compact serialization。
+    ///
+    /// 返回：可用 key 验证成功返回 payload；依赖、kid、算法或 claims 错误返回 None。
+    async fn verified_payload_resolved(&self, token: &str) -> Option<serde_json::Value> {
+        let token = self.prepare_signed_token(token)?;
+        let token = token.as_ref();
+        let header = self.validate_header(token)?;
+        let payload = match &self.verifier {
+            JwtVerifier::Remote(remote) => {
+                let kid = header.kid.as_deref()?;
+                let key = remote.resolve_key(kid).await.ok().flatten()?;
+                self.verify_asymmetric(token, &key)?
+            }
+            _ => return self.verified_payload(token),
+        };
+        self.claims_match(&payload).then_some(payload)
+    }
+
+    /// 业务作用：在配置 JWE 时先严格解密 compact envelope，再把 plaintext 作为嵌套 JWS 验证输入。
+    ///
+    /// 参数说明：`token` 是客户端提交的 JWS 或 JWE compact serialization。
+    ///
+    /// 返回：未启用 JWE 时借用原 token；启用时仅接受 RSA-OAEP-256/A256GCM、`cty=JWT` 且无动态 key/zip 的有界 UTF-8 plaintext。
+    fn prepare_signed_token<'a>(&self, token: &'a str) -> Option<Cow<'a, str>> {
+        #[cfg(feature = "enterprise-jwe")]
+        if let Some(layer) = &self.jwe {
+            if token.len() > layer.max_compact_bytes || token.split('.').count() != 5 {
+                return None;
+            }
+            let (plaintext, header) =
+                josekit::jwe::deserialize_compact(token, &layer.decrypter).ok()?;
+            if header.algorithm() != Some("RSA-OAEP-256")
+                || header.content_encryption() != Some("A256GCM")
+                || header.content_type() != Some("JWT")
+                || header.compression().is_some()
+                || header.jwk_set_url().is_some()
+                || header.jwk().is_some()
+                || header.x509_url().is_some()
+                || header.x509_certificate_chain().is_some()
+                || header
+                    .critical()
+                    .is_some_and(|critical| !critical.is_empty())
+                || plaintext.len() > self.max_token_bytes
+            {
+                return None;
+            }
+            return String::from_utf8(plaintext).ok().map(Cow::Owned);
+        }
+        Some(Cow::Borrowed(token))
+    }
+
+    /// 业务作用：固定 JWS header 信任边界，只接受 route 声明算法并拒绝 `jku/x5u/jwk/x5c/crit`。
+    ///
+    /// 参数说明：`token` 是 compact JWT。
+    ///
+    /// 返回：长度、段数和 header 合法时返回解析结果；动态 key 指针或算法混淆返回 None。
+    fn validate_header(&self, token: &str) -> Option<jsonwebtoken::Header> {
+        if token.is_empty() || token.len() > self.max_token_bytes || token.split('.').count() != 3 {
+            return None;
+        }
+        let header = jsonwebtoken::decode_header(token).ok()?;
+        if header.alg != self.algorithm
+            || header.jku.is_some()
+            || header.x5u.is_some()
+            || header.jwk.is_some()
+            || header.x5c.is_some()
+            || header.crit.as_ref().is_some_and(|crit| !crit.is_empty())
+        {
+            return None;
+        }
+        Some(header)
+    }
+
+    /// 业务作用：用固定 family 的静态/JWKS key 验证 RS256/ES256，不让库自动选择其它算法或 claims 语义。
+    ///
+    /// 参数说明：`token` 是 compact JWT，`key` 已通过 PEM/JWK key type 与 alg pinning。
+    ///
+    /// 返回：密码学签名有效时返回 payload；库错误或 payload 非 object 返回 None。
+    fn verify_asymmetric(&self, token: &str, key: &DecodingKey) -> Option<serde_json::Value> {
+        let mut validation = Validation::new(self.algorithm);
+        validation.required_spec_claims.clear();
+        validation.validate_exp = false;
+        validation.validate_nbf = false;
+        validation.validate_aud = false;
+        let payload = jsonwebtoken::decode::<serde_json::Value>(token, key, &validation)
+            .ok()?
+            .claims;
+        payload.is_object().then_some(payload)
+    }
+
+    /// 业务作用：从签名、时效与 issuer/audience 均有效的 JWT 中提取有界 `sub`。
+    ///
+    /// 参数说明：`parts` 是下游请求 head。
+    ///
+    /// 返回：合法非空 `sub` 返回共享字符串，否则返回 None。
     fn authenticated_subject(&self, parts: &Parts) -> Option<Arc<str>> {
         self.authenticated_claim(parts, "sub")
     }
 
-    /// 提取任意已验证 claim(V8 edge 身份映射复用;校验规则与 `sub` 完全相同)。
+    /// 业务作用：从已验证 payload 提取边缘路由声明的字符串 claim，禁止客户端身份头替代 JWT 权威。
     ///
-    /// # 参数
-    /// - `claim`: payload 字段名;只接受非空、≤256 字节、无控制字符的字符串值。
+    /// 参数说明：`parts` 是请求 head，`claim` 是配置固定字段名。
+    ///
+    /// 返回：非空、≤256 字节、无控制字符的字符串返回共享值，否则返回 None。
     fn authenticated_claim(&self, parts: &Parts, claim: &str) -> Option<Arc<str>> {
-        let payload = self.verified_payload(self.token(parts)?)?;
-        let value = payload.get(claim)?.as_str()?.trim();
-        (!value.is_empty()
-            && value.len() <= 256
-            && !value.bytes().any(|byte| byte.is_ascii_control()))
-        .then(|| Arc::from(value))
+        let payload = self.verified_payload_from_parts(parts)?;
+        bounded_jwt_claim(&payload, claim)
     }
 
-    /// 校验 JWT payload claims。
+    /// 业务作用：执行公共 JWT 与 OIDC claims 约束，包含时间、issuer、audience/azp、nonce 与主体。
     ///
-    /// # 参数
-    /// - `payload`: JWT payload JSON。
+    /// 参数说明：`payload` 是密码学签名已通过的 JSON object。
+    ///
+    /// 返回：全部声明满足 route pinning 时返回 true；缺失必需项、类型错误或时间越界返回 false。
     fn claims_match(&self, payload: &serde_json::Value) -> bool {
         let Some(now) = unix_now_secs() else {
             return false;
         };
-        if let Some(exp) = payload.get("exp").and_then(json_i64) {
-            if now > exp.saturating_add(self.leeway_secs) {
-                return false;
-            }
+        let exp = payload.get("exp").and_then(json_i64);
+        if self.require_oidc_claims && exp.is_none() {
+            return false;
+        }
+        if exp.is_some_and(|exp| now > exp.saturating_add(self.leeway_secs)) {
+            return false;
         }
         if let Some(nbf) = payload.get("nbf").and_then(json_i64) {
             if now.saturating_add(self.leeway_secs) < nbf {
                 return false;
             }
         }
+        let issued_at = payload.get("iat").and_then(json_i64);
+        if self.require_oidc_claims && issued_at.is_none() {
+            return false;
+        }
+        if issued_at.is_some_and(|iat| iat > now.saturating_add(self.leeway_secs)) {
+            return false;
+        }
         if let Some(issuer) = &self.issuer {
             if payload.get("iss").and_then(|value| value.as_str()) != Some(issuer.as_str()) {
                 return false;
             }
+        } else if self.require_oidc_claims {
+            return false;
         }
         if let Some(audience) = &self.audience {
             if !jwt_audience_matches(payload.get("aud"), audience) {
                 return false;
             }
+        } else if self.require_oidc_claims {
+            return false;
+        }
+        if let Some(azp) = &self.authorized_party {
+            if payload.get("azp").and_then(|value| value.as_str()) != Some(azp.as_str()) {
+                return false;
+            }
+        } else if jwt_audience_count(payload.get("aud")) > 1 {
+            return false;
+        }
+        if let Some(nonce) = &self.nonce {
+            if payload.get("nonce").and_then(|value| value.as_str()) != Some(nonce.as_str()) {
+                return false;
+            }
+        }
+        if self.require_oidc_claims
+            && payload
+                .get("sub")
+                .and_then(|value| value.as_str())
+                .is_none_or(str::is_empty)
+        {
+            return false;
         }
         true
+    }
+}
+
+/// 业务作用：从已验签 payload 提取可作为授权主体或身份头来源的有界字符串 claim。
+///
+/// 参数说明：`payload` 是完成签名与 claims 门的 JSON object，`claim` 是 route 固定字段名。
+///
+/// 返回：非空、长度受限且无控制字符时返回共享值；其它类型或非法文本返回 None。
+fn bounded_jwt_claim(payload: &serde_json::Value, claim: &str) -> Option<Arc<str>> {
+    let value = payload.get(claim)?.as_str()?.trim();
+    (!value.is_empty()
+        && value.len() <= MAX_JWT_IDENTITY_BYTES
+        && !value.bytes().any(|byte| byte.is_ascii_control()))
+    .then(|| Arc::from(value))
+}
+
+/// 业务作用：验证兼容 HS256 token，并与 asymmetric 路径共用外层 header 与 claims 门。
+///
+/// 参数说明：`token` 是 compact JWT，`secret` 是构建期解析并冻结的 route secret。
+///
+/// 返回：签名正确且 payload 是 JSON object 时返回 payload；格式或签名错误返回 None。
+fn verify_hs256_token(token: &str, secret: &str) -> Option<serde_json::Value> {
+    let mut parts = token.split('.');
+    let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if header_b64.is_empty() || payload_b64.is_empty() || signature_b64.is_empty() {
+        return None;
+    }
+    let signature = nasa::crypto::base64_url_decode(signature_b64).ok()?;
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature_hex = hex_lower_bytes(signature.as_slice());
+    if !nasa::crypto::hmac_sha256_verify(&signing_input, secret, &signature_hex) {
+        return None;
+    }
+    let payload = decode_jwt_json(payload_b64)?;
+    payload.is_object().then_some(payload)
+}
+
+impl RemoteJwks {
+    /// 业务作用：从当前未过期或 stale 窗内状态读取 key，供认证后身份提取保持同步且零网络 I/O。
+    ///
+    /// 参数说明：`kid` 是已通过长度检查的受信查找键。
+    ///
+    /// 返回：fresh key 或仍在 stale 窗内的已知 key；未知/过期返回 None。
+    fn cached_key(&self, kid: &str) -> Option<Arc<DecodingKey>> {
+        let now = Instant::now();
+        let state = self.state.read();
+        (now < state.stale_until)
+            .then(|| state.keys.get(kid).cloned())
+            .flatten()
+    }
+
+    /// 业务作用：按 kid 解析可轮换 JWKS key，使用单飞 refresh、负缓存、退避和有界 stale 策略抑制风暴。
+    ///
+    /// 参数说明：`kid` 来自已验证 JWS header，必须精确匹配固定 endpoint 返回的 key。
+    ///
+    /// 返回：fresh/允许 stale 的 key 返回 Some；未知 kid 返回 None；网络/协议错误返回错误并 fail closed。
+    async fn resolve_key(&self, kid: &str) -> Result<Option<Arc<DecodingKey>>> {
+        if kid.is_empty()
+            || kid.len() > MAX_JWT_IDENTITY_BYTES
+            || kid.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Ok(None);
+        }
+        let now = Instant::now();
+        {
+            let state = self.state.read();
+            if now < state.expires_at {
+                if let Some(key) = state.keys.get(kid) {
+                    return Ok(Some(key.clone()));
+                }
+                if state
+                    .negative
+                    .get(kid)
+                    .is_some_and(|expires| now < *expires)
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        let _refresh = self.refresh.lock().await;
+        let now = Instant::now();
+        {
+            let state = self.state.read();
+            if now < state.expires_at {
+                if let Some(key) = state.keys.get(kid) {
+                    return Ok(Some(key.clone()));
+                }
+                if state
+                    .negative
+                    .get(kid)
+                    .is_some_and(|expires| now < *expires)
+                {
+                    return Ok(None);
+                }
+            }
+            if now < state.next_retry {
+                return if now < state.stale_until {
+                    Ok(state.keys.get(kid).cloned())
+                } else {
+                    bail!("JWKS refresh is in backoff and stale window expired")
+                };
+            }
+        }
+
+        match self.fetch_keys().await {
+            Ok((keys, ttl)) => {
+                let mut state = self.state.write();
+                let now = Instant::now();
+                state.keys = keys;
+                state.expires_at = now + ttl;
+                state.stale_until = state.expires_at + self.stale_ttl;
+                state.next_retry = now;
+                state.negative.clear();
+                if let Some(key) = state.keys.get(kid) {
+                    return Ok(Some(key.clone()));
+                }
+                state
+                    .negative
+                    .insert(kid.to_string(), now + self.negative_ttl);
+                Ok(None)
+            }
+            Err(error) => {
+                let mut state = self.state.write();
+                let now = Instant::now();
+                state.next_retry = now + self.min_ttl.min(Duration::from_secs(5));
+                // 已知 key 仅能在显式 stale 窗内兜底；未知 kid 永不因依赖故障猜测或复用其它 key。
+                if now < state.stale_until {
+                    if let Some(key) = state.keys.get(kid) {
+                        tracing::warn!(%error, "JWKS refresh failed; use bounded stale key");
+                        return Ok(Some(key.clone()));
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// 业务作用：从固定 HTTPS JWKS 或 issuer-pinned discovery 获取完整 key 集并编译匹配算法的验证器。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：至少一个唯一 kid 的匹配 key 与有界 TTL；issuer/URL/media/大小/key type/alg 错误返回失败。
+    async fn fetch_keys(&self) -> Result<(HashMap<String, Arc<DecodingKey>>, Duration)> {
+        let jwks_uri = match &self.endpoint {
+            RemoteJwksEndpoint::Direct(uri) => uri.to_string(),
+            RemoteJwksEndpoint::Discovery(uri) => {
+                let (document, _) =
+                    fetch_bounded_json::<OidcDiscoveryDocument>(&self.client, uri, self.timeout)
+                        .await?;
+                if document.issuer != self.issuer.as_ref() {
+                    bail!("OIDC discovery issuer does not match pinned issuer");
+                }
+                validate_https_url(&document.jwks_uri, "OIDC jwks_uri")?;
+                if uri_authority(uri)? != uri_authority(&document.jwks_uri)? {
+                    bail!("OIDC discovery jwks_uri must use the pinned discovery authority");
+                }
+                document.jwks_uri
+            }
+        };
+        let (set, advertised_ttl) =
+            fetch_bounded_json::<jsonwebtoken::jwk::JwkSet>(&self.client, &jwks_uri, self.timeout)
+                .await?;
+        if set.keys.is_empty() || set.keys.len() > MAX_JWKS_KEYS {
+            bail!("JWKS key count must be within 1..={MAX_JWKS_KEYS}");
+        }
+        let mut keys = HashMap::with_capacity(set.keys.len());
+        for jwk in set.keys {
+            let Some(kid) = jwk.common.key_id.as_deref() else {
+                continue;
+            };
+            if kid.is_empty()
+                || kid.len() > MAX_JWT_IDENTITY_BYTES
+                || jwk.common.x509_url.is_some()
+                || jwk.common.key_algorithm.as_ref().is_none_or(|algorithm| {
+                    algorithm.to_string() != format!("{:?}", self.algorithm)
+                })
+                || jwk
+                    .common
+                    .public_key_use
+                    .as_ref()
+                    .is_some_and(|usage| usage != &jsonwebtoken::jwk::PublicKeyUse::Signature)
+                || jwk
+                    .common
+                    .key_operations
+                    .as_ref()
+                    .is_some_and(|operations| {
+                        !operations.contains(&jsonwebtoken::jwk::KeyOperations::Verify)
+                    })
+                || !jwk_type_matches_algorithm(&jwk, self.algorithm)
+            {
+                continue;
+            }
+            let key = DecodingKey::from_jwk(&jwk).context("compile JWKS public key")?;
+            if keys.insert(kid.to_string(), Arc::new(key)).is_some() {
+                bail!("JWKS contains duplicate kid `{kid}`");
+            }
+        }
+        if keys.is_empty() {
+            bail!("JWKS contains no key matching the pinned algorithm");
+        }
+        Ok((keys, advertised_ttl.clamp(self.min_ttl, self.max_ttl)))
+    }
+}
+
+/// 业务作用：有界下载 JSON identity metadata，先验证 HTTPS/status/media/Content-Length，再流式限制实体。
+///
+/// 参数说明：`client` 是无重定向客户端，`url` 是固定 endpoint，`timeout` 是 head+body 总期限。
+///
+/// 返回：返回严格 JSON 文档与 Cache-Control max-age；任何网络、协议、大小或解析错误返回失败。
+async fn fetch_bounded_json<T>(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<(T, Duration)>
+where
+    T: serde::de::DeserializeOwned,
+{
+    use futures::StreamExt as _;
+
+    validate_https_url(url, "identity metadata URL")?;
+    tokio::time::timeout(timeout, async {
+        let response = client.get(url).send().await?;
+        if !response.status().is_success() {
+            bail!("identity metadata returned HTTP {}", response.status());
+        }
+        let media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or_default().trim())
+            .unwrap_or_default();
+        if !media_type.eq_ignore_ascii_case("application/json") && !media_type.ends_with("+json") {
+            bail!("identity metadata response is not JSON");
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_JWT_METADATA_BYTES as u64)
+        {
+            bail!("identity metadata exceeds body limit");
+        }
+        let ttl =
+            parse_cache_control_max_age(response.headers()).unwrap_or(Duration::from_secs(300));
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read identity metadata body")?;
+            if body.len().saturating_add(chunk.len()) > MAX_JWT_METADATA_BYTES {
+                bail!("identity metadata exceeds body limit");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let document = serde_json::from_slice(&body).context("decode identity metadata JSON")?;
+        Ok((document, ttl))
+    })
+    .await
+    .context("identity metadata total timeout")?
+}
+
+/// 业务作用：解析响应的 `Cache-Control: max-age`，其余 directive 不参与 key 生命周期。
+///
+/// 参数说明：`headers` 是 JWKS/discovery 响应头。
+///
+/// 返回：合法秒数返回 Duration；缺失、重复或非法值返回 None 并使用 route 默认值。
+fn parse_cache_control_max_age(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::CACHE_CONTROL)?.to_str().ok()?;
+    let mut max_age = None;
+    for directive in value.split(',').map(str::trim) {
+        let Some(raw) = directive.strip_prefix("max-age=") else {
+            continue;
+        };
+        if max_age.is_some() {
+            return None;
+        }
+        max_age = Some(Duration::from_secs(raw.trim_matches('"').parse().ok()?));
+    }
+    max_age
+}
+
+/// 业务作用：固定 identity metadata URL 为 HTTPS origin，拒绝凭据、缺 authority 与非根绝对 URI。
+///
+/// 参数说明：`url` 是配置或 discovery 返回值，`field` 用于错误定位。
+///
+/// 返回：安全 HTTPS URL 成功；其它 scheme、userinfo 或非法 URI 返回错误。
+fn validate_https_url(url: &str, field: &str) -> Result<()> {
+    let uri = url
+        .parse::<http::Uri>()
+        .with_context(|| format!("{field} is not a valid URI"))?;
+    if uri.scheme_str() != Some("https")
+        || uri.authority().is_none()
+        || uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
+    {
+        bail!("{field} must be an HTTPS URL without userinfo");
+    }
+    Ok(())
+}
+
+/// 业务作用：提取 HTTPS URI authority，供 discovery issuer/JWKS 主机固定比较。
+///
+/// 参数说明：`url` 已经过 HTTPS URL 基础验证。
+///
+/// 返回：返回规范 authority 文本；缺失时返回错误。
+fn uri_authority(url: &str) -> Result<String> {
+    Ok(url
+        .parse::<http::Uri>()?
+        .authority()
+        .context("identity metadata URI is missing authority")?
+        .as_str()
+        .to_ascii_lowercase())
+}
+
+/// 业务作用：固定 JWK key type 与算法 family，阻止 RSA/EC 算法混淆。
+///
+/// 参数说明：`jwk` 是未信任 key，`algorithm` 只允许 RS256 或 ES256。
+///
+/// 返回：算法对应 RSA 或 P-256 EC 参数时返回 true。
+fn jwk_type_matches_algorithm(jwk: &jsonwebtoken::jwk::Jwk, algorithm: Algorithm) -> bool {
+    match (algorithm, &jwk.algorithm) {
+        (Algorithm::RS256, jsonwebtoken::jwk::AlgorithmParameters::RSA(_)) => true,
+        (Algorithm::ES256, jsonwebtoken::jwk::AlgorithmParameters::EllipticCurve(parameters)) => {
+            parameters.curve == jsonwebtoken::jwk::EllipticCurve::P256
+        }
+        _ => false,
     }
 }
 
@@ -2479,9 +3677,11 @@ enum ParsedFilter {
     None,
     Internal,
     ProxySetHeader(RequestHeaderSet),
+    GatewayRequestHeader(RequestHeaderOp),
     PassRequestHeaders(bool),
     PassRequestBody(bool),
     AddHeader(ResponseHeaderSet),
+    GatewayResponseHeader(ResponseHeaderOp),
     HideHeader(HeaderName),
     ProxyRedirect(ProxyRedirectRule),
     CookieRewrite(CookieRewriteRule),
@@ -2499,6 +3699,7 @@ enum ParsedFilter {
     ApiKey(ApiKeyPolicy),
     HmacAuth(HmacAuthPolicy),
     JwtAuth(JwtAuthPolicy),
+    EnterpriseAuth(EnterpriseAuthPolicy),
     ExtAuthz(ExtAuthzPolicy),
     Satisfy(SatisfyMode),
     ConditionalReturn(ConditionalReturn),
@@ -2511,6 +3712,7 @@ enum ParsedFilter {
     XAccelRedirect(bool),
     Return(DirectResponse),
     RewritePrefix(RewritePrefix),
+    GatewayRewriteFullPath(String),
     Mirror(MirrorPolicy),
 }
 
@@ -2526,9 +3728,47 @@ fn parse_filter(spec: &str, variables: &VariablePlan, config_dir: &Path) -> Resu
         let op = parse_request_header_set(trimmed, "proxy_set_header", variables)?;
         return Ok(ParsedFilter::ProxySetHeader(op));
     }
+    for (command, mode) in [
+        ("gateway_request_header_set_b64", HeaderMutationMode::Set),
+        ("gateway_request_header_add_b64", HeaderMutationMode::Add),
+    ] {
+        if starts_filter(trimmed, command) {
+            return parse_gateway_literal_request_header(trimmed, command, mode)
+                .map(ParsedFilter::GatewayRequestHeader);
+        }
+    }
+    for (command, mode) in [
+        ("gateway_request_header_set", HeaderMutationMode::Set),
+        ("gateway_request_header_add", HeaderMutationMode::Add),
+        ("gateway_request_header_remove", HeaderMutationMode::Remove),
+    ] {
+        if trimmed.starts_with(command) {
+            return parse_gateway_request_header(trimmed, command, mode, variables)
+                .map(ParsedFilter::GatewayRequestHeader);
+        }
+    }
     if trimmed.starts_with("add_header ") {
         let op = parse_response_header_set(trimmed, "add_header", variables)?;
         return Ok(ParsedFilter::AddHeader(op));
+    }
+    for (command, mode) in [
+        ("gateway_response_header_set_b64", HeaderMutationMode::Set),
+        ("gateway_response_header_add_b64", HeaderMutationMode::Add),
+    ] {
+        if starts_filter(trimmed, command) {
+            return parse_gateway_literal_response_header(trimmed, command, mode)
+                .map(ParsedFilter::GatewayResponseHeader);
+        }
+    }
+    for (command, mode) in [
+        ("gateway_response_header_set", HeaderMutationMode::Set),
+        ("gateway_response_header_add", HeaderMutationMode::Add),
+        ("gateway_response_header_remove", HeaderMutationMode::Remove),
+    ] {
+        if trimmed.starts_with(command) {
+            return parse_gateway_response_header(trimmed, command, mode, variables)
+                .map(ParsedFilter::GatewayResponseHeader);
+        }
     }
     if trimmed.starts_with("proxy_hide_header ") {
         let name = trimmed
@@ -2583,6 +3823,9 @@ fn parse_filter(spec: &str, variables: &VariablePlan, config_dir: &Path) -> Resu
     if starts_filter(trimmed, "FallbackHeaders") {
         return parse_fallback_headers(trimmed).map(|()| ParsedFilter::FallbackHeaders);
     }
+    if starts_filter(trimmed, "gateway_cors_b64") {
+        return parse_gateway_cors(trimmed).map(ParsedFilter::Cors);
+    }
     if starts_filter(trimmed, "Cors") || starts_filter(trimmed, "cors") {
         return parse_cors(trimmed).map(ParsedFilter::Cors);
     }
@@ -2623,6 +3866,14 @@ fn parse_filter(spec: &str, variables: &VariablePlan, config_dir: &Path) -> Resu
     }
     if starts_filter(trimmed, "jwt_hs256") {
         return parse_jwt_auth(trimmed, "jwt_hs256", config_dir).map(ParsedFilter::JwtAuth);
+    }
+    if starts_filter(trimmed, "saml_auth") {
+        return crate::enterprise_identity::parse_saml_auth(trimmed, config_dir)
+            .map(ParsedFilter::EnterpriseAuth);
+    }
+    if starts_filter(trimmed, "ldap_auth") {
+        return crate::enterprise_identity::parse_ldap_auth(trimmed, config_dir)
+            .map(ParsedFilter::EnterpriseAuth);
     }
     if starts_filter(trimmed, "ext_authz") {
         return parse_ext_authz(trimmed, "ext_authz").map(ParsedFilter::ExtAuthz);
@@ -2668,6 +3919,9 @@ fn parse_filter(spec: &str, variables: &VariablePlan, config_dir: &Path) -> Resu
     }
     if trimmed.starts_with("rewrite ") {
         return parse_rewrite_prefix(trimmed).map(ParsedFilter::RewritePrefix);
+    }
+    if starts_filter(trimmed, "gateway_rewrite_full_path") {
+        return parse_gateway_rewrite_full_path(trimmed).map(ParsedFilter::GatewayRewriteFullPath);
     }
     if starts_filter(trimmed, "mirror") {
         return parse_mirror(trimmed).map(ParsedFilter::Mirror);
@@ -2841,6 +4095,160 @@ fn starts_filter(spec: &str, name: &str) -> bool {
                         .unwrap_or(false)
             })
             .unwrap_or(false)
+}
+
+#[derive(Clone, Copy)]
+enum HeaderMutationMode {
+    Set,
+    Add,
+    Remove,
+}
+
+/// 业务作用：解码 Gateway API 生成的请求头字面量，使外部 `${...}` 文本不会获得配置变量能力。
+///
+/// 参数说明：`spec` 含 header 名和 URL-safe Base64 值；`command` 是固定内部命令；
+/// `mode` 只能为 add 或 set。
+///
+/// 返回：UTF-8 与 HeaderValue 均合法时返回字面量操作，否则拒绝候选快照。
+fn parse_gateway_literal_request_header(
+    spec: &str,
+    command: &str,
+    mode: HeaderMutationMode,
+) -> Result<RequestHeaderOp> {
+    let set = parse_gateway_literal_header(spec, command)?;
+    Ok(match mode {
+        HeaderMutationMode::Set => RequestHeaderOp::Set(RequestHeaderSet {
+            name: set.name,
+            value: set.value,
+        }),
+        HeaderMutationMode::Add => RequestHeaderOp::Add(RequestHeaderSet {
+            name: set.name,
+            value: set.value,
+        }),
+        HeaderMutationMode::Remove => bail!("literal remove does not carry a value"),
+    })
+}
+
+/// 业务作用：解码 Gateway API 生成的响应头字面量，并保留协议定义的 add/set 差异。
+///
+/// 参数说明：`spec` 含 header 名和 URL-safe Base64 值；`command` 是固定内部命令；
+/// `mode` 只能为 add 或 set。
+///
+/// 返回：UTF-8 与 HeaderValue 均合法时返回字面量操作，否则拒绝候选快照。
+fn parse_gateway_literal_response_header(
+    spec: &str,
+    command: &str,
+    mode: HeaderMutationMode,
+) -> Result<ResponseHeaderOp> {
+    let set = parse_gateway_literal_header(spec, command)?;
+    let set = ResponseHeaderSet {
+        name: set.name,
+        value: set.value,
+    };
+    Ok(match mode {
+        HeaderMutationMode::Set => ResponseHeaderOp::Set(set),
+        HeaderMutationMode::Add => ResponseHeaderOp::Add(set),
+        HeaderMutationMode::Remove => bail!("literal remove does not carry a value"),
+    })
+}
+
+/// 业务作用：解析内部 Base64 header 载荷并一次完成名称、UTF-8 与 HTTP 值校验。
+///
+/// 参数说明：`spec` 是完整命令；`command` 用于安全截取参数和错误上下文。
+///
+/// 返回：成功时返回可直接复用的 header 名和纯字面量模板。
+fn parse_gateway_literal_header(spec: &str, command: &str) -> Result<RequestHeaderSet> {
+    let rest = spec
+        .strip_prefix(command)
+        .context("gateway literal header command mismatch")?
+        .trim();
+    let (name, encoded) = rest
+        .split_once(char::is_whitespace)
+        .with_context(|| format!("{command} requires header name and Base64 value"))?;
+    anyhow::ensure!(
+        !encoded.trim().is_empty() && !encoded.trim().chars().any(char::is_whitespace),
+        "{command} requires one Base64 value"
+    );
+    let name = name
+        .parse::<HeaderName>()
+        .with_context(|| format!("invalid header name `{name}`"))?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded.trim())
+        .with_context(|| format!("{command} value is not URL-safe Base64"))?;
+    let value = std::str::from_utf8(&decoded).context("Gateway header value must be UTF-8")?;
+    HeaderValue::from_str(value).context("Gateway header value is invalid")?;
+    Ok(RequestHeaderSet {
+        name,
+        value: ValueTemplate::literal(value),
+    })
+}
+
+/// 业务作用：解析 Gateway API 请求头 add/set/remove，并在构建期固定 header 名与值模板。
+///
+/// 参数说明：`spec` 是完整 filter；`command` 是已命中的命令；`mode` 决定变更语义；
+/// `variables` 用于编译允许的 Naway value 模板。
+///
+/// 返回：语法和 HeaderValue 合法时返回统一请求头操作，否则拒绝候选快照。
+fn parse_gateway_request_header(
+    spec: &str,
+    command: &str,
+    mode: HeaderMutationMode,
+    variables: &VariablePlan,
+) -> Result<RequestHeaderOp> {
+    let rest = spec
+        .strip_prefix(command)
+        .context("gateway request header command mismatch")?
+        .trim();
+    if matches!(mode, HeaderMutationMode::Remove) {
+        anyhow::ensure!(
+            !rest.is_empty() && !rest.chars().any(char::is_whitespace),
+            "{command} requires exactly one header name"
+        );
+        return rest
+            .parse::<HeaderName>()
+            .with_context(|| format!("invalid header name `{rest}`"))
+            .map(RequestHeaderOp::Remove);
+    }
+    let set = parse_request_header_set(spec, command, variables)?;
+    Ok(match mode {
+        HeaderMutationMode::Set => RequestHeaderOp::Set(set),
+        HeaderMutationMode::Add => RequestHeaderOp::Add(set),
+        HeaderMutationMode::Remove => unreachable!("remove handled above"),
+    })
+}
+
+/// 业务作用：解析 Gateway API 响应头 add/set/remove，并复用统一响应过滤执行点。
+///
+/// 参数说明：`spec` 是完整 filter；`command` 是已命中的命令；`mode` 决定变更语义；
+/// `variables` 用于编译允许的 Naway value 模板。
+///
+/// 返回：语法和 HeaderValue 合法时返回响应头操作，否则拒绝候选快照。
+fn parse_gateway_response_header(
+    spec: &str,
+    command: &str,
+    mode: HeaderMutationMode,
+    variables: &VariablePlan,
+) -> Result<ResponseHeaderOp> {
+    let rest = spec
+        .strip_prefix(command)
+        .context("gateway response header command mismatch")?
+        .trim();
+    if matches!(mode, HeaderMutationMode::Remove) {
+        anyhow::ensure!(
+            !rest.is_empty() && !rest.chars().any(char::is_whitespace),
+            "{command} requires exactly one header name"
+        );
+        return rest
+            .parse::<HeaderName>()
+            .with_context(|| format!("invalid header name `{rest}`"))
+            .map(ResponseHeaderOp::Hide);
+    }
+    let set = parse_response_header_set(spec, command, variables)?;
+    Ok(match mode {
+        HeaderMutationMode::Set => ResponseHeaderOp::Set(set),
+        HeaderMutationMode::Add => ResponseHeaderOp::Add(set),
+        HeaderMutationMode::Remove => unreachable!("remove handled above"),
+    })
 }
 
 fn parse_request_header_set(
@@ -3936,28 +5344,77 @@ fn parse_hmac_signed_headers(raw: &str) -> Result<Vec<HeaderName>> {
     Ok(headers)
 }
 
-/// 解析 V4 JWT HS256 鉴权规则。
+/// 业务作用：把 JWT/JWKS/OIDC route DSL 编译为算法与 endpoint 均固定的认证策略。
 ///
-/// # 参数
-/// - `spec`: route filter 原始字符串,如 `jwt_auth secret=s issuer=gw audience=api`。
-/// - `cmd`: 实际命中的指令名。
+/// 参数说明：`spec` 是 route filter 原文，`cmd` 是实际指令名，`config_dir` 是 SecretSource 相对目录。
+///
+/// 返回：返回可直接用于数据面的验证器；算法/key 来源冲突、弱 URL、无界参数或非法身份映射会拒绝快照。
 fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPolicy> {
     let rest = filter_args(spec, cmd).trim();
     if rest.is_empty() {
         bail!("{cmd} requires `secret=<hs256-secret>`");
     }
     let mut secret = None;
+    let mut generic_key = None;
+    let mut public_key = None;
+    let mut jwks_url = None;
+    let mut discovery_url = None;
+    let mut ca_certificate = None;
+    let mut jwe_private_key = None;
+    let mut jwe_max_compact_bytes = None;
+    let mut jwe_options_configured = false;
+    let mut algorithm = Algorithm::HS256;
     let mut source = JwtTokenSource::Bearer;
     let mut issuer = None;
     let mut audience = None;
+    let mut authorized_party = None;
+    let mut nonce = None;
     let mut leeway_secs = DEFAULT_JWT_LEEWAY_SECS;
+    let mut max_token_bytes = DEFAULT_JWT_TOKEN_BYTES;
+    let mut timeout_ms = DEFAULT_JWKS_TIMEOUT_MS;
+    let mut min_ttl_secs = 30_u64;
+    let mut max_ttl_secs = 3_600_u64;
+    let mut stale_ttl_secs = 300_u64;
+    let mut negative_ttl_secs = 30_u64;
+    let mut identity_headers = Vec::new();
     for token in rest.split_whitespace() {
         let (key, raw_value) = token
             .split_once('=')
             .with_context(|| format!("{cmd} option `{token}` must be key=value"))?;
         let raw_value = unquote_token(raw_value.trim());
         match key {
-            "secret" | "key" | "hs256_secret" => secret = Some(raw_value.to_string()),
+            "secret" | "hs256_secret" => secret = Some(raw_value.to_string()),
+            "key" => generic_key = Some(raw_value.to_string()),
+            "public_key" | "public_key_pem" => public_key = Some(raw_value.to_string()),
+            "jwks_url" | "jwks_uri" => jwks_url = Some(raw_value.to_string()),
+            "oidc_discovery" | "discovery_url" => discovery_url = Some(raw_value.to_string()),
+            "ca_certificate" | "ca_pem" | "ca_file" => ca_certificate = Some(raw_value.to_string()),
+            "jwe_private_key" | "jwe_key" => {
+                jwe_private_key = Some(raw_value.to_string());
+                jwe_options_configured = true;
+            }
+            "jwe_alg" => {
+                jwe_options_configured = true;
+                if raw_value != "RSA-OAEP-256" {
+                    bail!("{cmd} jwe_alg must be RSA-OAEP-256");
+                }
+            }
+            "jwe_enc" => {
+                jwe_options_configured = true;
+                if raw_value != "A256GCM" {
+                    bail!("{cmd} jwe_enc must be A256GCM");
+                }
+            }
+            "jwe_max_compact_bytes" => {
+                jwe_options_configured = true;
+                let parsed = raw_value.parse::<usize>().with_context(|| {
+                    format!("{cmd} invalid jwe_max_compact_bytes `{raw_value}`")
+                })?;
+                if !(1_024..=256 * 1024).contains(&parsed) {
+                    bail!("{cmd} jwe_max_compact_bytes must be in 1024..=262144");
+                }
+                jwe_max_compact_bytes = Some(parsed);
+            }
             "header" | "token_header" => {
                 if raw_value.eq_ignore_ascii_case("authorization")
                     || raw_value.eq_ignore_ascii_case("bearer")
@@ -3972,6 +5429,8 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
             }
             "issuer" | "iss" => issuer = Some(raw_value.to_string()),
             "audience" | "aud" => audience = Some(raw_value.to_string()),
+            "authorized_party" | "azp" => authorized_party = Some(raw_value.to_string()),
+            "nonce" => nonce = Some(raw_value.to_string()),
             "leeway_secs" | "clock_skew_secs" => {
                 leeway_secs = raw_value
                     .parse::<i64>()
@@ -3980,27 +5439,301 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
                     bail!("{cmd} leeway_secs must be in 0..={MAX_JWT_LEEWAY_SECS}");
                 }
             }
-            "algorithm" | "alg" => {
-                if !raw_value.eq_ignore_ascii_case("HS256") {
-                    bail!("{cmd} only supports HS256 in V4 basic mode");
+            "max_token_bytes" => {
+                max_token_bytes = raw_value
+                    .parse::<usize>()
+                    .with_context(|| format!("{cmd} invalid max_token_bytes `{raw_value}`"))?;
+                if !(256..=MAX_JWT_TOKEN_BYTES).contains(&max_token_bytes) {
+                    bail!("{cmd} max_token_bytes must be in 256..={MAX_JWT_TOKEN_BYTES}");
                 }
             }
+            "timeout_ms" => {
+                timeout_ms = raw_value
+                    .parse::<u64>()
+                    .with_context(|| format!("{cmd} invalid timeout_ms `{raw_value}`"))?;
+                if !(1..=MAX_JWKS_TIMEOUT_MS).contains(&timeout_ms) {
+                    bail!("{cmd} timeout_ms must be in 1..={MAX_JWKS_TIMEOUT_MS}");
+                }
+            }
+            "jwks_min_ttl_secs" | "min_ttl_secs" => {
+                min_ttl_secs = parse_jwt_ttl(raw_value, cmd, key, 86_400)?
+            }
+            "jwks_max_ttl_secs" | "max_ttl_secs" => {
+                max_ttl_secs = parse_jwt_ttl(raw_value, cmd, key, 86_400)?
+            }
+            "stale_ttl_secs" | "stale_secs" => {
+                stale_ttl_secs = parse_jwt_ttl(raw_value, cmd, key, 86_400)?
+            }
+            "negative_ttl_secs" => negative_ttl_secs = parse_jwt_ttl(raw_value, cmd, key, 3_600)?,
+            "identity_headers" | "claim_headers" => {
+                identity_headers = parse_jwt_identity_headers(raw_value, cmd)?
+            }
+            "algorithm" | "alg" => algorithm = parse_jwt_algorithm(raw_value, cmd)?,
             other => bail!("{cmd} unsupported option `{other}`"),
         }
     }
-    let secret = secret.with_context(|| format!("{cmd} requires secret"))?;
-    let secret = crate::secret::resolve_text(&secret, config_dir, "jwt secret")?;
-    validate_basic_auth_secret("jwt secret", &secret)?;
-    if issuer.as_deref() == Some("") || audience.as_deref() == Some("") {
-        bail!("{cmd} issuer/audience must not be empty");
+    for (field, value) in [
+        ("issuer", issuer.as_deref()),
+        ("audience", audience.as_deref()),
+        ("authorized_party", authorized_party.as_deref()),
+    ] {
+        if value.is_some_and(str::is_empty) {
+            bail!("{cmd} {field} must not be empty");
+        }
+    }
+    if min_ttl_secs > max_ttl_secs {
+        bail!("{cmd} jwks_min_ttl_secs must not exceed jwks_max_ttl_secs");
+    }
+    if let JwtTokenSource::Header(token_header) = &source {
+        if identity_headers
+            .iter()
+            .any(|mapping: &JwtIdentityHeader| mapping.header == *token_header)
+        {
+            bail!("{cmd} token header cannot also be an identity output header");
+        }
+    }
+
+    if let Some(value) = generic_key {
+        if algorithm == Algorithm::HS256 {
+            secret.get_or_insert(value);
+        } else {
+            public_key.get_or_insert(value);
+        }
+    }
+    let remote_count = usize::from(jwks_url.is_some()) + usize::from(discovery_url.is_some());
+    let require_oidc_claims = discovery_url.is_some();
+    let verifier = match algorithm {
+        Algorithm::HS256 => {
+            if public_key.is_some()
+                || remote_count != 0
+                || ca_certificate.is_some()
+                || require_oidc_claims
+            {
+                bail!("{cmd} HS256 accepts only secret/key and cannot use PEM/JWKS/OIDC options");
+            }
+            let secret = secret.with_context(|| format!("{cmd} HS256 requires secret"))?;
+            let secret = crate::secret::resolve_text(&secret, config_dir, "jwt secret")?;
+            validate_basic_auth_secret("jwt secret", &secret)?;
+            JwtVerifier::Hs256(Arc::from(secret))
+        }
+        Algorithm::RS256 | Algorithm::ES256 => {
+            if secret.is_some() {
+                bail!("{cmd} asymmetric algorithms do not accept secret/hs256_secret");
+            }
+            if usize::from(public_key.is_some()) + remote_count != 1 {
+                bail!("{cmd} requires exactly one of public_key, jwks_url, or oidc_discovery");
+            }
+            if let Some(public_key) = public_key {
+                if ca_certificate.is_some() {
+                    bail!("{cmd} ca_certificate is only valid with JWKS/OIDC");
+                }
+                let pem = crate::secret::resolve_text(&public_key, config_dir, "jwt public key")?;
+                let key = if algorithm == Algorithm::RS256 {
+                    DecodingKey::from_rsa_pem(pem.as_bytes())
+                } else {
+                    DecodingKey::from_ec_pem(pem.as_bytes())
+                }
+                .with_context(|| format!("{cmd} invalid public key PEM"))?;
+                JwtVerifier::Static(Arc::new(key))
+            } else {
+                let issuer_value = issuer
+                    .as_deref()
+                    .context("remote JWKS/OIDC requires issuer pinning")?;
+                if require_oidc_claims && audience.is_none() {
+                    bail!("{cmd} OIDC discovery requires audience");
+                }
+                if require_oidc_claims {
+                    validate_https_url(issuer_value, "OIDC issuer")?;
+                }
+                let endpoint = if let Some(url) = discovery_url {
+                    validate_https_url(&url, "OIDC discovery URL")?;
+                    if uri_authority(&url)? != uri_authority(issuer_value)? {
+                        bail!("{cmd} OIDC discovery URL must use the pinned issuer authority");
+                    }
+                    RemoteJwksEndpoint::Discovery(Arc::from(url))
+                } else {
+                    let url = jwks_url.expect("remote_count guarantees a JWKS URL");
+                    validate_https_url(&url, "JWKS URL")?;
+                    RemoteJwksEndpoint::Direct(Arc::from(url))
+                };
+                let mut client = reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .https_only(true);
+                if let Some(source) = ca_certificate {
+                    let pem = crate::secret::resolve_text(
+                        &source,
+                        config_dir,
+                        "JWT identity metadata CA",
+                    )?;
+                    let certificate = reqwest::Certificate::from_pem(pem.as_bytes())
+                        .context("parse JWT identity metadata CA PEM")?;
+                    client = client.add_root_certificate(certificate);
+                }
+                let now = Instant::now();
+                JwtVerifier::Remote(Arc::new(RemoteJwks {
+                    endpoint,
+                    issuer: Arc::from(issuer_value),
+                    algorithm,
+                    client: client
+                        .build()
+                        .context("build JWT identity metadata client")?,
+                    timeout: Duration::from_millis(timeout_ms),
+                    min_ttl: Duration::from_secs(min_ttl_secs),
+                    max_ttl: Duration::from_secs(max_ttl_secs),
+                    stale_ttl: Duration::from_secs(stale_ttl_secs),
+                    negative_ttl: Duration::from_secs(negative_ttl_secs),
+                    state: RwLock::new(RemoteJwksState {
+                        keys: HashMap::new(),
+                        expires_at: now,
+                        stale_until: now,
+                        negative: HashMap::new(),
+                        next_retry: now,
+                    }),
+                    refresh: AsyncMutex::new(()),
+                }))
+            }
+        }
+        _ => unreachable!("parse_jwt_algorithm only permits three algorithms"),
+    };
+    let nonce = nonce
+        .map(|value| crate::secret::resolve_text(&value, config_dir, "OIDC nonce"))
+        .transpose()?;
+    if nonce.as_ref().is_some_and(|value| {
+        value.is_empty()
+            || value.len() > MAX_JWT_IDENTITY_BYTES
+            || value.bytes().any(|byte| byte.is_ascii_control())
+    }) {
+        bail!("{cmd} nonce must be non-empty, bounded, and free of control characters");
+    }
+    #[cfg(feature = "enterprise-jwe")]
+    let jwe = jwe_private_key
+        .map(|source| -> Result<Arc<JweLayer>> {
+            let pem = crate::secret::resolve_text(&source, config_dir, "JWE private key")?;
+            let decrypter = josekit::jwe::RSA_OAEP_256
+                .decrypter_from_pem(pem.as_bytes())
+                .context("compile JWE RSA-OAEP-256 private key")?;
+            Ok(Arc::new(JweLayer {
+                decrypter,
+                max_compact_bytes: jwe_max_compact_bytes.unwrap_or(MAX_JWT_TOKEN_BYTES),
+            }))
+        })
+        .transpose()?;
+    #[cfg(feature = "enterprise-jwe")]
+    if jwe_options_configured && jwe.is_none() {
+        bail!("{cmd} JWE options require jwe_private_key");
+    }
+    #[cfg(not(feature = "enterprise-jwe"))]
+    if jwe_options_configured {
+        let _ = (jwe_private_key, jwe_max_compact_bytes);
+        bail!("{cmd} JWE options require the enterprise-jwe feature");
     }
     Ok(JwtAuthPolicy {
-        secret,
+        verifier,
+        algorithm,
         source,
         issuer,
         audience,
+        authorized_party,
+        nonce,
         leeway_secs,
+        max_token_bytes,
+        require_oidc_claims,
+        identity_headers: Arc::new(identity_headers),
+        #[cfg(feature = "enterprise-jwe")]
+        jwe,
     })
+}
+
+/// 业务作用：把配置中的 JWS 算法限制到经过实现和 key-type 约束的集合。
+///
+/// 参数说明：`raw` 是算法文本，`cmd` 用于错误定位。
+///
+/// 返回：返回 HS256、RS256 或 ES256；其它算法在构建期拒绝。
+fn parse_jwt_algorithm(raw: &str, cmd: &str) -> Result<Algorithm> {
+    match raw.to_ascii_uppercase().as_str() {
+        "HS256" => Ok(Algorithm::HS256),
+        "RS256" => Ok(Algorithm::RS256),
+        "ES256" => Ok(Algorithm::ES256),
+        _ => bail!("{cmd} algorithm must be one of HS256, RS256, ES256"),
+    }
+}
+
+/// 业务作用：解析 JWKS 生命周期秒数并施加非零硬上限，防止配置形成永久 key 或刷新风暴。
+///
+/// 参数说明：`raw` 是秒数字符串，`cmd` 与 `field` 用于错误定位，`maximum` 是字段硬上限。
+///
+/// 返回：范围内秒数；零、超限或非数字返回错误。
+fn parse_jwt_ttl(raw: &str, cmd: &str, field: &str, maximum: u64) -> Result<u64> {
+    let value = raw
+        .parse::<u64>()
+        .with_context(|| format!("{cmd} invalid {field} `{raw}`"))?;
+    if !(1..=maximum).contains(&value) {
+        bail!("{cmd} {field} must be in 1..={maximum}");
+    }
+    Ok(value)
+}
+
+/// 业务作用：编译受信 JWT claim 到上游身份 header 的显式 allowlist，并拒绝凭据/传输控制头。
+///
+/// 参数说明：`raw` 是逗号分隔的 `claim:Header-Name`，`cmd` 用于错误定位。
+///
+/// 返回：返回去重后的映射；非法 claim、重复 header 或安全敏感 header 返回错误。
+fn parse_jwt_identity_headers(raw: &str, cmd: &str) -> Result<Vec<JwtIdentityHeader>> {
+    let mut mappings = Vec::new();
+    let mut headers = HashSet::new();
+    for item in raw.split(',') {
+        let (claim, header) = item.split_once(':').with_context(|| {
+            format!("{cmd} identity_headers item `{item}` must be claim:Header")
+        })?;
+        if claim.is_empty()
+            || claim.len() > 64
+            || !claim
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            bail!("{cmd} invalid identity claim `{claim}`");
+        }
+        let header = header
+            .parse::<HeaderName>()
+            .with_context(|| format!("{cmd} invalid identity header `{header}`"))?;
+        if is_forbidden_identity_header(&header) {
+            bail!("{cmd} cannot generate security/framing header `{header}` from a JWT claim");
+        }
+        if !headers.insert(header.clone()) {
+            bail!("{cmd} duplicate identity header `{header}`");
+        }
+        mappings.push(JwtIdentityHeader {
+            claim: Arc::from(claim),
+            header,
+        });
+    }
+    if mappings.is_empty() || mappings.len() > 16 {
+        bail!("{cmd} identity_headers must contain 1..=16 mappings");
+    }
+    Ok(mappings)
+}
+
+/// 业务作用：识别不能由身份 claim 覆盖的凭据、路由与 HTTP framing header。
+///
+/// 参数说明：`name` 是已经完成语法校验的 header 名。
+///
+/// 返回：安全敏感 header 返回 true，普通业务身份 header 返回 false。
+pub(crate) fn is_forbidden_identity_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "host"
+            | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "content-length"
+    )
 }
 
 /// 解析 V4 ext_authz / nginx auth_request 基础规则。
@@ -4262,6 +5995,23 @@ fn jwt_audience_matches(claim: Option<&serde_json::Value>, expected: &str) -> bo
             values.iter().any(|value| value.as_str() == Some(expected))
         }
         _ => false,
+    }
+}
+
+/// 业务作用：计算 JWT `aud` 的有效字符串成员数，供 OIDC `azp` 歧义门判断。
+///
+/// 参数说明：`claim` 是 payload 中尚未信任的 `aud` 值。
+///
+/// 返回：字符串返回一，纯字符串数组返回成员数；缺失或类型不合法返回零。
+fn jwt_audience_count(claim: Option<&serde_json::Value>) -> usize {
+    match claim {
+        Some(serde_json::Value::String(_)) => 1,
+        Some(serde_json::Value::Array(values))
+            if values.iter().all(serde_json::Value::is_string) =>
+        {
+            values.len()
+        }
+        _ => 0,
     }
 }
 
@@ -4840,8 +6590,8 @@ fn parse_byte_size(raw: &str) -> Result<u64> {
 fn parse_cors(spec: &str) -> Result<CorsPolicy> {
     let mut policy = CorsPolicy {
         allow_origin: CorsAllowOrigin::Any,
-        allow_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD".to_string(),
-        allow_headers: "*".to_string(),
+        allow_methods: Some("GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD".to_string()),
+        allow_headers: Some("*".to_string()),
         expose_headers: None,
         max_age_seconds: Some(86_400),
         allow_credentials: false,
@@ -4870,11 +6620,11 @@ fn parse_cors(spec: &str) -> Result<CorsPolicy> {
             }
             "allow_methods" | "methods" => {
                 validate_header_value("Cors allow_methods", value)?;
-                policy.allow_methods = value.to_string();
+                policy.allow_methods = Some(value.to_string());
             }
             "allow_headers" | "headers" => {
                 validate_header_value("Cors allow_headers", value)?;
-                policy.allow_headers = value.to_string();
+                policy.allow_headers = Some(value.to_string());
             }
             "expose_headers" | "expose" => {
                 validate_header_value("Cors expose_headers", value)?;
@@ -4898,6 +6648,281 @@ fn parse_cors(spec: &str) -> Result<CorsPolicy> {
         bail!("Cors allow_credentials=true cannot be used with allow_origin=*");
     }
     Ok(policy)
+}
+
+/// 业务作用：解码控制器生成的 Gateway API CORS 策略，并在数据面快照构建前再次执行安全校验。
+///
+/// 参数说明：`spec` 是 `gateway_cors_b64 <base64url-json>` 形式的内部生成配置。
+///
+/// 返回：字段、数量、origin、method 和 header 全部合法时返回编译策略；畸形输入拒绝整个候选快照。
+fn parse_gateway_cors(spec: &str) -> Result<CorsPolicy> {
+    let encoded = filter_args(spec, "gateway_cors_b64").trim();
+    anyhow::ensure!(!encoded.is_empty(), "gateway_cors_b64 payload is empty");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .context("gateway_cors_b64 payload is not base64url")?;
+    anyhow::ensure!(
+        bytes.len() <= 32 * 1024,
+        "gateway CORS payload is too large"
+    );
+    let document = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .context("gateway CORS payload is not JSON")?;
+    let object = document
+        .as_object()
+        .context("gateway CORS payload must be an object")?;
+    for key in object.keys() {
+        anyhow::ensure!(
+            matches!(
+                key.as_str(),
+                "allow_origins"
+                    | "allow_methods"
+                    | "allow_headers"
+                    | "expose_headers"
+                    | "allow_credentials"
+                    | "max_age"
+            ),
+            "gateway CORS payload contains unknown field `{key}`"
+        );
+    }
+
+    let allow_credentials = object
+        .get("allow_credentials")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let origin_values = gateway_cors_string_list(object, "allow_origins", 64)?;
+    anyhow::ensure!(
+        !(origin_values.iter().any(|origin| origin == "*") && origin_values.len() > 1),
+        "gateway CORS allow_origins cannot combine `*` with other origins"
+    );
+    let allow_origin = if origin_values.as_slice() == ["*"] {
+        // Gateway API 允许无凭据请求直接返回 `*`，但实际请求是否携带 Cookie/Authorization
+        // 只能在请求期确定。统一回显已提供的 Origin 同时覆盖有/无凭据两类请求，并通过
+        // `Vary: Origin` 保持共享缓存隔离。
+        CorsAllowOrigin::Echo
+    } else {
+        CorsAllowOrigin::Gateway(
+            origin_values
+                .iter()
+                .map(|origin| parse_gateway_cors_origin(origin))
+                .collect::<Result<Vec<_>>>()?,
+        )
+    };
+
+    let allow_methods = gateway_cors_method_list(object, "allow_methods", 9)?;
+    let allow_headers = gateway_cors_header_list(object, "allow_headers", 64)?;
+    let expose_headers = gateway_cors_header_list(object, "expose_headers", 64)?;
+    let max_age_seconds = match object.get("max_age") {
+        Some(value) => {
+            let seconds = value
+                .as_u64()
+                .context("gateway CORS max_age must be an integer")?;
+            anyhow::ensure!(
+                seconds > 0 && seconds <= i32::MAX as u64,
+                "gateway CORS max_age is out of range"
+            );
+            Some(seconds)
+        }
+        None => Some(5),
+    };
+    Ok(CorsPolicy {
+        allow_origin,
+        allow_methods: (!allow_methods.is_empty()).then(|| allow_methods.join(",")),
+        allow_headers: (!allow_headers.is_empty()).then(|| allow_headers.join(",")),
+        expose_headers: (!expose_headers.is_empty()).then(|| expose_headers.join(",")),
+        max_age_seconds,
+        allow_credentials,
+    })
+}
+
+/// 业务作用：读取 Gateway CORS 的有界字符串数组，统一拒绝缺失类型和空白元素。
+///
+/// 参数说明：`object` 是内部策略对象；`field` 是字段名；`max_items` 是协议硬上限。
+///
+/// 返回：字段缺省时返回空列表；类型、数量与元素合法时返回拥有所有权的字符串。
+fn gateway_cors_string_list(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    max_items: usize,
+) -> Result<Vec<String>> {
+    let Some(value) = object.get(field) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .with_context(|| format!("gateway CORS {field} must be an array"))?;
+    anyhow::ensure!(
+        values.len() <= max_items,
+        "gateway CORS {field} exceeds {max_items} items"
+    );
+    let mut output = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value
+            .as_str()
+            .with_context(|| format!("gateway CORS {field} entry must be a string"))?;
+        anyhow::ensure!(
+            !value.is_empty() && value.len() <= 4096,
+            "gateway CORS {field} entry has invalid length"
+        );
+        output.push(value.to_owned());
+    }
+    Ok(output)
+}
+
+/// 业务作用：校验并合并 Gateway CORS method 列表，确保凭证分支不会发布畸形 header。
+///
+/// 参数说明：`object`、`field` 和 `max_items` 描述待读取数组及协议上限。
+///
+/// 返回：合法 method 列表；`*` 与其它值并存或非法 token 时失败。
+fn gateway_cors_method_list(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    max_items: usize,
+) -> Result<Vec<String>> {
+    let methods = gateway_cors_string_list(object, field, max_items)?;
+    anyhow::ensure!(
+        !(methods.iter().any(|method| method == "*") && methods.len() > 1),
+        "gateway CORS {field} cannot combine `*` with other methods"
+    );
+    for method in &methods {
+        if method != "*" {
+            http::Method::from_bytes(method.as_bytes())
+                .with_context(|| format!("gateway CORS method `{method}` is invalid"))?;
+        }
+    }
+    Ok(methods)
+}
+
+/// 业务作用：校验并规范化 Gateway CORS header 名列表，避免响应分隔符注入。
+///
+/// 参数说明：`object`、`field` 和 `max_items` 描述待读取数组及协议上限。
+///
+/// 返回：合法且转为小写的 header 列表；`*` 与其它值并存或非法名称时失败。
+fn gateway_cors_header_list(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    max_items: usize,
+) -> Result<Vec<String>> {
+    let mut headers = gateway_cors_string_list(object, field, max_items)?;
+    anyhow::ensure!(
+        !(headers.iter().any(|header| header == "*") && headers.len() > 1),
+        "gateway CORS {field} cannot combine `*` with other headers"
+    );
+    for header in &mut headers {
+        if header != "*" {
+            *header = HeaderName::from_bytes(header.as_bytes())
+                .with_context(|| format!("gateway CORS header `{header}` is invalid"))?
+                .as_str()
+                .to_owned();
+        }
+    }
+    Ok(headers)
+}
+
+/// 业务作用：把 Gateway API origin 规范化为 scheme、默认端口和精确/左侧通配主机计划。
+///
+/// 参数说明：`origin` 是 CRD 中单个 `allowOrigins` 值，`*` 已由上层单独处理。
+///
+/// 返回：符合 HTTP(S) origin 语法时返回匹配计划；路径、凭据和非法通配符一律拒绝。
+pub(crate) fn parse_gateway_cors_origin(origin: &str) -> Result<CorsOriginPattern> {
+    let (scheme, authority) = origin
+        .split_once("://")
+        .with_context(|| format!("gateway CORS origin `{origin}` lacks scheme"))?;
+    anyhow::ensure!(
+        matches!(scheme, "http" | "https"),
+        "gateway CORS origin `{origin}` has unsupported scheme"
+    );
+    anyhow::ensure!(
+        !authority.is_empty()
+            && !authority.contains('/')
+            && !authority.contains('?')
+            && !authority.contains('#')
+            && !authority.contains('@'),
+        "gateway CORS origin `{origin}` must contain only an authority"
+    );
+    if let Some(wildcard) = authority.strip_prefix("*.") {
+        anyhow::ensure!(
+            !wildcard.contains('*') && !wildcard.starts_with('.') && !wildcard.ends_with('.'),
+            "gateway CORS origin `{origin}` has invalid wildcard hostname"
+        );
+        let (host, port) = split_cors_dns_authority(wildcard, scheme)?;
+        anyhow::ensure!(
+            host.contains('.'),
+            "gateway CORS wildcard origin `{origin}` requires a DNS suffix"
+        );
+        return Ok(CorsOriginPattern {
+            scheme: scheme.to_owned(),
+            host: CorsOriginHost::WildcardSuffix(format!(".{host}")),
+            port,
+        });
+    }
+    let (normalized_scheme, host, port) = parse_cors_request_origin(origin)?;
+    Ok(CorsOriginPattern {
+        scheme: normalized_scheme,
+        host: CorsOriginHost::Exact(host),
+        port,
+    })
+}
+
+/// 业务作用：解析无路径的 DNS authority，并补齐 HTTP(S) 默认端口供通配 origin 比较。
+///
+/// 参数说明：`authority` 不含 scheme；`scheme` 已由调用方验证为 `http` 或 `https`。
+///
+/// 返回：返回小写 DNS host 与有效端口；非法端口、空 host 或 IP 通配输入失败。
+fn split_cors_dns_authority(authority: &str, scheme: &str) -> Result<(String, u16)> {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            let port = port
+                .parse::<u16>()
+                .with_context(|| format!("gateway CORS origin port `{port}` is invalid"))?;
+            anyhow::ensure!(port > 0, "gateway CORS origin port must be non-zero");
+            (host, port)
+        }
+        _ => (authority, if scheme == "http" { 80 } else { 443 }),
+    };
+    anyhow::ensure!(
+        !host.is_empty()
+            && host
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.') }),
+        "gateway CORS wildcard host is invalid"
+    );
+    Ok((host.to_ascii_lowercase(), port))
+}
+
+/// 业务作用：规范化请求 `Origin`，让显式默认端口与省略默认端口按同一 origin 比较。
+///
+/// 参数说明：`origin` 是 CRD 精确 origin 或下游浏览器 `Origin` 值。
+///
+/// 返回：合法、无路径、无凭据的 HTTP(S) origin 返回 `(scheme, host, port)`；其它输入失败。
+fn parse_cors_request_origin(origin: &str) -> Result<(String, String, u16)> {
+    let (_, authority) = origin
+        .split_once("://")
+        .with_context(|| format!("CORS origin `{origin}` lacks scheme"))?;
+    anyhow::ensure!(
+        !authority.is_empty()
+            && !authority.contains('/')
+            && !authority.contains('?')
+            && !authority.contains('#')
+            && !authority.contains('@'),
+        "CORS origin `{origin}` must contain only an authority"
+    );
+    let parsed = reqwest::Url::parse(origin)
+        .with_context(|| format!("CORS origin `{origin}` is invalid"))?;
+    let scheme = parsed.scheme();
+    anyhow::ensure!(
+        matches!(scheme, "http" | "https"),
+        "CORS origin `{origin}` has unsupported scheme"
+    );
+    let host = parsed
+        .host_str()
+        .with_context(|| format!("CORS origin `{origin}` lacks host"))?
+        .to_ascii_lowercase();
+    let port = parsed
+        .port_or_known_default()
+        .with_context(|| format!("CORS origin `{origin}` lacks port"))?;
+    Ok((scheme.to_owned(), host, port))
 }
 
 fn filter_args<'a>(spec: &'a str, name: &str) -> &'a str {
@@ -4938,6 +6963,24 @@ fn parse_rewrite_prefix(spec: &str) -> Result<RewritePrefix> {
         from: from.to_string(),
         to: to.trim().to_string(),
     })
+}
+
+/// 业务作用：解析 Gateway API ReplaceFullPath 的内部 filter，并在构建期固定安全 origin path。
+///
+/// 参数说明：`spec` 是 `gateway_rewrite_full_path /path` 形式的生成配置。
+///
+/// 返回：path 合法时返回完整替换值；空白、query、fragment、控制字符或超长值返回错误。
+fn parse_gateway_rewrite_full_path(spec: &str) -> Result<String> {
+    let path = filter_args(spec, "gateway_rewrite_full_path").trim();
+    anyhow::ensure!(
+        path.starts_with('/')
+            && path.len() <= 2048
+            && !path
+                .bytes()
+                .any(|byte| byte <= 0x20 || matches!(byte, b'?' | b'#')),
+        "gateway_rewrite_full_path requires a valid origin path within 2048 bytes"
+    );
+    Ok(path.to_owned())
 }
 
 fn contains_regex_meta(value: &str) -> bool {

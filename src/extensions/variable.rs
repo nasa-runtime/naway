@@ -224,6 +224,19 @@ impl VariablePlan {
 }
 
 impl ValueTemplate {
+    /// 业务作用：为经过外部协议校验的字面量构造不参与 `${...}` 展开的模板，避免控制面值
+    /// 被误解释为 Naway 配置变量。
+    ///
+    /// 参数说明：`value` 是已按调用方协议边界验证的原始字面量。
+    ///
+    /// 返回：返回始终原样渲染且可走静态快路径的模板。
+    pub(crate) fn literal(value: &str) -> Self {
+        Self {
+            parts: Arc::from([TemplatePart::Literal(Arc::from(value))]),
+            static_literal: Some(Arc::from(value)),
+        }
+    }
+
     /// 按当前请求上下文渲染模板。
     ///
     /// # 参数

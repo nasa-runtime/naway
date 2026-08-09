@@ -21,8 +21,9 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::config::model::{
-    LlmCacheScopeCfg, LlmEmbeddingCfg, LlmModelCfg, LlmProviderCfg, LlmQuotaDimensionCfg,
-    LlmRouteCfg, LlmSelectionStrategyCfg, LlmSemanticCacheCfg, LlmTokenQuotaCfg,
+    LlmCacheScopeCfg, LlmEmbeddingCfg, LlmModelCfg, LlmModerationCfg, LlmModerationFailModeCfg,
+    LlmProviderCfg, LlmQuotaDimensionCfg, LlmRouteCfg, LlmSelectionStrategyCfg,
+    LlmSemanticCacheCfg, LlmTokenQuotaCfg,
 };
 
 /// 单 route 最多允许的 fallback 模型数，限制一次请求最坏尝试次数与配置内存。
@@ -53,6 +54,8 @@ pub struct LlmRoutePolicy {
     system_prompt: Option<Arc<str>>,
     /// 非流式输出本地审核短语。
     blocked_response_substrings: Arc<[Arc<str>]>,
+    /// 可选外部 moderation 计划；在模型 admission 前执行。
+    pub(crate) moderation: Option<Arc<LlmModerationPolicy>>,
     /// 可选精确 + 语义缓存。状态随 route 快照生命周期走，换版不会串用旧策略 entry。
     pub(crate) semantic_cache: Option<Arc<LlmSemanticCache>>,
     /// 构建期编译的模型首选策略。
@@ -61,6 +64,26 @@ pub struct LlmRoutePolicy {
     pub(crate) cache_salt: [u8; 32],
     /// 主模型在前、fallback 在后的不可变模型 slice。
     models: Arc<[LlmModel]>,
+}
+
+/// 已解析凭据、超时和资源上限的外部 OpenAI-compatible moderation 计划。
+pub struct LlmModerationPolicy {
+    /// `http(s)://` 或 `lb://` 上游。
+    pub(crate) upstream: Arc<str>,
+    /// 固定 API path。
+    pub(crate) path: Arc<str>,
+    /// 固定 moderation model。
+    model: Arc<str>,
+    /// 已解析 bearer token。
+    api_key: Option<HeaderValue>,
+    /// 调用总超时。
+    pub(crate) timeout: Duration,
+    /// 序列化 request 硬上限。
+    max_request_bytes: usize,
+    /// response 聚合硬上限。
+    pub(crate) max_response_bytes: usize,
+    /// 依赖故障策略。
+    pub(crate) fail_mode: LlmModerationFailModeCfg,
 }
 
 /// 已编译的 LLM 精确/语义缓存计划。
@@ -121,6 +144,8 @@ pub struct LlmModel {
     model: Arc<str>,
     /// Provider API path。
     pub(crate) path: Arc<str>,
+    /// Google SSE API path；其它 provider 为 None。
+    stream_path: Option<Arc<str>>,
     /// 已解析的 provider API key header 值。
     api_key: Option<HeaderValue>,
     /// Anthropic 强制版本 header。
@@ -156,6 +181,8 @@ pub enum LlmProvider {
     Openai,
     /// Anthropic Messages。
     Anthropic,
+    /// Google Gemini Developer API。
+    Google,
 }
 
 /// 与 serde 配置解耦的模型首选策略。
@@ -196,7 +223,7 @@ pub struct ParsedLlmRequest {
     document: Value,
     /// 客户端是否请求 SSE。
     pub stream: bool,
-    /// 基于 UTF-8 字节数的保守 prompt token 估算；后续 provider usage 会覆盖观测值。
+    /// 基于 UTF-8 字节上界的保守 prompt token 预留；后续 provider usage 用于多退少补。
     pub prompt_tokens: u64,
     /// 客户端声明的 completion 上限；未声明时为 None。
     pub max_completion_tokens: Option<u64>,
@@ -307,6 +334,12 @@ impl LlmRoutePolicy {
             route_id,
             "blocked_response_substrings",
         )?;
+        let moderation = cfg
+            .moderation
+            .as_ref()
+            .map(|moderation| LlmModerationPolicy::build(moderation, config_dir, route_id))
+            .transpose()?
+            .map(Arc::new);
         if cfg.guardrails.system_prompt.len() > 16 * 1024
             || cfg.guardrails.system_prompt.bytes().any(|byte| byte == 0)
         {
@@ -322,6 +355,13 @@ impl LlmRoutePolicy {
         for pattern in &cfg.guardrails.blocked_response_substrings {
             hash_digest_part(&mut cache_salt, pattern.as_bytes());
         }
+        if let Some(moderation) = &moderation {
+            hash_digest_part(&mut cache_salt, moderation.upstream.as_bytes());
+            hash_digest_part(&mut cache_salt, moderation.path.as_bytes());
+            hash_digest_part(&mut cache_salt, moderation.model.as_bytes());
+            cache_salt.update(moderation.timeout.as_millis().to_be_bytes());
+            cache_salt.update([moderation.fail_mode as u8]);
+        }
         cache_salt.update(cfg.max_completion_tokens.to_be_bytes());
         cache_salt.update([selection as u8]);
         for model in &models {
@@ -329,6 +369,9 @@ impl LlmRoutePolicy {
             hash_digest_part(&mut cache_salt, model.model.as_bytes());
             hash_digest_part(&mut cache_salt, model.upstream.as_bytes());
             hash_digest_part(&mut cache_salt, model.path.as_bytes());
+            if let Some(path) = &model.stream_path {
+                hash_digest_part(&mut cache_salt, path.as_bytes());
+            }
             cache_salt.update([model.provider as u8]);
         }
         Ok(Self {
@@ -339,6 +382,7 @@ impl LlmRoutePolicy {
             blocked_substrings: blocked.into(),
             system_prompt,
             blocked_response_substrings: blocked_response_substrings.into(),
+            moderation,
             semantic_cache,
             selection,
             cache_salt: cache_salt.finalize().into(),
@@ -566,6 +610,149 @@ impl LlmEmbeddingModel {
     }
 }
 
+impl LlmModerationPolicy {
+    /// 业务作用：在候选快照构建期解析 external moderation 的 endpoint、SecretSource 与资源门。
+    ///
+    /// 参数说明：`cfg` 是 route moderation 配置，`config_dir` 是 SecretSource 相对目录，`route_id` 用于错误定位。
+    ///
+    /// 返回：所有边界合法时返回不可变调用计划；超时、体积、URI、model 或凭据非法时拒绝候选快照。
+    fn build(cfg: &LlmModerationCfg, config_dir: &Path, route_id: &str) -> Result<Self> {
+        validate_upstream(cfg.uri.as_str(), route_id, "moderation")?;
+        if cfg.model.trim().is_empty()
+            || cfg.model.len() > 256
+            || cfg
+                .model
+                .bytes()
+                .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            bail!("route `{route_id}` llm.moderation.model must be 1..=256 bytes without control characters");
+        }
+        let path = if cfg.path.is_empty() {
+            "/v1/moderations"
+        } else {
+            cfg.path.as_str()
+        };
+        validate_provider_path(path, route_id, "moderation")?;
+        if !(1..=60_000).contains(&cfg.timeout_ms) {
+            bail!("route `{route_id}` llm.moderation.timeout_ms must be within 1..=60000");
+        }
+        if !(1..=MAX_LLM_BODY_BYTES).contains(&cfg.max_request_bytes) {
+            bail!(
+                "route `{route_id}` llm.moderation.max_request_bytes must be within 1..={MAX_LLM_BODY_BYTES}"
+            );
+        }
+        if !(1..=4 * 1024 * 1024).contains(&cfg.max_response_bytes) {
+            bail!(
+                "route `{route_id}` llm.moderation.max_response_bytes must be within 1..=4194304"
+            );
+        }
+        let api_key = resolve_api_key(cfg.api_key.as_str(), config_dir, route_id, "moderation")?;
+        Ok(Self {
+            upstream: Arc::from(cfg.uri.as_str()),
+            path: Arc::from(path),
+            model: Arc::from(cfg.model.as_str()),
+            api_key,
+            timeout: Duration::from_millis(cfg.timeout_ms),
+            max_request_bytes: cfg.max_request_bytes as usize,
+            max_response_bytes: cfg.max_response_bytes as usize,
+            fail_mode: cfg.fail_mode,
+        })
+    }
+
+    /// 业务作用：构造仅包含统一 prompt 文本与固定 model 的 external moderation 请求。
+    ///
+    /// 参数说明：`request` 是完成可信 system prompt 注入后的统一请求。
+    ///
+    /// 返回：纯文本 prompt 可在 request 硬上限内序列化时返回 body；多模态块或超限时失败闭合。
+    pub(crate) fn body(&self, request: &ParsedLlmRequest) -> Result<Bytes> {
+        let messages = request
+            .document
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("LLM messages validated at parse");
+        let mut input = String::with_capacity(
+            usize::try_from(request.prompt_tokens.saturating_mul(4))
+                .unwrap_or(usize::MAX)
+                .min(self.max_request_bytes),
+        );
+        for message in messages {
+            let message = message.as_object().expect("LLM message validated at parse");
+            input.push_str(
+                message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .expect("LLM role validated at parse"),
+            );
+            input.push(':');
+            input.push_str(&strict_content_text(
+                message
+                    .get("content")
+                    .expect("LLM content validated at parse"),
+            )?);
+            input.push('\n');
+            if input.len() > self.max_request_bytes {
+                bail!("LLM moderation input exceeds request limit");
+            }
+        }
+        let body = serde_json::to_vec(&json!({"model":self.model.as_ref(),"input":input}))
+            .map(Bytes::from)
+            .context("encode LLM moderation request")?;
+        if body.len() > self.max_request_bytes {
+            bail!("LLM moderation request exceeds request limit");
+        }
+        Ok(body)
+    }
+
+    /// 业务作用：清除下游凭据并注入 external moderation bearer token，维持独立信任边界。
+    ///
+    /// 参数说明：`parts` 是将发送给 moderation endpoint 的请求头副本。
+    ///
+    /// 返回：无；原地清除客户端/provider 专属认证字段并设置 JSON content type。
+    pub(crate) fn prepare_headers(&self, parts: &mut Parts) {
+        parts.headers.remove(AUTHORIZATION);
+        parts.headers.remove(COOKIE);
+        parts.headers.remove("x-api-key");
+        parts.headers.remove("x-goog-api-key");
+        parts.headers.remove("anthropic-version");
+        parts.headers.remove(CONTENT_LENGTH);
+        parts.headers.remove(TRANSFER_ENCODING);
+        parts.headers.remove(http::header::ACCEPT_ENCODING);
+        parts.headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        if let Some(key) = &self.api_key {
+            let mut value = Vec::with_capacity("Bearer ".len() + key.as_bytes().len());
+            value.extend_from_slice(b"Bearer ");
+            value.extend_from_slice(key.as_bytes());
+            if let Ok(mut value) = HeaderValue::from_bytes(&value) {
+                value.set_sensitive(true);
+                parts.headers.insert(AUTHORIZATION, value);
+            }
+        }
+    }
+}
+
+/// 业务作用：解析 OpenAI-compatible moderation 响应的最终 flagged 判定。
+///
+/// 参数说明：`body` 是经过 route response 硬上限约束的 JSON。
+///
+/// 返回：唯一 result 的 `flagged` 布尔值；空/多结果、坏 JSON 或字段类型错误时返回错误，由 route fail policy 决定是否继续。
+pub(crate) fn moderation_flagged(body: &[u8]) -> Result<bool> {
+    let value: Value = serde_json::from_slice(body).context("moderation response is not JSON")?;
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .context("moderation response requires results array")?;
+    if results.len() != 1 {
+        bail!("moderation response must contain exactly one result");
+    }
+    results[0]
+        .get("flagged")
+        .and_then(Value::as_bool)
+        .context("moderation result requires boolean flagged")
+}
+
 impl LlmTokenQuota {
     fn build(cfg: &LlmTokenQuotaCfg, route_id: &str) -> Result<Self> {
         if cfg.tokens == 0 {
@@ -589,6 +776,11 @@ impl LlmTokenQuota {
 }
 
 impl LlmModel {
+    /// 业务作用：在候选快照构建阶段把 provider 配置编译成不含未解析 SecretSource 的固定模型计划。
+    ///
+    /// 参数说明：`cfg` 是单模型配置，`config_dir` 是 SecretSource 相对目录，`route_id` 用于错误定位。
+    ///
+    /// 返回：配置、路径、模型名和凭据都合法时返回可发布模型；任一信任边界不满足时拒绝候选快照。
     fn build(cfg: &LlmModelCfg, config_dir: &Path, route_id: &str) -> Result<Self> {
         if cfg.model.trim().is_empty() || cfg.model.len() > 256 {
             bail!(
@@ -606,23 +798,50 @@ impl LlmModel {
         let provider = match cfg.provider {
             LlmProviderCfg::Openai => LlmProvider::Openai,
             LlmProviderCfg::Anthropic => LlmProvider::Anthropic,
+            LlmProviderCfg::Google => LlmProvider::Google,
         };
+        if provider == LlmProvider::Google {
+            validate_google_model_name(cfg.model.as_str(), route_id, cfg.id.as_str())?;
+        }
         let default_path = match provider {
-            LlmProvider::Openai => "/v1/chat/completions",
-            LlmProvider::Anthropic => "/v1/messages",
+            LlmProvider::Openai => "/v1/chat/completions".to_string(),
+            LlmProvider::Anthropic => "/v1/messages".to_string(),
+            LlmProvider::Google => {
+                format!("/v1beta/models/{}:generateContent", cfg.model)
+            }
         };
         let path = if cfg.path.is_empty() {
             default_path
         } else {
-            cfg.path.as_str()
+            cfg.path.clone()
         };
-        validate_provider_path(path, route_id, cfg.id.as_str())?;
+        validate_provider_path(path.as_str(), route_id, cfg.id.as_str())?;
+        let stream_path = match provider {
+            LlmProvider::Google => {
+                let stream_path = if cfg.stream_path.is_empty() {
+                    format!("/v1beta/models/{}:streamGenerateContent?alt=sse", cfg.model)
+                } else {
+                    cfg.stream_path.clone()
+                };
+                validate_google_stream_path(stream_path.as_str(), route_id, cfg.id.as_str())?;
+                Some(Arc::from(stream_path))
+            }
+            LlmProvider::Openai | LlmProvider::Anthropic => {
+                if !cfg.stream_path.is_empty() {
+                    bail!(
+                        "route `{route_id}` non-Google LLM model `{}` cannot set stream_path",
+                        cfg.id
+                    );
+                }
+                None
+            }
+        };
         let api_key = resolve_api_key(cfg.api_key.as_str(), config_dir, route_id, cfg.id.as_str())?;
         let anthropic_version = match provider {
-            LlmProvider::Openai => {
+            LlmProvider::Openai | LlmProvider::Google => {
                 if !cfg.anthropic_version.is_empty() {
                     bail!(
-                        "route `{route_id}` OpenAI model `{}` cannot set anthropic_version",
+                        "route `{route_id}` non-Anthropic model `{}` cannot set anthropic_version",
                         cfg.id
                     );
                 }
@@ -648,6 +867,7 @@ impl LlmModel {
             upstream: Arc::from(cfg.uri.as_str()),
             model: Arc::from(cfg.model.as_str()),
             path: Arc::from(path),
+            stream_path,
             api_key,
             anthropic_version,
             input_cost_microusd_per_million: cfg.input_cost_microusd_per_million,
@@ -656,14 +876,16 @@ impl LlmModel {
         })
     }
 
-    /// 把下游认证字段替换为 provider 凭据并设置 provider 固定 header。
+    /// 业务作用：把下游认证字段替换为 provider 凭据并设置 provider 固定 header，阻止客户端凭据越界泄漏。
     ///
-    /// 下游 Authorization/Cookie/API-Key 属客户端到 gateway 的信任边界，绝不能因默认透传泄漏
-    /// 给外部模型。HeaderValue 在快照中已解析；clone 只复制小 header 元数据/内部字节。
-    pub(crate) fn prepare_headers(&self, parts: &mut Parts) {
+    /// 参数说明：`parts` 是即将发送给模型 provider 的独立请求头副本；`stream` 表示是否使用 SSE endpoint。
+    ///
+    /// 返回：无；原地清理不可信凭据并注入快照构建期解析的 provider 凭据。
+    pub(crate) fn prepare_headers(&self, parts: &mut Parts, stream: bool) {
         parts.headers.remove(AUTHORIZATION);
         parts.headers.remove(COOKIE);
         parts.headers.remove("x-api-key");
+        parts.headers.remove("x-goog-api-key");
         parts.headers.remove("anthropic-version");
         parts.headers.remove(CONTENT_LENGTH);
         parts.headers.remove(TRANSFER_ENCODING);
@@ -692,7 +914,32 @@ impl LlmModel {
                     parts.headers.insert("anthropic-version", version.clone());
                 }
             }
+            LlmProvider::Google => {
+                if let Some(key) = &self.api_key {
+                    parts.headers.insert("x-goog-api-key", key.clone());
+                }
+                if stream {
+                    parts.headers.insert(
+                        http::header::ACCEPT,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                }
+            }
         }
+    }
+
+    /// 业务作用：为当前请求选择 provider 固定的 unary 或 SSE path，避免运行期拼接不可信模型名。
+    ///
+    /// 参数说明：`stream` 表示下游是否请求 SSE。
+    ///
+    /// 返回：Google SSE 返回构建期校验过的 `stream_path`，其它情况返回普通 `path`。
+    pub(crate) fn path_for(&self, stream: bool) -> &str {
+        if stream {
+            if let Some(path) = &self.stream_path {
+                return path.as_ref();
+            }
+        }
+        self.path.as_ref()
     }
 }
 
@@ -712,11 +959,10 @@ impl ParsedLlmRequest {
             bail!("LLM messages must contain 1..=4096 entries");
         }
         let prompt_bytes = prompt_text_bytes(messages)?;
-        // 4 UTF-8 bytes/token is an intentionally conservative tokenizer-independent estimate;
-        // add a small per-message framing cost so many empty messages cannot appear free.
-        let prompt_tokens = (prompt_bytes as u64)
-            .div_ceil(4)
-            .saturating_add((messages.len() as u64).saturating_mul(4));
+        // 不依赖 provider tokenizer 时，UTF-8 字节数是比 bytes/4 更安全的 token 上界；
+        // 再加入 message framing，使空消息不能免费穿过配额。最终账单会按 usage 退款差额。
+        let prompt_tokens =
+            (prompt_bytes as u64).saturating_add((messages.len() as u64).saturating_mul(4));
         let stream = object
             .get("stream")
             .map(|value| value.as_bool().context("LLM stream must be boolean"))
@@ -742,7 +988,11 @@ impl ParsedLlmRequest {
         })
     }
 
-    /// 为一个模型生成上游 body。返回 `Bytes`，fallback 只增加引用计数或拥有一次转换结果。
+    /// 业务作用：把统一 OpenAI Chat Completions 请求转换为选中 provider 的有界 wire body。
+    ///
+    /// 参数说明：`model` 是快照构建期已校验的目标 provider 与模型计划。
+    ///
+    /// 返回：字段可无损映射时返回 JSON `Bytes`；存在 provider 不支持的角色、内容或参数时失败闭合。
     pub(crate) fn body_for(&mut self, model: &LlmModel) -> Result<Bytes> {
         match model.provider {
             LlmProvider::Openai => {
@@ -768,6 +1018,12 @@ impl ParsedLlmRequest {
                 serde_json::to_vec(&body)
                     .map(Bytes::from)
                     .context("encode Anthropic model request")
+            }
+            LlmProvider::Google => {
+                let body = openai_to_google(&self.document, self.stream)?;
+                serde_json::to_vec(&body)
+                    .map(Bytes::from)
+                    .context("encode Google model request")
             }
         }
     }
@@ -883,9 +1139,8 @@ impl ParsedLlmRequest {
         }
         messages.insert(0, json!({"role":"system","content":prompt}));
         let prompt_bytes = prompt_text_bytes(messages)?;
-        self.prompt_tokens = (prompt_bytes as u64)
-            .div_ceil(4)
-            .saturating_add((messages.len() as u64).saturating_mul(4));
+        self.prompt_tokens =
+            (prompt_bytes as u64).saturating_add((messages.len() as u64).saturating_mul(4));
         self.pristine = false;
         Ok(())
     }
@@ -1114,6 +1369,139 @@ pub(crate) fn anthropic_response_to_openai(body: &[u8]) -> Result<(Bytes, LlmUsa
     ))
 }
 
+/// 业务作用：把 Google `GenerateContentResponse` 映射回统一 OpenAI Chat Completions 响应，并提取账单事实。
+///
+/// 参数说明：`body` 是经过响应体硬上限约束的 Google unary JSON。
+///
+/// 返回：候选与 text part 合法时返回统一响应和可选 usage；prompt 被安全策略拦截、候选缺失或含非文本 part 时失败闭合。
+pub(crate) fn google_response_to_openai(body: &[u8]) -> Result<(Bytes, Option<LlmUsage>)> {
+    let source: Value = serde_json::from_slice(body).context("Google response is not JSON")?;
+    let object = source
+        .as_object()
+        .context("Google response must be a JSON object")?;
+    if let Some(reason) = source
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+    {
+        bail!("Google blocked prompt with reason `{reason}`");
+    }
+    let candidates = object
+        .get("candidates")
+        .and_then(Value::as_array)
+        .context("Google response requires candidates array")?;
+    if candidates.is_empty() || candidates.len() > 8 {
+        bail!("Google response candidates must contain 1..=8 entries");
+    }
+    let mut choices = Vec::with_capacity(candidates.len());
+    for (position, candidate) in candidates.iter().enumerate() {
+        let candidate = candidate
+            .as_object()
+            .context("Google candidate must be an object")?;
+        let parts = candidate
+            .get("content")
+            .and_then(Value::as_object)
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+            .context("Google candidate requires content.parts array")?;
+        let mut content = String::new();
+        for part in parts {
+            let part = part
+                .as_object()
+                .context("Google candidate part must be an object")?;
+            if part.len() != 1 || !part.contains_key("text") {
+                bail!("Google adapter received a non-text candidate part");
+            }
+            content.push_str(
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .context("Google text part requires string text")?,
+            );
+        }
+        let index = candidate
+            .get("index")
+            .and_then(Value::as_u64)
+            .unwrap_or(position as u64);
+        choices.push(json!({
+            "index": index,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": google_finish_reason(
+                candidate.get("finishReason").and_then(Value::as_str)
+            )
+        }));
+    }
+    let usage = google_usage(&source)?;
+    let mut converted = Map::new();
+    converted.insert(
+        "id".to_string(),
+        object
+            .get("responseId")
+            .cloned()
+            .unwrap_or_else(|| Value::String("google".to_string())),
+    );
+    converted.insert(
+        "object".to_string(),
+        Value::String("chat.completion".to_string()),
+    );
+    converted.insert(
+        "created".to_string(),
+        Value::Number(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .into(),
+        ),
+    );
+    converted.insert(
+        "model".to_string(),
+        object.get("modelVersion").cloned().unwrap_or(Value::Null),
+    );
+    converted.insert("choices".to_string(), Value::Array(choices));
+    if let Some(usage) = usage {
+        converted.insert(
+            "usage".to_string(),
+            json!({
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.prompt_tokens.saturating_add(usage.completion_tokens)
+            }),
+        );
+    }
+    let encoded = serde_json::to_vec(&Value::Object(converted))
+        .map(Bytes::from)
+        .context("encode unified Google response")?;
+    Ok((encoded, usage))
+}
+
+/// 业务作用：从 Google `usageMetadata` 提取 provider 最终 token 事实，不用网关估算冒充账单值。
+///
+/// 参数说明：`source` 是已解析且受体积上限保护的 Google response。
+///
+/// 返回：usage 完整时返回 prompt/completion 计数，整体缺失时返回 None，字段半缺或类型错误时拒绝响应。
+pub(crate) fn google_usage(source: &Value) -> Result<Option<LlmUsage>> {
+    let Some(usage) = source.get("usageMetadata") else {
+        return Ok(None);
+    };
+    let prompt_tokens = match usage.get("promptTokenCount") {
+        Some(value) => value
+            .as_u64()
+            .context("Google usageMetadata.promptTokenCount must be an unsigned integer")?,
+        None => return Ok(None),
+    };
+    let completion_tokens = match usage.get("candidatesTokenCount") {
+        Some(value) => value
+            .as_u64()
+            .context("Google usageMetadata.candidatesTokenCount must be an unsigned integer")?,
+        // 流式中间 event 可只携带 promptTokenCount；只有最终完整 usage 才能结算，
+        // 半字段不能用零值猜测，否则会错误退款 completion 预留。
+        None => return Ok(None),
+    };
+    Ok(Some(LlmUsage {
+        prompt_tokens,
+        completion_tokens,
+    }))
+}
+
 /// 从 OpenAI-compatible 非流式响应读取 usage；缺失 usage 返回 None，不用估算值冒充账单事实。
 pub(crate) fn openai_usage(body: &[u8]) -> Result<Option<LlmUsage>> {
     let value: Value = serde_json::from_slice(body).context("OpenAI response is not JSON")?;
@@ -1191,6 +1579,186 @@ fn openai_to_anthropic(source: &Value, model: &str) -> Result<Value> {
         }
     }
     Ok(Value::Object(target))
+}
+
+/// 业务作用：把统一 text-only Chat Completions 请求转换成 Google `GenerateContentRequest`，并拒绝无法证明等价的字段。
+///
+/// 参数说明：`source` 是已解析的统一请求，`stream` 表示将使用 Google SSE endpoint。
+///
+/// 返回：角色、内容块和生成参数可无损映射时返回 Google JSON；工具、多模态、未知参数或多候选流式请求失败闭合。
+fn openai_to_google(source: &Value, stream: bool) -> Result<Value> {
+    let object = source
+        .as_object()
+        .context("LLM request must be an object")?;
+    const ALLOWED_KEYS: &[&str] = &[
+        "messages",
+        "model",
+        "stream",
+        "stream_options",
+        "max_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "top_p",
+        "stop",
+        "n",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+    ];
+    if let Some(field) = object
+        .keys()
+        .find(|field| !ALLOWED_KEYS.contains(&field.as_str()))
+    {
+        bail!("Google adapter does not support request field `{field}`");
+    }
+    if let Some(options) = object.get("stream_options") {
+        let options = options
+            .as_object()
+            .context("LLM stream_options must be an object")?;
+        if options
+            .iter()
+            .any(|(key, value)| key != "include_usage" || value != &Value::Bool(true))
+        {
+            bail!("Google adapter only accepts stream_options.include_usage=true");
+        }
+    }
+    let messages = object
+        .get("messages")
+        .and_then(Value::as_array)
+        .context("LLM body requires messages array")?;
+    let mut system = Vec::new();
+    let mut contents = Vec::with_capacity(messages.len());
+    for message in messages {
+        let message = message
+            .as_object()
+            .context("LLM message must be an object")?;
+        if message
+            .keys()
+            .any(|key| !matches!(key.as_str(), "role" | "content"))
+        {
+            bail!("Google adapter only supports message role and content fields");
+        }
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .context("LLM message requires string role")?;
+        let text = strict_content_text(
+            message
+                .get("content")
+                .context("LLM message requires content")?,
+        )?;
+        match role {
+            "system" => system.push(text),
+            "user" => contents.push(json!({"role":"user","parts":[{"text":text}]})),
+            "assistant" => contents.push(json!({"role":"model","parts":[{"text":text}]})),
+            _ => bail!("Google adapter only supports system/user/assistant roles"),
+        }
+    }
+    if contents.is_empty() {
+        bail!("Google adapter requires at least one user/assistant message");
+    }
+    let mut generation = Map::new();
+    if let Some(value) = object
+        .get("max_tokens")
+        .or_else(|| object.get("max_completion_tokens"))
+    {
+        generation.insert("maxOutputTokens".to_string(), value.clone());
+    }
+    for (source_key, target_key) in [
+        ("temperature", "temperature"),
+        ("top_p", "topP"),
+        ("seed", "seed"),
+        ("frequency_penalty", "frequencyPenalty"),
+        ("presence_penalty", "presencePenalty"),
+    ] {
+        if let Some(value) = object.get(source_key) {
+            generation.insert(target_key.to_string(), value.clone());
+        }
+    }
+    if let Some(stop) = object.get("stop") {
+        let stop = if let Some(stop) = stop.as_str() {
+            vec![Value::String(stop.to_string())]
+        } else {
+            stop.as_array()
+                .filter(|values| {
+                    !values.is_empty() && values.len() <= 64 && values.iter().all(Value::is_string)
+                })
+                .cloned()
+                .context("LLM stop must be a string or 1..=64 strings")?
+        };
+        generation.insert("stopSequences".to_string(), Value::Array(stop));
+    }
+    if let Some(count) = object.get("n") {
+        let count = count
+            .as_u64()
+            .filter(|count| (1..=8).contains(count))
+            .context("LLM n must be within 1..=8 for Google")?;
+        if stream && count != 1 {
+            bail!("Google streaming adapter only supports n=1");
+        }
+        generation.insert("candidateCount".to_string(), Value::Number(count.into()));
+    }
+    let mut target = Map::new();
+    target.insert("contents".to_string(), Value::Array(contents));
+    if !system.is_empty() {
+        target.insert(
+            "systemInstruction".to_string(),
+            json!({"parts":[{"text":system.join("\n")}]}),
+        );
+    }
+    if !generation.is_empty() {
+        target.insert("generationConfig".to_string(), Value::Object(generation));
+    }
+    Ok(Value::Object(target))
+}
+
+/// 业务作用：把统一消息内容收窄为 Google 当前适配器支持的纯文本，阻止多模态块被静默丢弃。
+///
+/// 参数说明：`content` 是单条 Chat Completions message 的 content。
+///
+/// 返回：字符串或全部为 text 的 block 数组被拼接返回；空数组、非 text block 与畸形字段失败闭合。
+fn strict_content_text(content: &Value) -> Result<String> {
+    if let Some(text) = content.as_str() {
+        return Ok(text.to_string());
+    }
+    let blocks = content
+        .as_array()
+        .filter(|blocks| !blocks.is_empty())
+        .context("Google message content must be string or non-empty text array")?;
+    let mut text = String::new();
+    for block in blocks {
+        let block = block
+            .as_object()
+            .context("Google message content block must be an object")?;
+        if block.len() != 2
+            || block.get("type").and_then(Value::as_str) != Some("text")
+            || !block.contains_key("text")
+        {
+            bail!("Google adapter only supports OpenAI text content blocks");
+        }
+        text.push_str(
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .context("Google text content block requires string text")?,
+        );
+    }
+    Ok(text)
+}
+
+/// 业务作用：把 Google 的固定完成原因收敛为 OpenAI 下游可理解的低基数 finish reason。
+///
+/// 参数说明：`reason` 是候选的可选 Google `finishReason`。
+///
+/// 返回：token 上限映射为 `length`，安全类终止映射为 `content_filter`，其它完成态映射为 `stop`。
+pub(crate) fn google_finish_reason(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("MAX_TOKENS") => "length",
+        Some("SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII") => {
+            "content_filter"
+        }
+        _ => "stop",
+    }
 }
 
 fn prompt_text_bytes(messages: &[Value]) -> Result<usize> {
@@ -1382,6 +1950,43 @@ fn validate_provider_path(path: &str, route_id: &str, model_id: &str) -> Result<
     {
         bail!(
             "route `{route_id}` llm model `{model_id}` path must be an absolute path without query/fragment/control bytes"
+        );
+    }
+    Ok(())
+}
+
+/// 业务作用：验证 Google model 名可安全进入构建期生成的 URI path，阻止 path/query 注入。
+///
+/// 参数说明：`model` 是 provider 模型名，`route_id` 与 `model_id` 只用于配置错误定位。
+///
+/// 返回：1..=256 字节安全 ASCII segment 返回成功，其它输入拒绝候选快照。
+fn validate_google_model_name(model: &str, route_id: &str, model_id: &str) -> Result<()> {
+    if model.is_empty()
+        || model.len() > 256
+        || !model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "route `{route_id}` Google model `{model_id}` model name must be 1..=256 ASCII [A-Za-z0-9._-]"
+        );
+    }
+    Ok(())
+}
+
+/// 业务作用：验证 Google SSE endpoint 只携带固定 `alt=sse` query，避免自定义 path 注入任意参数。
+///
+/// 参数说明：`path` 是待发布的 stream path，`route_id` 与 `model_id` 用于配置错误定位。
+///
+/// 返回：安全绝对路径加精确 `?alt=sse` 时成功，否则拒绝候选快照。
+fn validate_google_stream_path(path: &str, route_id: &str, model_id: &str) -> Result<()> {
+    let Some(base) = path.strip_suffix("?alt=sse") else {
+        bail!("route `{route_id}` Google model `{model_id}` stream_path must end with `?alt=sse`");
+    };
+    validate_provider_path(base, route_id, model_id)?;
+    if !base.contains(":streamGenerateContent") {
+        bail!(
+            "route `{route_id}` Google model `{model_id}` stream_path must target `:streamGenerateContent`"
         );
     }
     Ok(())

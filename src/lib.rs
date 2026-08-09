@@ -64,17 +64,27 @@ pub mod edge_relay;
 #[cfg(feature = "grpc-edge")]
 #[path = "dataplane/edge_ws_bridge.rs"]
 pub mod edge_ws_bridge;
+#[path = "security/enterprise_identity.rs"]
+mod enterprise_identity;
 #[path = "extensions/external_plugin.rs"]
 mod external_plugin;
 #[path = "extensions/graphql.rs"]
 mod graphql;
 #[path = "extensions/grpc_edge.rs"]
 pub mod grpc_edge;
+#[path = "extensions/grpc_transcoding.rs"]
+pub(crate) mod grpc_transcoding;
 pub mod guard;
 #[path = "dataplane/health.rs"]
 pub mod health;
+#[cfg(feature = "http3")]
+#[path = "dataplane/http3.rs"]
+pub mod http3;
 #[path = "cache/http_cache.rs"]
 pub mod http_cache;
+#[cfg(feature = "kafka-governance")]
+#[path = "dataplane/kafka.rs"]
+pub mod kafka;
 #[path = "dataplane/kubernetes_routes.rs"]
 pub mod kubernetes_routes;
 #[path = "extensions/llm.rs"]
@@ -83,6 +93,9 @@ pub mod llm;
 mod log_sink;
 #[path = "observability/metrics.rs"]
 pub mod metrics;
+#[cfg(feature = "mqtt-governance")]
+#[path = "dataplane/mqtt.rs"]
+pub mod mqtt;
 #[path = "dataplane/net.rs"]
 pub mod net;
 #[path = "security/opa.rs"]
@@ -110,6 +123,12 @@ pub mod upstream;
 pub mod variable;
 #[path = "extensions/wasm.rs"]
 mod wasm;
+#[cfg(feature = "xds-client")]
+#[path = "control/xds.rs"]
+pub mod xds;
+#[cfg(feature = "xds-client")]
+#[path = "control/xds_resources.rs"]
+pub(crate) mod xds_resources;
 
 // V5 管理面路由由 nasa::web 在链接期收集；状态类型固定为进程级 AdminState Arc。
 nasa::web::mvc_router!(std::sync::Arc<crate::admin::AdminState>);

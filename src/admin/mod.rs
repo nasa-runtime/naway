@@ -3,7 +3,7 @@
 //! 与数据面【端口隔离】:默认只绑内网 `127.0.0.1:18080`,承载健康 / 就绪端点(本增量),
 //! 以及后续的 `/metrics`(V2-B)、admin API / Web UI(V4/V5)。**控制面挂了不影响数据面转发**(§14.1)。
 //!
-//! 本增量(V2-A 首批,据 Codex「健康端点优先于复杂协议」)只实现:
+//! 当前管理面优先提供部署所需的健康、就绪与指标端点：
 //! - `GET /healthz`:liveness,进程活着即 200(不看依赖),供容器 / K8s 判是否重启。
 //! - `GET /readyz`:readiness,配置已加载且数据面监听就绪 → 200,否则 503(供前置 LB / K8s 判是否分流)。
 
@@ -38,6 +38,8 @@ use crate::{full_body, BoxBody};
 pub enum AdminPlaneMode {
     /// 数据节点：只开放健康、指标、reload/status 等最小节点运维接口。
     Data,
+    /// service-mesh sidecar：权限与 Data 相同，但 status 明确暴露部署 profile。
+    Sidecar,
     /// 独立控制面：开放完整 admin API/UI，但不承载数据流量。
     Admin,
     /// 小规模兼容形态：完整管理面与数据面同进程。
@@ -45,14 +47,22 @@ pub enum AdminPlaneMode {
 }
 
 impl AdminPlaneMode {
-    /// 是否允许配置编排、运行态写操作与 UI。
+    /// 业务作用：判断当前进程是否拥有完整控制面写权限与 UI。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：仅独立 admin 与 all-in-one 返回 true；data/sidecar 均保持最小权限。
     fn full_control_plane(self) -> bool {
         matches!(self, Self::Admin | Self::AllInOne)
     }
 
-    /// readiness 是否还需要检查数据面 listener 和关键上游。
+    /// 业务作用：判断 readiness 是否必须同时检查数据面 listener 与关键上游。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：data、sidecar、all-in-one 返回 true，纯 admin 返回 false。
     fn runs_data(self) -> bool {
-        matches!(self, Self::Data | Self::AllInOne)
+        matches!(self, Self::Data | Self::Sidecar | Self::AllInOne)
     }
 }
 
@@ -68,6 +78,9 @@ pub struct AdminState {
     config_history: ConfigHistory,
     /// 数据面是否已就绪(监听已绑定、可接流量);停机时置 false → /readyz 转 503,供 LB 摘流(§24)。
     ready: Arc<AtomicBool>,
+    /// V10 xDS require_xds 独立启动门与低基数状态；未启用 xDS 时为 None。
+    #[cfg(feature = "xds-client")]
+    xds_status: Option<Arc<crate::xds::XdsStatus>>,
     metrics: Arc<Metrics>,
     /// 长连接注册表(§6.1 / L2):/metrics 据此出 gw_long_connections 低基数指标。
     conn_registry: Arc<ConnectionRegistry>,
@@ -75,7 +88,7 @@ pub struct AdminState {
     /// 进程没有数据面,保持未注入即不渲染 edge gauge。
     #[cfg(feature = "grpc-edge")]
     edge_hub: std::sync::OnceLock<Arc<crate::edge_hub::EdgeHub>>,
-    /// V8-3:集群中继运行时(仅 /metrics 渲染读取);单机部署保持未注入。
+    /// 集群中继运行时；仅供 `/metrics` 渲染读取，单机部署保持未注入。
     #[cfg(feature = "grpc-edge")]
     edge_relay: std::sync::OnceLock<Arc<arc_swap::ArcSwapOption<crate::edge_relay::EdgeRelay>>>,
     /// Redis Pub/Sub 集群总线观测；配置保证与 relay 互斥。
@@ -83,7 +96,7 @@ pub struct AdminState {
     edge_redis_bus: std::sync::OnceLock<Arc<crate::edge_redis_bus::EdgeRedisBus>>,
     #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
     edge_redis_stream: std::sync::OnceLock<Arc<crate::edge_redis_bus::EdgeRedisStreamBus>>,
-    /// V8-7:可选指路条(仅 /metrics 渲染读取);session_registry=none 时未注入。
+    /// 可选 SessionDirectory 指路条；仅供 `/metrics` 渲染，`session_registry=none` 时未注入。
     #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
     edge_directory: std::sync::OnceLock<Arc<crate::edge_directory::SessionDirectory>>,
     /// P0-3:集群发布登记(进程内有界,重启归零;事实源仍是 Nacos + 成员表)。
@@ -118,6 +131,9 @@ pub struct AdminRuntimeState {
     pub http_cache: Arc<crate::http_cache::HttpCacheRuntime>,
     /// 管理操作持久审计器。
     pub audit: crate::admin_audit::AdminAuditLog,
+    /// V10 xDS EDS 客户端状态；只读挂接到 readiness/metrics/admin status。
+    #[cfg(feature = "xds-client")]
+    pub xds_status: Option<Arc<crate::xds::XdsStatus>>,
 }
 
 impl AdminState {
@@ -150,22 +166,22 @@ impl AdminState {
         let _ = self.edge_redis_stream.set(bus);
     }
 
-    /// V8-7:挂接指路条;仅 /metrics 渲染读取。一次性注入,后到者忽略。
+    /// 业务作用：挂接仅供 `/metrics` 读取的 SessionDirectory 指路条，保持运行时身份唯一。
+    ///
+    /// 参数说明：`directory` 是已完成连接与配置校验的进程级目录句柄。
+    ///
+    /// 返回：无；只接受首次注入，后到句柄忽略。
     #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
     pub fn attach_edge_directory(&self, directory: Arc<crate::edge_directory::SessionDirectory>) {
         let _ = self.edge_directory.set(directory);
     }
 
-    /// 构造管理面状态。
+    /// 业务作用：构造管理面共享状态，并把 listener、关键上游与可选 xDS readiness 事实接到同一读面。
     ///
-    /// # 参数
-    /// - `snap`: 与数据面共享的原子配置快照指针。
-    /// - `cfg_path`: 本地 `gateway.yml` 路径。
-    /// - `ready`: 数据面就绪标志;由 `main` 在数据面监听绑定后置 true、停机时置 false。
-    /// - `metrics`: 低基数运行指标,用于 `/metrics` 输出。
-    /// - `conn_registry`: 长连接注册表,用于 `/metrics` 的 gw_long_connections 与长连接关闭 admin 入口。
-    /// - `active_health`: 主动健康探测器,用于 `/readyz` 与选实例一致地判定 critical 服务可用性(§5.1 / N2)。
-    /// - `runtime_state`: 管理面需要写入/刷新的运行态依赖。
+    /// 参数说明：`snap`/`cfg_path` 是当前配置；`ready`、`active_health` 和
+    /// `runtime_state.xds_status` 共同形成 readiness；其余参数是常驻管理观测依赖。
+    ///
+    /// 返回：所有句柄封装成共享 `AdminState`；不打开 socket、不执行外部写操作。
     pub fn new(
         snap: Arc<ArcSwap<GatewaySnapshot>>,
         cfg_path: PathBuf,
@@ -192,6 +208,8 @@ impl AdminState {
             rollouts: RolloutRegistry::new(),
             config_history: runtime_state.config_history,
             ready,
+            #[cfg(feature = "xds-client")]
+            xds_status: runtime_state.xds_status,
             metrics,
             conn_registry,
             active_health,
@@ -204,17 +222,16 @@ impl AdminState {
     }
 }
 
-/// 跑管理面 accept 循环(监听已由 `main` 在启动期绑定)。
+/// 业务作用：运行一个可代际停止的管理面 accept generation，单连接错误不拖垮数据面。
 ///
-/// **绑定放在 `main` 且失败即 fatal(据 Codex 审查记录 P2#1)**:健康端点是容器部署的关键依赖
-/// (Docker `HEALTHCHECK` 打 admin `/healthz`),绑不上应 fail-fast、暴露配置问题,而不是「数据面在跑、
-/// 容器却一直 unhealthy 被反复重启」。本函数只跑 accept 循环——**循环内单连接错误不影响其它连接,
-/// 更不影响数据面转发**(§14.1「控制面 runtime 故障不拖垮数据面」由此体现)。
+/// 参数说明：`listener` 是 prepare 阶段已绑定 socket；`state` 是共享管理状态；`shutdown` 在候选发布后关闭旧代。
 ///
-/// # 参数
-/// - `listener`: 已绑定的管理面 `TcpListener`(来自 `main`,地址取自 `admin.listen`)。
-/// - `state`: 管理面共享状态(配置快照 + 就绪标志)。
-pub async fn serve(listener: TcpListener, state: Arc<AdminState>) {
+/// 返回：监听器正常 drain 或服务错误后返回；服务错误只记录告警，不触发进程 panic/abort。
+pub async fn serve_until(
+    listener: TcpListener,
+    state: Arc<AdminState>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     let local = listener.local_addr().ok();
     info!(?local, "admin plane listening (nasa::web + axum)");
     // 注解路由先由链接期表装配，成熟的精确分发器作为 fallback；当前注解只声明
@@ -235,7 +252,17 @@ pub async fn serve(listener: TcpListener, state: Arc<AdminState>) {
         }
     };
     let app = mvc.fallback(legacy_admin_handler).with_state(state);
-    if let Err(error) = axum::serve(listener, app).await {
+    let graceful_shutdown = async move {
+        loop {
+            if *shutdown.borrow() || shutdown.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    if let Err(error) = axum::serve(listener, app)
+        .with_graceful_shutdown(graceful_shutdown)
+        .await
+    {
         // Admin task 退出不会 panic/abort 数据面；主进程仍由数据 listener 与信号生命周期管理。
         warn!(%error, "admin axum server stopped");
     }
@@ -452,6 +479,8 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
         (&Method::GET, "/readyz") => readyz(&state),
         (&Method::GET, "/metrics") => metrics(&state),
         (&Method::GET, "/admin/config/status") => config_status(&state),
+        #[cfg(feature = "xds-client")]
+        (&Method::GET, "/admin/xds/status") => xds_status(&state),
         (&Method::GET, "/api/dashboard") => dashboard(&state),
         (&Method::POST, "/admin/reload") => reload_config(),
         // 只读发现视图(§34 V4):列出上游服务/实例/来源,供管理面展示集群拓扑。
@@ -599,17 +628,19 @@ impl AdminIdentity {
     }
 }
 
-/// 把现有 admin API 精确映射为 `资源域 × 动作`；未知路由保持 404，不意外继承宽权限。
+/// 业务作用：把现有 admin API 精确映射为 `资源域 × 动作`；未知路由保持 404，不意外继承宽权限。
 ///
-/// # 参数
-/// - `method`: 请求方法，同一路径的读写动作可能不同。
-/// - `path`: 不含 query 的请求路径。
+/// 参数说明：`method`/`path` 是不含 query 的规范请求目标。
+///
+/// 返回：已知端点的资源域与动作；未知路径返回 None 并由分发器保持 404。
 fn admin_permission(method: &Method, path: &str) -> Option<(AdminResource, AdminAction)> {
     match (method, path) {
         (&Method::GET, "/readyz") | (&Method::GET, "/metrics") => {
             Some((AdminResource::Cluster, AdminAction::Read))
         }
         (&Method::GET, "/admin/config/status") => Some((AdminResource::Config, AdminAction::Read)),
+        #[cfg(feature = "xds-client")]
+        (&Method::GET, "/admin/xds/status") => Some((AdminResource::Cluster, AdminAction::Read)),
         (&Method::GET, "/api/dashboard") => Some((AdminResource::Cluster, AdminAction::Read)),
         (&Method::POST, "/admin/reload") => Some((AdminResource::Cluster, AdminAction::Write)),
         (&Method::GET, "/admin/upstreams") => Some((AdminResource::Upstreams, AdminAction::Read)),
@@ -655,11 +686,11 @@ fn admin_permission(method: &Method, path: &str) -> Option<(AdminResource, Admin
     }
 }
 
-/// 判断 data 模式的最小 admin allowlist；默认拒绝能改运行态或配置事实源的端点。
+/// 业务作用：判断 data 模式的最小 admin allowlist；默认拒绝能改运行态或配置事实源的端点。
 ///
-/// # 参数
-/// - `method`: 管理请求方法，写入口必须精确到方法，不能只按 path 放行。
-/// - `path`: 已由 HTTP parser 分离 query 的规范路径。
+/// 参数说明：`method`/`path` 是已由 HTTP parser 分离 query 的规范请求目标。
+///
+/// 返回：数据/sidecar 节点允许访问时返回 true；其它管理能力返回 false。
 fn data_mode_path_allowed(method: &Method, path: &str) -> bool {
     matches!(
         (method, path),
@@ -667,14 +698,16 @@ fn data_mode_path_allowed(method: &Method, path: &str) -> bool {
             | (&Method::GET, "/readyz")
             | (&Method::GET, "/metrics")
             | (&Method::GET, "/admin/config/status")
+            | (&Method::GET, "/admin/xds/status")
             | (&Method::POST, "/admin/reload")
     )
 }
 
-/// 返回本节点当前配置与部署模式；只暴露低基数摘要，不返回密钥或完整配置原文。
+/// 业务作用：返回本节点当前配置与部署模式；只暴露低基数摘要，不返回密钥或完整配置原文。
 ///
-/// # 参数
-/// - `state`: 当前节点管理面共享状态。
+/// 参数说明：`state` 是当前节点管理面共享状态。
+///
+/// 返回：包含部署模式和低基数 Snapshot 摘要的 JSON 200 响应。
 fn config_status(state: &AdminState) -> Response<BoxBody> {
     let snapshot = state.snap.load();
     json(
@@ -684,6 +717,53 @@ fn config_status(state: &AdminState) -> Response<BoxBody> {
             "mode": admin_mode_name(state.mode),
             "ready": state.ready.load(Ordering::Acquire),
             "summary": snapshot.summary(),
+        }),
+    )
+}
+
+/// 业务作用：输出本节点 ADS/EDS 权威状态，供发布门区分首次未同步、active 与 LKG degraded。
+///
+/// 参数说明：`state` 提供可选 xDS 运行时句柄。
+///
+/// 返回：启用 xDS 时返回低敏 version/nonce、错误摘要和累计计数；未启用时返回 404。
+#[cfg(feature = "xds-client")]
+fn xds_status(state: &AdminState) -> Response<BoxBody> {
+    let Some(status) = &state.xds_status else {
+        return plain(StatusCode::NOT_FOUND, "not found\n");
+    };
+    let status = status.snapshot();
+    let state_name = match status.state {
+        crate::xds::XdsConnectionState::Disconnected => "disconnected",
+        crate::xds::XdsConnectionState::Syncing => "syncing",
+        crate::xds::XdsConnectionState::Active => "active",
+        crate::xds::XdsConnectionState::Degraded => "degraded",
+    };
+    json(
+        StatusCode::OK,
+        serde_json::json!({
+            "ok": true,
+            "state": state_name,
+            "ready": status.ready,
+            "stream_up": status.stream_up,
+            "accepted_version": status.accepted_version,
+            "accepted_versions": status.accepted_versions,
+            "last_nonce": status.last_nonce,
+            "last_nonces": status.last_nonces,
+            "last_error": status.last_error,
+            "warming_dependencies": status.warming_dependencies,
+            "applied_fingerprint": status.applied_fingerprint,
+            "ack_total": status.ack_total,
+            "nack_total": status.nack_total,
+            "reconnect_total": status.reconnect_total,
+            "duplicate_total": status.duplicate_total,
+            "last_received_timestamp": status.last_received_timestamp,
+            "last_applied_timestamp": status.last_applied_timestamp,
+            "active_resources": status.active_resources,
+            "active_resources_by_type": status.active_resources_by_type,
+            "apply_queue_depth": status.apply_queue_depth,
+            "rejected_bytes_total": status.rejected_bytes_total,
+            "warming_timeout_total": status.warming_timeout_total,
+            "ttl_expired_total": status.ttl_expired_total,
         }),
     )
 }
@@ -719,13 +799,15 @@ fn dashboard(state: &AdminState) -> Response<BoxBody> {
     )
 }
 
-/// 固定部署模式名称，供 status/dashboard 使用同一协议值。
+/// 业务作用：返回固定部署模式名称，供 status/dashboard 使用同一协议值。
 ///
-/// # 参数
-/// - `mode`: 启动时确定的管理平面模式。
+/// 参数说明：`mode` 是启动时确定且热更不可改变的管理平面模式。
+///
+/// 返回：稳定的小写 API 字符串。
 const fn admin_mode_name(mode: AdminPlaneMode) -> &'static str {
     match mode {
         AdminPlaneMode::Data => "data",
+        AdminPlaneMode::Sidecar => "sidecar",
         AdminPlaneMode::Admin => "admin",
         AdminPlaneMode::AllInOne => "all-in-one",
     }
@@ -1905,9 +1987,15 @@ fn admin_browser_source_allowed(
     !saw_browser_source || !allowed_origins.is_empty()
 }
 
+/// 业务作用：实现 `/readyz` 关键依赖门；只有 listener、xDS 权威与每个 critical 上游同时可用才放流。
+///
 /// `/readyz`(§24 关键依赖):就绪 = 数据面已绑定监听(`ready`)**且**每个 critical 上游服务都还有可用实例。
 /// 「可用」与数据面选实例同源:selectable(healthy && !down)+ 未被主动探测判死(N2)+ Nacos 未失联超 stale_ttl(N1)。
 /// 未就绪即 503,供前置 LB / K8s 摘流;非关键上游全挂不摘除整个节点(§24「关键依赖」)。
+///
+/// 参数说明：`state` 提供 listener、xDS、关键上游和配置版本事实。
+///
+/// 返回：所有门通过返回 200；否则返回 503 与单一低敏 reason。
 fn readyz(state: &AdminState) -> Response<BoxBody> {
     let snap = state.snap.load();
     let version = snap.version;
@@ -1918,11 +2006,20 @@ fn readyz(state: &AdminState) -> Response<BoxBody> {
     // 传入主动探测的不健康集合(N2):readyz 与选实例用同一份可用集判定,避免「select 挂但 readyz 仍 ready」。
     let critical_down =
         crate::health::critical_upstreams_not_ready(snap.as_ref(), &state.active_health);
-    if state.ready.load(Ordering::Relaxed) && critical_down.is_empty() {
+    #[cfg(feature = "xds-client")]
+    let xds_ready = state
+        .xds_status
+        .as_ref()
+        .is_none_or(|status| status.ready());
+    #[cfg(not(feature = "xds-client"))]
+    let xds_ready = true;
+    if state.ready.load(Ordering::Relaxed) && xds_ready && critical_down.is_empty() {
         plain(StatusCode::OK, &format!("ready config_version={version}\n"))
     } else {
         let reason = if !state.ready.load(Ordering::Relaxed) {
             "listener_not_ready".to_string()
+        } else if !xds_ready {
+            "xds_not_ready".to_string()
         } else {
             format!("critical_upstreams_down={}", critical_down.join(","))
         };
@@ -1933,6 +2030,11 @@ fn readyz(state: &AdminState) -> Response<BoxBody> {
     }
 }
 
+/// 业务作用：渲染数据面与可选控制面的低基数 Prometheus 指标，不暴露资源名/version/nonce 标签。
+///
+/// 参数说明：`state` 提供当前快照和常驻运行态计数器。
+///
+/// 返回：允许暴露时返回文本指标；关闭 metrics 时返回 404。
 fn metrics(state: &AdminState) -> Response<BoxBody> {
     let snap = state.snap.load();
     if !snap.expose_metrics {
@@ -1941,6 +2043,101 @@ fn metrics(state: &AdminState) -> Response<BoxBody> {
     let mut body = state
         .metrics
         .render_prometheus(snap.version, snap.upstreams.service_count());
+    #[cfg(feature = "xds-client")]
+    if let Some(status) = &state.xds_status {
+        let status = status.snapshot();
+        body.push_str("# HELP gw_xds_ready Whether at least one EDS version has been applied.\n");
+        body.push_str("# TYPE gw_xds_ready gauge\n");
+        body.push_str(&format!("gw_xds_ready {}\n", u8::from(status.ready)));
+        body.push_str("# HELP gw_xds_stream_up Whether the ADS HTTP/2 stream is connected.\n");
+        body.push_str("# TYPE gw_xds_stream_up gauge\n");
+        body.push_str(&format!(
+            "gw_xds_stream_up {}\n",
+            u8::from(status.stream_up)
+        ));
+        body.push_str("# HELP gw_xds_ack_total Accepted xDS responses.\n");
+        body.push_str("# TYPE gw_xds_ack_total counter\n");
+        body.push_str(&format!("gw_xds_ack_total {}\n", status.ack_total));
+        body.push_str("# HELP gw_xds_nack_total Rejected xDS responses.\n");
+        body.push_str("# TYPE gw_xds_nack_total counter\n");
+        body.push_str(&format!("gw_xds_nack_total {}\n", status.nack_total));
+        body.push_str("# HELP gw_xds_reconnect_total ADS reconnect attempts.\n");
+        body.push_str("# TYPE gw_xds_reconnect_total counter\n");
+        body.push_str(&format!(
+            "gw_xds_reconnect_total {}\n",
+            status.reconnect_total
+        ));
+        body.push_str(
+            "# HELP gw_xds_duplicate_total Accepted xDS responses with unchanged native content.\n",
+        );
+        body.push_str("# TYPE gw_xds_duplicate_total counter\n");
+        body.push_str(&format!(
+            "gw_xds_duplicate_total {}\n",
+            status.duplicate_total
+        ));
+        body.push_str("# HELP gw_xds_resources Active xDS resources by fixed type.\n");
+        body.push_str("# TYPE gw_xds_resources gauge\n");
+        for type_label in ["cds", "rds", "eds"] {
+            body.push_str(&format!(
+                "gw_xds_resources{{type=\"{type_label}\",state=\"active\"}} {}\n",
+                status
+                    .active_resources_by_type
+                    .get(type_label)
+                    .copied()
+                    .unwrap_or_default()
+            ));
+            let warming = status
+                .warming_dependencies
+                .iter()
+                .filter(|dependency| dependency.starts_with(&format!("{type_label}:")))
+                .count();
+            body.push_str(&format!(
+                "gw_xds_resources{{type=\"{type_label}\",state=\"warming\"}} {warming}\n"
+            ));
+        }
+        body.push_str(
+            "# HELP gw_xds_last_received_timestamp Unix timestamp of the latest xDS response.\n",
+        );
+        body.push_str("# TYPE gw_xds_last_received_timestamp gauge\n");
+        body.push_str(&format!(
+            "gw_xds_last_received_timestamp {}\n",
+            status.last_received_timestamp
+        ));
+        body.push_str("# HELP gw_xds_last_applied_timestamp Unix timestamp of the latest applied xDS response.\n");
+        body.push_str("# TYPE gw_xds_last_applied_timestamp gauge\n");
+        body.push_str(&format!(
+            "gw_xds_last_applied_timestamp {}\n",
+            status.last_applied_timestamp
+        ));
+        body.push_str("# HELP gw_xds_apply_queue_depth Current xDS translate/apply queue depth.\n");
+        body.push_str("# TYPE gw_xds_apply_queue_depth gauge\n");
+        body.push_str(&format!(
+            "gw_xds_apply_queue_depth {}\n",
+            status.apply_queue_depth
+        ));
+        body.push_str("# HELP gw_xds_warming_timeout_total Dependency warming cycles that exceeded their deadline.\n");
+        body.push_str("# TYPE gw_xds_warming_timeout_total counter\n");
+        body.push_str(&format!(
+            "gw_xds_warming_timeout_total {}\n",
+            status.warming_timeout_total
+        ));
+        body.push_str(
+            "# HELP gw_xds_ttl_expired_total Delta xDS resources removed after TTL expiry.\n",
+        );
+        body.push_str("# TYPE gw_xds_ttl_expired_total counter\n");
+        body.push_str(&format!(
+            "gw_xds_ttl_expired_total {}\n",
+            status.ttl_expired_total
+        ));
+        body.push_str(
+            "# HELP gw_xds_rejected_bytes_total Encoded bytes of rejected xDS responses.\n",
+        );
+        body.push_str("# TYPE gw_xds_rejected_bytes_total counter\n");
+        body.push_str(&format!(
+            "gw_xds_rejected_bytes_total {}\n",
+            status.rejected_bytes_total
+        ));
+    }
     // 长连接低基数指标(§6.1/§13/L2):按 current/stale 拆分 + 最旧快照版本(不出高基数具体版本 label)。
     let stats = state.conn_registry.stats(snap.version);
     body.push_str("# HELP gw_long_connections Active long-lived upgraded connections.\n");
@@ -2004,7 +2201,7 @@ fn metrics(state: &AdminState) -> Response<BoxBody> {
             "gw_edge_reassembly_bytes_total {reassembly_bytes}\n"
         ));
     }
-    // V8-3 集群中继低基数观测(§25.2.6:peer 明细只进有界日志,不作 label)。
+    // 集群中继只暴露低基数观测；peer 明细只进有界日志，不得成为 metric label。
     #[cfg(feature = "grpc-edge")]
     if let Some(relay) = state.edge_relay.get().and_then(|slot| slot.load_full()) {
         let snapshot = relay.metrics();
@@ -2169,7 +2366,7 @@ fn metrics(state: &AdminState) -> Response<BoxBody> {
             metrics.cursor_failed_total()
         ));
     }
-    // V8-7 指路条观测(低基数;无 tenant/user label)。
+    // SessionDirectory 指路条只暴露低基数观测，不得带 tenant/user label。
     #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
     if let Some(directory) = state.edge_directory.get() {
         let snapshot = directory.metrics();
@@ -3283,30 +3480,9 @@ fn dry_run_snapshot_response(state: &AdminState, candidate: GatewaySnapshot) -> 
     let current = state.snap.load();
     let candidate_listener_topology = candidate.listen_topology();
     let current_listener_topology = current.listen_topology();
-    let data_listener_change = candidate_listener_topology != current_listener_topology;
-    let uses_acme = |topology: &crate::config::ProxyListenTopology| {
-        topology.tls.as_ref().is_some_and(|tls| tls.acme.is_some())
-    };
-    let acme_listener_change = candidate_listener_topology
-        .iter()
-        .any(|candidate_topology| {
-            let old = current_listener_topology
-                .iter()
-                .find(|current_topology| current_topology.id == candidate_topology.id);
-            old != Some(candidate_topology)
-                && (uses_acme(candidate_topology) || old.is_some_and(uses_acme))
-        })
-        || current_listener_topology.iter().any(|current_topology| {
-            !candidate_listener_topology
-                .iter()
-                .any(|candidate_topology| candidate_topology.id == current_topology.id)
-                && uses_acme(current_topology)
-        });
-    let restart_field = if candidate.admin_listen != current.admin_listen {
-        Some("admin listener topology")
-    } else if acme_listener_change {
-        Some("ACME listener topology")
-    } else if !current.admin_audit.same_bootstrap(&candidate.admin_audit) {
+    let listener_prepare_required = candidate_listener_topology != current_listener_topology
+        || candidate.admin_listen != current.admin_listen;
+    let restart_field = if !current.admin_audit.same_bootstrap(&candidate.admin_audit) {
         Some("admin.audit")
     } else if !current.access_log.same_sink_topology(&candidate.access_log) {
         Some("access_log queue/sink topology")
@@ -3336,7 +3512,7 @@ fn dry_run_snapshot_response(state: &AdminState, candidate: GatewaySnapshot) -> 
             "ok": true,
             "summary": candidate.summary(),
             "applied": false,
-            "listener_prepare_required": data_listener_change,
+            "listener_prepare_required": listener_prepare_required,
         }),
     )
 }

@@ -256,7 +256,7 @@ impl RequestValidationPlan {
             Err(CollectError::Read) => return ValidationOutcome::BodyReadFailed,
         };
         if collected.bytes.is_empty() && !self.body_required {
-            return ValidationOutcome::Valid(ForwardBody::Boxed(buffered_body(collected)));
+            return ValidationOutcome::Valid(buffered_body(collected));
         }
         if collected.bytes.is_empty() {
             return ValidationOutcome::BadRequest("request JSON body is required");
@@ -286,7 +286,7 @@ impl RequestValidationPlan {
             );
             return ValidationOutcome::BadRequest("request body schema validation failed");
         }
-        ValidationOutcome::Valid(ForwardBody::Boxed(buffered_body(collected)))
+        ValidationOutcome::Valid(buffered_body(collected))
     }
 }
 
@@ -1024,10 +1024,7 @@ pub(crate) async fn collect_bounded(
     body: ForwardBody,
     max_body_bytes: u64,
 ) -> std::result::Result<CollectedBody, CollectError> {
-    let mut body: BoxBody = match body {
-        ForwardBody::Incoming(body) => body.map_err(|error| Box::new(error) as BoxError).boxed(),
-        ForwardBody::Boxed(body) => body,
-    };
+    let mut body = body;
     let mut first: Option<Bytes> = None;
     let mut merged: Option<BytesMut> = None;
     let mut trailers: Option<HeaderMap> = None;

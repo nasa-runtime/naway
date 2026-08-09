@@ -1,7 +1,7 @@
-//! V8-7 可选 SessionDirectory(架构规范 §25.2.7):定向 push 的**寻址加速**,不是正确性来源。
+//! 可选 SessionDirectory（架构规范 §25.2.7）：定向 push 的**寻址加速**，不是正确性来源。
 //!
 //! 需要同时编译 `grpc-edge` 与 `redis-runtime`;`session_registry: none`(默认)时本模块
-//! 完全不构造,push 走 V8-4 broadcast-probe。
+//! 完全不构造，push 走 broadcast-probe。
 //!
 //! 正确性纪律(§25.2.7 逐条对应):
 //! - **generation-safe 删除**:key 是 `user`,field 是 `SessionKey{node_id#boot_id#stream_id}`。

@@ -494,7 +494,11 @@ pub(crate) fn response_is_json(headers: &HeaderMap) -> bool {
                 .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+json")))
 }
 
-/// 有界读取插件响应。单 data frame 直接返回其 `Bytes`；只有第二个 frame 才分配合并缓冲。
+/// 业务作用：有界收集外部插件 JSON body，并接受符合 HTTP 语义的尾随元数据。
+///
+/// 参数说明：`body` 是插件响应流；`headers` 用于前置 Content-Length 门；`max_bytes` 是 JSON body 硬上限。
+///
+/// 返回：单 DATA frame 保持零拷贝，多 frame 只合并一次；trailers 不参与插件动作解析但会被安全消费。
 pub(crate) async fn collect_response(
     mut body: BoxBody,
     headers: &HeaderMap,
@@ -513,9 +517,14 @@ pub(crate) async fn collect_response(
     let mut length = 0usize;
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|error| anyhow::anyhow!("read plugin response: {error}"))?;
-        let data = frame
-            .into_data()
-            .map_err(|_| anyhow::anyhow!("plugin response trailers are unsupported"))?;
+        let data = match frame.into_data() {
+            Ok(data) => data,
+            Err(_trailers) => {
+                // 插件动作的唯一事实源是有界 JSON body；HTTP trailers 属于传输元数据。
+                // 接受但不映射成业务 header，避免未经 mutation allowlist 的尾部字段越权写入请求。
+                continue;
+            }
+        };
         length = length
             .checked_add(data.len())
             .context("plugin response size overflow")?;

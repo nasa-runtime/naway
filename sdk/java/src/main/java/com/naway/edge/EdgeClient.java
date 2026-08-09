@@ -9,6 +9,8 @@ import io.grpc.MethodDescriptor;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.ClientCalls;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ClientResponseObserver;
 import io.grpc.stub.MetadataUtils;
 import io.grpc.stub.StreamObserver;
 
@@ -19,6 +21,9 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * Naway gRPC 边缘模式(V8)Java 客户端。
@@ -41,6 +46,25 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 能碰哪个 group 由 route 的 {@code grpc_edge.authz} 决定,越权返回 {@code PERMISSION_DENIED}。
  */
 public final class EdgeClient {
+
+    private static final int MAX_COALESCE_KEY_BYTES = 256;
+
+    /** 一条可参与 {@code latest_by_key} 合并的发布消息；发送完成前调用方不得修改数组。 */
+    public static final class PublishFrame {
+        public final byte[] payload;
+        public final byte[] coalesceKey;
+
+        /**
+         * 业务作用：构造一条带显式合并键的 Publish/PublishStream 消息。
+         *
+         * @param coalesceKey 1..=256 字节业务实体键
+         * @param payload 业务 protobuf 字节
+         */
+        public PublishFrame(byte[] coalesceKey, byte[] payload) {
+            this.coalesceKey = java.util.Objects.requireNonNull(coalesceKey, "coalesceKey");
+            this.payload = java.util.Objects.requireNonNull(payload, "payload");
+        }
+    }
 
     private final Channel channel;
     private final EdgeConfig config;
@@ -81,6 +105,22 @@ public final class EdgeClient {
     }
 
     /**
+     * 业务作用：群播一条带合并键的消息，使 {@code latest_by_key} 队列按业务实体只保留最新状态。
+     *
+     * @param group 目标授权 group
+     * @param coalesceKey 1..=256 字节合并键
+     * @param payload 业务 protobuf 字节
+     * @return 诚实入队回执，不代表终端已收到
+     */
+    public EdgeSummaries.PublishSummary publishKeyed(
+            String group, byte[] coalesceKey, byte[] payload) {
+        byte[] reply = ClientCalls.blockingUnaryCall(
+                withHeaders("publish", config.groupHeader, group),
+                publish, callOptions(), encodeFramePush(payload, coalesceKey));
+        return new EdgeSummaries.PublishSummary(EdgeSummaries.decodeFlat(reply));
+    }
+
+    /**
      * 定向单播给某 user 的全部在线 session。
      *
      * @param targetUser 目标 user;能否 push 由 {@code authz.push_targets} 决定
@@ -91,6 +131,22 @@ public final class EdgeClient {
         byte[] reply = ClientCalls.blockingUnaryCall(
                 withHeaders("push", config.targetHeader, targetUser),
                 push, callOptions(), encodeFramePush(payload));
+        return new EdgeSummaries.PushSummary(EdgeSummaries.decodeFlat(reply));
+    }
+
+    /**
+     * 业务作用：定向推送一条带合并键的消息，使目标会话 keyed 队列只保留最新状态。
+     *
+     * @param targetUser 目标授权 user
+     * @param coalesceKey 1..=256 字节合并键
+     * @param payload 业务 protobuf 字节
+     * @return 诚实入队回执；目标离线仍正常返回 {@code accepted=0}
+     */
+    public EdgeSummaries.PushSummary pushKeyed(
+            String targetUser, byte[] coalesceKey, byte[] payload) {
+        byte[] reply = ClientCalls.blockingUnaryCall(
+                withHeaders("push", config.targetHeader, targetUser),
+                push, callOptions(), encodeFramePush(payload, coalesceKey));
         return new EdgeSummaries.PushSummary(EdgeSummaries.decodeFlat(reply));
     }
 
@@ -112,51 +168,145 @@ public final class EdgeClient {
      */
     public EdgeSummaries.PublishSummary publishStream(String group, java.util.List<byte[]> payloads)
             throws InterruptedException {
-        // 先全部编码再发:任何一条越界都应在**一条都没发出去**之前失败,否则调用方会拿到
-        // "发了一半"的不确定状态,而流式面没有逐条 ack 可对账。
-        java.util.List<byte[]> wire = new java.util.ArrayList<>(payloads.size());
-        for (byte[] payload : payloads) {
-            wire.add(encodeFramePush(payload));
+        return publishStreamInternal(
+                group,
+                payloads,
+                payload -> validateFramePushSize(payload.length, null),
+                this::encodeFramePush);
+    }
+
+    /**
+     * 业务作用：按 H2 flow-control 增量发送带 {@code coalesce_key} 的 PublishStream。
+     *
+     * @param group 目标授权 group
+     * @param frames 本段 keyed 消息序列；只预检长度，不预编码整批 wire
+     * @return 本段聚合回执
+     * @throws InterruptedException 调用线程被取消
+     */
+    public EdgeSummaries.PublishSummary publishStreamKeyed(
+            String group, java.util.List<PublishFrame> frames) throws InterruptedException {
+        return publishStreamInternal(
+                group,
+                frames,
+                frame -> validateFramePushSize(frame.payload.length, frame.coalesceKey),
+                frame -> encodeFramePush(frame.payload, frame.coalesceKey));
+    }
+
+    /**
+     * 业务作用：共用 PublishStream 的预检、isReady 背压、取消和 summary 生命周期。
+     *
+     * @param group 目标授权 group
+     * @param items 调用方原始序列，不复制 payload
+     * @param validator 单项无分配预检
+     * @param encoder onNext 前才执行的单项 FramePush 编码器
+     * @return 本段聚合回执
+     * @throws InterruptedException 调用线程被取消
+     */
+    private <T> EdgeSummaries.PublishSummary publishStreamInternal(
+            String group,
+            java.util.List<T> items,
+            Consumer<T> validator,
+            Function<T, byte[]> encoder) throws InterruptedException {
+        // 固定 List API 先做无持久缓冲的长度预检，保留本地参数错误时“一条都不发”；
+        // wire 编码在 onNext 前逐条完成，不再额外驻留整段 FramePush 副本。
+        for (T item : items) {
+            validator.accept(item);
         }
         java.util.concurrent.CompletableFuture<byte[]> reply = new java.util.concurrent.CompletableFuture<>();
-        StreamObserver<byte[]> requests = ClientCalls.asyncClientStreamingCall(
-                withHeaders("publish", config.groupHeader, group)
-                        .newCall(publishStream, callOptions()),
-                new StreamObserver<byte[]>() {
-                    @Override
-                    public void onNext(byte[] value) {
-                        reply.complete(value);
-                    }
-
-                    @Override
-                    public void onError(Throwable t) {
-                        reply.completeExceptionally(t);
-                    }
-
-                    @Override
-                    public void onCompleted() {
-                        // summary 已在 onNext 到达;若对端只给 trailer 未给 body,
-                        // 这里让 future 以协议错误结束,而不是永远挂着。
-                        reply.completeExceptionally(new IllegalStateException(
-                                "PublishStream completed without a PublishSummary"));
+        Object readiness = new Object();
+        AtomicReference<ClientCallStreamObserver<byte[]>> requestRef = new AtomicReference<>();
+        java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(1);
+        ClientResponseObserver<byte[], byte[]> responses = new ClientResponseObserver<byte[], byte[]>() {
+            @Override
+            public void beforeStart(ClientCallStreamObserver<byte[]> requestStream) {
+                // onReady 是 grpc-java 将 HTTP/2 flow-control 传回生产循环的唯一权威；
+                // 不看它就会把整段消息重新堆进客户端内部缓冲，表面 streaming、实质预加载。
+                requestStream.setOnReadyHandler(() -> {
+                    synchronized (readiness) {
+                        readiness.notifyAll();
                     }
                 });
+                requestRef.set(requestStream);
+                started.countDown();
+            }
+
+            @Override
+            public void onNext(byte[] value) {
+                reply.complete(value);
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                reply.completeExceptionally(t);
+            }
+
+            @Override
+            public void onCompleted() {
+                // summary 已在 onNext 到达；若对端只给 trailer 未给 body，
+                // 这里让 future 以协议错误结束，而不是永远挂着。
+                reply.completeExceptionally(new IllegalStateException(
+                        "PublishStream completed without a PublishSummary"));
+            }
+        };
+        ClientCalls.asyncClientStreamingCall(
+                withHeaders("publish", config.groupHeader, group)
+                        .newCall(publishStream, callOptions()),
+                responses);
+        if (!started.await(config.reconnectMaxMillis, TimeUnit.MILLISECONDS)) {
+            throw new IllegalStateException("publish stream did not start before deadline");
+        }
+        ClientCallStreamObserver<byte[]> requests = requestRef.get();
+        long deadlineNanos = System.nanoTime()
+                + TimeUnit.MILLISECONDS.toNanos(config.reconnectMaxMillis);
         try {
-            for (byte[] message : wire) {
-                requests.onNext(message);
+            for (T item : items) {
+                awaitReady(requests, readiness, reply, deadlineNanos);
+                requests.onNext(encoder.apply(item));
             }
             requests.onCompleted();
-            byte[] summary = reply.get(config.reconnectMaxMillis, TimeUnit.MILLISECONDS);
+            long remaining = Math.max(1L, deadlineNanos - System.nanoTime());
+            byte[] summary = reply.get(remaining, TimeUnit.NANOSECONDS);
             return new EdgeSummaries.PublishSummary(EdgeSummaries.decodeFlat(summary));
         } catch (java.util.concurrent.ExecutionException e) {
-            requests.onError(e);
+            requests.cancel("publish stream failed", e.getCause());
             if (e.getCause() instanceof StatusRuntimeException) {
                 throw (StatusRuntimeException) e.getCause();
             }
             throw new IllegalStateException("publish stream failed", e.getCause());
         } catch (java.util.concurrent.TimeoutException e) {
-            requests.onError(e);
+            requests.cancel("publish stream timed out", e);
             throw new IllegalStateException("publish stream timed out waiting for summary", e);
+        } catch (RuntimeException e) {
+            requests.cancel("publish stream local validation failed", e);
+            throw e;
+        }
+    }
+
+    /**
+     * 业务作用：等待 grpc-java 宣布下一条消息可写，把 HTTP/2 flow-control 变成调用线程背压。
+     *
+     * @param requests 当前 client-streaming 请求控制器
+     * @param readiness onReady 唤醒监视器
+     * @param reply 对端完成/失败信号，避免已失败后继续等待
+     * @param deadlineNanos 本段发送与回执共用的单调时钟截止点
+     * @throws InterruptedException 调用线程被取消
+     * @throws java.util.concurrent.TimeoutException 截止点前始终不可写
+     */
+    private static void awaitReady(
+            ClientCallStreamObserver<byte[]> requests,
+            Object readiness,
+            java.util.concurrent.CompletableFuture<byte[]> reply,
+            long deadlineNanos)
+            throws InterruptedException, java.util.concurrent.TimeoutException {
+        synchronized (readiness) {
+            while (!requests.isReady() && !reply.isDone()) {
+                long remaining = deadlineNanos - System.nanoTime();
+                if (remaining <= 0) {
+                    throw new java.util.concurrent.TimeoutException(
+                            "publish stream remained flow-control blocked");
+                }
+                TimeUnit.NANOSECONDS.timedWait(readiness, remaining);
+            }
         }
     }
 
@@ -291,17 +441,55 @@ public final class EdgeClient {
 
     /** 按统一 proto 编码 `FramePush { bytes payload = 1; }`。 */
     byte[] encodeFramePush(byte[] payload) {
-        int lenBytes = varintLength(payload.length);
-        long wireLength = 1L + lenBytes + payload.length;
-        if (wireLength > config.maxMessageBytes) {
-            throw new IllegalArgumentException(
-                    "FramePush wire length " + wireLength + " exceeds " + config.maxMessageBytes);
-        }
+        return encodeFramePush(payload, null);
+    }
+
+    /**
+     * 业务作用：按统一 proto 编码 payload 与可选 {@code coalesce_key}，不依赖生成代码。
+     *
+     * @param payload 业务 protobuf 字节
+     * @param coalesceKey 空缺或 1..=256 字节合并键
+     * @return FramePush protobuf message 字节
+     */
+    byte[] encodeFramePush(byte[] payload, byte[] coalesceKey) {
+        int wireLength = validateFramePushSize(payload.length, coalesceKey);
         byte[] wire = new byte[(int) wireLength];
         wire[0] = 0x0a;
         int cursor = writeVarint(payload.length, wire, 1);
         System.arraycopy(payload, 0, wire, cursor, payload.length);
+        cursor += payload.length;
+        if (coalesceKey != null) {
+            wire[cursor++] = 0x12;
+            cursor = writeVarint(coalesceKey.length, wire, cursor);
+            System.arraycopy(coalesceKey, 0, wire, cursor, coalesceKey.length);
+        }
         return wire;
+    }
+
+    /**
+     * 业务作用：无分配校验 FramePush 精确 wire 长度，供整段预检与逐条编码共用。
+     *
+     * @param payloadLength 业务 payload 字节数
+     * @param coalesceKey 空缺或 1..=256 字节合并键
+     * @return FramePush protobuf message 字节数
+     * @throws IllegalArgumentException 超过配置或 Java 数组边界
+     */
+    private int validateFramePushSize(int payloadLength, byte[] coalesceKey) {
+        int lenBytes = varintLength(payloadLength);
+        long wireLength = 1L + lenBytes + payloadLength;
+        if (coalesceKey != null) {
+            if (coalesceKey.length == 0 || coalesceKey.length > MAX_COALESCE_KEY_BYTES) {
+                throw new IllegalArgumentException(
+                        "FramePush coalesce_key length " + coalesceKey.length
+                                + " is outside 1..=" + MAX_COALESCE_KEY_BYTES);
+            }
+            wireLength += 1L + varintLength(coalesceKey.length) + coalesceKey.length;
+        }
+        if (wireLength > config.maxMessageBytes || wireLength > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                    "FramePush wire length " + wireLength + " exceeds " + config.maxMessageBytes);
+        }
+        return (int) wireLength;
     }
 
     /**

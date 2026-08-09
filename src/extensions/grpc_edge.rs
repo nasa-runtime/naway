@@ -1,8 +1,8 @@
 //! V8 gRPC 边缘模式(架构规范 §25.2 2026-08-02 深审修订版 / 验收记录 V8-0R)——构建期契约层。
 //!
 //! 本文件负责 route 级 `grpc_edge` 与进程级 `grpc_edge_cluster` 的解析定型和构建期
-//! 拒绝矩阵。V8-1..V8-3 数据面分别位于 `edge_hub`、`proxy` 与 `edge_relay`；本层
-//! 必须拒绝所有尚未落地的 V8-4+ 选项，避免配置成功但运行时静默退化。
+//! 拒绝矩阵。数据面分别位于 `edge_hub`、`proxy` 与 `edge_relay`；本层必须拒绝任何
+//! 没有运行时执行语义的选项，避免配置成功但静默退化。
 //!
 //! 校验顺序刻意是【值校验在前、feature 门在后】:这样"坏配置逐条被拒"的报错
 //! 文案在默认/`--features grpc-edge`/`--all-features` 三种构建形态下完全一致,
@@ -29,7 +29,7 @@ const MAX_QUEUE_MESSAGES: usize = 65_536;
 /// 单队列逻辑字节硬上限:1 GiB。逻辑字节按帧/record 全长计费。
 const MAX_QUEUE_BYTES: usize = 1024 * 1024 * 1024;
 /// 单条 protobuf message body(不含 5 字节 gRPC 前缀)硬上限:16 MiB。
-/// V8-2 decoder 必须先校验 prefix 中的 length 再申请重组内存。
+/// decoder 必须先校验 prefix 中的 length 再申请重组内存。
 /// 边缘散出面向行情/IM 小帧,更大负载应走普通 L7。
 const MAX_MSG_BYTES: usize = 16 * 1024 * 1024;
 /// gRPC message 前缀长度(compressed flag 1B + big-endian length 4B)。
@@ -67,11 +67,11 @@ const MAX_FULL_MESH_NODES_CAP: usize = 256;
 /// §25.2.2 的全网状建议基线。**在 interest 路由落地之前这也是实际可用上限**:
 /// 超过它就必须靠 interest 收敛流量,而那套机制尚未实现,盲广播会按 O(N²) 打爆网络。
 const RECOMMENDED_FULL_MESH_NODES: usize = 32;
-/// V8-7 目录租约 TTL 下界(ms):续租按 TTL/3 触发,过短会让在线 session 频繁抖动。
+/// 目录租约 TTL 下界（ms）：续租按 TTL/3 触发，过短会让在线 session 频繁抖动。
 const MIN_DIRECTORY_TTL_MS: u64 = 3_000;
-/// V8-7 目录租约 TTL 上界(ms):崩溃节点的脏条目最多滞留这么久。
+/// 目录租约 TTL 上界（ms）：崩溃节点的脏条目最多滞留这么久。
 const MAX_DIRECTORY_TTL_MS: u64 = 3_600_000;
-/// V8-7 单条目录命令硬超时上界(ms)。
+/// 单条目录命令硬超时上界（ms）。
 const MAX_DIRECTORY_COMMAND_TIMEOUT_MS: u64 = 5_000;
 /// cluster_id 字节上限。
 const MAX_CLUSTER_ID_BYTES: usize = 64;
@@ -109,6 +109,7 @@ pub struct GrpcEdgeIdentityPlan {
 }
 
 /// 已编译节点级预算与基数上限(§25.2.5)。
+#[derive(Clone)]
 pub struct GrpcEdgeLimitsPlan {
     /// 单条 message body 字节上限(不含 5 字节前缀)。
     pub max_msg_bytes: usize,
@@ -277,11 +278,11 @@ pub struct GrpcEdgePublishStreamPlan {
 pub enum GrpcEdgeAction {
     /// 终端订阅(server-streaming 自响应)。
     Subscribe,
-    /// 后端 unary 群播(V8-2)。
+    /// 后端 unary 群播。
     Publish,
-    /// 后端 client-streaming 群播(V8-2)。
+    /// 后端 client-streaming 群播。
     PublishStream,
-    /// 后端定向单播(V8-2/V8-4)。
+    /// 后端定向单播。
     Push,
 }
 
@@ -334,9 +335,9 @@ pub struct GrpcEdgePlan {
     pub limits: GrpcEdgeLimitsPlan,
     /// 发布面 PublishStream 单流四门。
     pub publish_stream: GrpcEdgePublishStreamPlan,
-    /// V8-8:WS 桥接入口路径(None=不开桥)。
+    /// WS 桥接入口路径（None=不开桥）。
     pub ws_bridge_path: Option<Box<str>>,
-    /// V8-9:发布/订阅授权策略。edge route 必须显式配置；每 action 独立
+    /// 发布/订阅授权策略。edge route 必须显式配置；每 action 独立
     /// deny-by-default，刻意公开时也必须写 `*`。
     pub authz: Option<GrpcEdgeAuthzPlan>,
 }
@@ -443,7 +444,7 @@ impl GrpcEdgePlan {
         )?;
         validate_send_queue(route_id, &cfg.send_queue, max_msg_bytes)?;
         let publish_stream = build_publish_stream(route_id, &cfg.publish_stream, max_msg_bytes)?;
-        // V8-8:桥接只是 subscribe 的另一层传输外壳,发布/推送面不得开桥。
+        // 桥接只是 subscribe 的另一层传输外壳，发布/推送面不得开桥。
         let ws_bridge_path = match cfg.ws_bridge_path.as_deref().map(str::trim) {
             None | Some("") => None,
             Some(path) => {
@@ -571,7 +572,7 @@ pub struct GrpcEdgeClusterPlan {
     pub membership: GrpcEdgeMembershipCfg,
     /// `membership: static` 时已解析去重的 peer relay endpoint。
     pub static_peers: Vec<SocketAddr>,
-    /// 内部 relay 监听地址(V8-3 绑定;仅接受 peer 身份)。
+    /// 内部 relay 监听地址；仅接受 peer 身份。
     pub relay_listen: SocketAddr,
     /// peer 鉴别方式(V8-3b 起 mtls 与 cluster_secret 均已落地;非 loopback 强制 TLS)。
     pub peer_auth: GrpcEdgePeerAuthCfg,
@@ -587,15 +588,15 @@ pub struct GrpcEdgeClusterPlan {
     pub ack_deadline_ms: u64,
     /// 全网状节点数硬门。
     pub full_mesh_max_nodes: usize,
-    /// 兴趣路由策略(V8-5 落地;V8-0R 仅定型)。
+    /// 兴趣路由策略；当前大集群模式仍由构建期硬门拒绝。
     pub interest_route: GrpcEdgeInterestRouteCfg,
-    /// 顺序承诺(group_owner 到 V8-5 才生效)。
+    /// 顺序承诺；`group_owner` 通过确定性 owner 生效。
     pub ordering: GrpcEdgeOrderingCfg,
     /// 用户会话语义。
     pub session_mode: GrpcEdgeSessionModeCfg,
     /// 指路条后端(none=broadcast-probe)。
     pub session_registry: GrpcEdgeSessionRegistryCfg,
-    /// V8-7 目录参数(仅 session_registry=redis 时 Some)。
+    /// 目录参数（仅 `session_registry=redis` 时 Some）。
     pub session_directory: Option<crate::config::model::GrpcEdgeSessionDirectoryCfg>,
     /// relay 收包散出的节点级预算(§25.2.9)。relay 侧没有 route 计划可依,预算必须由
     /// 集群块显式给出;`max_msg_bytes` 恒为协议硬上限,不随配置放宽。
@@ -717,15 +718,6 @@ impl GrpcEdgeClusterPlan {
                      settings so one message cannot traverse two cluster transports"
                 );
             }
-            if cfg.ordering == GrpcEdgeOrderingCfg::GroupOwner {
-                bail!("grpc_edge_cluster.ordering=group_owner is not implemented for redis_pubsub");
-            }
-            if cfg.session_mode == GrpcEdgeSessionModeCfg::SingleSession {
-                bail!(
-                    "grpc_edge_cluster.session_mode=single_session is not implemented for \
-                     redis_pubsub"
-                );
-            }
             let redis = &cfg.redis_pubsub;
             if redis.url.trim().is_empty() {
                 bail!("grpc_edge_cluster.mode=redis_pubsub requires redis_pubsub.url");
@@ -814,15 +806,6 @@ impl GrpcEdgeClusterPlan {
                 bail!(
                     "grpc_edge_cluster.mode=redis_stream is mutually exclusive with relay_listen, \
                      static_peers, tls, cluster_secret, session_registry and redis_pubsub"
-                );
-            }
-            if cfg.ordering == GrpcEdgeOrderingCfg::GroupOwner {
-                bail!("grpc_edge_cluster.ordering=group_owner is not implemented for redis_stream");
-            }
-            if cfg.session_mode == GrpcEdgeSessionModeCfg::SingleSession {
-                bail!(
-                    "grpc_edge_cluster.session_mode=single_session is not implemented for \
-                     redis_stream"
                 );
             }
             let redis = &cfg.redis_stream;
@@ -958,7 +941,7 @@ impl GrpcEdgeClusterPlan {
                     bail!(
                         "grpc_edge_cluster.static_peers has {} peers plus this node, exceeding \
                          full_mesh_max_nodes={}; full-mesh relay is a small-cluster baseline — \
-                         larger clusters must wait for V8-5 interest/group-owner routing instead \
+                         larger clusters require implemented interest/group-owner routing instead \
                          of O(N^2) blind broadcast",
                         cfg.static_peers.len(),
                         cfg.full_mesh_max_nodes
@@ -1004,11 +987,8 @@ impl GrpcEdgeClusterPlan {
                  the ingress aggregates peer enqueue-acks within this fixed deadline"
             );
         }
-        // interest 路由至今未实现:`interest_route` 只进计划,relay 运行时从不查询它,
-        // 无论集群多大都是 O(nodes × message_bytes) 盲广播。`auto` 是默认值不能直接拒
-        // (会打断所有既有配置),但**不能让配置在需要它才成立的规模下静默通过**——
-        // 那等于承诺一个不存在的自动收敛能力,而代价是真的把网络打爆。
-        // 门设在 §25.2.2 的建议基线 32:小于等于它,盲广播是被明确接受的基线行为。
+        // broadcast_all 明确接受 O(nodes × message_bytes) 基线，因此超过建议规模时拒绝；
+        // auto 已由 relay interest revision/hint 实现，不再沿用早期“尚未实现”的注释。
         if cfg.interest_route == GrpcEdgeInterestRouteCfg::BroadcastAll
             && cfg.full_mesh_max_nodes > RECOMMENDED_FULL_MESH_NODES
         {
@@ -1019,9 +999,9 @@ impl GrpcEdgeClusterPlan {
                 cfg.full_mesh_max_nodes
             );
         }
-        // relay 模式实现 group_owner 与 single_session；两者在 mesh 不完整时运行期
-        // fail-closed，不能退化成乱序或多会话。Redis 两种总线仍在各自分支显式拒绝。
-        // V8-7:目录是可选加速面,值校验与 feature 门同款"先值后 feature"。
+        // relay 模式在 mesh 不完整时 fail-closed；Redis 模式则以 channel/stream 顺序、
+        // Redis TIME membership 与 fencing ACK 实现同等级保护，不能退化成 local-first。
+        // 目录是可选加速面；值校验必须先于 feature 门，避免坏配置因制品差异被掩盖。
         let session_directory = match cfg.session_registry {
             GrpcEdgeSessionRegistryCfg::None => None,
             GrpcEdgeSessionRegistryCfg::Redis => {
@@ -1115,7 +1095,7 @@ impl GrpcEdgeClusterPlan {
                 HeaderValue::try_from(secret.as_str()).map_err(|_| {
                     anyhow::anyhow!(
                         "grpc_edge_cluster.cluster_secret must resolve to a valid HTTP header \
-                         value because V8-3 cluster_secret authentication is carried in `{}`",
+                         value because cluster_secret authentication is carried in `{}`",
                         "x-naway-relay-secret"
                     )
                 })?;
@@ -1610,13 +1590,6 @@ fn validate_send_queue(
             "route `{route_id}` grpc_edge.send_queue.max_bytes must be within 1..={MAX_QUEUE_BYTES}"
         );
     }
-    if queue.overflow == GrpcEdgeOverflowCfg::LatestByKey {
-        bail!(
-            "route `{route_id}` grpc_edge.send_queue.overflow=latest_by_key is not implemented; \
-             opaque FramePush payloads expose no bounded replacement key, so silently treating \
-             it as drop_oldest would violate the configured semantics"
-        );
-    }
     let min_frame = max_msg_bytes + GRPC_MESSAGE_PREFIX_BYTES;
     if queue.max_bytes < min_frame {
         bail!(
@@ -1644,10 +1617,7 @@ fn validate_relay_queue(queue: &GrpcEdgeRelayQueueCfg) -> Result<()> {
              relay stream punishes every subscriber behind that node — use drop_new (default) \
              or drop_oldest"
         ),
-        GrpcEdgeOverflowCfg::LatestByKey => bail!(
-            "grpc_edge_cluster.relay_queue.overflow=latest_by_key is not implemented; relay \
-             records do not carry a bounded replacement key in V8-3"
-        ),
+        GrpcEdgeOverflowCfg::LatestByKey => {}
         _ => {}
     }
     Ok(())

@@ -13,10 +13,13 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 
 use crate::config::model::{
-    DiscoveryCfg, StaticInstanceCfg, StaticServiceCfg, UpstreamPrewarmCfg, UpstreamsCfg,
+    DiscoveryCfg, StaticInstanceCfg, StaticServiceCfg, UpstreamLocalityCfg, UpstreamPrewarmCfg,
+    UpstreamsCfg,
 };
 use crate::config::resolve_relative;
-use crate::tls::{build_upstream_tls_profile, UpstreamTlsProfile};
+use crate::tls::{
+    build_upstream_tls_profile, build_upstream_tls_profile_with_material, UpstreamTlsProfile,
+};
 
 /// 服务发现快照提供者。
 pub trait ServiceRegistry: Send + Sync {
@@ -134,6 +137,56 @@ impl DynamicUpstreamStore {
         self.services.store(Arc::new(next));
     }
 
+    /// 业务作用：把一个控制面 response 中的多个动态服务作为同一事务发布，并清除该
+    /// owner 本轮已省略的服务，避免请求看到半份 EDS SotW。
+    ///
+    /// 参数说明：`managed_services` 是该 owner 独占的全部逻辑服务；`replacement` 是已完成
+    /// 全量校验的新实例表，缺失 key 表示该服务当前没有 endpoint。
+    ///
+    /// 返回：无返回值；单次 `ArcSwap::store` 后所有读者同时观察新版本，未变化身份保留
+    /// slow-start 起点。调用前必须先验证整份 response，函数本身不执行外部 IO。
+    pub fn replace_managed_services(
+        &self,
+        managed_services: &[String],
+        mut replacement: HashMap<String, Vec<UpstreamInstance>>,
+    ) {
+        // 同一 ADS response 必须只发布一次：逐服务 replace 会让并发请求观察到新旧 cluster
+        // 混合状态，ACK 后也无法证明数据面实际对应完整 nonce。
+        let _write = self
+            .write_lock
+            .lock()
+            .expect("dynamic upstream write lock poisoned");
+        let current = self.services.load();
+        let mut next = current.as_ref().clone();
+        for service in managed_services {
+            let instances = replacement.remove(service).unwrap_or_default();
+            let old = current.get(service);
+            let instances = instances
+                .into_iter()
+                .map(|mut instance| {
+                    if let Some(previous) = old.and_then(|state| {
+                        state
+                            .instances
+                            .iter()
+                            .find(|previous| previous.health_key == instance.health_key)
+                    }) {
+                        instance.created_at = previous.created_at;
+                    }
+                    Arc::new(instance)
+                })
+                .collect::<Vec<_>>()
+                .into();
+            next.insert(
+                service.clone(),
+                DynamicServiceState {
+                    instances,
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+        self.services.store(Arc::new(next));
+    }
+
     /// 原子移除一个动态服务及其 freshness 状态。
     pub fn remove_service(&self, service: &str) {
         // 串行化写者(见结构体注释):否则 reconcile 的 remove 可能被并发 touch/replace 覆盖回退。
@@ -242,7 +295,13 @@ impl UpstreamDirectory {
         Self::build_with_dynamic_at_discovery(cfg, dynamic, &discovery, cfg_path)
     }
 
-    /// 按每个 V7 registry 后端的 stale TTL 编译动态服务目录。
+    /// 业务作用：按每个 registry 的 stale TTL、协议/TLS、健康、预热和 locality 策略编译
+    /// 完整服务目录；这是候选 Snapshot 发布前的统一 fail-closed 入口。
+    ///
+    /// 参数说明：`cfg` 是上游声明；`dynamic` 是常驻发现事实源；`discovery` 提供各后端
+    /// freshness 契约；`cfg_path` 用于解析 TLS 相对路径。
+    ///
+    /// 返回：全部服务和实例校验成功时返回不可变目录，任一协议/zone/资源配置非法则失败。
     pub fn build_with_dynamic_at_discovery(
         cfg: &UpstreamsCfg,
         dynamic: Arc<DynamicUpstreamStore>,
@@ -303,6 +362,9 @@ impl UpstreamDirectory {
                         "service `{name}` source=kubernetes registry_port cannot be zero"
                     );
                 }
+                // xDS transport 是否启用、bootstrap/owner 是否安全由配置层统一门禁；目录层只
+                // 负责把该服务固定为动态 EDS 事实源，避免和任一本地 registry worker 双写。
+                ServiceSource::Xds => {}
             }
             if source != ServiceSource::Static {
                 anyhow::ensure!(
@@ -315,13 +377,45 @@ impl UpstreamDirectory {
             let scheme = svc.scheme.as_deref().unwrap_or("http").trim().to_string();
             validate_upstream_scheme(&scheme)
                 .with_context(|| format!("service `{name}` scheme"))?;
-            let tls_profile = build_service_tls_profile(cfg_path, name, svc)
+            if source != ServiceSource::Static && protocol == UpstreamProtocol::H3 {
+                anyhow::ensure!(
+                    scheme == "https",
+                    "service `{name}` protocol=h3 requires scheme=https for discovered instances"
+                );
+            }
+            let mut tls_profile = build_service_tls_profile(cfg_path, name, svc)
                 .with_context(|| format!("service `{name}` tls"))?;
+            if protocol == UpstreamProtocol::H3 && tls_profile.is_none() {
+                // Hyper 的 HTTPS connector 会隐式创建 native-root TLS config；H3 自有 Quinn
+                // connector 必须显式持有同等 profile，才能把 CA/SNI/ALPN 纳入连接池身份。
+                tls_profile = Some(
+                    build_upstream_tls_profile(None, None, None, None)
+                        .with_context(|| format!("service `{name}` HTTP/3 native TLS profile"))?,
+                );
+            }
             let prewarm = svc
                 .prewarm
                 .as_ref()
                 .map(|cfg| UpstreamPrewarmPolicy::parse(cfg, name))
                 .transpose()?;
+            let locality = svc
+                .locality
+                .as_ref()
+                .map(|cfg| UpstreamLocalityPolicy::parse(cfg, name))
+                .transpose()?;
+            let active_health = match &svc.health_check {
+                Some(cfg) => {
+                    let policy = crate::health::ActiveHealthPolicy::parse(cfg)
+                        .with_context(|| format!("service `{name}` health_check"))?;
+                    // gRPC Health 必须在快照发布前绑定到 HTTP/2-capable transport；若等到
+                    // 后台探测再失败，实例会被持续误摘且旧配置已失去 LKG 保护机会。
+                    policy
+                        .validate_protocol(protocol)
+                        .with_context(|| format!("service `{name}` health_check transport"))?;
+                    Some(policy)
+                }
+                None => None,
+            };
             let mut instances = Vec::with_capacity(svc.instances.len());
             for inst in &svc.instances {
                 instances.push(Arc::new(
@@ -353,14 +447,9 @@ impl UpstreamDirectory {
                         max_fails: svc.max_fails,
                         fail_timeout_ms: svc.fail_timeout_ms,
                     },
-                    active_health: match &svc.health_check {
-                        Some(hc) => Some(
-                            crate::health::ActiveHealthPolicy::parse(hc)
-                                .with_context(|| format!("service `{name}` health_check"))?,
-                        ),
-                        None => None,
-                    },
+                    active_health,
                     prewarm,
+                    locality,
                     instances: instances.into(),
                     protocol,
                     tls_profile,
@@ -384,6 +473,9 @@ impl UpstreamDirectory {
                         ServiceSource::Eureka => discovery.eureka.stale_ttl_ms,
                         ServiceSource::Dns => discovery.dns.stale_ttl_ms,
                         ServiceSource::Kubernetes => discovery.kubernetes.stale_ttl_ms,
+                        // ADS 断线由 xDS 状态机与 readiness 管理；已 ACK 的 LKG 不按本地 TTL
+                        // 静默过期，否则短暂控制面抖动会无依据清空仍可用的数据面端点。
+                        ServiceSource::Xds => 0,
                     },
                 },
             );
@@ -488,7 +580,8 @@ impl UpstreamDirectory {
         self.select_instance_where(service, |key| excluded.contains(key), load, rr)
     }
 
-    /// 用调用方提供的借用式排除谓词选择实例。
+    /// 业务作用：用调用方提供的借用式排除谓词，按健康、primary/backup、locality 和 LB
+    /// 顺序选择一个真实实例；retry/hedge 可借此保证不重复命中同一身份。
     ///
     /// 该入口供数据面把「已尝试列表 + 被动摘除列表 + 主动健康集合」直接组合判断，避免每请求
     /// 合并成临时 `Vec`/`HashSet`。目录实例以共享 `Arc` 返回，选择本身不深拷贝 URI、TLS 或 metadata。
@@ -514,7 +607,14 @@ impl UpstreamDirectory {
     {
         let svc = self.services.get(service)?;
         let instances = self.instances_for(service, svc);
-        select_instance_from_slice(instances.as_slice(), svc.lb_policy, is_excluded, load, rr)
+        select_instance_from_slice(
+            instances.as_slice(),
+            svc.lb_policy,
+            svc.locality.as_ref(),
+            is_excluded,
+            load,
+            rr,
+        )
     }
 
     /// 查询服务级 `proxy_next_upstream` 策略。
@@ -534,7 +634,8 @@ impl UpstreamDirectory {
             .is_some_and(|svc| svc.lb_policy == LbPolicy::LeastConn)
     }
 
-    /// 返回所有未就绪的关键服务名,用于 `/readyz` 判定(§24)。
+    /// 业务作用：返回所有未就绪的关键服务名，供 `/readyz` 与真实 locality-aware 选择保持
+    /// 同一可用性口径，避免前置 LB 把流量送给已无允许 zone 容量的节点。
     ///
     /// 「就绪」= 该 critical 服务至少有一个**既 selectable(healthy && !down)、又未被主动探测判死**的实例。
     /// 关键:与「选实例」用**同一份可用集**(`instances_for`,Nacos 已按 stale_ttl 门控,N1),使 readyz 与 select
@@ -543,6 +644,8 @@ impl UpstreamDirectory {
     ///
     /// # 参数
     /// - `active_unhealthy`: 主动健康探测当前判为不健康的 URI 集合(§5.1);传引用免拷贝,为空表示未配探测或全健康。
+    ///
+    /// 返回：所有没有可选实例的 critical service 名；空数组表示关键依赖已就绪。
     pub fn critical_not_ready(&self, active_unhealthy: &HashSet<String>) -> Vec<String> {
         self.services
             .iter()
@@ -554,6 +657,10 @@ impl UpstreamDirectory {
                 let instances = self.instances_for(name, svc);
                 let has_usable = instances.as_slice().iter().any(|inst| {
                     inst.is_selectable()
+                        && svc
+                            .locality
+                            .as_ref()
+                            .is_none_or(|policy| policy.rank(inst.zone.as_deref()).is_some())
                         && !active_unhealthy.contains(inst.uri.as_ref())
                         && !active_unhealthy.contains(inst.health_key.as_ref())
                 });
@@ -595,6 +702,7 @@ impl UpstreamDirectory {
                 base: instance.uri.clone(),
                 health_key: instance.health_key.clone(),
                 protocol: instance.protocol,
+                connect_timeout_ms: instance.connect_timeout_ms,
                 tls_profile: instance.tls_profile.clone(),
                 policy: policy.clone(),
             })
@@ -620,10 +728,16 @@ impl UpstreamDirectory {
         (services, identities)
     }
 
+    /// 业务作用：生成 Admin 只读发现视图，列出 native 与 xDS 上游的当前实例和可选择数量。
+    ///
     /// Admin 只读发现视图(§14 / §34 V4「Admin UI 展示服务/实例/metadata」):列出所有上游服务及其
     /// **当前**实例(static 来自 yml,nacos 来自动态目录的 last-known-good),供管理面/运维查看拓扑与健康。
     /// 只读、不进请求热路径;实例的 `healthy` 是发现/静态标记,主动探测的不健康态由 `/metrics` 的
     /// `gw_upstream_healthy{service}` 反映(此处不并入,避免管理视图与探测器强耦合)。
+    ///
+    /// 参数说明：`route_refs` 是逻辑服务到 route id 的低频反向索引。
+    ///
+    /// 返回：按服务名稳定排序的 JSON；不会修改发现状态或触发外部查询。
     pub fn service_view_json(
         &self,
         route_refs: &HashMap<String, Vec<String>>,
@@ -642,6 +756,7 @@ impl UpstreamDirectory {
                     ServiceSource::Eureka => "eureka",
                     ServiceSource::Dns => "dns",
                     ServiceSource::Kubernetes => "kubernetes",
+                    ServiceSource::Xds => "xds",
                 };
                 let current_instances = self.instances_for(name, svc);
                 let instances: Vec<serde_json::Value> = current_instances
@@ -716,7 +831,11 @@ impl UpstreamDirectory {
             .collect()
     }
 
-    /// 枚举 Consul/Eureka/DNS/K8s 后台轮询 worker 规格。
+    /// 业务作用：枚举 Consul/Eureka/DNS/K8s 后台轮询 worker 规格，并排除 xDS 独占服务以防双写。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：仅 native registry 服务的不可变 watch 规格。
     pub fn registry_watch_specs(&self) -> Vec<RegistryWatchSpec> {
         self.services
             .iter()
@@ -726,7 +845,9 @@ impl UpstreamDirectory {
                     ServiceSource::Eureka => RegistryKind::Eureka,
                     ServiceSource::Dns => RegistryKind::Dns,
                     ServiceSource::Kubernetes => RegistryKind::Kubernetes,
-                    ServiceSource::Static | ServiceSource::Nacos => return None,
+                    ServiceSource::Static | ServiceSource::Nacos | ServiceSource::Xds => {
+                        return None;
+                    }
                 };
                 Some(RegistryWatchSpec {
                     kind,
@@ -745,7 +866,34 @@ impl UpstreamDirectory {
             .collect()
     }
 
-    /// 枚举配置了主动健康探测的服务及其当前实例(静态来自 yml,nacos 来自动态目录),供后台探测任务。
+    /// 业务作用：枚举当前快照由 EDS 独占端点事实的逻辑服务，供单个 ADS task 建立
+    /// physical cluster 到本地 service 的确定映射。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：每个 `source: xds` 服务的一份不可变转换规格；不包含 native registry 服务。
+    pub fn xds_watch_specs(&self) -> Vec<XdsWatchSpec> {
+        self.services
+            .iter()
+            .filter(|(_, svc)| svc.source == ServiceSource::Xds)
+            .map(|(logical_service, svc)| XdsWatchSpec {
+                logical_service: logical_service.clone(),
+                cluster_name: svc.registry_service.clone(),
+                protocol: svc.protocol,
+                connect_timeout_ms: 0,
+                scheme: svc.scheme.clone(),
+                slow_start_ms: svc.slow_start_ms,
+                tls_profile: svc.tls_profile.clone(),
+            })
+            .collect()
+    }
+
+    /// 业务作用：枚举配置了主动健康探测的服务及其当前实例，并传递实例的
+    /// 真实传输协议，供后台以与数据面相同的 H1/H2/H3 语义探测。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：当前快照中的服务、策略与可见实例列表；未配置探测的服务不返回。
     pub fn active_health_targets(&self) -> Vec<crate::health::HealthTarget> {
         self.services
             .iter()
@@ -758,6 +906,7 @@ impl UpstreamDirectory {
                     .map(|inst| crate::health::HealthInstanceTarget {
                         key: inst.health_key.to_string(),
                         uri: inst.uri.to_string(),
+                        protocol: inst.protocol,
                         tls_profile: inst.tls_profile.clone(),
                     })
                     .collect::<Vec<_>>();
@@ -770,11 +919,10 @@ impl UpstreamDirectory {
             .collect()
     }
 
-    /// 读取当前服务可参与数据面的不可变实例集合。
+    /// 业务作用：读取当前服务可参与数据面的不可变实例集合，并对需要 TTL 的 native
+    /// registry 执行 freshness 门禁；xDS 则保留最近一次 ACK 的 LKG。
     ///
-    /// # 参数
-    /// - `service`: 逻辑服务名，用于查询动态发现表。
-    /// - `svc`: 同一配置快照中的服务策略，决定实例来源与 stale TTL。
+    /// 参数说明：`service` 是动态表 key；`svc` 是同一快照中的来源与 freshness 策略。
     ///
     /// 返回：静态来源只借用快照切片；Nacos 来源只 clone 一次 `Arc`；过期/缺失时返回空视图。
     fn instances_for<'a>(
@@ -792,7 +940,8 @@ impl UpstreamDirectory {
             | ServiceSource::Consul
             | ServiceSource::Eureka
             | ServiceSource::Dns
-            | ServiceSource::Kubernetes => {
+            | ServiceSource::Kubernetes
+            | ServiceSource::Xds => {
                 if self
                     .dynamic
                     .service_fresh(service, svc.discovery_stale_ttl_ms)
@@ -852,8 +1001,10 @@ pub struct ServiceSnapshot {
     pub passive_health: PassiveHealthPolicy,
     /// 主动健康探测策略(§5.1);None = 未配置该服务的 health_check。
     pub active_health: Option<crate::health::ActiveHealthPolicy>,
-    /// 新实例进入目录后使用业务 Hyper pool 执行的一次性连接预热；None = 关闭。
+    /// 新实例进入目录后使用对应 H1/H2/H2c/H3 业务池执行的一次性连接预热；None = 关闭。
     pub prewarm: Option<UpstreamPrewarmPolicy>,
+    /// V9 可信 zone-aware 选择与有序 failover；None 保持全实例 LB。
+    locality: Option<UpstreamLocalityPolicy>,
     /// 静态实例的不可变共享切片；每请求 LB 扫描只借用，不 clone 整表。
     pub instances: Arc<[Arc<UpstreamInstance>]>,
     /// 服务默认上游 HTTP 协议；构建实例时复制，避免请求期解析字符串。
@@ -878,6 +1029,84 @@ pub struct ServiceSnapshot {
     pub slow_start_ms: u64,
     /// Nacos watch 失联后 last-known-good 最长可用时间(ms)。
     pub discovery_stale_ttl_ms: u64,
+}
+
+/// 已校验的 zone-aware locality 与 failover 顺序。
+#[derive(Clone)]
+struct UpstreamLocalityPolicy {
+    local_zone: Arc<str>,
+    failover_zones: Arc<[Arc<str>]>,
+    allow_unlisted: bool,
+}
+
+impl UpstreamLocalityPolicy {
+    /// 业务作用：把声明式 zone 顺序编译成只读策略，在快照发布前拒绝空值、
+    /// 重复 zone 和过长标识，避免数据面出现模糊 failover 顺序。
+    ///
+    /// 参数说明：`cfg` 是 service 级 locality 声明；`service` 用于定位构建错误。
+    ///
+    /// 返回：成功时返回按 local→failover 排序的不可变策略；非法 zone 拒绝快照。
+    fn parse(cfg: &UpstreamLocalityCfg, service: &str) -> Result<Self> {
+        let local_zone = validate_zone(&cfg.local_zone)
+            .with_context(|| format!("service `{service}` locality.local_zone"))?;
+        let mut seen = HashSet::new();
+        seen.insert(local_zone.clone());
+        let mut failover_zones = Vec::with_capacity(cfg.failover_zones.len());
+        for raw in &cfg.failover_zones {
+            let zone = validate_zone(raw)
+                .with_context(|| format!("service `{service}` locality.failover_zones"))?;
+            anyhow::ensure!(
+                seen.insert(zone.clone()),
+                "service `{service}` locality contains duplicate zone `{zone}`"
+            );
+            failover_zones.push(Arc::<str>::from(zone));
+        }
+        Ok(Self {
+            local_zone: Arc::from(local_zone),
+            failover_zones: failover_zones.into(),
+            allow_unlisted: cfg.allow_unlisted,
+        })
+    }
+
+    /// 业务作用：将实例 zone 映射为本区优先、指定跨区次之、未列最后的稳定等级。
+    ///
+    /// 参数说明：`zone` 是可信配置或发现 metadata 中的实例 zone。
+    ///
+    /// 返回：可参与选择时返回越小越优先的 rank；未列且禁止降级时返回 None。
+    fn rank(&self, zone: Option<&str>) -> Option<usize> {
+        if zone == Some(self.local_zone.as_ref()) {
+            return Some(0);
+        }
+        if let Some(index) = self
+            .failover_zones
+            .iter()
+            .position(|candidate| zone == Some(candidate.as_ref()))
+        {
+            return Some(index + 1);
+        }
+        self.allow_unlisted
+            .then_some(self.failover_zones.len().saturating_add(1))
+    }
+}
+
+/// 校验并规范化一个 locality zone 标识。
+///
+/// 业务作用：对手写配置与发现 metadata 使用同一字节边界，防止空白/过长值
+/// 进入快照或绕过 zone 精确比较。
+///
+/// 参数说明：`raw` 是外部 zone 字符串。
+///
+/// 返回：去除首尾空白的 zone；空值或超过 128 bytes 时返回错误。
+fn validate_zone(raw: &str) -> Result<String> {
+    let zone = raw.trim();
+    anyhow::ensure!(!zone.is_empty(), "zone must not be empty");
+    anyhow::ensure!(zone.len() <= 128, "zone must be <= 128 bytes");
+    anyhow::ensure!(
+        zone.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+        "zone must contain only ASCII letters, digits, '.', '_' or '-'"
+    );
+    Ok(zone.to_owned())
 }
 
 /// 构建期校验后的连接预热策略。
@@ -923,6 +1152,7 @@ pub(crate) struct UpstreamPrewarmTarget {
     pub base: Arc<str>,
     pub health_key: Arc<str>,
     pub protocol: UpstreamProtocol,
+    pub connect_timeout_ms: u64,
     pub tls_profile: Option<UpstreamTlsProfile>,
     pub policy: UpstreamPrewarmPolicy,
 }
@@ -942,9 +1172,16 @@ pub enum ServiceSource {
     Dns,
     /// Kubernetes Endpoints 实例。
     Kubernetes,
+    /// xDS v3 EDS ClusterLoadAssignment 实例。
+    Xds,
 }
 
 impl ServiceSource {
+    /// 业务作用：把声明式服务来源编译成封闭枚举，防止未知 provider 在运行期退化成静态服务。
+    ///
+    /// 参数说明：`raw` 是 `upstreams.services.*.source` 的规范小写值。
+    ///
+    /// 返回：已支持来源返回枚举；未知值返回带允许集合的构建错误。
     fn parse(raw: &str) -> Result<Self> {
         match raw {
             "static" | "" => Ok(Self::Static),
@@ -953,8 +1190,9 @@ impl ServiceSource {
             "eureka" => Ok(Self::Eureka),
             "dns" => Ok(Self::Dns),
             "k8s" | "kubernetes" => Ok(Self::Kubernetes),
+            "xds" => Ok(Self::Xds),
             other => anyhow::bail!(
-                "unsupported upstream source `{other}` (static|nacos|consul|eureka|dns|kubernetes)"
+                "unsupported upstream source `{other}` (static|nacos|consul|eureka|dns|kubernetes|xds)"
             ),
         }
     }
@@ -977,6 +1215,25 @@ pub struct NacosWatchSpec {
     pub slow_start_ms: u64,
     /// watch 失联后 last-known-good 最长保留时间。
     pub stale_ttl_ms: u64,
+    /// 动态 HTTPS 实例共享的已验证 TLS profile。
+    pub tls_profile: Option<UpstreamTlsProfile>,
+}
+
+/// EDS ClusterLoadAssignment 到一个本地逻辑服务的不可变转换规格。
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct XdsWatchSpec {
+    /// gateway 配置中的逻辑服务名。
+    pub logical_service: String,
+    /// management server 发布的 EDS cluster 名；缺省等于逻辑服务名。
+    pub cluster_name: String,
+    /// 转发使用的上游 HTTP 协议。
+    pub protocol: UpstreamProtocol,
+    /// CDS Cluster.connect_timeout；0 仅用于 EDS-only native cluster profile，保持既有连接行为。
+    pub connect_timeout_ms: u64,
+    /// EDS socket address 拼接 URI 时使用的 scheme。
+    pub scheme: String,
+    /// 新实例默认 slow-start 时长。
+    pub slow_start_ms: u64,
     /// 动态 HTTPS 实例共享的已验证 TLS profile。
     pub tls_profile: Option<UpstreamTlsProfile>,
 }
@@ -1182,7 +1439,7 @@ impl PassiveHealthPolicy {
     }
 }
 
-/// 上游 HTTP 协议偏好(review L1 / §5):决定转发时给上游请求打什么版本 hint。
+/// 上游 HTTP 协议选择：决定转发进入 Hyper H1/H2、raw H2c 还是 QUIC/H3 transport。
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum UpstreamProtocol {
     /// 自动:普通 http 走 h1;gRPC(content-type=application/grpc)走 h2。
@@ -1193,6 +1450,8 @@ pub enum UpstreamProtocol {
     H2,
     /// 强制明文 HTTP/2 prior-knowledge(h2c)。
     H2c,
+    /// 强制 HTTP/3 over QUIC；只允许 https:// 实例且要求编译 `http3` feature。
+    H3,
 }
 
 impl UpstreamProtocol {
@@ -1202,7 +1461,21 @@ impl UpstreamProtocol {
             "h1" | "http1" | "http/1.1" => Ok(Self::H1),
             "h2" | "http2" => Ok(Self::H2),
             "h2c" => Ok(Self::H2c),
-            other => anyhow::bail!("unsupported upstream protocol `{other}` (auto|h1|h2|h2c)"),
+            "h3" | "http3" => {
+                #[cfg(feature = "http3")]
+                {
+                    Ok(Self::H3)
+                }
+                #[cfg(not(feature = "http3"))]
+                {
+                    anyhow::bail!(
+                        "upstream protocol h3 requires a binary compiled with feature `http3`"
+                    )
+                }
+            }
+            other => {
+                anyhow::bail!("unsupported upstream protocol `{other}` (auto|h1|h2|h2c|h3)")
+            }
         }
     }
 }
@@ -1231,18 +1504,32 @@ pub struct UpstreamInstance {
     created_at: Instant,
     /// 上游 HTTP 协议偏好(review L1),由所属服务复制而来,转发层据此设请求版本。
     pub protocol: UpstreamProtocol,
+    /// 建立 TCP transport 的独立超时；0 沿用 native connector 既有行为。
+    pub connect_timeout_ms: u64,
     /// HTTP 上游 TLS profile(§36 `proxy_ssl_*`),仅对 `https://` 实例生效。
     pub tls_profile: Option<UpstreamTlsProfile>,
+    /// 可信配置/发现提供的 locality zone；None 表示未声明。
+    pub zone: Option<Arc<str>>,
     /// 注册中心 metadata 或静态空 metadata;只供 admin 只读展示,不进入 metrics label。
     pub metadata: HashMap<String, String>,
 }
 
 impl UpstreamInstance {
+    /// 业务作用：把静态实例及其可信 zone 注入统一实例模型，使静态与发现来源共享完全相同
+    /// 的协议、TLS、健康身份和 locality 选择语义。
+    ///
+    /// 参数说明：`cfg` 是静态实例声明；`protocol`/`tls_profile` 来自所属 service。
+    ///
+    /// 返回：URI、协议、TLS 与 zone 全部合法时返回实例，否则拒绝候选快照。
     fn try_from_cfg(
         cfg: &StaticInstanceCfg,
         protocol: UpstreamProtocol,
         tls_profile: Option<UpstreamTlsProfile>,
     ) -> Result<Self> {
+        let mut metadata = HashMap::new();
+        if let Some(zone) = &cfg.zone {
+            metadata.insert("zone".to_owned(), zone.clone());
+        }
         Self::try_from_parts(
             &cfg.uri,
             cfg.healthy,
@@ -1251,15 +1538,22 @@ impl UpstreamInstance {
             cfg.backup,
             cfg.slow_start_ms,
             protocol,
+            0,
             tls_profile,
-            HashMap::new(),
+            metadata,
             Instant::now(),
         )
     }
 
     // 参数逐项对应注册中心实例属性;保持此构造入口可读比把它们塞进位置不明的 tuple 更重要。
     #[allow(clippy::too_many_arguments)]
-    /// 从发现后端的规范化属性构造并验证一个动态实例。
+    /// 业务作用：从发现后端的规范化属性构造动态实例，并校验 URI、协议、TLS 与可信
+    /// locality metadata，防止坏发现快照进入 LB。
+    ///
+    /// 参数说明：`uri` 是规范化 endpoint；`weight/down/backup/slow_start_ms` 是调度属性；
+    /// `protocol/connect_timeout_ms/tls_profile` 来自服务策略；`metadata` 携带只读发现属性与可选 zone。
+    ///
+    /// 返回：全部属性合法时返回带新加入时刻的实例，否则返回错误并保留旧发现版本。
     pub fn try_dynamic(
         uri: String,
         weight: u32,
@@ -1267,6 +1561,7 @@ impl UpstreamInstance {
         backup: bool,
         slow_start_ms: u64,
         protocol: UpstreamProtocol,
+        connect_timeout_ms: u64,
         tls_profile: Option<UpstreamTlsProfile>,
         metadata: HashMap<String, String>,
     ) -> Result<Self> {
@@ -1278,6 +1573,7 @@ impl UpstreamInstance {
             backup,
             slow_start_ms,
             protocol,
+            connect_timeout_ms,
             tls_profile,
             metadata,
             Instant::now(),
@@ -1285,6 +1581,12 @@ impl UpstreamInstance {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// 业务作用：集中执行所有来源实例的 URI/协议/TLS/zone 校验并生成稳定 health identity。
+    ///
+    /// 参数说明：`raw_uri` 到 `created_at` 是已经规范化的 endpoint、调度、transport、metadata
+    /// 与慢启动时刻；静态和动态入口都必须经过本函数。
+    ///
+    /// 返回：成功时返回可进入只读目录的实例；任何不安全组合或非法 zone 返回错误。
     fn try_from_parts(
         raw_uri: &str,
         healthy: bool,
@@ -1293,6 +1595,7 @@ impl UpstreamInstance {
         backup: bool,
         slow_start_ms: u64,
         protocol: UpstreamProtocol,
+        connect_timeout_ms: u64,
         tls_profile: Option<UpstreamTlsProfile>,
         metadata: HashMap<String, String>,
         created_at: Instant,
@@ -1315,6 +1618,9 @@ impl UpstreamInstance {
                     "upstream protocol h2 requires an https:// uri; use h2c for `{raw_uri}`"
                 )
             }
+            (UpstreamProtocol::H3, Some("http")) => {
+                anyhow::bail!("upstream protocol h3 requires an https:// uri, got `{raw_uri}`")
+            }
             _ => {}
         }
         if uri.authority().is_none() {
@@ -1323,11 +1629,22 @@ impl UpstreamInstance {
         if tls_profile.is_some() && scheme != Some("https") {
             anyhow::bail!("upstream tls profile requires an https:// uri, got `{raw_uri}`");
         }
+        anyhow::ensure!(
+            connect_timeout_ms == 0 || (1..=60_000).contains(&connect_timeout_ms),
+            "upstream connect timeout must be 0 or within 1ms..=60s"
+        );
         let uri = Arc::<str>::from(raw_uri.trim_end_matches('/'));
         let health_key = match &tls_profile {
             Some(profile) => Arc::<str>::from(format!("{uri}#{}", profile.key)),
             None => uri.clone(),
         };
+        let zone = metadata
+            .get("zone")
+            .or_else(|| metadata.get("topology.kubernetes.io/zone"))
+            .map(|zone| validate_zone(zone))
+            .transpose()
+            .context("upstream instance locality zone")?
+            .map(Arc::<str>::from);
         Ok(Self {
             uri,
             health_key,
@@ -1338,7 +1655,9 @@ impl UpstreamInstance {
             slow_start_ms,
             created_at,
             protocol,
+            connect_timeout_ms,
             tls_profile,
+            zone,
             metadata,
         })
     }
@@ -1365,6 +1684,9 @@ impl UpstreamInstance {
 
 /// 在共享实例切片上执行 primary/backup 分层与具体 LB 算法。
 ///
+/// 业务作用：把健康、排除身份、primary/backup 与最优 locality rank 收敛成唯一候选层，
+/// 再执行既有 LB，确保本区仍有容量时不泄漏跨区流量。
+///
 /// 流程与不变式：
 /// 1. 先扫描是否存在可用 primary；只要存在，backup 就绝不参与。
 /// 2. `first`/`least_conn` 单次扫描，WRR 两次扫描（总权重 + 定位），均不建立候选 `Vec`。
@@ -1373,6 +1695,7 @@ impl UpstreamInstance {
 /// # 参数
 /// - `instances`: 当前快照/发现版本的不可变实例切片。
 /// - `policy`: 服务级 LB 策略。
+/// - `locality`: 可选本区优先与有序跨区 failover 策略。
 /// - `is_excluded`: 按 URI 或完整身份键判断本次请求不可选择的实例。
 /// - `load`: `least_conn` 的在途计数读取器。
 /// - `rr`: WRR 的单调游标读取器，仅确有候选且策略为 WRR 时调用一次。
@@ -1381,6 +1704,7 @@ impl UpstreamInstance {
 fn select_instance_from_slice<E, F, R>(
     instances: &[Arc<UpstreamInstance>],
     policy: LbPolicy,
+    locality: Option<&UpstreamLocalityPolicy>,
     is_excluded: E,
     mut load: F,
     rr: R,
@@ -1396,7 +1720,10 @@ where
     // 性能快路径变成健康检查旁路。返回只增加选中实例 Arc 的引用计数，不复制 URI/TLS。
     if let [inst] = instances {
         let inst = inst.as_ref();
-        if !inst.is_selectable() || is_excluded(inst.uri.as_ref()) {
+        if !inst.is_selectable()
+            || locality.is_some_and(|policy| policy.rank(inst.zone.as_deref()).is_none())
+            || is_excluded(inst.uri.as_ref())
+        {
             return None;
         }
         // 无 TLS 时 health_key 与 URI 是同一个逻辑身份，重复调用排除谓词只会再次扫描
@@ -1406,17 +1733,31 @@ where
         }
         return Some(instances[0].clone());
     }
-    let is_candidate = |inst: &UpstreamInstance, backup: bool| {
+    let is_base_candidate = |inst: &UpstreamInstance, backup: bool| {
         inst.is_selectable()
             && inst.backup == backup
             && !is_excluded(inst.uri.as_ref())
             && (inst.health_key.as_ref() == inst.uri.as_ref()
                 || !is_excluded(inst.health_key.as_ref()))
     };
-    // primary 存在时绝不把流量泄漏给 backup；该预扫描替代原先两份候选 Vec。
-    let use_backup = !instances
+    let locality_rank = |inst: &UpstreamInstance| {
+        locality
+            .map(|policy| policy.rank(inst.zone.as_deref()))
+            .unwrap_or(Some(0))
+    };
+    // primary 存在时绝不把流量泄漏给 backup；不在允许 locality 集合的 primary
+    // 不能阻塞可用 backup，否则 fail-closed locality 会被错误解释为整服务不可用。
+    let use_backup = !instances.iter().any(|inst| {
+        is_base_candidate(inst.as_ref(), false) && locality_rank(inst.as_ref()).is_some()
+    });
+    let selected_locality_rank = instances
         .iter()
-        .any(|inst| is_candidate(inst.as_ref(), false));
+        .filter(|inst| is_base_candidate(inst.as_ref(), use_backup))
+        .filter_map(|inst| locality_rank(inst.as_ref()))
+        .min()?;
+    let is_candidate = |inst: &UpstreamInstance, backup: bool| {
+        is_base_candidate(inst, backup) && locality_rank(inst) == Some(selected_locality_rank)
+    };
     let first = || {
         instances
             .iter()
@@ -1479,7 +1820,11 @@ where
     }
 }
 
-/// 将 Nacos SDK 实例快照转换为排序稳定、已验证的 gateway 实例。
+/// 业务作用：将 Nacos SDK 实例快照转换为排序稳定、已验证且携带可信 locality 的 gateway 实例。
+///
+/// 参数说明：`spec` 是逻辑服务 watch 契约；`discovered` 是本轮完整 Nacos 实例快照。
+///
+/// 返回：全部实例合法时返回稳定排序结果；任一 URI/metadata 非法时拒绝整轮发现更新。
 pub fn discovery_instances_to_upstreams(
     spec: &NacosWatchSpec,
     discovered: &[nasa::discovery::Instance],
@@ -1500,6 +1845,7 @@ pub fn discovery_instances_to_upstreams(
             backup,
             slow_start_ms,
             spec.protocol,
+            0,
             spec.tls_profile.clone(),
             inst.metadata.clone(),
         )?);
@@ -1508,7 +1854,11 @@ pub fn discovery_instances_to_upstreams(
     Ok(instances)
 }
 
-/// 将 Consul/Eureka/DNS/K8s 的中立实例转成与 Nacos 共用的上游类型。
+/// 业务作用：将 Consul/Eureka/DNS/K8s 的中立实例转成与 Nacos 共用的上游类型和 locality 语义。
+///
+/// 参数说明：`spec` 是 registry watch 契约；`discovered` 是本轮完整中立实例集合。
+///
+/// 返回：全部 endpoint/metadata 合法时返回稳定排序结果，否则拒绝整轮发现更新。
 pub fn registry_instances_to_upstreams(
     spec: &RegistryWatchSpec,
     discovered: Vec<RegistryInstance>,
@@ -1531,6 +1881,7 @@ pub fn registry_instances_to_upstreams(
             instance.backup,
             spec.slow_start_ms,
             spec.protocol,
+            0,
             spec.tls_profile.clone(),
             instance.metadata,
         )?);
@@ -1563,12 +1914,11 @@ fn validate_upstream_scheme(scheme: &str) -> Result<()> {
     }
 }
 
-/// 从 service 配置构建 HTTP 上游 TLS profile(§36 `proxy_ssl_*`)。
+/// 业务作用：把静态或动态 service TLS 配置构建成数据面可复用的上游身份与信任策略。
 ///
-/// # 参数
-/// - `cfg_path`: 主配置路径,用于解析相对证书文件。
-/// - `name`: 服务名,用于错误上下文。
-/// - `svc`: 当前上游服务配置。
+/// 参数说明：`cfg_path` 用于解析相对文件；`name` 提供低敏错误上下文；`svc` 是服务配置。
+///
+/// 返回：未配置 TLS 时返回空；材料和身份策略有效时返回 profile；非法配置拒绝快照。
 fn build_service_tls_profile(
     cfg_path: &Path,
     name: &str,
@@ -1589,11 +1939,15 @@ fn build_service_tls_profile(
         .client_key_file
         .as_ref()
         .map(|path| resolve_relative(cfg_path, path));
-    build_upstream_tls_profile(
+    build_upstream_tls_profile_with_material(
         tls.server_name.as_deref(),
         ca_file.as_deref(),
+        tls.ca_pem.as_deref(),
+        &tls.subject_alt_names,
         client_cert_file.as_deref(),
         client_key_file.as_deref(),
+        tls.client_cert_pem.as_deref(),
+        tls.client_key_pem.as_deref(),
     )
     .with_context(|| format!("build upstream tls profile for service `{name}`"))
     .map(Some)

@@ -36,6 +36,7 @@ pub(crate) struct GraphqlGuardPolicy {
     max_depth: usize,
     max_complexity: usize,
     allow_introspection: bool,
+    allow_websocket_subscriptions: bool,
 }
 
 /// GraphQL 守卫的固定低基数结果。只由网关代码产生，绝不接受请求输入作为 label。
@@ -109,6 +110,7 @@ impl GraphqlGuardPolicy {
             max_depth: cfg.max_depth,
             max_complexity: cfg.max_complexity,
             allow_introspection: cfg.allow_introspection,
+            allow_websocket_subscriptions: cfg.allow_websocket_subscriptions,
         })
     }
 
@@ -130,6 +132,19 @@ impl GraphqlGuardPolicy {
     pub(crate) async fn inspect(&self, parts: &Parts, body: ForwardBody) -> GraphqlOutcome {
         match parts.method {
             Method::GET => {
+                if is_graphql_websocket_upgrade(parts) {
+                    return if self.allow_websocket_subscriptions {
+                        // HTTP guard 无法在不终止透明隧道的情况下逐条重写 WebSocket；显式开关
+                        // 把 message-level query budget 权威交给上游，握手前治理仍由网关执行。
+                        GraphqlOutcome::Allowed(body)
+                    } else {
+                        GraphqlOutcome::Rejected(reject(
+                            GraphqlGuardResult::Invalid,
+                            403,
+                            "GraphQL WebSocket subscriptions are disabled",
+                        ))
+                    };
+                }
                 let analysis = self.inspect_get(parts);
                 match analysis {
                     Ok(()) => GraphqlOutcome::Allowed(body),
@@ -216,21 +231,7 @@ impl GraphqlGuardPolicy {
             Some(MediaType::Json) => {
                 // `Cow<str>` lets serde_json borrow the common unescaped query directly from
                 // `Bytes`; escaped JSON strings allocate only the decoded query, which is required.
-                let envelope: JsonEnvelope<'_> = match serde_json::from_slice(&collected.bytes) {
-                    Ok(envelope) => envelope,
-                    Err(_) => {
-                        return GraphqlOutcome::Rejected(reject(
-                            GraphqlGuardResult::Invalid,
-                            400,
-                            "GraphQL JSON envelope is invalid",
-                        ));
-                    }
-                };
-                self.analyze(
-                    envelope.query.as_ref(),
-                    envelope.operation_name.as_deref(),
-                    false,
-                )
+                self.inspect_json_operations(&collected.bytes)
             }
             Some(MediaType::Graphql) => match std::str::from_utf8(&collected.bytes) {
                 Ok(query) => self.analyze(query, None, false),
@@ -240,6 +241,7 @@ impl GraphqlGuardPolicy {
                     "GraphQL query is not UTF-8",
                 )),
             },
+            Some(MediaType::Multipart) => self.inspect_multipart(parts, &collected.bytes),
             None => Err(reject(
                 GraphqlGuardResult::Invalid,
                 415,
@@ -247,8 +249,75 @@ impl GraphqlGuardPolicy {
             )),
         };
         match analysis {
-            Ok(()) => GraphqlOutcome::Allowed(ForwardBody::Boxed(buffered_body(collected))),
+            Ok(()) => GraphqlOutcome::Allowed(buffered_body(collected)),
             Err(rejection) => GraphqlOutcome::Rejected(rejection),
+        }
+    }
+
+    /// 业务作用：从 GraphQL multipart request 提取 operations JSON，并对每个 operation 执行同一预算门。
+    ///
+    /// 参数说明：`parts` 提供 multipart boundary；`body` 是已受 max_body_bytes 限制且将原样重放的实体。
+    ///
+    /// 返回：operations 唯一且所有查询通过时成功；MIME/envelope 非法或任一查询越界时返回固定拒绝。
+    fn inspect_multipart(
+        &self,
+        parts: &Parts,
+        body: &[u8],
+    ) -> std::result::Result<(), GraphqlRejection> {
+        let boundary = multipart_boundary(parts).ok_or_else(|| {
+            reject(
+                GraphqlGuardResult::Invalid,
+                400,
+                "GraphQL multipart boundary is invalid",
+            )
+        })?;
+        let operations = multipart_named_part(body, boundary.as_bytes(), b"operations")
+            .ok_or_else(|| {
+                reject(
+                    GraphqlGuardResult::Invalid,
+                    400,
+                    "GraphQL multipart operations part is invalid",
+                )
+            })?;
+        self.inspect_json_operations(operations)
+    }
+
+    /// 业务作用：统一检查单 operation 与 GraphQL batch JSON envelope，避免 multipart 绕过查询预算。
+    ///
+    /// 参数说明：`bytes` 是普通 JSON body 或 multipart 的 operations part。
+    ///
+    /// 返回：每个 envelope 都通过 parser/depth/complexity 门时成功；空 batch 或 JSON 结构错误时拒绝。
+    fn inspect_json_operations(&self, bytes: &[u8]) -> std::result::Result<(), GraphqlRejection> {
+        let operations: JsonOperations<'_> = serde_json::from_slice(bytes).map_err(|_| {
+            reject(
+                GraphqlGuardResult::Invalid,
+                400,
+                "GraphQL JSON envelope is invalid",
+            )
+        })?;
+        match operations {
+            JsonOperations::One(envelope) => self.analyze(
+                envelope.query.as_ref(),
+                envelope.operation_name.as_deref(),
+                false,
+            ),
+            JsonOperations::Many(envelopes) => {
+                if envelopes.is_empty() {
+                    return Err(reject(
+                        GraphqlGuardResult::Invalid,
+                        400,
+                        "GraphQL JSON envelope is invalid",
+                    ));
+                }
+                for envelope in envelopes {
+                    self.analyze(
+                        envelope.query.as_ref(),
+                        envelope.operation_name.as_deref(),
+                        false,
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -341,6 +410,7 @@ fn content_length(parts: &Parts) -> Option<u64> {
 enum MediaType {
     Json,
     Graphql,
+    Multipart,
 }
 
 fn request_media_type(parts: &Parts) -> Option<MediaType> {
@@ -358,6 +428,8 @@ fn request_media_type(parts: &Parts) -> Option<MediaType> {
         Some(MediaType::Json)
     } else if media_type.eq_ignore_ascii_case("application/graphql") {
         Some(MediaType::Graphql)
+    } else if media_type.eq_ignore_ascii_case("multipart/form-data") {
+        Some(MediaType::Multipart)
     } else {
         None
     }
@@ -369,6 +441,175 @@ struct JsonEnvelope<'a> {
     query: Cow<'a, str>,
     #[serde(default, rename = "operationName", borrow)]
     operation_name: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum JsonOperations<'a> {
+    One(#[serde(borrow)] JsonEnvelope<'a>),
+    Many(#[serde(borrow)] Vec<JsonEnvelope<'a>>),
+}
+
+/// 业务作用：识别 GraphQL WebSocket upgrade，且只接受标准/legacy 两个明确 subprotocol。
+///
+/// 参数说明：`parts` 是尚未转交透明 WebSocket tunnel 的请求 head。
+///
+/// 返回：Upgrade/Connection 与 Sec-WebSocket-Protocol 同时满足时为 true，普通 GET 为 false。
+fn is_graphql_websocket_upgrade(parts: &Parts) -> bool {
+    let upgrade = parts
+        .headers
+        .get(http::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    let connection = parts
+        .headers
+        .get(http::header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        });
+    let protocol = parts
+        .headers
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| matches!(token.trim(), "graphql-transport-ws" | "graphql-ws"))
+        });
+    upgrade && connection && protocol
+}
+
+/// 业务作用：从 Content-Type 读取并校验 multipart boundary，防止控制字符或超长分隔符进入扫描器。
+///
+/// 参数说明：`parts` 是 GraphQL POST 请求 head。
+///
+/// 返回：boundary 为 1..=70 个可见 ASCII 且不含 MIME 分隔危险字符时返回其值，否则 None。
+fn multipart_boundary(parts: &Parts) -> Option<String> {
+    let content_type = parts.headers.get(CONTENT_TYPE)?.to_str().ok()?;
+    for parameter in content_type.split(';').skip(1) {
+        let Some((name, raw)) = parameter.trim().split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("boundary") {
+            continue;
+        }
+        let value = raw.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(value);
+        if !value.is_empty()
+            && value.len() <= 70
+            && value
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte) && !matches!(byte, b'"' | b'\\'))
+        {
+            return Some(value.to_owned());
+        }
+        return None;
+    }
+    None
+}
+
+/// 业务作用：在有界 multipart 实体中定位唯一命名 part，并返回其 body slice。
+///
+/// 参数说明：`body` 是完整实体；`boundary` 已校验；`target` 是 Content-Disposition name。
+///
+/// 返回：目标 part 恰好出现一次且 MIME 边界完整时返回借用切片；缺失、重复或结构错误返回 None。
+fn multipart_named_part<'a>(body: &'a [u8], boundary: &[u8], target: &[u8]) -> Option<&'a [u8]> {
+    let mut marker = Vec::with_capacity(boundary.len() + 4);
+    marker.extend_from_slice(b"--");
+    marker.extend_from_slice(boundary);
+    let mut cursor = 0usize;
+    let mut found = None;
+    while cursor < body.len() {
+        let start = find_bytes(&body[cursor..], &marker)? + cursor;
+        let after_marker = start.checked_add(marker.len())?;
+        if body.get(after_marker..after_marker + 2) == Some(b"--") {
+            break;
+        }
+        if body.get(after_marker..after_marker + 2) != Some(b"\r\n") {
+            return None;
+        }
+        let headers_start = after_marker + 2;
+        let headers_end = find_bytes(&body[headers_start..], b"\r\n\r\n")? + headers_start;
+        let data_start = headers_end + 4;
+        let mut next_marker = Vec::with_capacity(marker.len() + 2);
+        next_marker.extend_from_slice(b"\r\n");
+        next_marker.extend_from_slice(&marker);
+        let data_end = find_bytes(&body[data_start..], &next_marker)? + data_start;
+        let headers = &body[headers_start..headers_end];
+        if multipart_headers_name(headers) == Some(target) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(&body[data_start..data_end]);
+        }
+        cursor = data_end + 2;
+    }
+    found
+}
+
+/// 业务作用：从单个 MIME part headers 中提取 Content-Disposition 的 name 参数。
+///
+/// 参数说明：`headers` 不含末尾空行，使用 CRLF 分隔。
+///
+/// 返回：唯一合法 name 的借用字节；缺失或畸形时 None。
+fn multipart_headers_name(headers: &[u8]) -> Option<&[u8]> {
+    for line in headers.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let prefix = b"content-disposition:";
+        if line.len() < prefix.len() || !line[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            continue;
+        }
+        for parameter in line[prefix.len()..].split(|byte| *byte == b';') {
+            let parameter = trim_ascii(parameter);
+            let Some(value) = parameter.strip_prefix(b"name=\"") else {
+                continue;
+            };
+            return value.strip_suffix(b"\"");
+        }
+    }
+    None
+}
+
+/// 业务作用：在有界 MIME 字节中查找子串，不执行 UTF-8 假设。
+///
+/// 参数说明：`haystack` 是待扫描字节，`needle` 必须非空。
+///
+/// 返回：首次匹配偏移；不存在时 None。
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    (!needle.is_empty())
+        .then(|| {
+            haystack
+                .windows(needle.len())
+                .position(|window| window == needle)
+        })
+        .flatten()
+}
+
+/// 业务作用：去除 MIME 参数两侧 SP/HTAB，保持其余字节逐字语义。
+///
+/// 参数说明：`value` 是单个 header parameter 字节。
+///
+/// 返回：返回借用的裁剪切片。
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

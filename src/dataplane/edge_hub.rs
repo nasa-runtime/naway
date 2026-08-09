@@ -1,11 +1,11 @@
-//! V8-1/V8-2 gRPC 边缘模式运行时(架构规范 §25.2.4/§25.2.5)。
+//! gRPC 边缘模式运行时（架构规范 §25.2.4/§25.2.5）。
 //!
 //! 本模块整体由 feature `grpc-edge` 门控(见 lib.rs):默认构建不编译、不改变任何
-//! 默认路径行为(A10)。V8-1 落 Subscribe 侧:增量解帧器、双维有界 EdgeRing、
+//! 默认路径行为（A10）。Subscribe 侧包含增量解帧器、双维有界 EdgeRing、
 //! tenant 作用域的 EdgeHub 订阅索引、channel-backed 订阅响应 Body 与治理关闭;
-//! V8-2 落发布面本地散出:`publish_group`/`push_user` 共享 fanout 内核(唯一
+//! 发布面本地散出由 `publish_group`/`push_user` 共享 fanout 内核（唯一
 //! payload 租约 + Drop 链预算结算 + 在途任务门)、unary 回执自产与 PublishStream
-//! 节流令牌桶(`StreamRateGate`,背压不丢)。跨节点 relay/probe 归 V8-3/V8-4,
+//! 节流令牌桶（`StreamRateGate`，背压不丢）。跨节点 relay/probe 由独立运行时承载，
 //! 本文件不含任何跨节点通信。
 //!
 //! 并发纪律(§25.2.5):所有锁内操作都是 O(1)/O(丢弃数) 的非等待操作;绝不在
@@ -34,6 +34,8 @@ use crate::resp::BoxError;
 
 /// gRPC message 前缀:compressed flag 1B + 大端长度 4B。
 pub const GRPC_PREFIX_BYTES: usize = 5;
+/// `FramePush.coalesce_key` 硬上限；key 只用于队列索引，不能成为第二份业务载荷。
+pub const MAX_COALESCE_KEY_BYTES: usize = 256;
 
 /// SubReq 读取总预算:登记 session 之前的有界读取,慢/停滞客户端在这里被掐断,
 /// 不占索引、不占注册表(§25.2.3 相位序:失败永远发生在登记之前)。
@@ -306,13 +308,15 @@ impl EdgeCloseReason {
     }
 }
 
-/// push 结果;V8-2 fanout 据此计数/断开。
+/// push 结果；fanout 据此计数或断开慢流。
 #[derive(Debug, PartialEq, Eq)]
 pub enum RingPush {
     /// 已入队。
     Enqueued,
     /// drop_oldest:为腾位弹掉了 n 条旧帧后入队。
     DroppedOldest(usize),
+    /// latest_by_key:新帧已入队，并替换同 key 旧帧或为预算淘汰了若干 key。
+    Coalesced(usize),
     /// drop_new:队满,本帧被拒。
     DroppedNew,
     /// close_slow:队满即关流;本帧被拒且 ring 进入关闭态。
@@ -343,6 +347,8 @@ impl Drop for PayloadLease {
 pub struct QueuedFrame {
     /// 完整 `[prefix+body]` 帧;订阅 body 直接以它写 DATA。
     pub bytes: Bytes,
+    /// `FramePush.coalesce_key` 对原帧的零拷贝 slice；None 表示未提供或 envelope 非法。
+    key: Option<Bytes>,
     _lease: Arc<PayloadLease>,
     /// 队列引用记账:构造 +1、Drop -1;弹旧/清队/交付全部经 Drop 自动结算,
     /// 任何路径都不可能漏减(§25.2.5 queue_refs 预算)。
@@ -388,26 +394,35 @@ impl Drop for FanoutJobGuard {
 /// ring 内部状态;单把 `parking_lot::Mutex` 下全部操作 O(1)/O(弹出数),无等待。
 struct RingInner {
     queue: VecDeque<QueuedFrame>,
+    /// latest_by_key 使用独立的 key→frame 表；FIFO 策略保持 None、零额外索引成本。
+    latest: Option<LatestQueue>,
     /// 队内逻辑字节(帧全长累计);与消息数构成双维预算。
     bytes: usize,
     closed: Option<EdgeCloseReason>,
 }
 
-/// 溢出策略的运行时形态(由 V8-0R 配置枚举映射;latest_by_key 的 key 语义要等
-/// V8-2 的 publish envelope 定型,当前按 drop_oldest 执行并在计划构建处注释)。
+/// latest_by_key 的有界队列。`order` 只保存活跃 key，替换 value 不改变首次入队顺序。
+struct LatestQueue {
+    order: VecDeque<Bytes>,
+    items: HashMap<Bytes, QueuedFrame>,
+}
+
+/// 溢出策略的运行时形态。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RingOverflow {
     /// 弹旧入新(同一临界区释放旧帧字节配额后入队,普通 mpsc 冒充不了,§25.2.5)。
     DropOldest,
     /// 拒新保旧 FIFO。
     DropNew,
+    /// 按 `FramePush.coalesce_key` 原子替换旧 value，key 索引与消息/字节预算同锁维护。
+    LatestByKey,
     /// 队满即关流。
     CloseSlow,
 }
 
 /// 每订阅流一份的双维有界发送环。
 ///
-/// 单消费者(订阅响应 body)+ 多生产者(V8-2 fanout);消费者侧用 `AtomicWaker`
+/// 单消费者（订阅响应 body）+ 多生产者（fanout）；消费者侧用 `AtomicWaker`
 /// 订阅唤醒。所有维度(消息数/逻辑字节)在同一临界区内维护,保证预算恒等式。
 pub struct EdgeRing {
     inner: Mutex<RingInner>,
@@ -425,6 +440,10 @@ impl EdgeRing {
         Arc::new(Self {
             inner: Mutex::new(RingInner {
                 queue: VecDeque::new(),
+                latest: (overflow == RingOverflow::LatestByKey).then(|| LatestQueue {
+                    order: VecDeque::new(),
+                    items: HashMap::new(),
+                }),
                 bytes: 0,
                 closed: None,
             }),
@@ -449,42 +468,91 @@ impl EdgeRing {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return RingPush::DroppedNew;
             }
-            let over = |inner: &RingInner| {
-                inner.queue.len() >= self.max_messages || inner.bytes + frame_len > self.max_bytes
-            };
-            if !over(&inner) {
-                inner.bytes += frame_len;
-                inner.queue.push_back(frame);
-                RingPush::Enqueued
+            if self.overflow == RingOverflow::LatestByKey {
+                let Some(key) = frame.key.clone() else {
+                    // 没有 key 时不能悄悄退化成 drop_oldest，否则配置的合并语义是假的。
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    return RingPush::DroppedNew;
+                };
+                let RingInner {
+                    latest: Some(latest),
+                    bytes,
+                    ..
+                } = &mut *inner
+                else {
+                    unreachable!("latest_by_key ring owns a latest index")
+                };
+                let mut dropped = 0usize;
+                let mut key_in_order = latest.items.contains_key(&key);
+                if let Some(old) = latest.items.remove(&key) {
+                    *bytes -= old.bytes.len();
+                    dropped += 1;
+                }
+                while latest.items.len() >= self.max_messages || *bytes + frame_len > self.max_bytes
+                {
+                    let Some(old_key) = latest.order.pop_front() else {
+                        break;
+                    };
+                    if old_key == key {
+                        key_in_order = false;
+                        continue;
+                    }
+                    if let Some(old) = latest.items.remove(&old_key) {
+                        *bytes -= old.bytes.len();
+                        dropped += 1;
+                    }
+                }
+                if !key_in_order {
+                    latest.order.push_back(key.clone());
+                }
+                *bytes += frame_len;
+                latest.items.insert(key, frame);
+                self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+                if dropped == 0 {
+                    RingPush::Enqueued
+                } else {
+                    RingPush::Coalesced(dropped)
+                }
             } else {
-                match self.overflow {
-                    RingOverflow::DropOldest => {
-                        let mut popped = 0usize;
-                        while over(&inner) {
-                            let Some(old) = inner.queue.pop_front() else {
-                                break;
-                            };
-                            inner.bytes -= old.bytes.len();
-                            popped += 1;
+                let over = |inner: &RingInner| {
+                    inner.queue.len() >= self.max_messages
+                        || inner.bytes + frame_len > self.max_bytes
+                };
+                if !over(&inner) {
+                    inner.bytes += frame_len;
+                    inner.queue.push_back(frame);
+                    RingPush::Enqueued
+                } else {
+                    match self.overflow {
+                        RingOverflow::DropOldest => {
+                            let mut popped = 0usize;
+                            while over(&inner) {
+                                let Some(old) = inner.queue.pop_front() else {
+                                    break;
+                                };
+                                inner.bytes -= old.bytes.len();
+                                popped += 1;
+                            }
+                            self.dropped.fetch_add(popped as u64, Ordering::Relaxed);
+                            inner.bytes += frame_len;
+                            inner.queue.push_back(frame);
+                            RingPush::DroppedOldest(popped)
                         }
-                        self.dropped.fetch_add(popped as u64, Ordering::Relaxed);
-                        inner.bytes += frame_len;
-                        inner.queue.push_back(frame);
-                        RingPush::DroppedOldest(popped)
-                    }
-                    RingOverflow::DropNew => {
-                        self.dropped.fetch_add(1, Ordering::Relaxed);
-                        RingPush::DroppedNew
-                    }
-                    RingOverflow::CloseSlow => {
-                        // close_slow 的业务含义是立即隔离慢连接。若先排空旧队列再发 trailer，
-                        // 最慢的连接反而继续长期占用 payload/ref 预算，无法形成 OOM 保护。
-                        let dropped = inner.queue.len().saturating_add(1);
-                        inner.queue.clear();
-                        inner.bytes = 0;
-                        inner.closed = Some(EdgeCloseReason::SlowConsumer);
-                        self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
-                        RingPush::ClosedSlow
+                        RingOverflow::DropNew => {
+                            self.dropped.fetch_add(1, Ordering::Relaxed);
+                            RingPush::DroppedNew
+                        }
+                        RingOverflow::LatestByKey => unreachable!("handled before FIFO queue"),
+                        RingOverflow::CloseSlow => {
+                            // close_slow 的业务含义是立即隔离慢连接。若先排空旧队列再发 trailer，
+                            // 最慢的连接反而继续长期占用 payload/ref 预算，无法形成 OOM 保护。
+                            let dropped = inner.queue.len().saturating_add(1);
+                            inner.queue.clear();
+                            inner.bytes = 0;
+                            inner.closed = Some(EdgeCloseReason::SlowConsumer);
+                            self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+                            RingPush::ClosedSlow
+                        }
                     }
                 }
             }
@@ -509,6 +577,14 @@ impl EdgeRing {
 
     fn try_pop(&self) -> Option<Result<QueuedFrame, EdgeCloseReason>> {
         let mut inner = self.inner.lock();
+        if let Some(latest) = &mut inner.latest {
+            while let Some(key) = latest.order.pop_front() {
+                if let Some(frame) = latest.items.remove(&key) {
+                    inner.bytes -= frame.bytes.len();
+                    return Some(Ok(frame));
+                }
+            }
+        }
         if let Some(frame) = inner.queue.pop_front() {
             inner.bytes -= frame.bytes.len();
             return Some(Ok(frame));
@@ -519,9 +595,16 @@ impl EdgeRing {
     /// 清空残留帧并返回条数;订阅注销(含 RST)时结算 queue_refs,防引用计数泄漏。
     fn drain_remaining(&self) -> usize {
         let mut inner = self.inner.lock();
-        let n = inner.queue.len();
+        let n = inner
+            .latest
+            .as_ref()
+            .map_or_else(|| inner.queue.len(), |latest| latest.items.len());
         inner.bytes = 0;
         inner.queue.clear();
+        if let Some(latest) = &mut inner.latest {
+            latest.order.clear();
+            latest.items.clear();
+        }
         n
     }
 
@@ -548,6 +631,7 @@ impl EdgeRing {
         hub.payload_bytes.fetch_add(len, Ordering::Relaxed);
         QueuedFrame {
             bytes,
+            key: None,
             _lease: Arc::new(PayloadLease {
                 len,
                 hub: hub.clone(),
@@ -555,6 +639,14 @@ impl EdgeRing {
             _queue_ref: QueueRefGuard::try_new(hub.clone(), usize::MAX)
                 .expect("test queue-ref reservation"),
         }
+    }
+
+    /// 单测专用：构造带显式合并键的队列帧，验证替换与预算结算不依赖 protobuf fixture。
+    #[cfg(test)]
+    pub(crate) fn test_frame_with_key(hub: &Arc<EdgeHub>, bytes: Bytes, key: Bytes) -> QueuedFrame {
+        let mut frame = Self::test_frame(hub, bytes);
+        frame.key = Some(key);
+        frame
     }
 
     /// 单测专用的非阻塞取帧(生产消费者一律走 `poll_pop` 以获得唤醒登记)。
@@ -584,8 +676,8 @@ pub struct EdgeUserKey {
     pub user: Arc<str>,
 }
 
-/// group 成员表。外层 DashMap 已按 key hash 分片;组内单锁在 V8-1(注册/注销)
-/// 足够,fanout 热路径的组内分片留给 V8-2 按基准决定(§25.2.5 bucket 分片)。
+/// group 成员表。外层 DashMap 已按 key hash 分片；组内单锁只覆盖注册/注销，fanout
+/// 通过不可变成员切片避免在散出期间长期持锁。
 pub struct GroupMembers {
     members: parking_lot::RwLock<HashMap<u64, Arc<EdgeRing>>>,
 }
@@ -595,6 +687,16 @@ struct UserSession {
     stream_id: u64,
     ring: Arc<EdgeRing>,
     single_session_token: Option<u64>,
+}
+
+/// Redis 等非 relay 控制面接收 single-session 生命周期收尾的最小接口。
+pub(crate) trait EdgeSessionControl: Send + Sync {
+    /// 业务作用：在本地 single-session 结束后触发条件释放，避免历史 fence 无限驻留。
+    ///
+    /// 参数说明：`tenant`/`user` 标识已验证用户，`token` 是本次结束会话持有的 fencing 版本。
+    ///
+    /// 返回：无返回值；实现必须异步执行外部 I/O，不能阻塞订阅 Drop 路径。
+    fn session_closed(&self, tenant: Arc<str>, user: Arc<str>, token: u64);
 }
 
 /// 进程常驻的边缘订阅索引(不进 Snapshot;地位同 ConnectionRegistry)。
@@ -625,6 +727,8 @@ pub struct EdgeHub {
     drain_trim_armed: AtomicBool,
     /// E1 interest 传播目标；Weak 避免 hub↔relay 强引用环，relay 换代时可替换。
     interest_relay: parking_lot::RwLock<Weak<crate::edge_relay::EdgeRelay>>,
+    /// Redis strong control 的会话收尾端；只在非 relay single-session 模式注入。
+    session_control: parking_lot::RwLock<Option<Weak<dyn EdgeSessionControl>>>,
 }
 
 /// 订阅准入失败;调用方映射 RESOURCE_EXHAUSTED(8)。
@@ -676,6 +780,7 @@ impl EdgeHub {
             runtime_schedule_pause_max_us: AtomicU64::new(0),
             drain_trim_armed: AtomicBool::new(false),
             interest_relay: parking_lot::RwLock::new(Weak::new()),
+            session_control: parking_lot::RwLock::new(None),
         });
         // 单测可能在 Tokio runtime 外构造 Hub；此时不启动观测任务。生产 Proxy 在
         // runtime 内创建，弱引用使任务随 Hub 自动结束，不形成进程常驻泄漏。
@@ -712,6 +817,16 @@ impl EdgeHub {
     /// 返回：无返回值；热换代会覆盖旧引用，旧代释放后通知自动降级为无操作。
     pub(crate) fn attach_interest_relay(&self, relay: Weak<crate::edge_relay::EdgeRelay>) {
         *self.interest_relay.write() = relay;
+    }
+
+    /// 业务作用：绑定非 relay single-session 控制面，使订阅结束能条件释放远端 fence。
+    ///
+    /// 参数说明：`control` 是当前 Redis strong control 的弱引用，避免控制面与 Hub 形成引用环。
+    ///
+    /// 返回：无返回值；后注入的 generation 会覆盖旧引用。
+    #[cfg(feature = "redis-runtime")]
+    pub(crate) fn attach_session_control(&self, control: Weak<dyn EdgeSessionControl>) {
+        *self.session_control.write() = Some(control);
     }
 
     /// 业务作用：为新建 relay 链路生成当前本地 group interest 全量快照。
@@ -769,7 +884,7 @@ impl EdgeHub {
         self.queue_refs.load(Ordering::Relaxed)
     }
 
-    /// 业务作用：向 V8-6 资源门与管理面暴露进程启动以来 edge runtime 的最大调度停顿。
+    /// 业务作用：向资源门与管理面暴露进程启动以来 edge runtime 的最大调度停顿。
     ///
     /// 参数说明：无。
     ///
@@ -863,6 +978,8 @@ impl EdgeHub {
             len,
             hub: self.clone(),
         });
+        // 只扫描 FramePush 顶层 field 2，返回原帧零拷贝 slice；业务 payload 始终 opaque。
+        let coalesce_key = frame_push_coalesce_key(&frame);
         let mut outcome = LocalFanoutOutcome {
             members: rings.len() as u32,
             ..LocalFanoutOutcome::default()
@@ -880,12 +997,17 @@ impl EdgeHub {
             };
             let queued = QueuedFrame {
                 bytes: frame.clone(),
+                key: coalesce_key.clone(),
                 _lease: lease.clone(),
                 _queue_ref: queue_ref,
             };
             match ring.push(queued) {
                 RingPush::Enqueued => outcome.accepted += 1,
                 RingPush::DroppedOldest(n) => {
+                    outcome.accepted += 1;
+                    outcome.dropped_oldest += n as u64;
+                }
+                RingPush::Coalesced(n) => {
                     outcome.accepted += 1;
                     outcome.dropped_oldest += n as u64;
                 }
@@ -1064,6 +1186,41 @@ impl EdgeHub {
         }
     }
 
+    /// 业务作用：在 Redis 控制订阅或 membership 租约失效时立即关闭全部 single-session，
+    /// 阻止已被 membership 排除的节点继续持有旧会话而形成多活。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；先关闭所有受 fence 保护的 ring，再清空本地 token，使并发准入复验失败。
+    #[cfg(feature = "redis-runtime")]
+    pub(crate) fn protect_single_sessions(&self) {
+        for sessions in &self.users {
+            let sessions = sessions.lock();
+            for session in sessions.iter() {
+                if session.single_session_token.is_some() {
+                    session.ring.close(EdgeCloseReason::SessionReplaced);
+                }
+            }
+        }
+        // 失去控制权威后不能保留任何可供 subscribe_single 复验通过的旧 token。
+        self.session_fences.clear();
+    }
+
+    /// 业务作用：复验 Redis claim 返回的 token 仍是本节点当前 fence，防止并发新 claim 使旧请求越权。
+    ///
+    /// 参数说明：`tenant`/`user` 标识用户，`token` 是待复验版本。
+    ///
+    /// 返回：仅在当前 fence 精确匹配时返回 `true`。
+    #[cfg(feature = "redis-runtime")]
+    pub(crate) fn session_fence_matches(&self, tenant: &str, user: &str, token: u64) -> bool {
+        self.session_fences
+            .get(&EdgeUserKey {
+                tenant: Arc::from(tenant),
+                user: Arc::from(user),
+            })
+            .is_some_and(|current| *current == token)
+    }
+
     /// 业务作用：仅在本地已无会话且 token 仍匹配时释放 fence，阻止迟到 release 误伤新登录。
     ///
     /// 参数说明：`tenant`/`user` 标识用户，`token` 是待释放的旧会话权威。
@@ -1128,6 +1285,14 @@ impl EdgeHub {
         if let Some(token) = sub.single_session_token {
             if let Some(relay) = self.interest_relay.read().upgrade() {
                 relay.session_closed(
+                    sub.user_key.tenant.clone(),
+                    sub.user_key.user.clone(),
+                    token,
+                );
+            } else if let Some(control) =
+                self.session_control.read().as_ref().and_then(Weak::upgrade)
+            {
+                control.session_closed(
                     sub.user_key.tenant.clone(),
                     sub.user_key.user.clone(),
                     token,
@@ -1368,15 +1533,101 @@ impl StreamRateGate {
     }
 }
 
-/// V8-0R 配置枚举 → 运行时策略。latest_by_key 的业务 key 依赖 V8-2 publish
-/// envelope 定型,当前按 drop_oldest 执行(publish 面尚不存在,无生产影响)。
+/// 业务作用：把构建期溢出枚举映射为 EdgeRing 的原子运行时策略。
+///
+/// 参数说明：`cfg` 是已通过 route 计划校验的队列策略。
+///
+/// 返回：返回一一对应的运行时策略，不做任何语义降级。
 fn map_overflow(cfg: crate::config::model::GrpcEdgeOverflowCfg) -> RingOverflow {
     use crate::config::model::GrpcEdgeOverflowCfg as Cfg;
     match cfg {
-        Cfg::DropOldest | Cfg::LatestByKey => RingOverflow::DropOldest,
+        Cfg::DropOldest => RingOverflow::DropOldest,
         Cfg::DropNew => RingOverflow::DropNew,
+        Cfg::LatestByKey => RingOverflow::LatestByKey,
         Cfg::CloseSlow => RingOverflow::CloseSlow,
     }
+}
+
+/// 业务作用：从完整 gRPC `FramePush` 帧读取有界 `coalesce_key`，不触碰业务 payload。
+///
+/// 参数说明：`frame` 必须是 `[5B gRPC prefix + FramePush protobuf]`。
+///
+/// 返回：field 2 唯一、非空且不超过 256 字节时返回零拷贝 slice；缺失或 envelope 非法返回 None。
+pub(crate) fn frame_push_coalesce_key(frame: &Bytes) -> Option<Bytes> {
+    if frame.len() < GRPC_PREFIX_BYTES || frame[0] != 0 {
+        return None;
+    }
+    let declared = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+    if declared != frame.len() - GRPC_PREFIX_BYTES {
+        return None;
+    }
+    let mut cursor = GRPC_PREFIX_BYTES;
+    let mut found = None;
+    while cursor < frame.len() {
+        let (field_key, next) = read_frame_push_varint(frame, cursor)?;
+        cursor = next;
+        let field = field_key >> 3;
+        let wire = (field_key & 7) as u8;
+        if field == 0 {
+            return None;
+        }
+        if field == 2 {
+            if wire != 2 || found.is_some() {
+                return None;
+            }
+            let (len, next) = read_frame_push_varint(frame, cursor)?;
+            let len = usize::try_from(len).ok()?;
+            let end = next.checked_add(len)?;
+            if len == 0 || len > MAX_COALESCE_KEY_BYTES || end > frame.len() {
+                return None;
+            }
+            found = Some(frame.slice(next..end));
+            cursor = end;
+            continue;
+        }
+        cursor = skip_frame_push_field(frame, cursor, wire)?;
+    }
+    found
+}
+
+/// 业务作用：有界读取 FramePush 顶层 protobuf varint，供合并键扫描复用。
+///
+/// 参数说明：`bytes` 是完整 gRPC 帧，`cursor` 指向 varint 首字节。
+///
+/// 返回：最多 10 字节内终止时返回值和新游标；截断或溢出返回 None。
+fn read_frame_push_varint(bytes: &Bytes, mut cursor: usize) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *bytes.get(cursor)?;
+        cursor += 1;
+        if shift == 63 && byte > 1 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, cursor));
+        }
+    }
+    None
+}
+
+/// 业务作用：跳过 FramePush 未知 protobuf 字段，维持只增字段的 wire 兼容性。
+///
+/// 参数说明：`bytes` 是完整帧，`cursor` 位于字段值开头，`wire` 是 protobuf wire type。
+///
+/// 返回：字段完整且类型受支持时返回新游标；越界或 group wire type 返回 None。
+fn skip_frame_push_field(bytes: &Bytes, cursor: usize, wire: u8) -> Option<usize> {
+    let end = match wire {
+        0 => read_frame_push_varint(bytes, cursor)?.1,
+        1 => cursor.checked_add(8)?,
+        2 => {
+            let (len, start) = read_frame_push_varint(bytes, cursor)?;
+            start.checked_add(usize::try_from(len).ok()?)?
+        }
+        5 => cursor.checked_add(4)?,
+        _ => return None,
+    };
+    (end <= bytes.len()).then_some(end)
 }
 
 /// 订阅登记句柄;Drop 幂等摘除 group/user 索引与计数。
@@ -1391,7 +1642,7 @@ pub struct EdgeSubscription {
 }
 
 impl EdgeSubscription {
-    /// 本订阅的发送环(body 消费;V8-2 fanout 生产)。
+    /// 本订阅的发送环（body 消费，fanout 生产）。
     pub fn ring(&self) -> &Arc<EdgeRing> {
         &self.ring
     }
@@ -1428,7 +1679,7 @@ pub struct EdgeSubscribeBody {
     /// route 级帧间空闲预算;仅在曾经 Pending 后计时(惰性,同 CountedBody)。
     idle_timeout: Duration,
     idle_sleep: Option<Pin<Box<Sleep>>>,
-    /// V8-7 目录租约(不透明持有):具体类型由 `edge_directory` 提供,Drop 即摘除
+    /// 目录租约（不透明持有）：具体类型由 `edge_directory` 提供，Drop 即摘除
     /// 自己那条 field。放在 body 里让"租约生命周期 == 订阅流生命周期"结构性成立;
     /// 未编 `redis-runtime` 或 `session_registry=none` 时恒为 None,零成本。
     directory_lease: Option<Arc<dyn Send + Sync>>,
@@ -1463,7 +1714,7 @@ impl EdgeSubscribeBody {
         }
     }
 
-    /// 挂上 V8-7 目录租约(builder;无目录时不调用)。
+    /// 挂上目录租约（builder；无目录时不调用）。
     pub fn with_directory_lease(mut self, lease: Arc<dyn Send + Sync>) -> Self {
         self.directory_lease = Some(lease);
         self

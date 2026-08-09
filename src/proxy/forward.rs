@@ -6,7 +6,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use http::header::{
     EXPECT, HOST, TE, TRANSFER_ENCODING, UPGRADE,
 };
 use http::request::Parts;
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::{BodyExt, Empty};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::rt::{Read as HyperRead, ReadBufCursor, Write as HyperWrite};
 use hyper::upgrade::OnUpgrade;
@@ -40,12 +40,17 @@ use crate::dubbo::{DubboError, DubboResult};
 use crate::external_plugin::{ExternalPlugin, ExternalPluginPayload};
 use crate::metrics::DubboMetric;
 use crate::opa::{OpaInputPayload, OpaPolicy};
-use crate::routing::{strip_n_segments, ExtAuthzPolicy, MirrorPolicy, RequestHeaderSet, Route};
+use crate::proxy::grpc_browser::{BrowserGrpc, BrowserGrpcError};
+use crate::routing::{strip_n_segments, ExtAuthzPolicy, MirrorPolicy, RequestHeaderOp, Route};
 use crate::tls::UpstreamTlsProfile;
 use crate::upstream::{NextUpstreamPolicy, PassiveHealthPolicy, UpstreamProtocol};
 use crate::{full_body, BoxBody, BoxError};
 
-type RawUpstreamHttpClient = Client<BudgetedConnector<HttpsConnector<HttpConnector>>, BoxBody>;
+type RawUpstreamHttpClient =
+    Client<BudgetedConnector<FixedDestinationConnector<HttpsConnector<HttpConnector>>>, BoxBody>;
+type RawUpstreamH2cConnector = BudgetedConnector<FixedDestinationConnector<HttpConnector>>;
+
+static DEFAULT_UPSTREAM_HTTPS_CONNECTOR: OnceLock<HttpsConnector<HttpConnector>> = OnceLock::new();
 
 const H2_SHARD_COLD: u8 = 0;
 const H2_SHARD_CONNECTING: u8 = 1;
@@ -335,6 +340,8 @@ impl Body for DirectH2cBody {
 enum UpstreamResponseBody {
     Pooled(Incoming),
     DirectH2c(DirectH2cBody),
+    #[cfg(feature = "http3")]
+    Http3(super::http3_upstream::UpstreamH3Body),
 }
 
 impl Body for UpstreamResponseBody {
@@ -350,6 +357,8 @@ impl Body for UpstreamResponseBody {
                 .poll_frame(cx)
                 .map(|frame| frame.map(|frame| frame.map_err(|error| Box::new(error) as BoxError))),
             Self::DirectH2c(body) => Pin::new(body).poll_frame(cx),
+            #[cfg(feature = "http3")]
+            Self::Http3(body) => Pin::new(body).poll_frame(cx),
         }
     }
 
@@ -357,6 +366,8 @@ impl Body for UpstreamResponseBody {
         match self {
             Self::Pooled(body) => body.is_end_stream(),
             Self::DirectH2c(body) => body.is_end_stream(),
+            #[cfg(feature = "http3")]
+            Self::Http3(body) => body.is_end_stream(),
         }
     }
 
@@ -364,6 +375,8 @@ impl Body for UpstreamResponseBody {
         match self {
             Self::Pooled(body) => body.size_hint(),
             Self::DirectH2c(body) => body.size_hint(),
+            #[cfg(feature = "http3")]
+            Self::Http3(body) => body.size_hint(),
         }
     }
 }
@@ -400,11 +413,17 @@ struct DirectH2cConnection {
 
 struct DirectH2cState {
     current: ArcSwapOption<DirectH2cConnection>,
-    connector: BudgetedConnector<HttpConnector>,
+    connector: RawUpstreamH2cConnector,
     policy: HttpPoolPolicy,
 }
 
 impl DirectH2cState {
+    /// 业务作用：向已选中的真实实例建立明文 HTTP/2 prior-knowledge transport，同时保留
+    /// 请求 URI 中面向业务虚拟主机的 authority。
+    ///
+    /// 参数说明：`uri` 是待发送请求的完整 URI；connector 已固定实际 Service Endpoint。
+    ///
+    /// 返回：握手成功后原子发布可复用 sender；拨号、预算或 HTTP/2 握手失败时不发布半成品连接。
     async fn connect(&self, uri: http::Uri) -> Result<(), BoxError> {
         let mut connector = self.connector.clone();
         std::future::poll_fn(|cx| connector.poll_ready(cx)).await?;
@@ -590,7 +609,9 @@ impl PhysicalConnectionBudget {
     }
 
     /// 非阻塞占用一个 dial 名额。满载必须快速失败，不能在 connector 内形成隐藏等待队列。
-    fn try_acquire(self: &Arc<Self>) -> Result<PhysicalConnectionSlot, ConnectionLimitReached> {
+    pub(super) fn try_acquire(
+        self: &Arc<Self>,
+    ) -> Result<PhysicalConnectionSlot, ConnectionLimitReached> {
         let acquired = self
             .active
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
@@ -608,7 +629,7 @@ impl PhysicalConnectionBudget {
 
 /// 物理 socket 已到上限。该错误保留在 Hyper error source chain 中，调用方映射为快速 503。
 #[derive(Debug)]
-struct ConnectionLimitReached;
+pub(super) struct ConnectionLimitReached;
 
 impl fmt::Display for ConnectionLimitReached {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -619,9 +640,74 @@ impl fmt::Display for ConnectionLimitReached {
 impl std::error::Error for ConnectionLimitReached {}
 
 /// 一个已占用的物理 transport 名额。
-struct PhysicalConnectionSlot {
+pub(super) struct PhysicalConnectionSlot {
     /// 跨 generation 共享的预算；Drop 是唯一归还路径。
     budget: Arc<PhysicalConnectionBudget>,
+}
+
+/// 让 Hyper 的请求 URI 可承载业务 authority，同时把物理连接固定到已选择的上游实例。
+#[derive(Clone)]
+struct FixedDestinationConnector<C> {
+    inner: C,
+    destination_scheme: http::uri::Scheme,
+    destination_authority: http::uri::Authority,
+}
+
+impl<C> FixedDestinationConnector<C> {
+    /// 业务作用：冻结当前健康实例的实际拨号 destination，供连接器与请求 authority 解耦。
+    ///
+    /// 参数说明：`inner` 执行实际 TCP/TLS 连接；`destination` 是已验证的实例 base URI。
+    ///
+    /// 返回：destination 含 scheme 与 authority 时返回连接器；内部调用方传入坏实例时立即失败。
+    fn new(inner: C, destination: &str) -> Self {
+        let uri = destination
+            .parse::<http::Uri>()
+            .expect("validated upstream destination URI");
+        Self {
+            inner,
+            destination_scheme: uri
+                .scheme()
+                .expect("validated upstream destination has scheme")
+                .clone(),
+            destination_authority: uri
+                .authority()
+                .expect("validated upstream destination has authority")
+                .clone(),
+        }
+    }
+}
+
+impl<C> Service<http::Uri> for FixedDestinationConnector<C>
+where
+    C: Service<http::Uri>,
+{
+    type Response = C::Response;
+    type Error = C::Error;
+    type Future = C::Future;
+
+    /// 业务作用：沿用底层 connector 的背压与就绪状态，不为 authority 改写另建队列。
+    ///
+    /// 参数说明：`cx` 是 Tower 调度上下文。
+    ///
+    /// 返回：原样返回底层 connector 的就绪或错误状态。
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    /// 业务作用：仅在物理连接边界把业务 URI 的 destination 换回已选择实例，确保
+    /// `preserve_host` 不改变 DNS、端口或 TLS 连接目标。
+    ///
+    /// 参数说明：`uri` 可携带客户端 Host 作为 HTTP/2 authority，path/query 保持不变。
+    ///
+    /// 返回：返回底层 connector future；destination 来自已验证实例，因此重建 URI 不失败。
+    fn call(&mut self, uri: http::Uri) -> Self::Future {
+        let mut parts = uri.into_parts();
+        parts.scheme = Some(self.destination_scheme.clone());
+        parts.authority = Some(self.destination_authority.clone());
+        let destination = http::Uri::from_parts(parts)
+            .expect("validated destination scheme and authority rebuild URI");
+        self.inner.call(destination)
+    }
 }
 
 impl Drop for PhysicalConnectionSlot {
@@ -728,6 +814,7 @@ fn upstream_request_version(protocol: UpstreamProtocol, parts: &Parts) -> http::
         UpstreamProtocol::H1 => http::Version::HTTP_11,
         // h2(TLS 经 ALPN)/ h2c(明文 prior-knowledge)都用 HTTP_2 版本 hint。
         UpstreamProtocol::H2 | UpstreamProtocol::H2c => http::Version::HTTP_2,
+        UpstreamProtocol::H3 => http::Version::HTTP_3,
         // auto:gRPC(content-type=application/grpc*)默认 h2,其余 h1。
         UpstreamProtocol::Auto => {
             if is_grpc_request(parts) {
@@ -789,13 +876,11 @@ pub(super) struct ForwardRequest<'a> {
     pub trace: Option<&'a crate::telemetry::ServerTrace>,
 }
 
-/// forward 内部请求体封装。
-pub(crate) enum ForwardBody {
-    /// 原始下游 Incoming,默认流式快路径。
-    Incoming(Incoming),
-    /// 显式慢路径收集后重新构造的 boxed body。
-    Boxed(BoxBody),
-}
+/// forward 内部统一请求体。
+///
+/// 业务作用：把 Hyper TCP/H2 `Incoming` 与 V9 HTTP/3 request stream 擦除成同一流式 body，
+/// 让全部 route/filter/upstream 只保留一套治理管线；擦除只移动 `Bytes` frame，不聚合 payload。
+pub(crate) type ForwardBody = BoxBody;
 
 /// 单次主上游发送的不可变执行参数；收拢参数以避免 retry 调用点发生位置错配。
 struct UpstreamSendContext<'a> {
@@ -815,6 +900,10 @@ struct UpstreamSendContext<'a> {
     client_shard_hint: u64,
     /// 原生 gRPC 主上游响应的长流治理；内部/插件调用及非 gRPC 请求为空。
     grpc_drain: Option<&'a GrpcDrainContext>,
+    /// 原始下游使用的浏览器 RPC wire mode；上游始终看到 native gRPC。
+    browser_grpc: Option<BrowserGrpc>,
+    /// Connect unary request/response 聚合预算；streaming 模式不使用该值。
+    browser_grpc_unary_limit: u64,
 }
 
 /// 在一次主请求的 retry attempts 间共享的 gRPC 长流登记参数。
@@ -844,6 +933,8 @@ struct MirrorSendContext {
 
 #[derive(Debug)]
 pub(super) enum ForwardError {
+    /// gRPC-Web/Connect 客户端格式错误或上游 native gRPC 响应协议错误。
+    BrowserGrpc(BrowserGrpcError),
     /// DNS/connect/protocol/上游 body 等通用代理错误，对下游映射 502。
     BadGateway(anyhow::Error),
     /// `lb://service` 没有可选择实例，对下游映射 503。
@@ -883,6 +974,7 @@ pub(super) enum ExtAuthzDecision {
 impl ForwardError {
     pub(super) fn status(&self) -> StatusCode {
         match self {
+            Self::BrowserGrpc(error) => error.status(),
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::NoHealthyUpstream(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
@@ -892,6 +984,7 @@ impl ForwardError {
 
     pub(super) fn message(&self) -> &'static str {
         match self {
+            Self::BrowserGrpc(error) => error.message(),
             Self::BadGateway(_) => "bad gateway",
             Self::NoHealthyUpstream(_) => "no healthy upstream",
             Self::Overloaded => "upstream overloaded",
@@ -900,11 +993,16 @@ impl ForwardError {
     }
 
     pub(super) fn is_upstream_error(&self) -> bool {
-        true
+        match self {
+            Self::BrowserGrpc(error) => error.is_upstream_error(),
+            _ => true,
+        }
     }
 
     pub(super) fn fallback_reason(&self) -> &'static str {
         match self {
+            Self::BrowserGrpc(error) if error.is_upstream_error() => "upstream_protocol_error",
+            Self::BrowserGrpc(_) => "client_protocol_error",
             Self::BadGateway(_) => "upstream_error",
             Self::NoHealthyUpstream(_) => "no_healthy_upstream",
             Self::Overloaded => "upstream_overloaded",
@@ -916,6 +1014,7 @@ impl ForwardError {
 impl fmt::Display for ForwardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BrowserGrpc(error) => write!(f, "browser gRPC protocol error: {error}"),
             Self::BadGateway(e) => write!(f, "bad gateway: {e:#}"),
             Self::NoHealthyUpstream(svc) => write!(f, "no healthy upstream for `{svc}`"),
             Self::Overloaded => f.write_str("upstream pending limit reached"),
@@ -947,15 +1046,54 @@ fn map_client_error(context: &'static str, error: BoxError) -> ForwardError {
 impl super::GatewayProxy {
     pub(super) async fn forward(
         &self,
+        ctx: ForwardRequest<'_>,
+    ) -> Result<Response<BoxBody>, ForwardError> {
+        let timeout_ms = [
+            ctx.route.request_timeout_ms,
+            ctx.route.backend_request_timeout_ms,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|timeout| *timeout > 0)
+        .min();
+        let Some(timeout_ms) = timeout_ms else {
+            return self.forward_inner(ctx).await;
+        };
+        let deadline = TokioInstant::now() + Duration::from_millis(timeout_ms);
+        let response = tokio::time::timeout_at(deadline, self.forward_inner(ctx))
+            .await
+            .map_err(|_| ForwardError::Timeout)??;
+        Ok(response.map(|body| AbsoluteDeadlineBody::new(body, deadline).boxed()))
+    }
+
+    /// 业务作用：执行不含 route 总 deadline wrapper 的原始上游转发流程，供外层统一
+    /// 约束 response head 与流式 body 的同一个绝对截止时刻。
+    ///
+    /// 参数说明：`ctx` 包含已经完成路由和安全门判断的单次转发上下文。
+    ///
+    /// 返回：上游成功时返回流式响应；连接、协议、预算或阶段超时映射为稳定转发错误。
+    async fn forward_inner(
+        &self,
         mut ctx: ForwardRequest<'_>,
     ) -> Result<Response<BoxBody>, ForwardError> {
         let downstream_version = ctx.parts.version;
+        #[cfg(feature = "grpc-descriptor")]
+        let browser_grpc = BrowserGrpc::detect_with_transcoding(
+            &ctx.parts.method,
+            &ctx.parts.headers,
+            &ctx.parts.uri,
+            ctx.route.grpc_transcoding.as_deref(),
+        )
+        .map_err(ForwardError::BrowserGrpc)?;
+        #[cfg(not(feature = "grpc-descriptor"))]
+        let browser_grpc = BrowserGrpc::detect(&ctx.parts.method, &ctx.parts.headers)
+            .map_err(ForwardError::BrowserGrpc)?;
         // request-id 本来就已为日志/追踪生成；Snowflake 十六进制末字节就是连续变化的 sequence
         // 低位，可直接作为最多 64 个 H2 shard 的稳定提示。无需再为每请求扫描 16 字节做 FNV，
         // 也不分配临时对象；非标准内部 ID 才回退完整稳定哈希。
         let client_shard_hint = super::request_id_shard_hint(ctx.request_id);
-        let grpc_drain = (downstream_version == http::Version::HTTP_2
-            && is_grpc_request(&ctx.parts))
+        let grpc_drain = (browser_grpc.is_some()
+            || (downstream_version == http::Version::HTTP_2 && is_grpc_request(&ctx.parts)))
         .then(|| GrpcDrainContext {
             registry: self.conn_registry.clone(),
             route_id: ctx.route.id_shared.clone(),
@@ -984,6 +1122,16 @@ impl super::GatewayProxy {
         if !ctx.route.pass_request_headers {
             ctx.parts.headers.clear();
         }
+        if let Some(protocol) = browser_grpc.as_ref() {
+            // 浏览器 envelope 必须在 header 清洗后重新盖成 native gRPC；否则
+            // pass_request_headers=false 会删掉协议必需的 Content-Type/TE。Connect unary 的
+            // 单消息 envelope 需要先知道长度，因此只在既有 max_body_bytes 内做有界读取。
+            let body = std::mem::replace(&mut ctx.body, full_body(Bytes::new()));
+            ctx.body = protocol
+                .prepare_request(&mut ctx.parts, body, ctx.proxy.limits.max_body_bytes)
+                .await
+                .map_err(ForwardError::BrowserGrpc)?;
+        }
 
         let mirror_body = if !ctx.route.mirrors.is_empty() && ctx.downstream_upgrade.is_none() {
             self.prepare_mirror_body(&mut ctx).await?
@@ -993,6 +1141,8 @@ impl super::GatewayProxy {
         // 组上游 URI:base(http://host:port) + StripPrefix 后的 path + query。必须放在可能
         // 替换 mirror body 的可变借用之后，默认路径才能安全地直接借用 ctx.parts URI。
         let rewritten: Cow<'_, str> = if let Some(path) = ctx.path_override {
+            Cow::Borrowed(path)
+        } else if let Some(path) = ctx.route.gateway_rewrite_full_path.as_deref() {
             Cow::Borrowed(path)
         } else if ctx.route.strip_prefix == 0 && ctx.route.rewrite_prefix.is_none() {
             // 绝大多数普通 route 不改 path；直接借用当前请求 URI，避免先由 strip 复制一次、
@@ -1022,11 +1172,7 @@ impl super::GatewayProxy {
         }
 
         if let Some((downstream, downstream_connection_lease)) = ctx.downstream_upgrade {
-            let ForwardBody::Incoming(body) = ctx.body else {
-                return Err(ForwardError::BadGateway(anyhow::anyhow!(
-                    "websocket body was pre-buffered unexpectedly"
-                )));
-            };
+            let body = ctx.body;
             let limit_conn_guards = std::mem::take(&mut ctx.limit_conn_guards);
             let reservation = self.resolve_upstream_base_excluding(
                 ctx.snap,
@@ -1077,6 +1223,219 @@ impl super::GatewayProxy {
         let passive_policy = lb_service
             .and_then(|svc| ctx.snap.upstreams.passive_health_policy(svc))
             .unwrap_or_else(PassiveHealthPolicy::disabled);
+        if let Some(hedge) = ctx
+            .route
+            .hedge
+            .filter(|_| can_hedge_request(&ctx.parts, ctx.route.pass_request_body))
+        {
+            let primary = self.resolve_upstream_base_excluding(
+                ctx.snap,
+                upstream_target.as_ref(),
+                &[],
+                &ctx.proxy.limits,
+            )?;
+            let primary_health_key = primary.health_key.clone();
+            let secondary = self.resolve_upstream_base_excluding(
+                ctx.snap,
+                upstream_target.as_ref(),
+                std::slice::from_ref(&primary_health_key),
+                &ctx.proxy.limits,
+            );
+            if let Ok(secondary) = secondary {
+                let primary_uri = upstream_uri(&primary.base, &rewritten, &query)?;
+                let secondary_uri = upstream_uri(&secondary.base, &rewritten, &query)?;
+                let primary_upstream = primary.base.clone();
+                let secondary_upstream = secondary.base.clone();
+                let secondary_health_key = secondary.health_key.clone();
+                let primary_parts = prepare_attempt_parts(
+                    &ctx.parts,
+                    primary_uri,
+                    ctx.route,
+                    primary.protocol,
+                    ctx.client_ip,
+                    ctx.client_ip_header.as_ref(),
+                    ctx.trusted_inbound,
+                    ctx.client_cert_verified,
+                    ctx.downstream_proto,
+                    ctx.request_id,
+                    false,
+                )?;
+                let secondary_parts = prepare_attempt_parts(
+                    &ctx.parts,
+                    secondary_uri,
+                    ctx.route,
+                    secondary.protocol,
+                    ctx.client_ip,
+                    ctx.client_ip_header.as_ref(),
+                    ctx.trusted_inbound,
+                    ctx.client_cert_verified,
+                    ctx.downstream_proto,
+                    ctx.request_id,
+                    false,
+                )?;
+                let primary_future = self.send_upstream_request(
+                    primary_parts,
+                    empty_body(),
+                    primary,
+                    UpstreamSendContext {
+                        ttfb_timeout_ms: ctx.proxy.timeouts.upstream_ttfb_timeout_ms,
+                        stream_idle_timeout_ms: response_stream_idle_timeout_ms,
+                        downstream_version,
+                        trace: ctx.trace,
+                        upstream: primary_upstream.as_ref(),
+                        attempt: 1,
+                        client_shard_hint,
+                        grpc_drain: grpc_drain.as_ref(),
+                        browser_grpc: browser_grpc.clone(),
+                        browser_grpc_unary_limit: ctx.proxy.limits.max_body_bytes,
+                    },
+                );
+                tokio::pin!(primary_future);
+                let delay = tokio::time::sleep(hedge.delay);
+                tokio::pin!(delay);
+
+                // 主请求在延迟窗内成功时绝不启动副本；失败则无需继续等待剩余延迟。
+                let primary_early = tokio::select! {
+                    result = &mut primary_future => Some(result),
+                    _ = &mut delay => None,
+                };
+                if let Some(result) = primary_early {
+                    if hedge_attempt_succeeded(&result) {
+                        return self.finish_hedge_attempt(
+                            result,
+                            &primary_health_key,
+                            passive_policy,
+                            primary_upstream.clone(),
+                            1,
+                        );
+                    }
+                    self.metrics.inc_upstream_hedge_started();
+                    let primary_result = self.finish_hedge_attempt(
+                        result,
+                        &primary_health_key,
+                        passive_policy,
+                        primary_upstream.clone(),
+                        2,
+                    );
+                    let secondary_result = self
+                        .send_upstream_request(
+                            secondary_parts,
+                            empty_body(),
+                            secondary,
+                            UpstreamSendContext {
+                                ttfb_timeout_ms: ctx.proxy.timeouts.upstream_ttfb_timeout_ms,
+                                stream_idle_timeout_ms: response_stream_idle_timeout_ms,
+                                downstream_version,
+                                trace: ctx.trace,
+                                upstream: secondary_upstream.as_ref(),
+                                attempt: 2,
+                                client_shard_hint,
+                                grpc_drain: grpc_drain.as_ref(),
+                                browser_grpc: browser_grpc.clone(),
+                                browser_grpc_unary_limit: ctx.proxy.limits.max_body_bytes,
+                            },
+                        )
+                        .await;
+                    let secondary_result = self.finish_hedge_attempt(
+                        secondary_result,
+                        &secondary_health_key,
+                        passive_policy,
+                        secondary_upstream,
+                        2,
+                    );
+                    if hedge_attempt_succeeded(&secondary_result) {
+                        self.metrics.inc_upstream_hedge_winner(true);
+                    } else {
+                        self.metrics.inc_upstream_hedge_failed();
+                    }
+                    return choose_hedge_result(primary_result, secondary_result);
+                }
+
+                self.metrics.inc_upstream_hedge_started();
+                let secondary_future = self.send_upstream_request(
+                    secondary_parts,
+                    empty_body(),
+                    secondary,
+                    UpstreamSendContext {
+                        ttfb_timeout_ms: ctx.proxy.timeouts.upstream_ttfb_timeout_ms,
+                        stream_idle_timeout_ms: response_stream_idle_timeout_ms,
+                        downstream_version,
+                        trace: ctx.trace,
+                        upstream: secondary_upstream.as_ref(),
+                        attempt: 2,
+                        client_shard_hint,
+                        grpc_drain: grpc_drain.as_ref(),
+                        browser_grpc: browser_grpc.clone(),
+                        browser_grpc_unary_limit: ctx.proxy.limits.max_body_bytes,
+                    },
+                );
+                tokio::pin!(secondary_future);
+                enum HedgeWinner<T> {
+                    Primary(T),
+                    Secondary(T),
+                }
+                let first = tokio::select! {
+                    result = &mut primary_future => HedgeWinner::Primary(result),
+                    result = &mut secondary_future => HedgeWinner::Secondary(result),
+                };
+                match first {
+                    HedgeWinner::Primary(result) => {
+                        let primary_result = self.finish_hedge_attempt(
+                            result,
+                            &primary_health_key,
+                            passive_policy,
+                            primary_upstream.clone(),
+                            2,
+                        );
+                        if hedge_attempt_succeeded(&primary_result) {
+                            self.metrics.inc_upstream_hedge_winner(false);
+                            // 丢弃未完成 future 会取消败方 response wait/QUIC stream，并由预留 RAII 归还预算。
+                            return primary_result;
+                        }
+                        let secondary_result = self.finish_hedge_attempt(
+                            secondary_future.await,
+                            &secondary_health_key,
+                            passive_policy,
+                            secondary_upstream.clone(),
+                            2,
+                        );
+                        if hedge_attempt_succeeded(&secondary_result) {
+                            self.metrics.inc_upstream_hedge_winner(true);
+                        } else {
+                            self.metrics.inc_upstream_hedge_failed();
+                        }
+                        return choose_hedge_result(primary_result, secondary_result);
+                    }
+                    HedgeWinner::Secondary(result) => {
+                        let secondary_result = self.finish_hedge_attempt(
+                            result,
+                            &secondary_health_key,
+                            passive_policy,
+                            secondary_upstream.clone(),
+                            2,
+                        );
+                        if hedge_attempt_succeeded(&secondary_result) {
+                            self.metrics.inc_upstream_hedge_winner(true);
+                            // 同上，取消仍在途的主请求；不等待失败副本拖长下游 TTFB。
+                            return secondary_result;
+                        }
+                        let primary_result = self.finish_hedge_attempt(
+                            primary_future.await,
+                            &primary_health_key,
+                            passive_policy,
+                            primary_upstream.clone(),
+                            2,
+                        );
+                        if hedge_attempt_succeeded(&primary_result) {
+                            self.metrics.inc_upstream_hedge_winner(false);
+                        } else {
+                            self.metrics.inc_upstream_hedge_failed();
+                        }
+                        return choose_hedge_result(secondary_result, primary_result);
+                    }
+                }
+            }
+        }
         if retry_policy
             .as_ref()
             .map(|policy| can_retry_request(&ctx.parts, policy, ctx.route.pass_request_body))
@@ -1150,6 +1509,8 @@ impl super::GatewayProxy {
                             attempt: attempt_count,
                             client_shard_hint,
                             grpc_drain: grpc_drain.as_ref(),
+                            browser_grpc: browser_grpc.clone(),
+                            browser_grpc_unary_limit: ctx.proxy.limits.max_body_bytes,
                         },
                     )
                     .await
@@ -1253,6 +1614,8 @@ impl super::GatewayProxy {
                     attempt: 1,
                     client_shard_hint,
                     grpc_drain: grpc_drain.as_ref(),
+                    browser_grpc: browser_grpc.clone(),
+                    browser_grpc_unary_limit: ctx.proxy.limits.max_body_bytes,
                 },
             )
             .await;
@@ -1287,15 +1650,36 @@ impl super::GatewayProxy {
             .map(|trace| trace.begin_client(&mut parts.headers, ctx.upstream, ctx.attempt));
         let ureq = Request::from_parts(parts, body);
         let use_h2c = reservation.protocol == UpstreamProtocol::H2c;
+        #[cfg(feature = "http3")]
+        let use_h3 = reservation.protocol == UpstreamProtocol::H3;
+        #[cfg(not(feature = "http3"))]
+        let use_h3 = false;
         let h2_request = ureq.version() == http::Version::HTTP_2;
-        let client = if use_h2c {
+        let client = if use_h2c || use_h3 {
             None
         } else {
             Some(self.http_client_for(&reservation, h2_request, Some(ctx.client_shard_hint)))
         };
         let h2c_client =
             use_h2c.then(|| self.h2c_client_for(&reservation, Some(ctx.client_shard_hint)));
+        #[cfg(feature = "http3")]
+        let h3_client = if use_h3 {
+            Some(
+                self.h3_client_for(&reservation)
+                    .map_err(|error| map_client_error("build HTTP/3 client", error))?,
+            )
+        } else {
+            None
+        };
         let fut = async {
+            #[cfg(feature = "http3")]
+            if use_h3 {
+                return h3_client
+                    .expect("HTTP/3 client prepared")
+                    .request(ureq)
+                    .await
+                    .map(|response| response.map(UpstreamResponseBody::Http3));
+            }
             if use_h2c {
                 h2c_client.expect("h2c client prepared").request(ureq).await
             } else {
@@ -1346,7 +1730,49 @@ impl super::GatewayProxy {
         if grpc_drain.is_some() {
             resp.extensions_mut().insert(GrpcDrainAttached);
         }
-        Ok(resp.map(|body| reservation.wrap_body(body, ctx.stream_idle_timeout_ms, grpc_drain)))
+        let response =
+            resp.map(|body| reservation.wrap_body(body, ctx.stream_idle_timeout_ms, grpc_drain));
+        if let Some(protocol) = ctx.browser_grpc.as_ref() {
+            // Connect unary 只有消费最终 grpc-status 后才能确定 HTTP 状态；转换必须留在
+            // upstream attempt 内完成，不能先把 200 response head 发布给浏览器再尝试改写。
+            protocol
+                .translate_response(response, ctx.browser_grpc_unary_limit)
+                .await
+                .map_err(ForwardError::BrowserGrpc)
+        } else {
+            Ok(response)
+        }
+    }
+
+    /// 业务作用：统一记录一个 hedge attempt 的健康结果并附着最终上游追踪信息，确保并发
+    /// 分支与普通/retry 分支使用相同的被动健康语义。
+    ///
+    /// 参数说明：`result` 是 response-head 结果；`health_key`/`upstream` 标识真实实例；
+    /// `passive_policy` 是服务摘除策略；`attempt` 是固定 1/2 序号。
+    ///
+    /// 返回：保留原成功/失败语义；成功响应额外带最终实例与 attempt 数。
+    fn finish_hedge_attempt(
+        &self,
+        result: Result<Response<BoxBody>, ForwardError>,
+        health_key: &str,
+        passive_policy: PassiveHealthPolicy,
+        upstream: Arc<str>,
+        attempt: usize,
+    ) -> Result<Response<BoxBody>, ForwardError> {
+        match result {
+            Ok(response) => {
+                if response.status().is_server_error() {
+                    self.record_upstream_failure(health_key, passive_policy);
+                } else {
+                    self.record_upstream_success(health_key);
+                }
+                Ok(annotate_upstream_trace(response, upstream, attempt))
+            }
+            Err(error) => {
+                self.record_upstream_failure(health_key, passive_policy);
+                Err(error)
+            }
+        }
     }
 
     /// 执行 route 的 ext_authz 外部鉴权策略。
@@ -1503,14 +1929,35 @@ impl super::GatewayProxy {
         parts.extensions.clear();
         let request = Request::from_parts(parts, empty_body());
         let use_h2c = reservation.protocol == UpstreamProtocol::H2c;
+        #[cfg(feature = "http3")]
+        let use_h3 = reservation.protocol == UpstreamProtocol::H3;
+        #[cfg(not(feature = "http3"))]
+        let use_h3 = false;
         let h2_request = request.version() == http::Version::HTTP_2;
-        let client = if use_h2c {
+        let client = if use_h2c || use_h3 {
             None
         } else {
             Some(self.http_client_for(&reservation, h2_request, None))
         };
         let h2c_client = use_h2c.then(|| self.h2c_client_for(&reservation, None));
+        #[cfg(feature = "http3")]
+        let h3_client = if use_h3 {
+            Some(
+                self.h3_client_for(&reservation)
+                    .map_err(|error| map_client_error("build HTTP/3 ext_authz client", error))?,
+            )
+        } else {
+            None
+        };
         let fut = async {
+            #[cfg(feature = "http3")]
+            if use_h3 {
+                return h3_client
+                    .expect("HTTP/3 ext_authz client prepared")
+                    .request(request)
+                    .await
+                    .map(|response| response.map(UpstreamResponseBody::Http3));
+            }
             if use_h2c {
                 h2c_client
                     .expect("h2c ext_authz client prepared")
@@ -1615,10 +2062,32 @@ impl super::GatewayProxy {
         parts.extensions.clear();
         let request = Request::from_parts(parts, full_body(payload.body));
         let use_h2c = reservation.protocol == UpstreamProtocol::H2c;
+        #[cfg(feature = "http3")]
+        let use_h3 = reservation.protocol == UpstreamProtocol::H3;
+        #[cfg(not(feature = "http3"))]
+        let use_h3 = false;
         let h2_request = request.version() == http::Version::HTTP_2;
-        let client = (!use_h2c).then(|| self.http_client_for(&reservation, h2_request, None));
+        let client =
+            (!use_h2c && !use_h3).then(|| self.http_client_for(&reservation, h2_request, None));
         let h2c_client = use_h2c.then(|| self.h2c_client_for(&reservation, None));
+        #[cfg(feature = "http3")]
+        let h3_client = if use_h3 {
+            Some(
+                self.h3_client_for(&reservation)
+                    .map_err(|error| map_client_error("build HTTP/3 OPA client", error))?,
+            )
+        } else {
+            None
+        };
         let send = async {
+            #[cfg(feature = "http3")]
+            if use_h3 {
+                return h3_client
+                    .expect("HTTP/3 OPA client prepared")
+                    .request(request)
+                    .await
+                    .map(|response| response.map(UpstreamResponseBody::Http3));
+            }
             if use_h2c {
                 h2c_client
                     .expect("h2c OPA client prepared")
@@ -1707,10 +2176,32 @@ impl super::GatewayProxy {
         parts.extensions.clear();
         let request = Request::from_parts(parts, full_body(payload.body));
         let use_h2c = reservation.protocol == UpstreamProtocol::H2c;
+        #[cfg(feature = "http3")]
+        let use_h3 = reservation.protocol == UpstreamProtocol::H3;
+        #[cfg(not(feature = "http3"))]
+        let use_h3 = false;
         let h2_request = request.version() == http::Version::HTTP_2;
-        let client = (!use_h2c).then(|| self.http_client_for(&reservation, h2_request, None));
+        let client =
+            (!use_h2c && !use_h3).then(|| self.http_client_for(&reservation, h2_request, None));
         let h2c_client = use_h2c.then(|| self.h2c_client_for(&reservation, None));
+        #[cfg(feature = "http3")]
+        let h3_client = if use_h3 {
+            Some(
+                self.h3_client_for(&reservation)
+                    .map_err(|error| map_client_error("build HTTP/3 plugin client", error))?,
+            )
+        } else {
+            None
+        };
         let send = async {
+            #[cfg(feature = "http3")]
+            if use_h3 {
+                return h3_client
+                    .expect("HTTP/3 external plugin client prepared")
+                    .request(request)
+                    .await
+                    .map(|response| response.map(UpstreamResponseBody::Http3));
+            }
             if use_h2c {
                 h2c_client
                     .expect("h2c external plugin client prepared")
@@ -1744,17 +2235,20 @@ impl super::GatewayProxy {
         Ok(response.map(|body| reservation.wrap_body(body, 0, None)))
     }
 
-    /// 发送一次已校验的 Dubbo2 generic invocation。
+    /// 业务作用：使用普通 upstream 选择/预算与 Dubbo 专用有界 TCP pool 发送一次已校验的
+    /// generic invocation，并把 provider 结果映射为 HTTP JSON 与低基数指标。
     ///
-    /// 上游选择、主动/被动健康、least_conn 与 pending 预算复用普通 HTTP 数据面；真正
-    /// transport 由 Dubbo plan 的有界原始 TCP pool 承担。完整响应 frame 在返回 HTTP head
-    /// 前已经读完，因此 RAII reservation 可在本函数结束时安全归还。
+    /// 参数说明：`snap`、`proxy` 与 `route` 提供当前快照、数据面预算和固定 Dubbo plan；
+    /// `invocation` 已在选择 upstream 前完成类型、资源上限与 wire 编码校验。
+    ///
+    /// 返回：provider 成功时返回 200 JSON；连接/超时/协议/远端异常返回分类后的
+    /// `ForwardError`。完整 response frame 在返回前读完，RAII reservation 随函数退出归还。
     pub(super) async fn send_dubbo_request(
         &self,
         snap: &GatewaySnapshot,
         proxy: &ProxyRuntime,
         route: &Route,
-        arguments: &[serde_json::Value],
+        invocation: &crate::dubbo::DubboInvocation,
     ) -> Result<Response<BoxBody>, ForwardError> {
         let plan = route
             .dubbo
@@ -1773,7 +2267,7 @@ impl super::GatewayProxy {
             .strip_prefix("lb://")
             .and_then(|service| snap.upstreams.passive_health_policy(service))
             .unwrap_or_else(PassiveHealthPolicy::disabled);
-        let result = plan.invoke(upstream.clone(), arguments).await;
+        let result = plan.invoke(upstream.clone(), invocation).await;
         let response = match result {
             Ok(DubboResult::Value(body)) => {
                 self.metrics.inc_dubbo(DubboMetric::Success);
@@ -1813,6 +2307,8 @@ impl super::GatewayProxy {
                 )));
             }
             Err(DubboError::InvalidInput(message)) => {
+                // 预编码调用已在占用 upstream 前排除客户端错误；此分支只防守内部契约回归，
+                // 不把它计入被动健康，但仍避免向下游暴露内部细节。
                 self.metrics.inc_dubbo(DubboMetric::InvalidInput);
                 return Err(ForwardError::BadGateway(anyhow::anyhow!(message)));
             }
@@ -1832,13 +2328,12 @@ impl super::GatewayProxy {
         Ok(annotate_upstream_trace(response, upstream, 1))
     }
 
-    /// 启动 route 配置的 mirror 子请求。
+    /// 业务作用：按稳定采样结果异步发送 route 镜像请求，且镜像失败不阻塞主请求响应。
     ///
-    /// # 参数
-    /// - `ctx`: 当前主请求转发上下文。
-    /// - `path`: 已执行 StripPrefix/rewrite 后的 path。
-    /// - `query`: 原始 query,包含可选前导 `?`。
-    /// - `downstream_version`: 下游请求版本,用于 mirror 请求的版本 hint。
+    /// 参数说明：`ctx` 是主请求上下文；`path`/`query` 是最终上游路径；`downstream_version`
+    /// 提供协议 hint；`mirror_body` 是与主请求共享的有界完整 body。
+    ///
+    /// 返回：无返回值；命中的子请求进入后台任务，跳过与失败只记录指标，不改变主链路结果。
     fn spawn_mirror_requests(
         &self,
         ctx: &ForwardRequest<'_>,
@@ -1870,12 +2365,29 @@ impl super::GatewayProxy {
                 Ok((parts, reservation, client_trace)) => {
                     self.metrics.inc_mirror_request();
                     let use_h2c = reservation.protocol == UpstreamProtocol::H2c;
+                    #[cfg(feature = "http3")]
+                    let use_h3 = reservation.protocol == UpstreamProtocol::H3;
+                    #[cfg(not(feature = "http3"))]
+                    let use_h3 = false;
                     let h2_request = parts.version == http::Version::HTTP_2;
                     // 只给真正使用的协议池计一次 keepalive request；旧实现同时取两个 client，
                     // 会让未发送请求的 pool generation 也提前轮换。
-                    let client =
-                        (!use_h2c).then(|| self.http_client_for(&reservation, h2_request, None));
+                    let client = (!use_h2c && !use_h3)
+                        .then(|| self.http_client_for(&reservation, h2_request, None));
                     let h2c_client = use_h2c.then(|| self.h2c_client_for(&reservation, None));
+                    #[cfg(feature = "http3")]
+                    let h3_client = if use_h3 {
+                        match self.h3_client_for(&reservation) {
+                            Ok(client) => Some(client),
+                            Err(error) => {
+                                self.metrics.inc_mirror_error();
+                                tracing::debug!(%error, "build HTTP/3 mirror client failed");
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let metrics = self.metrics.clone();
                     let ttfb_timeout_ms = ctx.proxy.timeouts.upstream_ttfb_timeout_ms;
                     let request_body = body_bytes.map(full_body).unwrap_or_else(empty_body);
@@ -1883,6 +2395,8 @@ impl super::GatewayProxy {
                         if let Err(err) = send_mirror_request(
                             client,
                             h2c_client,
+                            #[cfg(feature = "http3")]
+                            h3_client,
                             parts,
                             request_body,
                             reservation,
@@ -1907,10 +2421,11 @@ impl super::GatewayProxy {
         }
     }
 
-    /// 为显式开启 body 的 mirror 准备可复用请求体。
+    /// 业务作用：为显式开启 body 的 mirror 准备可复用请求体，同时保持主请求获得相同字节。
     ///
-    /// # 参数
-    /// - `ctx`: 当前主请求转发上下文,函数可能把原始 `Incoming` 替换成可复用 `Bytes` body。
+    /// 参数说明：`ctx` 是当前主请求转发上下文，函数会把原始 body 替换成可复用 `Bytes` body。
+    ///
+    /// 返回：没有镜像策略命中时返回 `None`；命中时返回受上限约束的完整 body，超限或读取失败则拒绝主请求。
     async fn prepare_mirror_body(
         &self,
         ctx: &mut ForwardRequest<'_>,
@@ -1925,26 +2440,25 @@ impl super::GatewayProxy {
         else {
             return Ok(None);
         };
-        let Some(content_length) = request_content_length(&ctx.parts) else {
-            return Ok(None);
-        };
-        if content_length > max_body_bytes {
-            return Ok(None);
+        if let Some(content_length) = request_content_length(&ctx.parts) {
+            if content_length > max_body_bytes {
+                return Ok(None);
+            }
         }
-        let body = std::mem::replace(&mut ctx.body, ForwardBody::Boxed(empty_body()));
+        // 缺少 Content-Length 既可能是空 GET，也可能是 chunked/HTTP2 流；都必须实际读取，
+        // 否则标准 RequestMirror 会静默漏掉无长度请求，破坏镜像比例与审计完整性。
+        let body = std::mem::replace(&mut ctx.body, empty_body());
         let bytes = collect_forward_body(body, max_body_bytes).await?;
-        ctx.body = ForwardBody::Boxed(full_body(bytes.clone()));
+        ctx.body = full_body(bytes.clone());
         Ok(Some(bytes))
     }
 
-    /// 构造单个 mirror 子请求。
+    /// 业务作用：基于可信 route 和当前请求构造单个镜像上游请求，并复用正常代理的安全头处理。
     ///
-    /// # 参数
-    /// - `ctx`: 当前主请求转发上下文。
-    /// - `mirror`: route 上的 mirror 规则。
-    /// - `path`: 已执行 StripPrefix/rewrite 后的 path。
-    /// - `query`: 原始 query,包含可选前导 `?`。
-    /// - `body_len`: mirror 子请求 body 字节数;`None` 表示不复制请求体。
+    /// 参数说明：`ctx` 是主请求上下文；`mirror` 是镜像策略；`path`/`query` 是最终上游路径；
+    /// `body_len` 是镜像 body 字节数，`None` 表示发送空 body。
+    ///
+    /// 返回：目标可解析且 URI/header 合法时返回请求 head、上游占位和 tracing 上下文，否则拒绝该镜像。
     fn prepare_mirror_request(
         &self,
         ctx: &ForwardRequest<'_>,
@@ -2007,7 +2521,7 @@ impl super::GatewayProxy {
     ///
     /// # 参数
     /// - `parts`: 已完成 hop-by-hop/Host/转发头处理的上游握手 head。
-    /// - `body`: 下游原始 `Incoming`；握手期保持流式，不预收集。
+    /// - `body`: 下游统一流式 body；握手期不预收集。
     /// - `downstream_upgrade`: 下游 101 升级 future。
     /// - `downstream_connection_lease`: 101 后随 tunnel 持有的 listener 物理连接预算。
     /// - `route_id`: 登记长连接和日志使用的稳定路由 id。
@@ -2025,7 +2539,7 @@ impl super::GatewayProxy {
     async fn forward_websocket(
         &self,
         parts: Parts,
-        body: Incoming,
+        body: ForwardBody,
         downstream_upgrade: OnUpgrade,
         downstream_connection_lease: Option<super::DownstreamConnectionLease>,
         route_id: &str,
@@ -2040,7 +2554,6 @@ impl super::GatewayProxy {
     ) -> Result<Response<BoxBody>, ForwardError> {
         self.metrics.inc_upstream_attempt();
         let final_upstream = reservation.base.clone();
-        let body = body.map_err(|e| Box::new(e) as BoxError).boxed();
         let ureq = Request::from_parts(parts, body);
         // WebSocket upgrade 固定使用 HTTP/1.1，不得因 route protocol=auto 扩大成 h2 shard 池。
         let client = self.http_client_for(&reservation, false, None);
@@ -2328,6 +2841,7 @@ fn mirror_sampled(request_id: &str, mirror: &MirrorPolicy) -> bool {
 /// # 参数
 /// - `client`: 普通 h1/h2 上游连接池。
 /// - `h2c_client`: h2c prior-knowledge 上游连接池。
+/// - `h3_client`: H3/QUIC multiplex 上游连接池。
 /// - `parts`: 已构造好的 mirror 请求 head。
 /// - `reservation`: 镜像上游实例预留计数。
 /// - `upstream_ttfb_timeout_ms`: mirror 响应头超时,0 表示关闭。
@@ -2335,14 +2849,25 @@ fn mirror_sampled(request_id: &str, mirror: &MirrorPolicy) -> bool {
 async fn send_mirror_request(
     client: Option<super::UpstreamHttpClient>,
     h2c_client: Option<super::UpstreamH2cClient>,
+    #[cfg(feature = "http3")] h3_client: Option<Arc<super::http3_upstream::UpstreamH3Client>>,
     parts: Parts,
     body: BoxBody,
     reservation: UpstreamReservation,
     ctx: MirrorSendContext,
 ) -> Result<(), ForwardError> {
     let use_h2c = reservation.protocol == UpstreamProtocol::H2c;
+    #[cfg(feature = "http3")]
+    let use_h3 = reservation.protocol == UpstreamProtocol::H3;
     let request = Request::from_parts(parts, body);
     let fut = async {
+        #[cfg(feature = "http3")]
+        if use_h3 {
+            return h3_client
+                .expect("HTTP/3 mirror client prepared")
+                .request(request)
+                .await
+                .map(|response| response.map(UpstreamResponseBody::Http3));
+        }
         if use_h2c {
             h2c_client
                 .expect("h2c mirror client prepared")
@@ -2524,11 +3049,11 @@ fn copy_ext_authz_upstream_headers(
     }
 }
 
-/// 应用 route 级 path 前缀改写。
+/// 业务作用：应用 route 级 path 前缀改写，并规范化替换前缀与剩余路径的连接边界。
 ///
-/// # 参数
-/// - `path`: 已经执行 `StripPrefix` 后的 path。
-/// - `route`: 当前命中的 route。
+/// 参数说明：`path` 是已经执行 `StripPrefix` 后的 path；`route` 是当前命中的 route。
+///
+/// 返回：未配置或未命中改写前缀时保留原 path；命中时返回恰好一个 `/` 连接边界的 origin path。
 fn rewrite_prefix(path: &str, route: &Route) -> String {
     let Some(rewrite) = &route.rewrite_prefix else {
         return path.to_string();
@@ -2536,17 +3061,34 @@ fn rewrite_prefix(path: &str, route: &Route) -> String {
     let Some(rest) = path.strip_prefix(&rewrite.from) else {
         return path.to_string();
     };
-    let mut out = String::with_capacity(rewrite.to.len() + rest.len() + 1);
-    if rewrite.to.starts_with('/') {
-        out.push_str(&rewrite.to);
+    join_rewrite_prefix(&rewrite.to, rest)
+}
+
+/// 业务作用：连接改写目标前缀与原路径剩余部分，避免产生双斜杠或缺失路径分隔符。
+///
+/// 参数说明：`replacement` 是替换后的前缀；`rest` 是从原路径剥离匹配前缀后的剩余部分。
+///
+/// 返回：返回以 `/` 开头且连接边界恰好包含一个 `/` 的 origin path。
+fn join_rewrite_prefix(replacement: &str, rest: &str) -> String {
+    let mut out = String::with_capacity(replacement.len() + rest.len() + 1);
+    if replacement.starts_with('/') {
+        out.push_str(replacement);
     } else {
         out.push('/');
-        out.push_str(&rewrite.to);
+        out.push_str(replacement);
     }
-    if !out.ends_with('/') && !rest.starts_with('/') && !rest.is_empty() {
-        out.push('/');
+    if !rest.is_empty() {
+        match (out.ends_with('/'), rest.starts_with('/')) {
+            // ReplacePrefixMatch `/` 与原路径剩余部分都带 `/` 时必须折叠边界，
+            // 否则上游会收到 `//suffix`，违反 Gateway API 的前缀替换语义。
+            (true, true) => out.push_str(&rest[1..]),
+            (false, false) => {
+                out.push('/');
+                out.push_str(rest);
+            }
+            _ => out.push_str(rest),
+        }
     }
-    out.push_str(rest);
     out
 }
 
@@ -2660,6 +3202,14 @@ fn prepare_attempt_parts_owned(
     )
 }
 
+/// 业务作用：为一次具体上游尝试完成 Host、forwarded 头、mTLS 盖章与 route
+/// header mutation，保证重试换实例时仍按当前 route 契约构造完整 head。
+///
+/// 参数说明：`parts`/`uri` 是下游 head 与当次目标；`route`/`protocol` 是已编译契约；
+/// 客户端、TLS、scheme、request-id、WebSocket 与 header 参数均是上游信任边界输入。
+///
+/// 返回：所有代理头与显式 mutation 合法时返回可发送 head；非法头值或变量渲染
+/// 失败时在任何上游 I/O 前拒绝请求。
 #[allow(clippy::too_many_arguments)]
 fn prepare_attempt_parts_rendered(
     mut parts: Parts,
@@ -2673,13 +3223,15 @@ fn prepare_attempt_parts_rendered(
     downstream_proto: &'static str,
     request_id: &str,
     is_ws: bool,
-    request_headers: Vec<(HeaderName, HeaderValue)>,
+    request_headers: Vec<RenderedRequestHeaderOp>,
 ) -> Result<Parts, ForwardError> {
-    // Host 头改成本次尝试的上游 authority(否则重试换实例后仍会带旧 Host)。
-    if let Some(auth) = uri.authority() {
-        parts
-            .headers
-            .insert(HOST, header_value(auth.as_str(), "host")?);
+    if !route.preserve_host {
+        // 非保留模式必须按每次尝试重写 authority，否则重试换实例后会带旧 Host。
+        if let Some(auth) = uri.authority() {
+            parts
+                .headers
+                .insert(HOST, header_value(auth.as_str(), "host")?);
+        }
     }
     inject_forward_headers(
         &mut parts,
@@ -2699,8 +3251,18 @@ fn prepare_attempt_parts_rendered(
             .headers
             .insert(X_CLIENT_CERT_VERIFIED, HeaderValue::from_static("SUCCESS"));
     }
-    for (name, value) in request_headers {
-        parts.headers.insert(name, value);
+    for operation in request_headers {
+        match operation {
+            RenderedRequestHeaderOp::Set(name, value) => {
+                parts.headers.insert(name, value);
+            }
+            RenderedRequestHeaderOp::Add(name, value) => {
+                parts.headers.append(name, value);
+            }
+            RenderedRequestHeaderOp::Remove(name) => {
+                parts.headers.remove(name);
+            }
+        }
     }
     if !route.pass_request_body {
         strip_request_body_headers(&mut parts);
@@ -2715,11 +3277,44 @@ fn prepare_attempt_parts_rendered(
         upstream_request_version(protocol, &parts)
     };
     sanitize_hop_headers_for_upstream(&mut parts, is_ws, upstream_version);
-    parts.uri = uri;
+    parts.uri = if route.preserve_host {
+        preserve_request_uri_authority(uri, parts.headers.get(HOST))?
+    } else {
+        uri
+    };
     // ★上游请求版本按【上游 protocol 配置】设(review L1):auto 时 gRPC 走 h2、普通 http 走 h1;
     //   WS 是 h1 upgrade 固定 1.1。避免把下游版本误传给 h1 上游。
     parts.version = upstream_version;
     Ok(parts)
+}
+
+/// 业务作用：在 `preserve_host` 路由上把原始 Host 同步到上游 URI authority，
+/// 防止 HTTP/2 把实际拨号地址编码为 `:authority` 后改变虚拟主机语义。
+///
+/// 参数说明：`uri` 含实际上游 scheme/地址/path；`host` 是已通过入口头部校验的原始 Host。
+///
+/// 返回：Host 存在且可作为 authority 时返回保留权威的新 URI；缺 Host 时保持实际 URI，非法值拒绝请求。
+fn preserve_request_uri_authority(
+    uri: http::Uri,
+    host: Option<&HeaderValue>,
+) -> Result<http::Uri, ForwardError> {
+    let Some(host) = host else {
+        return Ok(uri);
+    };
+    let authority = host
+        .to_str()
+        .map_err(|error| {
+            ForwardError::BadGateway(anyhow::anyhow!("invalid preserved Host: {error}"))
+        })?
+        .parse::<http::uri::Authority>()
+        .map_err(|error| {
+            ForwardError::BadGateway(anyhow::anyhow!("invalid preserved authority: {error}"))
+        })?;
+    let mut parts = uri.into_parts();
+    parts.authority = Some(authority);
+    http::Uri::from_parts(parts).map_err(|error| {
+        ForwardError::BadGateway(anyhow::anyhow!("build preserved upstream URI: {error}"))
+    })
 }
 
 /// 删除请求体相关头,避免 `proxy_pass_request_body off` 时上游继续等待 body。
@@ -2747,12 +3342,12 @@ fn upstream_request_body(
     stream_idle_timeout_ms: u64,
 ) -> BoxBody {
     if !pass_request_body {
-        // WHY:proxy_pass_request_body=off 的目标是“不读、不缓冲、不转发”请求体;丢弃 Incoming 即可让上游看到空 body。
+        // WHY:proxy_pass_request_body=off 的目标是“不读、不缓冲、不转发”请求体；丢弃下游流即可让上游看到空 body。
         return empty_body();
     }
-    // 流式转发:下游 body(Incoming)直接作上游请求 body,不全量 buffer(背压天然)。
+    // 流式转发：下游统一 body 直接作上游请求 body，不全量 buffer（背压天然）。
     // ★body 上限对【流式 / chunked】也生效(据 review M2):有 Content-Length 的已在入口 413 预拦;
-    //   无 Content-Length 的 chunked 上传靠 Limited 在超过 max_body_bytes 时中止,防无界上传打爆带宽/上游。
+    //   无 Content-Length 的 chunked/H3 上传靠 LimitedBoxBody 在超过 max_body_bytes 时中止，防无界上传打爆带宽/上游。
     idle_timeout_body(
         limited_forward_body(body, max_body_bytes),
         stream_idle_timeout_ms,
@@ -2762,27 +3357,15 @@ fn upstream_request_body(
 /// 为透传请求体包上可选大小限制。
 ///
 /// # 参数
-/// - `body`: 下游请求体,可能是原始 `Incoming` 或显式慢路径复用 body。
+/// - `body`: 下游或显式慢路径复用的统一流式 body。
 /// - `max_body_bytes`: 最大允许字节数,0 表示不限制。
 fn limited_forward_body(body: ForwardBody, max_body_bytes: u64) -> BoxBody {
-    match body {
-        ForwardBody::Incoming(body) => {
-            if max_body_bytes > 0 {
-                Limited::new(body, max_body_bytes as usize).boxed()
-            } else {
-                body.map_err(|e| Box::new(e) as BoxError).boxed()
-            }
-        }
-        ForwardBody::Boxed(body) => {
-            // Schema/GraphQL/degraphql 等显式慢路径会把已验证的 Bytes 重新包装成 BoxBody。
-            // 它们仍必须服从 proxy 级总 body 上限；尤其 chunked 请求没有入口
-            // Content-Length 预检，不能因一次有界重包装就绕过更小的全局限制。
-            if max_body_bytes > 0 {
-                LimitedBoxBody::new(body, max_body_bytes as usize).boxed()
-            } else {
-                body
-            }
-        }
+    // Schema/GraphQL/degraphql 以及 H3 adapter 都会产生同一 BoxBody。它们仍必须服从 proxy
+    // 总 body 上限；尤其无 Content-Length 的流不能因类型擦除绕过全局限制。
+    if max_body_bytes > 0 {
+        LimitedBoxBody::new(body, max_body_bytes as usize).boxed()
+    } else {
+        body
     }
 }
 
@@ -2795,16 +3378,10 @@ async fn collect_forward_body(
     body: ForwardBody,
     max_body_bytes: u64,
 ) -> Result<Bytes, ForwardError> {
-    let collected = match body {
-        ForwardBody::Incoming(body) => Limited::new(body, max_body_bytes as usize)
-            .collect()
-            .await
-            .map_err(|e| ForwardError::BadGateway(anyhow::anyhow!("mirror body collect: {e}")))?,
-        ForwardBody::Boxed(body) => LimitedBoxBody::new(body, max_body_bytes as usize)
-            .collect()
-            .await
-            .map_err(|e| ForwardError::BadGateway(anyhow::anyhow!("mirror body collect: {e}")))?,
-    };
+    let collected = LimitedBoxBody::new(body, max_body_bytes as usize)
+        .collect()
+        .await
+        .map_err(|e| ForwardError::BadGateway(anyhow::anyhow!("mirror body collect: {e}")))?;
     Ok(collected.to_bytes())
 }
 
@@ -2939,6 +3516,43 @@ fn empty_body() -> BoxBody {
         .boxed()
 }
 
+/// 业务作用：执行 hedge 的最后一道请求级安全门，避免配置声明被 POST 等实际请求复用。
+///
+/// 参数说明：`parts` 是真实下游请求 head；`pass_request_body` 是编译后的 route body 策略。
+///
+/// 返回：仅 GET/HEAD 且 route 明确不向上游发送 body 时允许启动副本。
+fn can_hedge_request(parts: &Parts, pass_request_body: bool) -> bool {
+    !pass_request_body && matches!(parts.method, http::Method::GET | http::Method::HEAD)
+}
+
+/// 业务作用：判定 hedge attempt 是否已经得到可交付的业务响应；5xx 继续等待另一实例，
+/// 4xx 视为权威业务结果，避免错误请求被重复放大。
+///
+/// 参数说明：`result` 是已完成健康记账和追踪标注的 attempt 结果。
+///
+/// 返回：transport 成功且状态码不是 5xx 时返回 true。
+fn hedge_attempt_succeeded(result: &Result<Response<BoxBody>, ForwardError>) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(|response| !response.status().is_server_error())
+}
+
+/// 业务作用：两个 hedge attempt 都未成功时选出对下游最有解释力的失败结果。
+///
+/// 参数说明：`first` 是先完成的失败；`second` 是后完成的失败。
+///
+/// 返回：优先返回真实 5xx response；两者都是 transport 错误时保留先发生的错误。
+fn choose_hedge_result(
+    first: Result<Response<BoxBody>, ForwardError>,
+    second: Result<Response<BoxBody>, ForwardError>,
+) -> Result<Response<BoxBody>, ForwardError> {
+    match (first, second) {
+        (response @ Ok(_), _) => response,
+        (_, response @ Ok(_)) => response,
+        (Err(first), Err(_)) => Err(first),
+    }
+}
+
 /// 判断当前请求是否允许尝试下一个上游实例。
 ///
 /// # 参数
@@ -3000,7 +3614,9 @@ fn should_retry_error(policy: &NextUpstreamPolicy, err: &ForwardError) -> bool {
     match err {
         ForwardError::BadGateway(_) => policy.error,
         ForwardError::Timeout => policy.timeout,
-        ForwardError::NoHealthyUpstream(_) | ForwardError::Overloaded => false,
+        ForwardError::BrowserGrpc(_)
+        | ForwardError::NoHealthyUpstream(_)
+        | ForwardError::Overloaded => false,
     }
 }
 
@@ -3014,8 +3630,12 @@ async fn retry_backoff(policy: Option<&NextUpstreamPolicy>) {
 }
 
 impl super::GatewayProxy {
-    /// 启动 V7 上游连接预热线程。每轮只处理尚未见过的完整实例/池身份；动态发现加入的新实例
-    /// 会在下一轮被预热，已完成项不会周期性制造业务请求。
+    /// 业务作用：启动上游连接预热线程；每轮只处理尚未见过的完整实例/池身份，
+    /// 动态发现加入的新实例在下一轮预热，已完成项不会周期性制造业务请求。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；后台 task 与 `GatewayProxy` 共享生命周期。
     pub fn spawn_upstream_prewarm(self: &Arc<Self>) {
         let gateway = self.clone();
         tokio::spawn(async move {
@@ -3029,7 +3649,11 @@ impl super::GatewayProxy {
         });
     }
 
-    /// 扫描一个不可变快照并并发预热所有新增实例。
+    /// 业务作用：扫描一个不可变快照并并发预热所有新增实例。
+    ///
+    /// 参数说明：`snapshot` 是本轮固定的路由与上游快照。
+    ///
+    /// 返回：无；成功 identity 记入去重集，失败 identity 留给下轮重试。
     async fn prewarm_snapshot(&self, snapshot: &GatewaySnapshot) {
         let mut current = std::collections::HashSet::new();
         let mut candidates = Vec::new();
@@ -3053,6 +3677,11 @@ impl super::GatewayProxy {
                         connections =
                             connections.min(pool_policy.h2_connection_shards_per_upstream);
                     }
+                    if target.protocol == UpstreamProtocol::H3 {
+                        // H3 client 在一条 QUIC connection 上 multiplex stream；预热多次只会制造
+                        // 额外 HEAD，不会建立更多物理连接，因此将该 identity 收敛为一次握手。
+                        connections = connections.min(1);
+                    }
                     connections = connections.min(pool_policy.max_idle_per_upstream);
                     if pool_policy.max_connections_per_upstream > 0 {
                         connections = connections.min(pool_policy.max_connections_per_upstream);
@@ -3060,6 +3689,7 @@ impl super::GatewayProxy {
                     let key = super::PrewarmedUpstreamKey {
                         health_key: target.health_key.clone(),
                         protocol: target.protocol,
+                        connect_timeout_ms: target.connect_timeout_ms,
                         path: target.policy.path.clone(),
                         connections,
                         max_idle_per_upstream: pool_policy.max_idle_per_upstream,
@@ -3110,8 +3740,13 @@ impl super::GatewayProxy {
         }
     }
 
-    /// 使用真实 Hyper client cache 建立一批连接。HEAD 请求从空 head 构造，不复制任何下游
-    /// header/body；只等待 response head，HTTP 规范保证 HEAD 没有响应正文，因此连接可直接回池。
+    /// 业务作用：使用真实 H1/H2/H2c/H3 client cache 建立连接；HEAD 从空 head
+    /// 构造，不复制任何下游 header/body，只等待 response head 便允许连接回池。
+    ///
+    /// 参数说明：`target` 是已验证的实例和预热策略；`pool_policy` 提供协议窗口与
+    /// 物理连接预算；`connections` 是本轮希望预热的物理连接数。
+    ///
+    /// 返回：所有预热请求在 deadline 内拿到响应头时为 true，否则为 false。
     async fn prewarm_target(
         &self,
         target: &crate::upstream::UpstreamPrewarmTarget,
@@ -3125,6 +3760,7 @@ impl super::GatewayProxy {
             base: target.base.clone(),
             health_key: target.health_key.clone(),
             protocol: target.protocol,
+            connect_timeout_ms: target.connect_timeout_ms,
             tls_profile: target.tls_profile.clone(),
             pool_policy,
             counter: None,
@@ -3135,6 +3771,22 @@ impl super::GatewayProxy {
             return false;
         };
         let timeout = Duration::from_millis(target.policy.timeout_ms);
+        #[cfg(feature = "http3")]
+        if target.protocol == UpstreamProtocol::H3 {
+            let Ok(client) = self.h3_client_for(&reservation) else {
+                return false;
+            };
+            let request = Request::builder()
+                .method(http::Method::HEAD)
+                .version(http::Version::HTTP_3)
+                .uri(uri)
+                .body(empty_body())
+                .expect("build validated HTTP/3 prewarm request");
+            return matches!(
+                tokio::time::timeout(timeout, client.request(request)).await,
+                Ok(Ok(_))
+            );
+        }
         if target.protocol == UpstreamProtocol::H2c {
             let sends = (0..connections).map(|_| {
                 // selector 轮转到独立 shard；请求/响应 body 仍由 Hyper 流式传递。
@@ -3212,6 +3864,7 @@ impl super::GatewayProxy {
         let cache_key = super::UpstreamHttpClientCacheKey {
             health_key: reservation.health_key.clone(),
             protocol: reservation.protocol,
+            connect_timeout_ms: reservation.connect_timeout_ms,
             profile_key: reservation
                 .tls_profile
                 .as_ref()
@@ -3271,9 +3924,11 @@ impl super::GatewayProxy {
             .map(|_| {
                 build_upstream_http_client(
                     reservation.tls_profile.as_ref(),
+                    reservation.base.as_ref(),
                     reservation.pool_policy,
                     physical_budget.clone(),
                     h2_request,
+                    reservation.connect_timeout_ms,
                 )
             })
             .collect::<Vec<_>>();
@@ -3324,6 +3979,62 @@ impl super::GatewayProxy {
         budget
     }
 
+    /// 获取匹配 authority、TLS identity 与 transport 预算的 HTTP/3 multiplex client。
+    ///
+    /// 业务作用：稳定请求复用同一 QUIC connection；reload 改证书、header/window/idle/物理上限时
+    /// 创建新 generation，并立即从 cache 撤下同 identity 旧 handle，既有 body 仍持连接自然 drain。
+    ///
+    /// 参数说明：`reservation` 是本次上游选择的不可变身份与资源计划。
+    ///
+    /// 返回：成功时返回惰性拨号 client；缺少 TLS profile 或 URI 无效时返回上游错误。
+    #[cfg(feature = "http3")]
+    fn h3_client_for(
+        &self,
+        reservation: &UpstreamReservation,
+    ) -> Result<Arc<super::http3_upstream::UpstreamH3Client>, BoxError> {
+        let tls_profile = reservation.tls_profile.clone().ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "HTTP/3 upstream is missing its validated TLS profile",
+            )) as BoxError
+        })?;
+        let key = super::UpstreamH3ClientCacheKey {
+            health_key: reservation.health_key.clone(),
+            profile_key: tls_profile.key.clone(),
+            max_response_header_bytes: reservation.pool_policy.max_header_bytes,
+            stream_receive_window_bytes: reservation.pool_policy.h2_initial_stream_window_bytes,
+            connection_receive_window_bytes: reservation
+                .pool_policy
+                .h2_initial_connection_window_bytes,
+            max_connections_per_upstream: reservation.pool_policy.max_connections_per_upstream,
+            idle_timeout_ms: reservation.pool_policy.idle_timeout_ms,
+        };
+        if let Some(client) = self.h3_clients.read().get(&key) {
+            return Ok(client.clone());
+        }
+        let physical_budget = self.physical_connection_budget_for(reservation);
+        let mut clients = self.h3_clients.write();
+        if let Some(client) = clients.get(&key) {
+            return Ok(client.clone());
+        }
+        // 同 identity 同时只保留一个可分配新 request 的 transport 计划；旧 Arc 可能仍被 response
+        // body 持有，移除 cache 不会粗暴关闭在途 stream。
+        clients.retain(|candidate, _| candidate.health_key != key.health_key);
+        let client = super::http3_upstream::UpstreamH3Client::new(
+            &reservation.base,
+            tls_profile,
+            key.max_response_header_bytes,
+            key.stream_receive_window_bytes,
+            key.connection_receive_window_bytes,
+            key.idle_timeout_ms,
+            physical_budget,
+            self.metrics.clone(),
+        )
+        .map_err(Into::<BoxError>::into)?;
+        clients.insert(key, client.clone());
+        Ok(client)
+    }
+
     /// 获取匹配当前池参数的 h2c prior-knowledge client。
     ///
     /// # 参数
@@ -3337,6 +4048,7 @@ impl super::GatewayProxy {
     ) -> super::UpstreamH2cClient {
         let cache_key = super::UpstreamH2cClientCacheKey {
             health_key: reservation.health_key.clone(),
+            connect_timeout_ms: reservation.connect_timeout_ms,
             max_idle_per_upstream: reservation.pool_policy.max_idle_per_upstream,
             h2_connection_shards_per_upstream: reservation
                 .pool_policy
@@ -3408,7 +4120,14 @@ impl super::GatewayProxy {
             reservation.pool_policy.old_pool_retain_ms,
         );
         let client_shards = (0..reservation.pool_policy.h2_connection_shards_per_upstream)
-            .map(|_| build_h2c_client(reservation.pool_policy, physical_budget.clone()))
+            .map(|_| {
+                build_h2c_client(
+                    reservation.pool_policy,
+                    physical_budget.clone(),
+                    reservation.connect_timeout_ms,
+                    reservation.base.as_ref(),
+                )
+            })
             .collect::<Vec<_>>();
         let client = client_shards[0].clone();
         let entry = Arc::new(super::CachedUpstreamH2cClient {
@@ -3480,6 +4199,7 @@ impl super::GatewayProxy {
             let base = inst.uri.clone();
             let health_key = inst.health_key.clone();
             let protocol = inst.protocol;
+            let connect_timeout_ms = inst.connect_timeout_ms;
             let tls_profile = inst.tls_profile.clone();
             // 只有 least_conn 会读取 in-flight；RR/first 为每请求维护一份永不读取的计数既增加
             // DashMap 查找，也让所有响应 body 在同一 atomic 上增减。单候选 least_conn 在选择时
@@ -3504,6 +4224,7 @@ impl super::GatewayProxy {
                     base,
                     health_key,
                     protocol,
+                    connect_timeout_ms,
                     tls_profile,
                     pool_policy: HttpPoolPolicy::from_limits(limits),
                     counter,
@@ -3519,6 +4240,7 @@ impl super::GatewayProxy {
                 health_key: base.clone(),
                 base,
                 protocol: UpstreamProtocol::Auto,
+                connect_timeout_ms: 0,
                 tls_profile: None,
                 pool_policy: HttpPoolPolicy::from_limits(limits),
                 counter: None,
@@ -3604,23 +4326,31 @@ impl super::GatewayProxy {
     }
 }
 
-/// 构建普通 HTTP(S) 上游 client。证书/CA 已在配置构建期解析校验,这里不做文件 IO。
+/// 业务作用：构建普通 HTTP(S) 上游 client，并把 TLS 身份、连接池和物理 socket 预算固化到
+/// 同一个 generation client；最小容器没有 native roots 时回退内置 WebPKI 公共根，避免明文
+/// HTTP 请求因初始化未使用的 TLS 分支而 panic。
 ///
-/// # 参数
-/// - `profile`: 可选 HTTP 上游 TLS profile；None 使用系统根证书。
-/// - `policy`: 显式连接池参数。
-/// - `physical_budget`: 当前 health_key/protocol 跨 generation 共享的物理 socket 预算。
+/// 参数说明：`profile` 是可选 HTTP 上游 TLS profile；`destination` 是实际实例 URI；
+/// `policy` 是连接池/窗口预算；`physical_budget` 是 health_key/protocol 跨 generation 共享的
+/// 物理 socket 预算；`h2_request` 表示是否需要 H2 冷启动单飞门；`connect_timeout_ms` 只限制拨号。
 ///
-/// 返回：同时支持 h1/h2 的 Hyper client；实际 pool 仍由 scheme + authority 隔离。
-///
-/// # Panic
-/// 仅当操作系统根证书无法加载时 panic；启动/首请求无法建立安全默认 TLS 信任属于不可恢复环境错误。
+/// 返回：同时支持 h1/h2 的 Hyper client；实际 pool 仍由 scheme + authority 隔离。显式 TLS
+/// profile 无效已在 Snapshot 构建期拒绝；无 profile 时优先 native roots，仅在环境完全无可用根
+/// 时使用编译锁定的 WebPKI roots，并留下告警而不是中止 worker。
 fn build_upstream_http_client(
     profile: Option<&UpstreamTlsProfile>,
+    destination: &str,
     policy: HttpPoolPolicy,
     physical_budget: Arc<PhysicalConnectionBudget>,
     h2_request: bool,
+    connect_timeout_ms: u64,
 ) -> super::UpstreamHttpClient {
+    let mut tcp_connector = configured_http_connector(connect_timeout_ms);
+    // `HttpsConnector` 会先判 scheme、再把同一 URI 交给底层 TCP connector。自定义
+    // connector 不像 builder 的默认 connector 那样自动解除 `http` 单 scheme 门；若不在
+    // 包装前关闭该底层检查，合法 `https://` 会在 TLS/SNI/mTLS 发生前被误拒为坏 URL。
+    // 这里只用于 HTTPS-capable client；direct h2c connector 继续保留其明文 scheme 门禁。
+    tcp_connector.enforce_http(false);
     let connector = match profile {
         Some(profile) => {
             let mut config = profile.client_config.as_ref().clone();
@@ -3635,18 +4365,16 @@ fn build_upstream_http_client(
                     .with_server_name_resolver(FixedServerNameResolver::new(name))
                     .enable_http1()
                     .enable_http2()
-                    .build()
+                    .wrap_connector(tcp_connector)
             } else {
-                builder.enable_http1().enable_http2().build()
+                builder
+                    .enable_http1()
+                    .enable_http2()
+                    .wrap_connector(tcp_connector)
             }
         }
-        None => hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .expect("load native TLS roots")
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build(),
+        None if connect_timeout_ms == 0 => default_upstream_https_connector().clone(),
+        None => default_upstream_https_connector_with(tcp_connector),
     };
     let mut builder = Client::builder(TokioExecutor::new());
     builder
@@ -3660,27 +4388,103 @@ fn build_upstream_http_client(
         )
         .pool_timer(TokioTimer::new());
     UpstreamHttpClient {
-        inner: builder.build(BudgetedConnector::new(connector, physical_budget)),
+        inner: builder.build(BudgetedConnector::new(
+            FixedDestinationConnector::new(connector, destination),
+            physical_budget,
+        )),
         // protocol=auto 的 H1 与 H2 cache key 已分离；只有明确按 H2 建立的 generation 才需
         // 冷启动单飞。H1 保持 Hyper 原生的多连接并发拨号能力。
         h2_gate: h2_request.then(H2ColdStartGate::new),
     }
 }
 
-/// 构建明文 HTTP/2 prior-knowledge direct sender，并把物理连接预算落实到 connector。
+/// 业务作用：进程级构建并缓存默认 HTTP(S) connector，使系统根扫描、最小容器 WebPKI 回退
+/// 和告警只发生一次；upstream client generation 后续只 clone 不可变 TLS 配置，避免冷连接
+/// 风暴把文件扫描/日志开销放大到请求延迟。
 ///
-/// # 参数
-/// - `policy`: 当前 proxy 快照固化的窗口、idle 与连接分片预算。
-/// - `physical_budget`: 当前 h2c 实例跨 generation 共享的物理 socket 预算。
+/// 参数说明: 无。
 ///
-/// 返回：每个 shard 只保存一条显式 H2 sender；不经过 legacy pool 的 authority 查找和
-/// dispatch，配置为 h2c 时也不会尝试 HTTP/1.1。`BudgetedIo` 跟随 connection driver 的
-/// 生命周期释放物理 socket 配额，响应 frame 始终由 Hyper `Incoming` 原样向下游移动。
+/// 返回：支持 h1/h2 与 http/https 的共享 connector 引用；私有 CA、SNI、mTLS 等显式 profile
+/// 仍走独立构建分支，不与该公共根身份混池。
+fn default_upstream_https_connector() -> &'static HttpsConnector<HttpConnector> {
+    DEFAULT_UPSTREAM_HTTPS_CONNECTOR.get_or_init(|| {
+        let builder = match hyper_rustls::HttpsConnectorBuilder::new().with_native_roots() {
+            Ok(builder) => builder,
+            Err(error) => {
+                // 明文上游同样复用 HTTPS-capable connector；native root 缺失不能让一个未走
+                // TLS 的请求 panic。内置公共根保持 HTTPS fail-closed，私有 CA 仍必须显式配置。
+                tracing::warn!(
+                    error = %error,
+                    "native TLS roots unavailable; falling back to bundled WebPKI roots"
+                );
+                hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots()
+            }
+        };
+        builder
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build()
+    })
+}
+
+/// 业务作用：构造带可选 TCP connect deadline 的底层 connector，CDS timeout 不挤占 response TTFB。
+///
+/// 参数说明：`connect_timeout_ms` 为 0 时不额外设 deadline，否则已由资源门限制在 1ms..=60s。
+///
+/// 返回：关闭 Nagle 且带对应 connect timeout 的 HttpConnector。
+fn configured_http_connector(connect_timeout_ms: u64) -> HttpConnector {
+    let mut connector = HttpConnector::new();
+    connector.set_nodelay(true);
+    connector.set_connect_timeout(
+        (connect_timeout_ms > 0).then(|| Duration::from_millis(connect_timeout_ms)),
+    );
+    connector
+}
+
+/// 业务作用：把指定 TCP connector 包进公共根 HTTPS 能力，供非默认 CDS timeout generation 使用。
+///
+/// 参数说明：`connector` 已固化本 generation 的 TCP 选项与 connect deadline。
+///
+/// 返回：支持 h1/h2 与 http/https；系统根缺失时使用编译锁定 WebPKI 根并留下告警。
+fn default_upstream_https_connector_with(
+    connector: HttpConnector,
+) -> HttpsConnector<HttpConnector> {
+    let builder = match hyper_rustls::HttpsConnectorBuilder::new().with_native_roots() {
+        Ok(builder) => builder,
+        Err(error) => {
+            // 明文上游同样复用 HTTPS-capable connector；native root 缺失不能让一个未走
+            // TLS 的请求 panic。内置公共根保持 HTTPS fail-closed，私有 CA 仍必须显式配置。
+            tracing::warn!(
+                error = %error,
+                "native TLS roots unavailable; falling back to bundled WebPKI roots"
+            );
+            hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots()
+        }
+    };
+    builder
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(connector)
+}
+
+/// 业务作用：构建固定拨号到已选实例的明文 HTTP/2 prior-knowledge sender，并把业务
+/// authority、物理 Endpoint 与 socket 预算分别落实到正确边界。
+///
+/// 参数说明：`policy` 是当前快照固化的窗口和连接分片预算；`physical_budget` 跨
+/// generation 约束同一实例的物理 socket；`connect_timeout_ms` 是 TCP connect deadline；
+/// `destination` 是已选实例的 base URI。
+///
+/// 返回：每个 shard 只保存一条显式 H2 sender；实际拨号始终使用 `destination`，请求中的
+/// authority 仍可承载 Route 虚拟主机。拨号失败由首次请求返回，且不会降级为 HTTP/1.1。
 fn build_h2c_client(
     policy: HttpPoolPolicy,
     physical_budget: Arc<PhysicalConnectionBudget>,
+    connect_timeout_ms: u64,
+    destination: &str,
 ) -> super::UpstreamH2cClient {
-    let mut connector = HttpConnector::new();
+    let mut connector = configured_http_connector(connect_timeout_ms);
     // hyper-util 的 HttpConnector 默认保留 Nagle。对 direct h2c/gRPC，这会让同一 transport 上的
     // 短 HEADERS/DATA/WINDOW_UPDATE 与 Linux delayed ACK 形成约 40ms 台阶；连接越少、mux 越深
     // 越明显。H2 driver 已负责 coalesce 同一轮 ready frame，因此关闭 Nagle 不等于逐 frame
@@ -3690,7 +4494,10 @@ fn build_h2c_client(
     UpstreamH2cClient {
         state: Arc::new(DirectH2cState {
             current: ArcSwapOption::empty(),
-            connector: BudgetedConnector::new(connector, physical_budget),
+            connector: BudgetedConnector::new(
+                FixedDestinationConnector::new(connector, destination),
+                physical_budget,
+            ),
             policy,
         }),
         h2_gate: H2ColdStartGate::new(),
@@ -3777,6 +4584,9 @@ fn validate_upstream_target(
 /// 固化在单次上游预留中的 Hyper 连接池策略。
 #[derive(Clone, Copy)]
 struct HttpPoolPolicy {
+    /// H2/H3 响应 header section 上限；H3 client 直接发布为 SETTINGS 并在 QPACK decode 执行。
+    #[cfg(feature = "http3")]
+    max_header_bytes: usize,
     /// 每 authority 最多保留的 idle 连接数。
     max_idle_per_upstream: usize,
     /// h2/h2c 独立 Hyper client 数；每个 client 在 authority 内仍多路复用 stream。
@@ -3811,6 +4621,8 @@ impl HttpPoolPolicy {
                 .min(limits.pool_max_connections_per_upstream)
         };
         Self {
+            #[cfg(feature = "http3")]
+            max_header_bytes: limits.max_header_bytes,
             max_idle_per_upstream: limits.pool_max_per_upstream,
             h2_connection_shards_per_upstream,
             h2_initial_stream_window_bytes: limits.h2_initial_stream_window_bytes,
@@ -3897,6 +4709,8 @@ struct UpstreamReservation {
     health_key: Arc<str>,
     /// 选中实例的上游协议(review L1),供转发层设上游请求版本。
     protocol: UpstreamProtocol,
+    /// 仅约束新 TCP transport 建立阶段；0 保持 native connector 既有行为。
+    connect_timeout_ms: u64,
     /// HTTP 上游 TLS profile(§36 `proxy_ssl_*`)。
     tls_profile: Option<UpstreamTlsProfile>,
     /// 当前 proxy 快照给出的连接池预算；进入 cache key，reload 改参数会创建新池并延迟淘汰旧池。
@@ -4196,6 +5010,89 @@ impl<B> Drop for CountedBody<B> {
     }
 }
 
+struct AbsoluteDeadlineBody {
+    /// 上游响应 body；deadline 到期时立即 Drop，向 H2/H3 传播取消并归还连接预算。
+    inner: Option<BoxBody>,
+    /// 与 response head 共用的绝对截止时刻，不能在每个 frame 后续期。
+    deadline: TokioInstant,
+    /// 单一 timer；创建响应 wrapper 时即注册，覆盖已返回 response head 后的静默 body。
+    sleep: Pin<Box<Sleep>>,
+    /// EOF、上游错误或 deadline 错误后进入终止态，防重复产生错误 frame。
+    done: bool,
+}
+
+impl AbsoluteDeadlineBody {
+    /// 业务作用：让 route request/backendRequest deadline 跨越 response head，继续约束
+    /// 完整流式响应，避免慢 body 绕过只覆盖 TTFB 的超时。
+    ///
+    /// 参数说明：`inner` 是已取得响应头的上游 body；`deadline` 与响应头等待共用。
+    ///
+    /// 返回：返回到期时先取消上游再产生唯一 TimedOut 错误的 body wrapper。
+    fn new(inner: BoxBody, deadline: TokioInstant) -> Self {
+        Self {
+            inner: Some(inner),
+            deadline,
+            sleep: Box::pin(tokio::time::sleep_until(deadline)),
+            done: false,
+        }
+    }
+}
+
+impl Body for AbsoluteDeadlineBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        // 已到期后必须先取消上游；即使同一轮 inner 偶然 Ready，也不能让调度延迟
+        // 延长声明的绝对时限或继续向下游泄漏过期响应数据。
+        if TokioInstant::now() >= self.deadline || self.sleep.as_mut().poll(cx).is_ready() {
+            self.inner.take();
+            self.done = true;
+            let error = std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "route request deadline expired",
+            );
+            return Poll::Ready(Some(Err(Box::new(error) as BoxError)));
+        }
+        let result = Pin::new(
+            self.inner
+                .as_mut()
+                .expect("deadline body remains present while active"),
+        )
+        .poll_frame(cx);
+        match result {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(error))) => {
+                self.inner.take();
+                self.done = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.inner.take();
+                self.done = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done || self.inner.as_ref().is_none_or(Body::is_end_stream)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner
+            .as_ref()
+            .map_or_else(SizeHint::default, Body::size_hint)
+    }
+}
+
 struct IdleTimeoutBody<B> {
     /// 直接持有具体 body，避免先擦除类型再包装造成双重 boxed body。
     inner: B,
@@ -4388,15 +5285,37 @@ impl fmt::Write for IpText {
     }
 }
 
+enum RenderedRequestHeaderOp {
+    Set(HeaderName, HeaderValue),
+    Add(HeaderName, HeaderValue),
+    Remove(HeaderName),
+}
+
+/// 业务作用：在覆盖代理生成头之前，基于原始可信请求上下文渲染 Gateway/nginx 请求头操作。
+///
+/// 参数说明：`ops` 是构建期固定操作；`variables` 与 `eval_ctx` 提供受控模板求值上下文。
+///
+/// 返回：全部动态值都是合法 HeaderValue 时返回有序操作；任一非法值时拒绝本次上游尝试。
 fn render_request_headers(
-    ops: &[RequestHeaderSet],
+    ops: &[RequestHeaderOp],
     variables: &crate::variable::VariablePlan,
     eval_ctx: &crate::variable::EvalContext<'_>,
-) -> Result<Vec<(HeaderName, HeaderValue)>, ForwardError> {
+) -> Result<Vec<RenderedRequestHeaderOp>, ForwardError> {
     ops.iter()
         .map(|op| {
-            let value = op.value.render(eval_ctx, variables);
-            Ok((op.name.clone(), header_value(&value, op.name.as_str())?))
+            let render = |set: &crate::routing::RequestHeaderSet| {
+                let value = set.value.render(eval_ctx, variables);
+                Ok::<_, ForwardError>((set.name.clone(), header_value(&value, set.name.as_str())?))
+            };
+            match op {
+                RequestHeaderOp::Set(set) => {
+                    render(set).map(|(name, value)| RenderedRequestHeaderOp::Set(name, value))
+                }
+                RequestHeaderOp::Add(set) => {
+                    render(set).map(|(name, value)| RenderedRequestHeaderOp::Add(name, value))
+                }
+                RequestHeaderOp::Remove(name) => Ok(RenderedRequestHeaderOp::Remove(name.clone())),
+            }
         })
         .collect()
 }

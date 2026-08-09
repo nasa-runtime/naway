@@ -28,7 +28,7 @@ pub struct GatewayConfig {
     /// 旧版全局路由。仅当 `proxies[]` 为空时使用,兼容成 default proxy 的 routes。
     #[serde(default)]
     pub routes: Vec<RouteCfg>,
-    /// 静态上游定义;`lb://service` 路由从这里选实例。Nacos 等动态注册中心走同一抽象后续接入。
+    /// 静态上游定义；`lb://service` 路由从这里选实例，Nacos 等动态注册中心通过同一发现抽象补充实例。
     #[serde(default)]
     pub upstreams: UpstreamsCfg,
     /// 服务发现后端配置。V2-B 接 Nacos watch;其它注册中心后端留到 V7。
@@ -46,6 +46,9 @@ pub struct GatewayConfig {
     /// 统一配置来源。V4 起可从 Nacos 配置中心 watch 网关配置,本地文件仍作为 bootstrap/兜底。
     #[serde(default)]
     pub config_source: ConfigSourceCfg,
+    /// 可选 xDS 控制面入口。bootstrap 永久拥有 server/identity/trust/ownership 与资源预算。
+    #[serde(default)]
+    pub control_plane: ControlPlaneCfg,
     /// 运行态共享后端配置。计数/动态事实源不进入路由 DSL,由运行态面统一装配。
     #[serde(default)]
     pub runtime_state: RuntimeStateCfg,
@@ -55,7 +58,7 @@ pub struct GatewayConfig {
     /// access log 执行参数。默认非阻塞 bounded queue,队列满丢弃并计数。
     #[serde(default)]
     pub access_log: AccessLogCfg,
-    /// V5 OpenTelemetry 链路追踪。导出器/队列属于进程 bootstrap 资源，修改后需重启。
+    /// OpenTelemetry 链路追踪。导出器/队列属于进程 bootstrap 资源，修改后需重启。
     #[serde(default)]
     pub telemetry: TelemetryCfg,
     /// 热重载控制面资源参数。这些值在启动时创建 worker 时生效，不属于请求热路径。
@@ -64,8 +67,8 @@ pub struct GatewayConfig {
     /// WS/gRPC 长连接在配置换版与管理面 drain 时的全局治理策略。
     #[serde(default)]
     pub long_connections: LongConnectionCfg,
-    /// V8 gRPC 边缘模式的进程级集群中继面(架构规范 §25.2)。None 或 `mode: none` = 单机,
-    /// 不建 peer 连接。V8-0 只做契约校验与快照接线,不启动任何 relay 网络组件。
+    /// gRPC 边缘模式的进程级集群中继面(架构规范 §25.2)。None 或 `mode: none` = 单机,
+    /// 不建 peer 连接；只保留单机 EdgeHub，不启动 relay 网络组件。
     #[serde(default)]
     pub grpc_edge_cluster: Option<GrpcEdgeClusterCfg>,
     /// 接口守卫独立配置文件路径(相对主配置目录或绝对);缺省 `interface-guard.yml`。
@@ -76,6 +79,360 @@ pub struct GatewayConfig {
     pub sentinel_rules_file: String,
 }
 
+/// 进程级控制面模式与 xDS bootstrap 配置。
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPlaneCfg {
+    /// 配置事实源模式；默认 native，不启动任何 xDS task。
+    #[serde(default)]
+    pub mode: ControlPlaneModeCfg,
+    /// 可选 xDS v3 client 配置。
+    #[serde(default)]
+    pub xds: XdsCfg,
+}
+
+/// 配置事实源的进程级所有权模式。
+#[derive(Debug, Deserialize, Clone, Copy, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlPlaneModeCfg {
+    /// file/Nacos/admin 继续拥有全部资源。
+    #[default]
+    Native,
+    /// xDS 拥有声明为 xDS 的完整资源域。
+    Xds,
+    /// native 与 xDS 按资源域整块分权，禁止同域 merge。
+    Hybrid,
+}
+
+/// xDS v3 client bootstrap 配置；所有字段只允许本地配置修改。
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XdsCfg {
+    /// 显式总开关；未编 `xds-client` 时 true 必须在构建期失败。
+    #[serde(default)]
+    pub enabled: bool,
+    /// ADS 传输 variant。
+    #[serde(default)]
+    pub transport: XdsTransportCfg,
+    /// management server URI；生产非 loopback 必须为 HTTPS+mTLS。
+    #[serde(default)]
+    pub server: String,
+    /// 稳定 Node identity 与固定 allowlist metadata。
+    #[serde(default)]
+    pub node: XdsNodeCfg,
+    /// xDS 自身 TLS/mTLS 信任与身份；远端资源永远不能修改。
+    #[serde(default)]
+    pub tls: XdsTlsCfg,
+    /// 启动时 xDS 不可达的策略。
+    #[serde(default)]
+    pub startup_policy: XdsStartupPolicyCfg,
+    /// 断线重连退避。
+    #[serde(default)]
+    pub reconnect: XdsReconnectCfg,
+    /// HTTP/2 keepalive 参数。
+    #[serde(default)]
+    pub keepalive: XdsKeepaliveCfg,
+    /// decode/translate/warming/apply 的硬预算。
+    #[serde(default)]
+    pub limits: XdsLimitsCfg,
+    /// listeners/routes/clusters/endpoints/secrets 的整域 owner。
+    #[serde(default)]
+    pub ownership: XdsOwnershipCfg,
+}
+
+impl Default for XdsCfg {
+    /// 业务作用：提供完全关闭、无 transport task 的 xDS 安全默认值。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：native owner、ADS SotW 与规范硬预算；`enabled=false`。
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            transport: XdsTransportCfg::default(),
+            server: String::new(),
+            node: XdsNodeCfg::default(),
+            tls: XdsTlsCfg::default(),
+            startup_policy: XdsStartupPolicyCfg::default(),
+            reconnect: XdsReconnectCfg::default(),
+            keepalive: XdsKeepaliveCfg::default(),
+            limits: XdsLimitsCfg::default(),
+            ownership: XdsOwnershipCfg::default(),
+        }
+    }
+}
+
+/// xDS ADS 传输 variant。
+#[derive(Debug, Deserialize, Clone, Copy, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum XdsTransportCfg {
+    /// v3 AggregatedDiscoveryService SotW bidi stream。
+    #[default]
+    AdsSotwV3,
+    /// v3 Delta ADS；按资源 version/removed/TTL 做增量缓存。
+    AdsDeltaV3,
+}
+
+/// xDS 启动不可达时的唯一降级策略。
+#[derive(Debug, Deserialize, Clone, Copy, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum XdsStartupPolicyCfg {
+    /// xDS-owned 资源未取得有效版本时 readiness 保持 503。
+    #[default]
+    RequireXds,
+    /// 仅允许经过签名、有效期和完整校验的磁盘 LKG；该策略尚未启用，配置校验会拒绝。
+    SignedLastGood,
+}
+
+/// xDS Node identity；metadata 只能使用构建期固定 allowlist key。
+#[derive(Debug, Deserialize, Clone, Default, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XdsNodeCfg {
+    /// 节点稳定唯一 id。
+    #[serde(default)]
+    pub id: String,
+    /// 节点所属逻辑 gateway cluster。
+    #[serde(default)]
+    pub cluster: String,
+    /// 允许发给 management server 的低敏、低基数 metadata。
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+}
+
+/// 一个文件型 xDS SecretSource；不接受远端覆盖或明文内联私钥。
+#[derive(Debug, Deserialize, Clone, Default, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XdsSecretFileCfg {
+    /// PEM 文件路径；相对 gateway.yml 目录解析。
+    #[serde(default)]
+    pub file: String,
+}
+
+/// xDS management server 的 TLS/mTLS bootstrap 身份。
+#[derive(Debug, Deserialize, Clone, Default, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XdsTlsCfg {
+    /// 服务端 CA PEM。
+    #[serde(default)]
+    pub ca: XdsSecretFileCfg,
+    /// 客户端证书链 PEM。
+    #[serde(default)]
+    pub cert: XdsSecretFileCfg,
+    /// 客户端私钥 PEM。
+    #[serde(default)]
+    pub key: XdsSecretFileCfg,
+    /// TLS SNI 与证书校验名。
+    #[serde(default)]
+    pub server_name: String,
+}
+
+/// xDS 断线重连的指数退避参数。
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XdsReconnectCfg {
+    /// 初始退避；使用 `200ms`/`2s` 形式。
+    #[serde(default = "default_xds_initial_backoff")]
+    pub initial_backoff: String,
+    /// 最大退避。
+    #[serde(default = "default_xds_max_backoff")]
+    pub max_backoff: String,
+    /// 对称 jitter 比例，范围 0..=1。
+    #[serde(default = "default_xds_jitter")]
+    pub jitter: f64,
+}
+
+impl Default for XdsReconnectCfg {
+    /// 业务作用：提供避免 management server 重连风暴的保守退避默认值。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：200ms 初始、30s 上限与 20% jitter。
+    fn default() -> Self {
+        Self {
+            initial_backoff: default_xds_initial_backoff(),
+            max_backoff: default_xds_max_backoff(),
+            jitter: default_xds_jitter(),
+        }
+    }
+}
+
+/// ADS HTTP/2 keepalive 参数。
+#[derive(Debug, Deserialize, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XdsKeepaliveCfg {
+    /// 空闲 PING 周期。
+    #[serde(default = "default_xds_keepalive_interval")]
+    pub interval: String,
+    /// PING ACK deadline。
+    #[serde(default = "default_xds_keepalive_timeout")]
+    pub timeout: String,
+}
+
+impl Default for XdsKeepaliveCfg {
+    /// 业务作用：提供低频保活且能有界发现半开连接的默认值。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：30s interval 与 5s timeout。
+    fn default() -> Self {
+        Self {
+            interval: default_xds_keepalive_interval(),
+            timeout: default_xds_keepalive_timeout(),
+        }
+    }
+}
+
+/// xDS decode、缓存、warming 与 apply channel 的资源硬上限。
+#[derive(Debug, Deserialize, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XdsLimitsCfg {
+    /// 单个 DiscoveryResponse 解码上限。
+    #[serde(default = "default_xds_max_response_bytes")]
+    pub max_response_bytes: usize,
+    /// 单 type SotW 资源数或 Delta 单次变更数上限。
+    #[serde(default = "default_xds_max_resources_per_type")]
+    pub max_resources_per_type: usize,
+    /// 单个 Any payload 上限。
+    #[serde(default = "default_xds_max_resource_bytes")]
+    pub max_resource_bytes: usize,
+    /// 单 type accepted/warming cache 资源与 named tombstone 上限。
+    #[serde(default = "default_xds_max_warming_resources")]
+    pub max_warming_resources: usize,
+    /// transport→apply 有界 channel 容量。
+    #[serde(default = "default_xds_max_apply_queue")]
+    pub max_apply_queue: usize,
+    /// 依赖 warming deadline。
+    #[serde(default = "default_xds_warming_timeout")]
+    pub warming_timeout: String,
+}
+
+impl Default for XdsLimitsCfg {
+    /// 业务作用：固定 xDS 敌意/异常控制面输入的默认内存和队列边界。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：与 §7.6 bootstrap 示例一致的硬上限。
+    fn default() -> Self {
+        Self {
+            max_response_bytes: default_xds_max_response_bytes(),
+            max_resources_per_type: default_xds_max_resources_per_type(),
+            max_resource_bytes: default_xds_max_resource_bytes(),
+            max_warming_resources: default_xds_max_warming_resources(),
+            max_apply_queue: default_xds_max_apply_queue(),
+            warming_timeout: default_xds_warming_timeout(),
+        }
+    }
+}
+
+/// 一个 xDS 资源域的唯一 owner。
+#[derive(Debug, Deserialize, Clone, Copy, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum XdsResourceOwnerCfg {
+    /// file/Nacos/admin owner。
+    #[default]
+    Native,
+    /// xDS owner；native 控制面不得写同域影子配置。
+    Xds,
+}
+
+/// 五个资源域的整块所有权声明。
+#[derive(Debug, Deserialize, Clone, Default, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XdsOwnershipCfg {
+    /// listener topology owner。
+    #[serde(default)]
+    pub listeners: XdsResourceOwnerCfg,
+    /// route owner。
+    #[serde(default)]
+    pub routes: XdsResourceOwnerCfg,
+    /// cluster policy owner。
+    #[serde(default)]
+    pub clusters: XdsResourceOwnerCfg,
+    /// endpoint table owner。
+    #[serde(default)]
+    pub endpoints: XdsResourceOwnerCfg,
+    /// TLS secret owner。
+    #[serde(default)]
+    pub secrets: XdsResourceOwnerCfg,
+}
+
+/// 业务作用：提供 xDS 首次重连退避默认值。
+/// 参数说明: 无。
+/// 返回：`200ms` duration 字符串。
+fn default_xds_initial_backoff() -> String {
+    "200ms".to_owned()
+}
+
+/// 业务作用：限制 xDS 指数退避上界，避免断线后永久沉默。
+/// 参数说明: 无。
+/// 返回：`30s` duration 字符串。
+fn default_xds_max_backoff() -> String {
+    "30s".to_owned()
+}
+
+/// 业务作用：提供抑制 xDS 客户端同步重连风暴的默认 jitter。
+/// 参数说明: 无。
+/// 返回：20% 对称 jitter 比例。
+const fn default_xds_jitter() -> f64 {
+    0.2
+}
+
+/// 业务作用：提供 ADS HTTP/2 空闲保活周期。
+/// 参数说明: 无。
+/// 返回：`30s` duration 字符串。
+fn default_xds_keepalive_interval() -> String {
+    "30s".to_owned()
+}
+
+/// 业务作用：限定 ADS keepalive ACK 等待时间。
+/// 参数说明: 无。
+/// 返回：`5s` duration 字符串。
+fn default_xds_keepalive_timeout() -> String {
+    "5s".to_owned()
+}
+
+/// 业务作用：限制单个 xDS response 的解码内存。
+/// 参数说明: 无。
+/// 返回：16 MiB 默认上限。
+const fn default_xds_max_response_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+/// 业务作用：限制单 type SotW 资源或 Delta 单次变更数量。
+/// 参数说明: 无。
+/// 返回：100000 条默认上限。
+const fn default_xds_max_resources_per_type() -> usize {
+    100_000
+}
+
+/// 业务作用：限制单个 xDS Any payload 的内存占用。
+/// 参数说明: 无。
+/// 返回：1 MiB 默认上限。
+const fn default_xds_max_resource_bytes() -> usize {
+    1024 * 1024
+}
+
+/// 业务作用：限制 accepted/warming cache 与 named deletion evidence 的驻留规模。
+/// 参数说明: 无。
+/// 返回：100000 条默认上限。
+const fn default_xds_max_warming_resources() -> usize {
+    100_000
+}
+
+/// 业务作用：限制 transport 到 apply single-writer 的在途候选数。
+/// 参数说明: 无。
+/// 返回：64 个候选的默认上限。
+const fn default_xds_max_apply_queue() -> usize {
+    64
+}
+
+/// 业务作用：限定 xDS 依赖 warming 的最长等待时间。
+/// 参数说明: 无。
+/// 返回：`30s` duration 字符串。
+fn default_xds_warming_timeout() -> String {
+    "30s".to_owned()
+}
+
 #[derive(Debug, Deserialize, Clone)]
 /// 旧版单 HTTP proxy 入口配置；新配置应优先使用 `proxies[]`。
 pub struct ServerCfg {
@@ -84,6 +441,9 @@ pub struct ServerCfg {
     /// 可选 TLS 数据面监听。明文与 TLS 是两个 socket,不做同端口 sniffing。
     #[serde(default)]
     pub tls: Option<TlsCfg>,
+    /// V9 HTTP/3/QUIC；UDP 端口固定复用 `tls.listen` 的数值端口。
+    #[serde(default)]
+    pub http3: Http3Cfg,
     /// 数据面资源上限:请求头/body/h2 stream 等预算必须在执行点生效。
     #[serde(default)]
     pub limits: ServerLimitsCfg,
@@ -102,12 +462,22 @@ pub struct ProxyCfg {
     pub id: String,
     /// 明文数据面监听地址。
     pub listen: String,
+    /// 是否实际绑定明文 listener。默认 true；false 只用于独立 TLS-only proxy，且必须配置 tls。
+    #[serde(default = "default_true")]
+    pub plain_enabled: bool,
     /// 可选 TLS 监听。明文与 TLS 分 socket。
     #[serde(default)]
     pub tls: Option<TlsCfg>,
+    /// V9 HTTP/3/QUIC；关闭时不建立 UDP listener，也不改变 h1/h2 行为。
+    #[serde(default)]
+    pub http3: Http3Cfg,
     /// server_name/Host 别名。空表示 default_server。
     #[serde(default)]
     pub server_names: Vec<String>,
+    /// Gateway API 共享 HTTP/HTTPS socket 上的逻辑 listener。请求管线先按 Host 选择
+    /// listener 隔离路由；HTTPS 再与 TLS SNI 的选择结果比较，不一致时返回 421。
+    #[serde(default)]
+    pub gateway_listeners: Vec<GatewayListenerCfg>,
     /// 可信前置代理网段(据 review L6 / §12):只有来自这些 CIDR 的直连对端,才信任其
     /// `X-Forwarded-For` / `traceparent` 等入站头(取真实客户端 IP、续用 trace);否则一律用 socket
     /// 对端并重生成 trace,防伪造绕过 IP ACL / 限流 / 审计。空 = 不信任任何 XFF(安全默认)。
@@ -136,6 +506,16 @@ pub struct ProxyCfg {
     /// 默认 0=关。HSTS 只在 https 响应上有意义(http 响应带它浏览器会忽略),故只作用于 TLS 入口。
     #[serde(default)]
     pub hsts_max_age: u64,
+}
+
+/// Gateway API HTTP/HTTPS socket 上参与 Host 路由隔离与 SNI 权威判断的逻辑 listener。
+#[derive(Debug, Deserialize, Clone)]
+pub struct GatewayListenerCfg {
+    /// listener 的稳定身份；同一 proxy 内必须唯一。
+    pub id: String,
+    /// 可选 listener hostname；支持精确 DNS 名和最左 `*.` 通配，空值是兜底 listener。
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
 /// PROXY protocol 配置。开启后只信任 `accept_from` 内的直连对端。
@@ -185,9 +565,19 @@ pub struct StreamListenerCfg {
     /// TLS ClientHello preread 配置,用于不终止 TLS 的 SNI 路由。
     #[serde(default)]
     pub preread: StreamPrereadCfg,
+    /// MQTT 协议治理 profile；默认关闭时仍是 wire-transparent TCP。
+    #[serde(default)]
+    pub mqtt: StreamMqttCfg,
+    /// Kafka 协议治理 profile；默认关闭时仍是 wire-transparent TCP。
+    #[serde(default)]
+    pub kafka: StreamKafkaCfg,
     /// 多 stream route。为空时沿用 listener 级 `upstream` 单路由行为。
     #[serde(default)]
     pub routes: Vec<StreamRouteCfg>,
+    /// 显式声明该 listener 不含任何可转发路由，所有连接在匹配阶段关闭；用于保留已接纳但
+    /// 暂无合法 Route 的受控 socket，不能与 `upstream` 或 `routes` 同时配置。
+    #[serde(default)]
+    pub reject_all: bool,
     /// PROXY protocol v1/v2 真实客户端地址解析配置。
     #[serde(default)]
     pub proxy_protocol: ProxyProtocolCfg,
@@ -230,6 +620,160 @@ impl Default for StreamPrereadCfg {
     }
 }
 
+/// MQTT 3.1.1/5.0 受限协议治理配置。
+#[derive(Debug, Deserialize, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamMqttCfg {
+    /// 是否启用 MQTT frame 解析、ACL 与 QoS 状态跟踪。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 该 listener 同时允许的 MQTT 连接数，包含 CONNECT preread/TLS 阶段。
+    #[serde(default = "default_stream_mqtt_max_connections")]
+    pub max_connections: usize,
+    /// 单个 MQTT Control Packet 的 wire 字节上限。
+    #[serde(default = "default_stream_mqtt_max_packet_bytes")]
+    pub max_packet_bytes: usize,
+    /// 从收到 fixed-header 首字节起到整枚 packet 完整的 deadline；纯 idle 不计时。
+    #[serde(default = "default_stream_mqtt_packet_timeout_ms")]
+    pub packet_timeout_ms: u64,
+    /// listener 内所有活跃 MQTT 连接可同时占用的双向 packet buffer 预算。
+    #[serde(default = "default_stream_mqtt_max_buffered_bytes")]
+    pub max_buffered_bytes: usize,
+    /// Topic Name/Topic Filter 的 UTF-8 字节上限。
+    #[serde(default = "default_stream_mqtt_max_topic_bytes")]
+    pub max_topic_bytes: usize,
+    /// 单连接已生效与待 SUBACK 的去重订阅总数上限。
+    #[serde(default = "default_stream_mqtt_max_subscriptions")]
+    pub max_subscriptions: usize,
+    /// 单连接两个方向的 QoS publish 与待 ACK 控制包总数上限。
+    #[serde(default = "default_stream_mqtt_max_inflight_messages")]
+    pub max_inflight_messages: usize,
+    /// 允许的 client id 精确集合；空集合表示不额外限制 client id。
+    #[serde(default)]
+    pub client_id_allow: Vec<String>,
+    /// 允许 client PUBLISH 的 MQTT Topic Filter；空集合表示拒绝所有 publish。
+    #[serde(default)]
+    pub publish_topic_allow: Vec<String>,
+    /// 允许 SUBSCRIBE/UNSUBSCRIBE 的 MQTT Topic Filter 边界；空集合表示拒绝全部。
+    #[serde(default)]
+    pub subscribe_topic_allow: Vec<String>,
+}
+
+impl Default for StreamMqttCfg {
+    /// 业务作用：保持 MQTT 治理默认关闭，同时为显式开启提供有界资源基线。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：默认关闭的 profile；不会让透明 stream 进入 MQTT parser。
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_connections: default_stream_mqtt_max_connections(),
+            max_packet_bytes: default_stream_mqtt_max_packet_bytes(),
+            packet_timeout_ms: default_stream_mqtt_packet_timeout_ms(),
+            max_buffered_bytes: default_stream_mqtt_max_buffered_bytes(),
+            max_topic_bytes: default_stream_mqtt_max_topic_bytes(),
+            max_subscriptions: default_stream_mqtt_max_subscriptions(),
+            max_inflight_messages: default_stream_mqtt_max_inflight_messages(),
+            client_id_allow: Vec::new(),
+            publish_topic_allow: Vec::new(),
+            subscribe_topic_allow: Vec::new(),
+        }
+    }
+}
+
+/// Kafka client data-plane 受限协议治理配置。
+#[derive(Debug, Deserialize, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamKafkaCfg {
+    /// 是否启用 Kafka frame、ACL、correlation 与 broker endpoint rewrite。
+    #[serde(default)]
+    pub enabled: bool,
+    /// listener 同时允许的受治理 Kafka 连接数，包含 TLS 阶段。
+    #[serde(default = "default_stream_kafka_max_connections")]
+    pub max_connections: usize,
+    /// 单枚 Kafka request/response 的完整 wire 字节上限，包含四字节长度前缀。
+    #[serde(default = "default_stream_kafka_max_frame_bytes")]
+    pub max_frame_bytes: usize,
+    /// 从长度前缀首字节到完整 frame 的 deadline；纯 idle 不计时。
+    #[serde(default = "default_stream_kafka_frame_timeout_ms")]
+    pub frame_timeout_ms: u64,
+    /// listener 所有连接双向 frame buffer 的悲观聚合预留上限。
+    #[serde(default = "default_stream_kafka_max_buffered_bytes")]
+    pub max_buffered_bytes: usize,
+    /// 单连接尚未收到 response 的 correlation id 数量上限。
+    #[serde(default = "default_stream_kafka_max_inflight_requests")]
+    pub max_inflight_requests: usize,
+    /// request header 中 client id 的 UTF-8 字节上限。
+    #[serde(default = "default_stream_kafka_max_client_id_bytes")]
+    pub max_client_id_bytes: usize,
+    /// topic 名 UTF-8 字节上限。
+    #[serde(default = "default_stream_kafka_max_topic_bytes")]
+    pub max_topic_bytes: usize,
+    /// consumer group id UTF-8 字节上限。
+    #[serde(default = "default_stream_kafka_max_group_bytes")]
+    pub max_group_bytes: usize,
+    /// 任一协议数组可包含的最大元素数。
+    #[serde(default = "default_stream_kafka_max_array_items")]
+    pub max_array_items: usize,
+    /// 允许的 client id 精确集合；空集合表示不额外限制。
+    #[serde(default)]
+    pub client_id_allow: Vec<String>,
+    /// 允许访问的 topic 精确集合；空集合拒绝所有 topic API。
+    #[serde(default)]
+    pub topic_allow: Vec<String>,
+    /// 允许访问的 consumer group 精确集合；空集合拒绝所有 group API。
+    #[serde(default)]
+    pub group_allow: Vec<String>,
+    /// 允许的 SASL mechanism 精确集合；空集合拒绝 SASL handshake。
+    #[serde(default)]
+    pub sasl_mechanism_allow: Vec<String>,
+    /// broker 在 Metadata/FindCoordinator 中返回的 endpoint 改写表。
+    #[serde(default)]
+    pub broker_rewrite: Vec<KafkaBrokerRewriteCfg>,
+}
+
+impl Default for StreamKafkaCfg {
+    /// 业务作用：保持 Kafka 治理默认关闭，同时提供总量可证明有界的连接/frame 基线。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：默认关闭的 profile；不会让透明 stream 进入 Kafka parser。
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_connections: default_stream_kafka_max_connections(),
+            max_frame_bytes: default_stream_kafka_max_frame_bytes(),
+            frame_timeout_ms: default_stream_kafka_frame_timeout_ms(),
+            max_buffered_bytes: default_stream_kafka_max_buffered_bytes(),
+            max_inflight_requests: default_stream_kafka_max_inflight_requests(),
+            max_client_id_bytes: default_stream_kafka_max_client_id_bytes(),
+            max_topic_bytes: default_stream_kafka_max_topic_bytes(),
+            max_group_bytes: default_stream_kafka_max_group_bytes(),
+            max_array_items: default_stream_kafka_max_array_items(),
+            client_id_allow: Vec::new(),
+            topic_allow: Vec::new(),
+            group_allow: Vec::new(),
+            sasl_mechanism_allow: Vec::new(),
+            broker_rewrite: Vec::new(),
+        }
+    }
+}
+
+/// Kafka broker endpoint 的精确地址改写项。
+#[derive(Debug, Deserialize, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaBrokerRewriteCfg {
+    /// broker response 中声明的原 host。
+    pub from_host: String,
+    /// broker response 中声明的原 port。
+    pub from_port: u16,
+    /// client 应连接的代理 host。
+    pub to_host: String,
+    /// client 应连接的代理 port。
+    pub to_port: u16,
+}
+
 /// L4 stream route。
 #[derive(Debug, Deserialize, Clone)]
 pub struct StreamRouteCfg {
@@ -244,11 +788,27 @@ pub struct StreamRouteCfg {
     /// 是否默认路由。
     #[serde(default)]
     pub default: bool,
+    /// 是否在选中该路由后终止下游 TLS；仅与 listener TLS 身份和 SNI preread 同时使用。
+    #[serde(default)]
+    pub terminate_tls: bool,
     /// 上游目标。支持 `host:port`、`tcp://host:port` 或 `lb://service`。
     pub upstream: String,
+    /// 按连接或 UDP session 选择的带权上游集合；非空时覆盖单一 `upstream`，零权重项不接收流量。
+    #[serde(default)]
+    pub weighted_upstreams: Vec<StreamWeightedUpstreamCfg>,
     /// 可选 stream 上游 TLS/mTLS profile；`lb://service` 应使用 service 级 `tls`。
     #[serde(default)]
     pub tls: Option<UpstreamTlsCfg>,
+}
+
+/// L4 route 的单个带权上游。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct StreamWeightedUpstreamCfg {
+    /// 上游目标；Gateway API 生成配置使用 `lb://service`。
+    pub upstream: String,
+    /// 相对权重；零表示保留声明但不参与选择。
+    pub weight: u32,
 }
 
 /// L4 listener 传输协议。
@@ -270,6 +830,9 @@ pub struct StreamTlsCfg {
     pub cert_file: String,
     /// 与证书匹配的 PEM 私钥文件，相对主配置文件目录解析。
     pub key_file: String,
+    /// 同一 stream socket 上按 SNI 选择的额外证书身份。
+    #[serde(default)]
+    pub certs: Vec<SniCertCfg>,
     /// 下游 TLS 握手 deadline，防慢 ClientHello 长期占用连接任务。
     #[serde(default = "default_stream_tls_handshake_timeout_ms")]
     pub handshake_timeout_ms: u64,
@@ -529,6 +1092,139 @@ pub struct TlsCfg {
     pub acme: Option<AcmeCfg>,
 }
 
+/// V9 HTTP/3/QUIC listener 配置。
+///
+/// 业务作用：为同一逻辑 TLS listener 声明 UDP/H3 transport 预算与安全策略；路由、过滤器和
+/// 上游语义仍复用现有 proxy，不允许用该配置建立第二套路由模型。
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Http3Cfg {
+    /// 是否为 `tls.listen` 同端口绑定 QUIC/UDP。
+    #[serde(default)]
+    pub enabled: bool,
+    /// readiness 成功后是否在 TCP TLS 响应中发布 `Alt-Svc: h3=...`。
+    #[serde(default = "default_true")]
+    pub advertise_alt_svc: bool,
+    /// Alt-Svc 广告缓存时间；关闭广告时保留但不发送。
+    #[serde(default = "default_http3_alt_svc_max_age_seconds")]
+    pub alt_svc_max_age_seconds: u32,
+    /// QUIC connection 空闲超时；必须非零且不超过运行期统一上限。
+    #[serde(default = "default_http3_max_idle_timeout_ms")]
+    pub max_idle_timeout_ms: u64,
+    /// 当前 proxy 的 QUIC 物理连接上限。
+    #[serde(default = "default_http3_max_connections")]
+    pub max_connections: usize,
+    /// 单个握手来源 IP 允许占用的 QUIC 物理连接上限。
+    #[serde(default = "default_http3_max_connections_per_ip")]
+    pub max_connections_per_ip: usize,
+    /// Quinn endpoint 同时保留的未决 Initial/handshake 数量。
+    #[serde(default = "default_http3_max_pending_handshakes")]
+    pub max_pending_handshakes: usize,
+    /// 每条未决 handshake 在首包之外允许缓冲的 datagram 字节数。
+    #[serde(default = "default_http3_max_pending_handshake_bytes")]
+    pub max_pending_handshake_bytes: u64,
+    /// 单 QUIC connection 允许的客户端双向 request stream 上限。
+    #[serde(default = "default_http3_max_bidi_streams_per_connection")]
+    pub max_bidi_streams_per_connection: u32,
+    /// H3 解码后单次 header section 上限。
+    #[serde(default = "default_http3_max_request_header_bytes")]
+    pub max_request_header_bytes: usize,
+    /// 单 request stream 在网关内允许暂存的 body/发送队列字节上限。
+    #[serde(default = "default_http3_max_stream_buffer_bytes")]
+    pub max_stream_buffer_bytes: usize,
+    /// 地址验证 Retry 策略。
+    #[serde(default)]
+    pub retry: Http3RetryCfg,
+    /// Retry token 最长有效期（秒）。
+    #[serde(default = "default_http3_retry_token_lifetime_seconds")]
+    pub retry_token_lifetime_seconds: u64,
+    /// Retry token 认证主密钥轮换周期（秒）。
+    #[serde(default = "default_http3_retry_token_rotation_seconds")]
+    pub retry_token_rotation_seconds: u64,
+    /// 0-RTT early data；V9 首版必须保持 false，true 在构建期拒绝。
+    #[serde(default)]
+    pub zero_rtt: bool,
+}
+
+impl Default for Http3Cfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            advertise_alt_svc: true,
+            alt_svc_max_age_seconds: default_http3_alt_svc_max_age_seconds(),
+            max_idle_timeout_ms: default_http3_max_idle_timeout_ms(),
+            max_connections: default_http3_max_connections(),
+            max_connections_per_ip: default_http3_max_connections_per_ip(),
+            max_pending_handshakes: default_http3_max_pending_handshakes(),
+            max_pending_handshake_bytes: default_http3_max_pending_handshake_bytes(),
+            max_bidi_streams_per_connection: default_http3_max_bidi_streams_per_connection(),
+            max_request_header_bytes: default_http3_max_request_header_bytes(),
+            max_stream_buffer_bytes: default_http3_max_stream_buffer_bytes(),
+            retry: Http3RetryCfg::default(),
+            retry_token_lifetime_seconds: default_http3_retry_token_lifetime_seconds(),
+            retry_token_rotation_seconds: default_http3_retry_token_rotation_seconds(),
+            zero_rtt: false,
+        }
+    }
+}
+
+/// QUIC Retry 地址验证策略。
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Http3RetryCfg {
+    /// 不主动要求 Retry；仍受 QUIC anti-amplification 限制。
+    Off,
+    /// 由 listener 根据地址验证状态和压力决定，作为安全默认。
+    #[default]
+    Auto,
+    /// 所有未验证地址先完成 Retry。
+    Always,
+}
+
+const fn default_http3_max_idle_timeout_ms() -> u64 {
+    30_000
+}
+
+const fn default_http3_alt_svc_max_age_seconds() -> u32 {
+    86_400
+}
+
+const fn default_http3_max_connections() -> usize {
+    100_000
+}
+
+const fn default_http3_max_connections_per_ip() -> usize {
+    1024
+}
+
+const fn default_http3_max_pending_handshakes() -> usize {
+    1024
+}
+
+const fn default_http3_max_pending_handshake_bytes() -> u64 {
+    16 * 1024
+}
+
+const fn default_http3_max_bidi_streams_per_connection() -> u32 {
+    256
+}
+
+const fn default_http3_max_request_header_bytes() -> usize {
+    64 * 1024
+}
+
+const fn default_http3_max_stream_buffer_bytes() -> usize {
+    1024 * 1024
+}
+
+const fn default_http3_retry_token_lifetime_seconds() -> u64 {
+    15
+}
+
+const fn default_http3_retry_token_rotation_seconds() -> u64 {
+    3600
+}
+
 /// ACME 自动证书配置(§19)。
 ///
 /// 账户凭据与私钥只写权限收紧的文件，不进入日志/admin diff。多节点模式必须同时使用 Redis 锁和
@@ -611,10 +1307,11 @@ pub struct AcmeDns01Cfg {
     pub timeout_ms: u64,
 }
 
-/// mTLS 客户端证书校验配置(§19,对齐 nginx `ssl_verify_client` + `ssl_client_certificate`)。
+/// mTLS 客户端证书校验配置。
 #[derive(Debug, Deserialize, Clone)]
 pub struct ClientAuthCfg {
-    /// `require`(必须出示合法客户端证书,否则握手拒绝)| `optional`(出示了才校验,未出示也放行)。默认 `require`。
+    /// `require` 要求受信客户端证书；`optional` 允许无证书但校验已出示证书；
+    /// `insecure_fallback` 请求任意证书但只校验私钥持有。默认 `require`。
     #[serde(default = "default_client_auth_mode")]
     pub mode: String,
     /// 受信任的客户端 CA 证书链 PEM 文件路径(校验客户端证书签名)。
@@ -1317,29 +2014,29 @@ pub struct GrpcEdgeCfg {
     #[serde(default)]
     pub encoding: GrpcEdgeEncodingCfg,
     /// 【兼容别名,已废弃】单条 protobuf message body(不含 5 字节前缀)字节上限。
-    /// V8-0R 起权威位置是 `limits.max_msg_bytes`;两处同时设置且不相等时构建期报错,
+    /// 权威位置是 `limits.max_msg_bytes`;两处同时设置且不相等时构建期报错,
     /// 只设旧位仍然生效(一次性迁移路径,§25.2.9)。
     #[serde(default)]
     pub max_msg_bytes: Option<usize>,
-    /// V8-0R:每 action 的精确 gRPC `:path`(§25.2.3)。edge 不能只靠可伪造 header 触发,
+    /// 每 action 的精确 gRPC `:path`(§25.2.3)。edge 不能只靠可伪造 header 触发,
     /// 必须同时命中精确方法;allowed_actions 里的每个 action 都要有对应 method。
     #[serde(default)]
     pub methods: GrpcEdgeMethodsCfg,
-    /// V8-0R:tenant/user 身份从已验证 principal 的 claim 映射(§25.2.3 相位 4),
+    /// tenant/user 身份从已验证 principal 的 claim 映射(§25.2.3 相位 4),
     /// 客户端自报 header 永不是权威身份。
     #[serde(default)]
     pub identity: GrpcEdgeIdentityCfg,
-    /// V8-0R:双维队列之外的节点级预算与基数上限(§25.2.5),拒绝高基数内存攻击。
+    /// 双维队列之外的节点级预算与基数上限(§25.2.5),拒绝高基数内存攻击。
     #[serde(default)]
     pub limits: GrpcEdgeLimitsCfg,
-    /// V8-8:浏览器 WS→内部 gRPC 边缘桥接入口路径(如 `/edge/ws`)。
+    /// 浏览器 WS→内部 gRPC 边缘桥接入口路径（如 `/edge/ws`）。
     ///
     /// 设了才开桥;要求本 route 允许 subscribe。桥接只换**传输外壳**——鉴权、身份、
     /// group 索引、队列预算、治理关闭全部复用同一条订阅路径,每条广播以一个
     /// binary 帧原样送出与 native gRPC 订阅者**字节一致**的 `[5B prefix + payload]`。
     #[serde(default)]
     pub ws_bridge_path: Option<String>,
-    /// V8-9:发布/订阅**授权**策略(§25.2.3 相位 4 之后、任何执行之前)。
+    /// 发布/订阅授权策略；在身份相位之后、任何执行副作用之前判定。
     ///
     /// 为什么必须单列一段:相位 4 只解决了「你是谁」——身份一律取自已验证 principal,
     /// 客户端自报 header 永不作数。但 `group`/`target` 是**客户端给的**,此前只校验
@@ -1353,7 +2050,7 @@ pub struct GrpcEdgeCfg {
     pub authz: Option<GrpcEdgeAuthzCfg>,
 }
 
-/// V8-9 发布/订阅授权策略(§25.2.3)。
+/// 发布/订阅授权策略（§25.2.3）。
 ///
 /// 三个 action 各自独立:订阅面通常按用户收敛(只能订自己的),发布面通常按业务域收敛。
 /// 未声明的 action 列表为空,即该 action 在本 route 上被全部拒绝——**空 ≠ 不限制**,
@@ -1429,7 +2126,7 @@ impl Default for GrpcEdgeIdentityCfg {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct GrpcEdgeLimitsCfg {
-    /// 单条 protobuf message body(不含 5 字节前缀)字节上限;V8-2 解码器读出 prefix
+    /// 单条 protobuf message body（不含 5 字节前缀）字节上限；解码器读出 prefix
     /// length 后须在分配重组缓冲前执行该限制。
     #[serde(default)]
     pub max_msg_bytes: Option<usize>,
@@ -1524,7 +2221,7 @@ impl Default for GrpcEdgeSendQueueCfg {
     }
 }
 
-/// 发布面 PublishStream 单流四门(§25.2.3,V8-2 后半)。
+/// 发布面 PublishStream 单流四门（§25.2.3）。
 ///
 /// 执行语义(v1):`max_msgs_per_sec` 是背压节流——无令牌即暂停读请求体,经 HTTP/2
 /// 流控传导到发布方,不丢消息不断流;其余三门到界即**优雅轮转**——停止读取、返回
@@ -1568,7 +2265,7 @@ pub enum GrpcEdgeOverflowCfg {
     DropOldest,
     /// 拒绝新消息、保留既有 FIFO(relay 默认:偷偷删除更早消息再宣称 FIFO 是撒谎)。
     DropNew,
-    /// 按业务 key 只保留最新一帧；V8-3 的 opaque payload 尚无 key envelope，当前构建期拒绝。
+    /// 按 `FramePush.coalesce_key` 只保留每个业务 key 的最新一帧；空键按 drop_new 处理。
     LatestByKey,
     /// 直接断开慢客户端(发 grpc-status 关闭)。
     CloseSlow,
@@ -1624,8 +2321,8 @@ pub struct GrpcEdgeClusterCfg {
     /// 内部 relay 监听地址(host:port),仅接受 peer 身份;relay 模式必填。
     #[serde(default)]
     pub relay_listen: String,
-    /// peer 身份鉴别方式(§25.2.6:优先 mTLS;mTLS 证书 schema 归 V8-3 后半,
-    /// 当前实现 cluster_secret,配 mtls 构建期 fail-fast 而非静默降级)。
+    /// peer 身份鉴别方式（§25.2.6）：默认 mTLS，在 TLS 握手期验证节点证书；
+    /// `cluster_secret` 仅作为缺少 mTLS 基建时的兼容形态。
     #[serde(default)]
     pub peer_auth: GrpcEdgePeerAuthCfg,
     /// `peer_auth: cluster_secret` 的共享凭证(SecretSource:literal/env/file/...);
@@ -1640,10 +2337,10 @@ pub struct GrpcEdgeClusterCfg {
     #[serde(default = "default_grpc_edge_ack_deadline_ms")]
     pub ack_deadline_ms: u64,
     /// 全网状中继的节点数硬门(§25.2.2 建议 <=32)。静态 peers 超门直接拒绝;
-    /// 更大集群必须等 V8-5 interest/group-owner 路由,不允许 O(N²) 盲广播。
+    /// 更大集群必须先实现 interest/group-owner 路由，不允许 O(N²) 盲广播。
     #[serde(default = "default_grpc_edge_full_mesh_max_nodes")]
     pub full_mesh_max_nodes: usize,
-    /// 兴趣路由策略(§25.2.6):`auto` = 小集群广播、超门后由 V8-5 interest 接管,
+    /// 兴趣路由策略（§25.2.6）：`auto` 当前只允许小集群广播，
     /// hint 缺失/过期一律 fail-open 广播;`broadcast_all` = 显式永远广播(仅小集群)。
     #[serde(default)]
     pub interest_route: GrpcEdgeInterestRouteCfg,
@@ -1659,7 +2356,7 @@ pub struct GrpcEdgeClusterCfg {
     /// `redis` = 大集群可选加速,需要 `redis-runtime` feature。
     #[serde(default)]
     pub session_registry: GrpcEdgeSessionRegistryCfg,
-    /// `session_registry: redis` 的连接与租约参数(V8-7);`none` 时整段忽略。
+    /// `session_registry: redis` 的连接与租约参数；`none` 时整段忽略。
     #[serde(default)]
     pub session_directory: GrpcEdgeSessionDirectoryCfg,
     /// relay **收包散出**使用的节点级预算(§25.2.9)。
@@ -1679,7 +2376,7 @@ pub struct GrpcEdgeClusterCfg {
     pub fanout_limits: GrpcEdgeLimitsCfg,
 }
 
-/// V8-7 SessionDirectory(redis)连接与租约参数(§25.2.7)。
+/// SessionDirectory（Redis）连接与租约参数（§25.2.7）。
 ///
 /// 目录只做寻址加速:miss/超时/脏条目一律回落 broadcast-probe,正确性不依赖它。
 /// 因此 TTL 只需覆盖"续租任务两三个周期"的量级,不必追求与连接寿命等长。
@@ -1888,7 +2585,7 @@ pub enum GrpcEdgeOrderingCfg {
     /// 默认:同 publisher stream 经同 ingress 到同目标队列保持 FIFO。
     #[default]
     IngressFifo,
-    /// group 严格序:rendezvous-hash group owner 统一定序(V8-5 落地)。
+    /// group 严格序：由 rendezvous-hash group owner 统一定序。
     GroupOwner,
 }
 
@@ -1922,7 +2619,7 @@ pub enum GrpcEdgeClusterModeCfg {
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GrpcEdgeMembershipCfg {
-    /// 复用 §9 Nacos 自注册 watch；运行时归 V8-5，当前构建期拒绝。
+    /// 复用 §9 Nacos 自注册 watch 驱动运行时成员对账。
     #[default]
     Nacos,
     /// 静态 peer 列表(all-in-one/无注册中心部署)。
@@ -1936,7 +2633,7 @@ pub enum GrpcEdgePeerAuthCfg {
     /// 双向 TLS(默认,§25.2.6 优先):证书身份即节点身份,握手期校验。
     #[default]
     Mtls,
-    /// 集群共享 secret(SecretSource,§19/§20);无 mTLS 基建的过渡形态,V8-3 落地校验。
+    /// 集群共享 secret（SecretSource，§19/§20）；仅作为无 mTLS 基建时的过渡认证形态。
     ClusterSecret,
 }
 
@@ -2267,6 +2964,42 @@ pub struct KubernetesRouteSourceCfg {
     /// 本控制器的 GatewayClass `spec.controllerName`。
     #[serde(default = "default_kubernetes_gateway_controller_name")]
     pub gateway_controller_name: String,
+    /// 固定的 Gateway API CRD/conformance contract 版本。
+    #[serde(default = "default_kubernetes_gateway_api_version")]
+    pub gateway_api_version: String,
+    /// Gateway API HTTP/HTTPS listener 物化为数据面 socket 时使用的本地绑定地址。
+    #[serde(default = "default_kubernetes_gateway_bind_address")]
+    pub gateway_bind_address: String,
+    /// Gateway API TLS/TCP/UDP listener 物化为 stream socket 时使用的本地绑定地址。
+    /// 默认与 `gateway_bind_address` 相同；同一端口同时承载 TLS 终止和 TLS passthrough
+    /// 时必须显式隔离地址，避免两个 listener 竞争同一 socket。
+    #[serde(default = "default_kubernetes_gateway_stream_bind_address")]
+    pub gateway_stream_bind_address: String,
+    /// 可选的逐 Gateway stream 地址池；非空时按稳定对象顺序为每个含 TLS/TCP/UDP listener
+    /// 的 Gateway 分配独立地址，地址不足的 Gateway 失败闭合。
+    #[serde(default)]
+    pub gateway_stream_bind_addresses: Vec<String>,
+    /// GRPCRoute 后端的固定 HTTP/2 transport；可选 `h2c` 或 `h2`。
+    #[serde(default = "default_kubernetes_grpc_backend_protocol")]
+    pub grpc_backend_protocol: String,
+    /// 是否通过 status subresource 发布本控制器拥有的 condition。
+    #[serde(default)]
+    pub status_updates_enabled: bool,
+    /// 是否用 finalizer 保证删除对象先退出数据面候选，再允许 API server 完成删除。
+    #[serde(default)]
+    pub finalizers_enabled: bool,
+    /// LIST 成功后是否用 watch 提前唤醒下一轮完整 relist。
+    #[serde(default = "default_true")]
+    pub watch_enabled: bool,
+    /// 单轮 watch 的服务端超时秒数；超时后重新 LIST，避免永久依赖断裂连接。
+    #[serde(default = "default_kubernetes_watch_timeout_seconds")]
+    pub watch_timeout_seconds: u32,
+    /// 删除对象退出候选后，等待 reload 发布确认的最长时间。
+    #[serde(default = "default_kubernetes_deletion_drain_timeout_ms")]
+    pub deletion_drain_timeout_ms: u64,
+    /// 单轮允许提交的 status/finalizer mutation 总数。
+    #[serde(default = "default_kubernetes_max_status_updates")]
+    pub max_status_updates: usize,
     /// namespace allowlist；空表示全部 namespace。
     #[serde(default)]
     pub namespaces: Vec<String>,
@@ -2300,6 +3033,17 @@ impl Default for KubernetesRouteSourceCfg {
             ingress_classes: default_kubernetes_ingress_classes(),
             gateway_api_enabled: true,
             gateway_controller_name: default_kubernetes_gateway_controller_name(),
+            gateway_api_version: default_kubernetes_gateway_api_version(),
+            gateway_bind_address: default_kubernetes_gateway_bind_address(),
+            gateway_stream_bind_address: default_kubernetes_gateway_stream_bind_address(),
+            gateway_stream_bind_addresses: Vec::new(),
+            grpc_backend_protocol: default_kubernetes_grpc_backend_protocol(),
+            status_updates_enabled: false,
+            finalizers_enabled: false,
+            watch_enabled: true,
+            watch_timeout_seconds: default_kubernetes_watch_timeout_seconds(),
+            deletion_drain_timeout_ms: default_kubernetes_deletion_drain_timeout_ms(),
+            max_status_updates: default_kubernetes_max_status_updates(),
             namespaces: Vec::new(),
             poll_interval_ms: default_registry_poll_interval_ms(),
             request_timeout_ms: default_registry_request_timeout_ms(),
@@ -2354,6 +3098,55 @@ fn default_kubernetes_route_target_proxy() -> String {
 }
 fn default_kubernetes_route_materialized_file() -> String {
     ".gateway-kubernetes-routes.json".to_owned()
+}
+
+/// 业务作用：为 Gateway API 生成的 L4 listener 提供安全的全接口默认绑定地址。
+/// 参数说明: 无。
+/// 返回：返回 IPv4 未指定地址；部署方可显式收窄到 Pod IP 或 loopback。
+fn default_kubernetes_gateway_bind_address() -> String {
+    "0.0.0.0".to_owned()
+}
+
+/// 业务作用：为 Gateway API 生成的 stream listener 提供向后兼容的全接口默认绑定地址。
+/// 参数说明: 无。
+/// 返回：返回 IPv4 未指定地址；需要同端口隔离 L7 与 L4 时由部署方显式配置独立地址。
+fn default_kubernetes_gateway_stream_bind_address() -> String {
+    "0.0.0.0".to_owned()
+}
+
+/// 业务作用：固定 controller 编译与 conformance 声明使用的 Gateway API 版本。
+/// 参数说明: 无。
+/// 返回：返回当前实现支持的稳定版本 `v1.5.1`。
+fn default_kubernetes_gateway_api_version() -> String {
+    "v1.5.1".to_owned()
+}
+
+/// 业务作用：固定未启用 TLS backend policy 时 GRPCRoute 的明文 HTTP/2 transport。
+/// 参数说明: 无。
+/// 返回：返回 `h2c`，避免 native gRPC 被自动协议选择降级到 HTTP/1.1。
+fn default_kubernetes_grpc_backend_protocol() -> String {
+    "h2c".to_owned()
+}
+
+/// 业务作用：限制单次 Kubernetes watch 占用连接的时间，周期性 relist 修复漏事件。
+/// 参数说明: 无。
+/// 返回：返回 30 秒服务端 watch 超时。
+const fn default_kubernetes_watch_timeout_seconds() -> u32 {
+    30
+}
+
+/// 业务作用：限定删除 finalizer 等待数据面发布确认的最长时长。
+/// 参数说明: 无。
+/// 返回：返回 5 秒；超时保留 finalizer，由下一轮继续恢复。
+const fn default_kubernetes_deletion_drain_timeout_ms() -> u64 {
+    5_000
+}
+
+/// 业务作用：限制单轮控制面外部写操作，防止异常对象集合放大 API server 压力。
+/// 参数说明: 无。
+/// 返回：返回 4096 个 mutation 的硬配置默认值。
+const fn default_kubernetes_max_status_updates() -> usize {
+    4_096
 }
 fn default_kubernetes_ingress_classes() -> Vec<String> {
     vec!["gateway".to_owned()]
@@ -2574,7 +3367,7 @@ impl Default for RateLimiterBackendCfg {
 /// 低频动态键值集合后端。
 #[derive(Debug, Deserialize, Clone)]
 pub struct DynamicStoreBackendCfg {
-    /// 后端类型:`file` 或 `redis`。默认 file,零外部依赖。
+    /// 后端类型:`file`、`redis` 或 `nacos`。默认 file,零外部依赖。
     #[serde(default = "default_dynamic_store_backend")]
     pub backend: String,
     /// file 后端配置。
@@ -2583,6 +3376,9 @@ pub struct DynamicStoreBackendCfg {
     /// Redis 后端配置。仅 `backend: redis` 时使用。
     #[serde(default)]
     pub redis: RedisStoreCfg,
+    /// Nacos 配置中心后端。仅 `backend: nacos` 时使用。
+    #[serde(default)]
+    pub nacos: NacosStoreCfg,
 }
 
 impl Default for DynamicStoreBackendCfg {
@@ -2591,6 +3387,57 @@ impl Default for DynamicStoreBackendCfg {
             backend: default_dynamic_store_backend(),
             file: FileStoreCfg::default(),
             redis: RedisStoreCfg::default(),
+            nacos: NacosStoreCfg::default(),
+        }
+    }
+}
+
+/// Nacos-backed DynamicStore 的连接、命名与文档资源配置。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct NacosStoreCfg {
+    /// Nacos server 地址。
+    #[serde(default)]
+    pub server_addr: String,
+    /// Nacos namespace ID；public 空间留空。
+    #[serde(default)]
+    pub namespace: String,
+    /// Nacos group。
+    #[serde(default = "default_nacos_group")]
+    pub group: String,
+    /// Nacos app name。
+    #[serde(default = "default_nacos_app_name")]
+    pub app_name: String,
+    /// 可选 Nacos 用户名。
+    #[serde(default)]
+    pub username: String,
+    /// 可选 Nacos 密码。
+    #[serde(default)]
+    pub password: String,
+    /// 每个 collection 对应的 dataId 前缀。
+    #[serde(default = "default_dynamic_store_nacos_prefix")]
+    pub data_id_prefix: String,
+    /// 单 collection JSON 文档硬上限；CAS 前和 watch 后都复验。
+    #[serde(default = "default_dynamic_store_nacos_max_document_bytes")]
+    pub max_document_bytes: u64,
+}
+
+impl Default for NacosStoreCfg {
+    /// 业务作用：提供零外部依赖的 Nacos store 占位配置，只有显式选择 backend=nacos 后才要求地址。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回 public namespace、规范 group/app/prefix 与有界文档上限的默认值。
+    fn default() -> Self {
+        Self {
+            server_addr: String::new(),
+            namespace: String::new(),
+            group: default_nacos_group(),
+            app_name: default_nacos_app_name(),
+            username: String::new(),
+            password: String::new(),
+            data_id_prefix: default_dynamic_store_nacos_prefix(),
+            max_document_bytes: default_dynamic_store_nacos_max_document_bytes(),
         }
     }
 }
@@ -2856,6 +3703,40 @@ impl Default for NacosDiscoveryCfg {
     }
 }
 
+/// Gateway API RequestRedirect 的运行期无关声明。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayRedirectCfg {
+    /// 覆盖目标 scheme；为空时保留入站 scheme。
+    #[serde(default)]
+    pub scheme: Option<String>,
+    /// 覆盖目标 hostname；为空时保留入站 authority host。
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// 覆盖目标端口；为空时按目标 scheme 和原 authority 决定。
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Gateway API 允许的重定向状态码。
+    #[serde(default = "default_gateway_redirect_status_code")]
+    pub status_code: u16,
+    /// 把完整请求 path 替换为固定 origin path。
+    #[serde(default)]
+    pub replace_full_path: Option<String>,
+    /// 只替换本 route 匹配的 path 前缀，保留剩余后缀。
+    #[serde(default)]
+    pub replace_prefix_match: Option<String>,
+    /// 构建期固定的原匹配前缀；仅与 `replace_prefix_match` 同时存在。
+    #[serde(default)]
+    pub matched_prefix: Option<String>,
+}
+
+/// 业务作用：为 Gateway API RequestRedirect 提供保持方法语义的默认状态码。
+/// 参数说明: 无。
+/// 返回：返回 302，与 Gateway API 未声明 statusCode 时的默认行为一致。
+const fn default_gateway_redirect_status_code() -> u16 {
+    302
+}
+
 /// 一条 HTTP 路由及其断言、过滤器、后端和资源预算。
 #[derive(Debug, Deserialize, Clone)]
 pub struct RouteCfg {
@@ -2873,6 +3754,16 @@ pub struct RouteCfg {
     /// route filter DSL 列表。
     #[serde(default)]
     pub filters: Vec<String>,
+    /// 是否在普通反向代理时保留下游 Host/authority；Gateway API/Ingress 需要开启，
+    /// 手写 nginx 风格 route 默认仍使用上游 authority。
+    #[serde(default)]
+    pub preserve_host: bool,
+    /// Gateway API RequestRedirect；存在时该 route 是终端响应，不允许再声明上游后端。
+    #[serde(default)]
+    pub gateway_redirect: Option<GatewayRedirectCfg>,
+    /// V9 显式 hedged request；只用于固定 `lb://`、GET/HEAD、可证明为空 body 的请求。
+    #[serde(default)]
+    pub hedge: Option<HedgeCfg>,
     /// V5 请求契约校验。未配置时保持纯流式快路径；body 校验必须携带显式有界上限。
     #[serde(default)]
     pub request_validation: Option<RequestValidationCfg>,
@@ -2900,7 +3791,7 @@ pub struct RouteCfg {
     /// V7 BFF 有界扇出聚合。它是终端后端，与 uri/serve/llm/mock 互斥。
     #[serde(default)]
     pub bff_aggregation: Option<BffAggregationCfg>,
-    /// V7 HTTP→Dubbo2 generic `$invoke` 终端后端。
+    /// HTTP→Dubbo2 generic `$invoke` 终端后端。
     #[serde(default)]
     pub dubbo: Option<DubboRouteCfg>,
     /// V7 typed API mock。适合从 OpenAPI example 物化后的稳定响应；与其它后端互斥。
@@ -2918,13 +3809,25 @@ pub struct RouteCfg {
     pub llm: Option<LlmRouteCfg>,
     /// V8 gRPC 边缘模式(架构规范 §25.2)。缺省/`enabled: false` 时本 route 保持
     /// Nginx/Envoy 式 L7 透传,一个字节不多碰;显式开启才进入 header 驱动的
-    /// subscribe/publish 自响应。V8-0 仅做构建期契约校验与快照接线,数据面 no-op。
+    /// subscribe/publish 自响应；命中 edge route 后进入已编译的实时散出数据面。
     #[serde(default)]
     pub grpc_edge: Option<GrpcEdgeCfg>,
+    /// 可选 descriptor 驱动 gRPC-JSON/Connect JSON 慢路径。未配置时普通 native gRPC
+    /// 不读取 descriptor、不解析 protobuf message，也不增加 reflection 依赖。
+    #[serde(default)]
+    pub grpc_transcoding: Option<GrpcTranscodingCfg>,
     /// 该 route 的 SSE/gRPC 响应帧间空闲超时(ms)。None 继承 proxy
     /// `timeouts.stream_idle_timeout_ms`；显式 0 表示关闭。
     #[serde(default)]
     pub long_stream_idle_timeout_ms: Option<u64>,
+    /// 单次下游 HTTP 请求到完整响应结束的总时限(ms)。None 使用实现默认；Some(0)
+    /// 显式关闭。Gateway API HTTPRoute `timeouts.request` 物化到该字段。
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// 单次上游 attempt 从开始发送到完整响应结束的时限(ms)。None 使用实现默认；
+    /// Some(0) 显式关闭。Gateway API HTTPRoute `timeouts.backendRequest` 物化到该字段。
+    #[serde(default)]
+    pub backend_request_timeout_ms: Option<u64>,
     /// 该 route 的 SSE/gRPC 最长存活时间(ms)；0 表示不限制。超时时 gRPC 发
     /// status 14 trailer，SSE 结束 body，两者都释放旧快照与上游连接。
     #[serde(default)]
@@ -2935,11 +3838,137 @@ pub struct RouteCfg {
     pub order: i32,
 }
 
+/// route 级 descriptor 驱动 protobuf JSON 转码契约。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcTranscodingCfg {
+    /// 受信本地 `FileDescriptorSet` 文件；相对路径以 `gateway.yml` 所在目录解析。
+    pub descriptor_set_file: String,
+    /// 允许暴露的 protobuf service full name；必须显式列出，空数组会 fail closed。
+    pub services: Vec<String>,
+    /// 可选 method full name 白名单；空表示允许上述 service 的全部 method。
+    #[serde(default)]
+    pub methods: Vec<String>,
+    /// 是否启用 `google.api.http` path/query/body 映射。
+    #[serde(default)]
+    pub google_http: bool,
+    /// 是否启用 Connect unary/streaming JSON。
+    #[serde(default = "default_true")]
+    pub connect_json: bool,
+    /// JSON 中出现 descriptor 未声明字段时是否拒绝；安全默认不静默丢字段。
+    #[serde(default = "default_true")]
+    pub reject_unknown_fields: bool,
+    /// descriptor 文件有界读取上限。
+    #[serde(default = "default_grpc_descriptor_bytes")]
+    pub max_descriptor_bytes: usize,
+    /// 单条输入 protobuf message 解码后的最大字节数。
+    #[serde(default = "default_grpc_input_message_bytes")]
+    pub max_input_message_bytes: usize,
+    /// 单条输出 protobuf message 解码前允许的最大字节数。
+    #[serde(default = "default_grpc_output_message_bytes")]
+    pub max_output_message_bytes: usize,
+    /// 单条 JSON document 的最大字节数；不能超过对应 protobuf message 上限。
+    #[serde(default = "default_grpc_json_bytes")]
+    pub max_json_bytes: usize,
+    /// 单个 streaming RPC 允许转换的最大消息数，防止无限流永久占用 descriptor 慢路径。
+    #[serde(default = "default_grpc_stream_messages")]
+    pub max_stream_messages: u64,
+    /// 单 stream codec 可保留的未完成 envelope/JSON 字节上限。
+    #[serde(default = "default_grpc_stream_buffer_bytes")]
+    pub max_stream_buffer_bytes: usize,
+}
+
+/// 业务作用：提供 descriptor 文件的默认有界读取预算，避免控制面按文件长度无界分配。
+///
+/// 参数说明: 无。
+///
+/// 返回：16 MiB descriptor 上限。
+fn default_grpc_descriptor_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+/// 业务作用：提供单条 gRPC 输入消息的默认转码预算。
+///
+/// 参数说明: 无。
+///
+/// 返回：4 MiB 输入消息上限。
+fn default_grpc_input_message_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+/// 业务作用：提供单条 gRPC 输出消息的默认转码预算。
+///
+/// 参数说明: 无。
+///
+/// 返回：4 MiB 输出消息上限。
+fn default_grpc_output_message_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+/// 业务作用：提供单条 protobuf JSON document 的默认转码预算。
+///
+/// 参数说明: 无。
+///
+/// 返回：4 MiB JSON 上限。
+fn default_grpc_json_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+/// 业务作用：限制单个长流可转换的消息总数，避免未设业务 deadline 时无限占用慢路径状态。
+///
+/// 参数说明: 无。
+///
+/// 返回：默认最多一百万条消息。
+fn default_grpc_stream_messages() -> u64 {
+    1_000_000
+}
+
+/// 业务作用：限制 streaming codec 为跨 DATA frame 拼接保留的未完成数据。
+///
+/// 参数说明: 无。
+///
+/// 返回：默认 4 MiB stream 暂存上限。
+fn default_grpc_stream_buffer_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+/// route 级有界 hedged request 策略。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HedgeCfg {
+    /// 操作者必须显式确认该 route 只承载允许重复执行的业务语义；false 会构建失败。
+    #[serde(default)]
+    pub idempotent: bool,
+    /// 主请求尚未得到成功响应时，启动第二实例副本前的等待时间。
+    #[serde(default = "default_hedge_delay_ms")]
+    pub delay_ms: u64,
+    /// 总 attempt 数；V9 首版固定为 2，避免配置制造扇出风暴。
+    #[serde(default = "default_hedge_max_attempts")]
+    pub max_attempts: usize,
+}
+
+/// 业务作用：提供能吸收常见尾延迟、又不会立即制造双倍请求的默认 hedge 延迟。
+///
+/// 参数说明：无。
+///
+/// 返回：默认延迟 25ms。
+const fn default_hedge_delay_ms() -> u64 {
+    25
+}
+
+/// 业务作用：把 V9 首版 hedge 扇出硬限制为一个主请求加一个副本。
+///
+/// 参数说明：无。
+///
+/// 返回：固定总 attempt 数 2。
+const fn default_hedge_max_attempts() -> usize {
+    2
+}
+
 /// 一个 route 绑定的 Proxy-Wasm ABI v0.2.1 插件。
 ///
-/// V7 首个完整执行面只开放 request/response headers：不向客体映射业务 body，
-/// 不挂 WASI，也不给文件、socket、时钟以外的环境能力。这使默认数据面仍保持流式，
-/// 插件的每份额外拷贝都被限定在显式选用的 header 慢路径。
+/// 只有显式选择 request/response body 相位才会进入有界聚合慢路径；header 相位与未配置
+/// route 仍保持流式。运行时不挂 WASI，也不给文件、socket 或环境变量能力。
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct WasmPluginCfg {
@@ -2973,9 +4002,61 @@ pub struct WasmPluginCfg {
     /// 插件可见并可交付的整份 header map 上限。
     #[serde(default = "default_wasm_max_header_bytes")]
     pub max_header_bytes: usize,
+    /// request/response body 相位可聚合、读取和改写的 data 字节上限。
+    #[serde(default = "default_wasm_max_body_bytes")]
+    pub max_body_bytes: usize,
     /// `proxy_send_local_response` 响应体上限；本地响应是插件唯一可生成的 body。
     #[serde(default = "default_wasm_max_local_response_body_bytes")]
     pub max_local_response_body_bytes: usize,
+    /// 客体可使用的固定 HTTP/gRPC callout 上游白名单。
+    #[serde(default)]
+    pub callout_clusters: Vec<WasmCalloutClusterCfg>,
+    /// 单次 invocation 可登记的 callout 总数。
+    #[serde(default = "default_wasm_max_callouts")]
+    pub max_callouts: usize,
+    /// 单个 callout 响应体可进入客体内存的字节上限。
+    #[serde(default = "default_wasm_max_callout_response_bytes")]
+    pub max_callout_response_bytes: usize,
+    /// 固定租户/业务命名空间；运行时叠加 route、插件 id 与模块摘要实现版本隔离。
+    #[serde(default)]
+    pub shared_namespace: String,
+    /// shared-data key 数量硬上限。
+    #[serde(default = "default_wasm_max_shared_entries")]
+    pub max_shared_entries: usize,
+    /// shared data、property 与 queue payload 合计驻留字节硬上限。
+    #[serde(default = "default_wasm_max_shared_bytes")]
+    pub max_shared_bytes: usize,
+    /// 可注册 shared queue 数量硬上限。
+    #[serde(default = "default_wasm_max_shared_queues")]
+    pub max_shared_queues: usize,
+    /// 单条 shared queue 消息数硬上限。
+    #[serde(default = "default_wasm_max_queue_entries")]
+    pub max_queue_entries: usize,
+    /// 可定义内部 metric 数量硬上限。
+    #[serde(default = "default_wasm_max_metrics")]
+    pub max_metrics: usize,
+}
+
+/// Proxy-Wasm callout 的固定上游能力声明。
+///
+/// 客体只能引用 `name`，不能提供 URL 或直接打开 socket；实际 origin 与 TLS 信任材料在
+/// 候选快照构建期固定，从而把网络权限收敛为可审计白名单。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WasmCalloutClusterCfg {
+    /// 客体在 `proxy_http_call`/`proxy_grpc_call` 中使用的稳定名称。
+    pub name: String,
+    /// 固定 `http://` 或 `https://` origin，不允许 path、query、fragment 或 userinfo。
+    pub origin: String,
+    /// 自定义 CA certificate bundle 的 SecretSource；空时使用平台根证书。
+    #[serde(default)]
+    pub ca_certificate: String,
+    /// 是否显式允许明文 HTTP；默认只接受 HTTPS。
+    #[serde(default)]
+    pub allow_cleartext: bool,
+    /// 对受控明文 origin 强制使用 HTTP/2 prior knowledge；主要用于内网 h2c gRPC 服务。
+    #[serde(default)]
+    pub http2_prior_knowledge: bool,
 }
 
 /// 一个 route 绑定的外部 HTTP 头部插件。
@@ -3118,15 +4199,30 @@ pub struct DubboRouteCfg {
     /// Dubbo service group。
     #[serde(default)]
     pub group: String,
-    /// wire serialization；首个原生闭环显式支持 Dubbo JSON id=6。
+    /// wire serialization；`json` 使用 id=6，`hessian2` 使用 id=2 且需要对应制品 feature。
     #[serde(default)]
     pub serialization: DubboSerializationCfg,
     /// 下游 JSON body 上限。
     #[serde(default = "default_dubbo_max_request_body_bytes")]
     pub max_request_body_bytes: u64,
+    /// 编码后 Dubbo request frame body 上限，独立约束序列化膨胀。
+    #[serde(default = "default_dubbo_max_request_frame_bytes")]
+    pub max_request_frame_bytes: usize,
     /// Dubbo response frame body 上限。
     #[serde(default = "default_dubbo_max_response_body_bytes")]
     pub max_response_body_bytes: usize,
+    /// Hessian2 单值最大字符串 UTF-8 字节数。
+    #[serde(default = "default_dubbo_max_hessian_string_bytes")]
+    pub max_hessian_string_bytes: usize,
+    /// Hessian2 单值最大 binary 字节数；HTTP JSON 使用标准 Base64 表示 binary。
+    #[serde(default = "default_dubbo_max_hessian_binary_bytes")]
+    pub max_hessian_binary_bytes: usize,
+    /// Hessian2 单 frame 可遍历的 collection/object 字段总数。
+    #[serde(default = "default_dubbo_max_hessian_collection_items")]
+    pub max_hessian_collection_items: usize,
+    /// Hessian2 collection/object 最大递归深度。
+    #[serde(default = "default_dubbo_max_hessian_depth")]
+    pub max_hessian_depth: usize,
     /// TCP connect 上限。
     #[serde(default = "default_dubbo_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
@@ -3148,24 +4244,96 @@ pub enum DubboSerializationCfg {
     /// Dubbo serialization id 6；provider 必须显式支持 `json`。
     #[default]
     Json,
+    /// Dubbo serialization id 2；使用 provider 默认 Hessian2 泛化调用协议。
+    Hessian2,
 }
 
+/// 业务作用：提供下游 Dubbo JSON envelope 的保守默认字节门。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 1 MiB 请求体上限。
 const fn default_dubbo_max_request_body_bytes() -> u64 {
     1024 * 1024
 }
 
+/// 业务作用：提供序列化后 Dubbo request frame 的独立默认上限，隔离编码膨胀。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 4 MiB frame body 上限。
+const fn default_dubbo_max_request_frame_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+/// 业务作用：提供 Dubbo response frame 的默认读取硬门。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 4 MiB frame body 上限。
 const fn default_dubbo_max_response_body_bytes() -> usize {
     4 * 1024 * 1024
 }
 
+/// 业务作用：限制单个 Hessian2 字符串的默认 UTF-8 字节数。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 1 MiB 单字符串上限。
+const fn default_dubbo_max_hessian_string_bytes() -> usize {
+    1024 * 1024
+}
+
+/// 业务作用：限制单个 Hessian2 binary 的默认真实字节数。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 1 MiB 单 binary 上限。
+const fn default_dubbo_max_hessian_binary_bytes() -> usize {
+    1024 * 1024
+}
+
+/// 业务作用：限制单个 Hessian2 frame 内 collection/object 的默认累计元素数。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 65,536 个元素的累计上限。
+const fn default_dubbo_max_hessian_collection_items() -> usize {
+    65_536
+}
+
+/// 业务作用：限制 Hessian2 collection/object 的默认递归深度。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 32 层递归上限。
+const fn default_dubbo_max_hessian_depth() -> usize {
+    32
+}
+
+/// 业务作用：提供 Dubbo TCP 建连的默认 deadline。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 1000 毫秒。
 const fn default_dubbo_connect_timeout_ms() -> u64 {
     1000
 }
 
+/// 业务作用：提供一次 Dubbo 写入与完整响应读取的默认总 deadline。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 3000 毫秒。
 const fn default_dubbo_request_timeout_ms() -> u64 {
     3000
 }
 
+/// 业务作用：提供每个 Dubbo endpoint 的默认空闲连接容量。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 8 条空闲连接。
 const fn default_dubbo_max_idle_connections() -> usize {
     8
 }
@@ -3233,14 +4401,22 @@ const fn default_mock_status() -> u16 {
     200
 }
 
-/// Proxy-Wasm 头部回调相位。
+/// Proxy-Wasm HTTP 回调相位。
 #[derive(Debug, Deserialize, Clone, Copy, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum WasmPluginPhaseCfg {
     /// 认证与 OPA 通过后、请求体校验/限流/上游前。
     RequestHeaders,
+    /// 请求头插件提交后、外部策略与上游转发前；显式有界聚合完整请求 body。
+    RequestBody,
+    /// 请求 body 逐 DATA frame 回调；每次只暴露当前 frame，并以 body poll 自然施加背压。
+    RequestBodyStream,
     /// 内部跳转与 error_page 完成后、压缩/限速前。
     ResponseHeaders,
+    /// 响应头插件提交后、压缩/限速前；显式有界聚合完整响应 body。
+    ResponseBody,
+    /// 响应 body 逐 DATA frame 回调；不聚合完整响应，适合长流与无限流。
+    ResponseBodyStream,
 }
 
 /// route 级内嵌 Casbin 决策配置。
@@ -3309,8 +4485,75 @@ const fn default_wasm_max_header_bytes() -> usize {
     64 * 1024
 }
 
+const fn default_wasm_max_body_bytes() -> usize {
+    1024 * 1024
+}
+
 const fn default_wasm_max_local_response_body_bytes() -> usize {
     64 * 1024
+}
+
+/// 业务作用：限制单次 Proxy-Wasm invocation 可登记的异步 callout 数量，避免客体制造出站扇出。
+///
+/// 参数说明: 无。
+///
+/// 返回：默认最多 4 个受控 callout。
+const fn default_wasm_max_callouts() -> usize {
+    4
+}
+
+/// 业务作用：限制单个 callout 响应可进入客体内存的字节数。
+///
+/// 参数说明: 无。
+///
+/// 返回：默认 1 MiB 响应上限。
+const fn default_wasm_max_callout_response_bytes() -> usize {
+    1024 * 1024
+}
+
+/// 业务作用：限制插件命名空间内可同时存在的 shared-data key 数量。
+///
+/// 参数说明: 无。
+///
+/// 返回：默认 1024 个条目。
+const fn default_wasm_max_shared_entries() -> usize {
+    1024
+}
+
+/// 业务作用：限制插件命名空间内 shared data、property 与 queue payload 的合计驻留字节。
+///
+/// 参数说明: 无。
+///
+/// 返回：默认 4 MiB 驻留上限。
+const fn default_wasm_max_shared_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+/// 业务作用：限制单个插件命名空间可注册的 shared queue 数量。
+///
+/// 参数说明: 无。
+///
+/// 返回：默认 64 条队列。
+const fn default_wasm_max_shared_queues() -> usize {
+    64
+}
+
+/// 业务作用：限制单条 shared queue 的待消费消息数，防止慢消费者造成无界堆积。
+///
+/// 参数说明: 无。
+///
+/// 返回：默认 1024 条消息。
+const fn default_wasm_max_queue_entries() -> usize {
+    1024
+}
+
+/// 业务作用：限制插件可定义的内部 metric 数量，控制指标名称基数。
+///
+/// 参数说明: 无。
+///
+/// 返回：默认 256 个 metric。
+const fn default_wasm_max_metrics() -> usize {
+    256
 }
 
 /// V6 路由级 AI/LLM 代理配置。
@@ -3332,6 +4575,9 @@ pub struct LlmRouteCfg {
     /// Prompt 注入/越权短语护栏。
     #[serde(default)]
     pub guardrails: LlmGuardrailsCfg,
+    /// 可选外部 OpenAI-compatible moderation；在缓存、配额预留和模型调用前执行。
+    #[serde(default)]
+    pub moderation: Option<LlmModerationCfg>,
     /// 可选精确 + embedding 语义缓存。未配置时不会计算缓存键、聚合额外响应或访问 Redis。
     #[serde(default)]
     pub semantic_cache: Option<LlmSemanticCacheCfg>,
@@ -3340,6 +4586,45 @@ pub struct LlmRouteCfg {
     pub selection: LlmSelectionCfg,
     /// 依次尝试的模型；首项是主模型，后续项只在连接错误、超时或 5xx 时 fallback。
     pub models: Vec<LlmModelCfg>,
+}
+
+/// 外部 OpenAI-compatible moderation 配置。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct LlmModerationCfg {
+    /// moderation 服务地址，支持 `http(s)://` 与 `lb://service`。
+    pub uri: String,
+    /// moderation model 名称，例如 `omni-moderation-latest`；必须显式配置以保持策略可审计。
+    pub model: String,
+    /// API path；空时使用 `/v1/moderations`。
+    #[serde(default)]
+    pub path: String,
+    /// provider API key SecretSource；空表示不注入凭据。
+    #[serde(default)]
+    pub api_key: String,
+    /// 一次 moderation 调用总超时(ms)。
+    #[serde(default = "default_llm_moderation_timeout_ms")]
+    pub timeout_ms: u64,
+    /// 序列化 moderation request 的硬上限。
+    #[serde(default = "default_llm_moderation_max_request_bytes")]
+    pub max_request_bytes: u64,
+    /// moderation response 的聚合硬上限。
+    #[serde(default = "default_llm_moderation_max_response_bytes")]
+    pub max_response_bytes: u64,
+    /// 依赖超时、非 2xx 或坏响应时的 `closed|open` 策略；明确 flagged 永远拒绝。
+    #[serde(default)]
+    pub fail_mode: LlmModerationFailModeCfg,
+}
+
+/// 外部 moderation 依赖失败策略。
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmModerationFailModeCfg {
+    /// 依赖不可判定时拒绝模型请求，安全优先。
+    #[default]
+    Closed,
+    /// 仅依赖故障时继续；明确 `flagged=true` 仍拒绝。
+    Open,
 }
 
 /// V6 LLM 精确/语义两级缓存。
@@ -3413,7 +4698,7 @@ pub struct LlmEmbeddingCfg {
 pub struct LlmModelCfg {
     /// 配置内稳定、低基数模型 id，用于 metrics/日志；不接受请求动态值。
     pub id: String,
-    /// `openai` 或 `anthropic`。
+    /// `openai`、`anthropic` 或 Google Gemini Developer API 的 `google`。
     pub provider: LlmProviderCfg,
     /// 模型后端地址，支持 `http(s)://` 与 `lb://service`。
     pub uri: String,
@@ -3422,6 +4707,10 @@ pub struct LlmModelCfg {
     /// provider API path；空时使用 provider 安全默认值。
     #[serde(default)]
     pub path: String,
+    /// Google SSE API path；空时由 `model` 生成
+    /// `/v1beta/models/{model}:streamGenerateContent?alt=sse`。其它 provider 必须留空。
+    #[serde(default)]
+    pub stream_path: String,
     /// provider API key SecretSource；空表示不注入凭据，适合本地 vLLM/Ollama。
     #[serde(default)]
     pub api_key: String,
@@ -3519,7 +4808,7 @@ pub struct LlmGuardrailsCfg {
     pub blocked_response_substrings: Vec<String>,
 }
 
-/// V6 首批支持的模型协议适配器。
+/// LLM 模型协议适配器。
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmProviderCfg {
@@ -3527,6 +4816,8 @@ pub enum LlmProviderCfg {
     Openai,
     /// Anthropic Messages API。
     Anthropic,
+    /// Google Gemini Developer API `generateContent` / `streamGenerateContent`。
+    Google,
 }
 
 fn default_llm_max_body_bytes() -> u64 {
@@ -3573,6 +4864,18 @@ fn default_llm_model_weight() -> u32 {
     100
 }
 
+fn default_llm_moderation_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_llm_moderation_max_request_bytes() -> u64 {
+    1024 * 1024
+}
+
+fn default_llm_moderation_max_response_bytes() -> u64 {
+    1024 * 1024
+}
+
 /// 路由级 OpenAPI / JSON Schema 请求校验配置。
 ///
 /// `head_schema` 校验一个稳定 envelope：`method`/`path`/`query`/`headers`/
@@ -3616,9 +4919,8 @@ pub struct RequestValidationCfg {
 
 /// V7 route 级 GraphQL 查询深度/复杂度守卫。
 ///
-/// 该配置只接受 GraphQL-over-HTTP 的 GET query、POST `application/json` 与 POST
-/// `application/graphql` 基础形态。multipart upload、subscription transport 和
-/// degraphql 不属于第一切片；不能用宽松解析把这些尚未实现的协议伪装成已支持。
+/// 支持 GraphQL-over-HTTP GET/JSON/raw query、multipart upload，以及显式放行的
+/// `graphql-transport-ws`/legacy `graphql-ws` 透明升级。degraphql 是独立的固定查询映射。
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct GraphqlGuardCfg {
@@ -3640,6 +4942,12 @@ pub struct GraphqlGuardCfg {
     /// 是否允许 `__schema`/`__type`/`__typename` 等 introspection 字段。
     #[serde(default)]
     pub allow_introspection: bool,
+    /// 是否允许 GraphQL WebSocket subscription transport 透明转发。
+    ///
+    /// WebSocket 消息不会被本 HTTP query guard 重写或拆包；开启表示上游 GraphQL server
+    /// 负责每条 subscription 的解析/复杂度门，网关仍执行握手前 auth/rate/连接预算。
+    #[serde(default)]
+    pub allow_websocket_subscriptions: bool,
 }
 
 /// REST→GraphQL 声明式映射。GraphQL 文档固定在配置中，客户端只能提供有界 variables，
@@ -3739,6 +5047,7 @@ impl Default for GraphqlGuardCfg {
             max_depth: default_graphql_max_depth(),
             max_complexity: default_graphql_max_complexity(),
             allow_introspection: false,
+            allow_websocket_subscriptions: false,
         }
     }
 }
@@ -3763,17 +5072,21 @@ fn default_graphql_max_complexity() -> usize {
     1_000
 }
 
-/// V7 route 级 OPA REST decision 配置。
+/// Route 级 OPA decision 配置。
 ///
-/// 第一切片固定调用 OPA Data API 风格 `POST`，request body 为 `{ "input": ... }`；
-/// `target` 只声明上游 base，`path` 显式声明 policy document 路径。业务请求 body 永不读取或
-/// 转发给策略服务，避免授权外呼破坏主管线的流式语义。
+/// 默认调用 OPA Data API；`engine=embedded` 时从签名 bundle 构建本地 Rego 引擎。
+/// request body 与完整 JWT claims 都必须在 `input` 中显式开启，未开启时保持 head-only 流式路径。
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct OpaAuthorizationCfg {
+    /// 求值引擎；默认 external。
+    #[serde(default)]
+    pub engine: OpaEngineCfg,
     /// OPA 上游 base：`http(s)://host[:port]` 或 `lb://service`。
+    #[serde(default)]
     pub target: String,
     /// OPA Data API 路径，例如 `/v1/data/gateway/authz`；必须显式填写。
+    #[serde(default)]
     pub path: String,
     /// response head + body 的总决策 deadline，毫秒。
     #[serde(default = "default_opa_timeout_ms")]
@@ -3802,20 +5115,168 @@ pub struct OpaAuthorizationCfg {
     /// 可选本节点 decision L1。存在即启用；错误和 unavailable 永不缓存。
     #[serde(default)]
     pub cache: Option<OpaDecisionCacheCfg>,
+    /// 可选签名标准 OPA bundle；embedded 引擎必须配置。
+    #[serde(default)]
+    pub bundle: Option<OpaBundleCfg>,
+    /// 输入扩展；默认不读取 body、不暴露完整 claims。
+    #[serde(default)]
+    pub input: OpaInputCfg,
+    /// OPA allow 结果可携带的受控副作用。
+    #[serde(default)]
+    pub obligations: OpaObligationsCfg,
+    /// 外部依赖首次失败后的退避，毫秒。
+    #[serde(default = "default_opa_backoff_initial_ms")]
+    pub backoff_initial_ms: u64,
+    /// 外部依赖连续失败的最大退避，毫秒。
+    #[serde(default = "default_opa_backoff_max_ms")]
+    pub backoff_max_ms: u64,
+}
+
+/// OPA 求值引擎。
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpaEngineCfg {
+    /// 通过 HTTP 调用独立 OPA。
+    #[default]
+    External,
+    /// 在进程内执行签名 bundle 中的 Rego。
+    Embedded,
+}
+
+/// 签名 OPA bundle 配置。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct OpaBundleCfg {
+    /// 本地 `.tar.gz` bundle；相对主配置目录解析并纳入 dependency watcher。
+    pub source: String,
+    /// detached Ed25519 signature 的 Base64 SecretSource，签名覆盖压缩 bundle 原始字节。
+    pub signature: String,
+    /// 32 字节 Ed25519 public key 的 Base64 SecretSource。
+    pub public_key: String,
+    /// Rego query，例如 `data.gateway.authz`。
+    #[serde(default = "default_opa_bundle_query")]
+    pub query: String,
+    /// 压缩 bundle 最大字节数。
+    #[serde(default = "default_opa_bundle_max_bytes")]
+    pub max_bundle_bytes: usize,
+    /// 所有 archive regular file 解压后累计最大字节数。
+    #[serde(default = "default_opa_bundle_max_expanded_bytes")]
+    pub max_expanded_bytes: usize,
+    /// archive regular file 数量硬上限。
+    #[serde(default = "default_opa_bundle_max_files")]
+    pub max_files: usize,
+}
+
+/// OPA request input 显式扩展。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct OpaInputCfg {
+    /// 是否把完整请求 body 加入 input 并原样重放给后续管线。
+    #[serde(default)]
+    pub include_body: bool,
+    /// body 聚合硬上限。
+    #[serde(default = "default_opa_input_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// 可聚合的 Content-Type allowlist；按去参数 media type 精确匹配。
+    #[serde(default = "default_opa_input_content_types")]
+    pub content_types: Vec<String>,
+    /// 是否加入网关已经验签、时效与 issuer/audience 均通过的完整 JWT claims。
+    #[serde(default)]
+    pub include_jwt_claims: bool,
+}
+
+impl Default for OpaInputCfg {
+    /// 业务作用：提供不读取 body/claims 的安全输入基线，并保留显式启用时的有限默认预算。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：返回 head-only 输入配置；body 上限与 media type 仅在 `include_body=true` 时生效。
+    fn default() -> Self {
+        Self {
+            include_body: false,
+            max_body_bytes: default_opa_input_max_body_bytes(),
+            content_types: default_opa_input_content_types(),
+            include_jwt_claims: false,
+        }
+    }
+}
+
+/// OPA obligations 白名单与资源门。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct OpaObligationsCfg {
+    /// OPA 可设置/删除的 request header 名称。
+    #[serde(default)]
+    pub request_headers: Vec<String>,
+    /// OPA 可设置/删除的 response header 名称。
+    #[serde(default)]
+    pub response_headers: Vec<String>,
+    /// 可接受的审计 metadata key。
+    #[serde(default)]
+    pub audit_metadata: Vec<String>,
+    /// 单次 decision obligation 条目硬上限。
+    #[serde(default = "default_opa_obligation_max_entries")]
+    pub max_entries: usize,
+    /// 单个 header/audit value 最大字节数。
+    #[serde(default = "default_opa_obligation_max_value_bytes")]
+    pub max_value_bytes: usize,
+    /// 全部 obligation 名称和值累计最大字节数。
+    #[serde(default = "default_opa_obligation_max_bytes")]
+    pub max_bytes: usize,
+}
+
+impl Default for OpaObligationsCfg {
+    /// 业务作用：默认不给 OPA 任何 header/audit 副作用权限，同时建立非零资源硬门。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：返回空 allowlist；即使策略返回 obligation 也会整体拒绝。
+    fn default() -> Self {
+        Self {
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+            audit_metadata: Vec::new(),
+            max_entries: default_opa_obligation_max_entries(),
+            max_value_bytes: default_opa_obligation_max_value_bytes(),
+            max_bytes: default_opa_obligation_max_bytes(),
+        }
+    }
 }
 
 /// OPA decision L1 配置。
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct OpaDecisionCacheCfg {
-    /// allow/deny decision TTL，毫秒。
+    /// allow decision TTL，毫秒。
     #[serde(default = "default_opa_cache_ttl_ms")]
     pub ttl_ms: u64,
+    /// deny decision TTL，毫秒；通常短于 allow。
+    #[serde(default = "default_opa_cache_deny_ttl_ms")]
+    pub deny_ttl_ms: u64,
     /// 每 route 最大 decision entry 数，TinyLFU 到顶淘汰。
     #[serde(default = "default_opa_cache_max_entries")]
     pub max_entries: u64,
-    /// 外部 Rego/data 的运维版本；启用 cache 时必须非空，策略发布必须同步变更。
+    /// 外部 Rego/data 的运维版本；签名 bundle 模式自动使用 manifest revision/digest。
+    #[serde(default)]
     pub policy_revision: String,
+    /// 是否合并本节点同 key 并发 miss。
+    #[serde(default = "default_true")]
+    pub singleflight: bool,
+    /// follower 最长等待时间，毫秒。
+    #[serde(default = "default_opa_singleflight_wait_ms")]
+    pub singleflight_wait_ms: u64,
+    /// 每 route 同时活跃的不同 miss key 硬上限。
+    #[serde(default = "default_opa_singleflight_max_keys")]
+    pub singleflight_max_keys: usize,
+    /// 是否把已验证 decision 写入 DynamicStore 供节点间复用。
+    #[serde(default)]
+    pub distributed: bool,
+    /// 跨节点 decision collection。
+    #[serde(default = "default_opa_distributed_collection")]
+    pub distributed_collection: String,
+    /// 跨节点 collection 最大 entry 数。
+    #[serde(default = "default_opa_distributed_max_entries")]
+    pub distributed_max_entries: usize,
 }
 
 fn default_opa_timeout_ms() -> u64 {
@@ -3836,6 +5297,70 @@ fn default_opa_max_response_bytes() -> usize {
 
 fn default_opa_cache_ttl_ms() -> u64 {
     1_000
+}
+
+fn default_opa_cache_deny_ttl_ms() -> u64 {
+    250
+}
+
+fn default_opa_singleflight_wait_ms() -> u64 {
+    1_000
+}
+
+fn default_opa_singleflight_max_keys() -> usize {
+    1_024
+}
+
+fn default_opa_distributed_collection() -> String {
+    "opa_decisions".to_string()
+}
+
+fn default_opa_distributed_max_entries() -> usize {
+    100_000
+}
+
+fn default_opa_bundle_query() -> String {
+    "data.gateway.authz".to_string()
+}
+
+fn default_opa_bundle_max_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+fn default_opa_bundle_max_expanded_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+fn default_opa_bundle_max_files() -> usize {
+    256
+}
+
+fn default_opa_input_max_body_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_opa_input_content_types() -> Vec<String> {
+    vec!["application/json".to_string()]
+}
+
+fn default_opa_obligation_max_entries() -> usize {
+    32
+}
+
+fn default_opa_obligation_max_value_bytes() -> usize {
+    4 * 1024
+}
+
+fn default_opa_obligation_max_bytes() -> usize {
+    32 * 1024
+}
+
+fn default_opa_backoff_initial_ms() -> u64 {
+    100
+}
+
+fn default_opa_backoff_max_ms() -> u64 {
+    5_000
 }
 
 fn default_opa_cache_max_entries() -> u64 {
@@ -3913,7 +5438,7 @@ pub struct StaticServiceCfg {
     /// 静态来源的实例列表；动态来源必须留空。
     #[serde(default)]
     pub instances: Vec<StaticInstanceCfg>,
-    /// 上游实例来源：`static`(默认)、`nacos`、`consul`、`eureka`、`dns` 或 `kubernetes`。
+    /// 上游实例来源：`static`(默认)、`nacos`、`consul`、`eureka`、`dns`、`kubernetes` 或 `xds`。
     #[serde(default)]
     pub source: Option<String>,
     /// Nacos 中的服务名;缺省使用 `services` map 的 key。
@@ -3943,7 +5468,11 @@ pub struct StaticServiceCfg {
     /// 兼容 架构规范 示例里的 `lb: least_conn`。
     #[serde(default)]
     pub lb: Option<String>,
-    /// 上游 HTTP 协议(据 review L1 / §5):`auto`(默认,按 scheme + gRPC content-type 判)| `h1` | `h2` | `h2c`。
+    /// V9 zone-aware locality/failover；未配置时保持既有全实例 LB 语义。
+    #[serde(default)]
+    pub locality: Option<UpstreamLocalityCfg>,
+    /// 上游 HTTP 协议：`auto`(默认，按 scheme + gRPC content-type 判) | `h1` | `h2` | `h2c` | `h3`。
+    /// `h3` 要求 `https://` 实例和 `http3` feature，不满足时构建期 fail closed，不静默退化。
     /// gRPC 上游应配 `h2`(TLS)/`h2c`(明文),否则会退化成 h1 多连接、丢多路复用。
     #[serde(default)]
     pub protocol: Option<String>,
@@ -3968,13 +5497,27 @@ pub struct StaticServiceCfg {
     /// 被动摘除窗口/摘除时长(ms),对齐 nginx `fail_timeout` 心智。
     #[serde(default = "default_fail_timeout_ms")]
     pub fail_timeout_ms: u64,
-    /// 主动健康探测(§5.1):缺省 = 关闭。配置后后台任务按间隔 TCP/HTTP 探测每个实例,
+    /// 主动健康探测(§5.1):缺省 = 关闭。配置后后台任务按间隔 TCP/HTTP/gRPC/UDP 探测每个实例,
     /// 连续成功/失败达阈值翻转健康态;不健康实例不进入 LB 候选(与被动摘除叠加,双保险)。
     #[serde(default)]
     pub health_check: Option<HealthCheckCfg>,
     /// 新静态/发现实例进入目录后，使用真实业务连接池主动建立空闲连接。None = 关闭。
     #[serde(default)]
     pub prewarm: Option<UpstreamPrewarmCfg>,
+}
+
+/// 上游 zone-aware locality 与显式跨区故障转移策略。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamLocalityCfg {
+    /// 本 Naway 数据面所在的可信 zone；仅与配置/发现 metadata 比较。
+    pub local_zone: String,
+    /// 本区无健康容量时按数组顺序选择的跨区 failover zone。
+    #[serde(default)]
+    pub failover_zones: Vec<String>,
+    /// 是否在已列 zone 全无健康容量后允许 zone 缺失/未列实例。默认 false。
+    #[serde(default)]
+    pub allow_unlisted: bool,
 }
 
 /// 上游 Hyper 连接池预热策略。预热只发送 HEAD 且不携带下游 head/body/身份。
@@ -3995,7 +5538,7 @@ pub struct UpstreamPrewarmCfg {
 /// 主动健康探测配置(nginx `health_check` / Envoy active health check 心智)。
 #[derive(Debug, Deserialize, Clone)]
 pub struct HealthCheckCfg {
-    /// 探测类型:`tcp`、`http` 或 V7 `udp`。UDP 发送一个有界 payload 并等待响应。
+    /// 探测类型:`tcp`、`http`、`grpc` 或 `udp`。gRPC 调用标准 Health/Check。
     #[serde(default = "default_health_check_type")]
     pub r#type: String,
     /// http 探测路径,默认 `/`。tcp 探测忽略。
@@ -4004,6 +5547,9 @@ pub struct HealthCheckCfg {
     /// 探测间隔(ms),默认 5000。
     #[serde(default = "default_health_check_interval_ms")]
     pub interval_ms: u64,
+    /// 每轮探测间隔的对称随机化上限(ms)；默认 0，且不得超过 interval 的一半。
+    #[serde(default)]
+    pub jitter_ms: u64,
     /// 单次探测超时(ms),默认 2000。
     #[serde(default = "default_health_check_timeout_ms")]
     pub timeout_ms: u64,
@@ -4016,6 +5562,9 @@ pub struct HealthCheckCfg {
     /// http 探测期望状态码;缺省接受任意 2xx。
     #[serde(default)]
     pub expected_status: Option<u16>,
+    /// gRPC Health/Check 的 service 名；空字符串表示检查服务器整体状态。
+    #[serde(default)]
+    pub grpc_service: String,
     /// UDP 探测发送的 UTF-8 payload；`type != udp` 时必须为空。
     #[serde(default)]
     pub udp_payload: String,
@@ -4044,6 +5593,9 @@ pub struct StaticInstanceCfg {
     /// 慢启动时长(ms):实例新加入/恢复后有效权重在该时长内线性爬满。
     #[serde(default)]
     pub slow_start_ms: u64,
+    /// 可信静态 locality zone；只在所属 service 配置 `locality` 时参与选择。
+    #[serde(default)]
+    pub zone: Option<String>,
 }
 
 /// HTTP 上游 TLS 配置,对齐 nginx `proxy_ssl_*` 的高频子集。
@@ -4055,12 +5607,25 @@ pub struct UpstreamTlsCfg {
     /// 自定义上游服务端 CA PEM,等价 nginx `proxy_ssl_trusted_certificate`;为空使用系统根证书。
     #[serde(default, alias = "proxy_ssl_trusted_certificate")]
     pub ca_file: Option<String>,
+    /// 内联 PEM CA bundle；用于受控发现源原子物化动态信任材料，不能与 `ca_file` 同时设置。
+    #[serde(default)]
+    pub ca_pem: Option<String>,
+    /// 显式证书 SAN allowlist，元素使用 `dns:<name>` 或 `uri:<absolute-uri>`；非空时
+    /// 证书至少匹配一项，`server_name` 只承担 SNI 选择而不作为认证名。
+    #[serde(default)]
+    pub subject_alt_names: Vec<String>,
     /// 发给上游的客户端证书 PEM,等价 nginx `proxy_ssl_certificate`。
     #[serde(default, alias = "proxy_ssl_certificate")]
     pub client_cert_file: Option<String>,
     /// 发给上游的客户端私钥 PEM,等价 nginx `proxy_ssl_certificate_key`。
     #[serde(default, alias = "proxy_ssl_certificate_key")]
     pub client_key_file: Option<String>,
+    /// 内联客户端证书链；只允许受控发现源原子物化，必须与内联私钥成对出现。
+    #[serde(default)]
+    pub client_cert_pem: Option<String>,
+    /// 内联客户端私钥；不进入日志或错误上下文，必须与内联证书链成对出现。
+    #[serde(default)]
+    pub client_key_pem: Option<String>,
 }
 
 fn default_guard_file() -> String {
@@ -4253,6 +5818,150 @@ fn default_stream_preread_max_bytes() -> usize {
     8 * 1024
 }
 
+/// 业务作用：给单 listener MQTT 会话设置默认并发硬门。
+///
+/// 参数说明：无。
+///
+/// 返回：默认最多 256 条正在握手或已建立的 MQTT 连接。
+fn default_stream_mqtt_max_connections() -> usize {
+    256
+}
+
+/// 业务作用：限制一枚 MQTT Control Packet 导致的单次分配。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 1 MiB wire packet 上限。
+fn default_stream_mqtt_max_packet_bytes() -> usize {
+    1024 * 1024
+}
+
+/// 业务作用：限制已开始 MQTT packet 的慢速传输，同时不误杀没有发包的长时间 idle 连接。
+///
+/// 参数说明：无。
+///
+/// 返回：fixed-header 首字节到完整 packet 默认 10 秒 deadline。
+fn default_stream_mqtt_packet_timeout_ms() -> u64 {
+    10_000
+}
+
+/// 业务作用：给 listener 内所有 MQTT packet buffer 设置可预留的聚合内存硬门。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 512 MiB，按每连接两个方向各一枚最大 packet 做悲观预留。
+fn default_stream_mqtt_max_buffered_bytes() -> usize {
+    512 * 1024 * 1024
+}
+
+/// 业务作用：收紧 broker 协议理论上限，避免 topic 成为大字符串攻击面。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 1024 字节 Topic Name/Filter 上限。
+fn default_stream_mqtt_max_topic_bytes() -> usize {
+    1_024
+}
+
+/// 业务作用：约束每条 MQTT 连接保留的订阅集合。
+///
+/// 参数说明：无。
+///
+/// 返回：默认最多 1024 个去重 topic filter。
+fn default_stream_mqtt_max_subscriptions() -> usize {
+    1_024
+}
+
+/// 业务作用：限制 QoS 与订阅控制流程的 packet-id 状态量。
+///
+/// 参数说明：无。
+///
+/// 返回：默认最多 128 个双向在途交换。
+fn default_stream_mqtt_max_inflight_messages() -> usize {
+    128
+}
+
+/// 业务作用：限制单 listener 的 Kafka 长连接任务与悲观 frame buffer 预留总量。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 256 条连接。
+fn default_stream_kafka_max_connections() -> usize {
+    256
+}
+
+/// 业务作用：限制单枚 Kafka frame 的分配；默认与常见 1 MiB record batch 保持同量级。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 1 MiB wire 上限。
+fn default_stream_kafka_max_frame_bytes() -> usize {
+    1024 * 1024
+}
+
+/// 业务作用：限制已经开始传输的慢 Kafka frame，不影响纯 idle 长连接。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 10 秒。
+fn default_stream_kafka_frame_timeout_ms() -> u64 {
+    10_000
+}
+
+/// 业务作用：限制 listener 内所有 Kafka 双向 frame buffer 的聚合预留。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 512 MiB。
+fn default_stream_kafka_max_buffered_bytes() -> usize {
+    512 * 1024 * 1024
+}
+
+/// 业务作用：限制单连接 correlation map，防止只发 request 不读 response 的状态堆积。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 128 个在途请求。
+fn default_stream_kafka_max_inflight_requests() -> usize {
+    128
+}
+
+/// 业务作用：限制 Kafka request header 的 client id 字符串。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 256 字节。
+fn default_stream_kafka_max_client_id_bytes() -> usize {
+    256
+}
+
+/// 业务作用：收紧 Kafka topic 名攻击面，同时覆盖 broker 的常见 topic 长度上限。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 249 字节。
+fn default_stream_kafka_max_topic_bytes() -> usize {
+    249
+}
+
+/// 业务作用：限制 consumer group id 的协议字符串分配。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 255 字节。
+fn default_stream_kafka_max_group_bytes() -> usize {
+    255
+}
+
+/// 业务作用：限制 topic/partition/member 等 Kafka 数组的循环与状态规模。
+///
+/// 参数说明：无。
+///
+/// 返回：默认每数组最多 4096 项。
+fn default_stream_kafka_max_array_items() -> usize {
+    4096
+}
+
 fn default_stream_proxy_protocol_upstream_version() -> String {
     "v1".to_string()
 }
@@ -4343,6 +6052,14 @@ fn default_dynamic_store_file_root() -> String {
 
 fn default_dynamic_store_redis_prefix() -> String {
     "gw:dynamic".to_string()
+}
+
+fn default_dynamic_store_nacos_prefix() -> String {
+    "naway.dynamic".to_string()
+}
+
+fn default_dynamic_store_nacos_max_document_bytes() -> u64 {
+    1024 * 1024
 }
 
 fn default_blacklist_collection() -> String {

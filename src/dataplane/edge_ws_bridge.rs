@@ -1,4 +1,4 @@
-//! V8-8 浏览器 WS→内部 gRPC 边缘桥接(架构规范 §25.2 边界 A / naway.md)。
+//! 浏览器 WS→内部 gRPC 边缘桥接（架构规范 §25.2 边界 A / naway.md）。
 //!
 //! 浏览器拿不到 HTTP/2 trailers,也没法发原生 gRPC 帧,所以 Web 端用 WebSocket 进
 //! 同一条订阅路径。**只换传输外壳**:鉴权、身份 claim、group 索引、双维队列预算、

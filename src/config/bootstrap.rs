@@ -73,6 +73,66 @@ server:
     websocket_max_lifetime_ms: 86400000
     drain_timeout_ms: 30000
 
+# MQTT 3.1.1/5.0 治理需使用 `--features mqtt-governance` 构建；保持注释时不创建 stream listener。
+# persistent session、shared subscription 或 topic-alias-only 空 topic 应使用不含 mqtt 段的透明 TCP profile。
+# stream:
+#   listeners:
+#     - id: mqtt-public
+#       protocol: tcp
+#       listen: "0.0.0.0:1883"
+#       preread:
+#         mqtt_connect: true
+#         timeout_ms: 3000
+#         max_bytes: 4096
+#       mqtt:
+#         enabled: true
+#         max_connections: 256
+#         max_packet_bytes: 1048576
+#         packet_timeout_ms: 10000
+#         max_buffered_bytes: 536870912
+#         max_topic_bytes: 1024
+#         max_subscriptions: 1024
+#         max_inflight_messages: 128
+#         client_id_allow: [device-a]
+#         publish_topic_allow: [sensors/+/temperature]
+#         subscribe_topic_allow: [sensors/#]
+#       routes:
+#         - id: broker
+#           default: true
+#           upstream: "10.0.0.20:1883"
+
+# Kafka client data-plane 治理需使用 `--features kafka-governance` 构建；完整 API 面使用透明 TCP profile。
+# 多 broker 必须分别暴露可达代理 endpoint，且所有成功 Metadata/FindCoordinator 地址都要显式映射。
+# stream:
+#   listeners:
+#     - id: kafka-broker-1
+#       protocol: tcp
+#       listen: "0.0.0.0:19092"
+#       kafka:
+#         enabled: true
+#         max_connections: 256
+#         max_frame_bytes: 1048576
+#         frame_timeout_ms: 10000
+#         max_buffered_bytes: 536870912
+#         max_inflight_requests: 128
+#         max_client_id_bytes: 256
+#         max_topic_bytes: 249
+#         max_group_bytes: 255
+#         max_array_items: 4096
+#         client_id_allow: [orders-client]
+#         topic_allow: [orders]
+#         group_allow: [orders-consumers]
+#         sasl_mechanism_allow: [PLAIN]
+#         broker_rewrite:
+#           - from_host: kafka-1.internal
+#             from_port: 9092
+#             to_host: kafka.example.com
+#             to_port: 19092
+#       routes:
+#         - id: broker-1
+#           default: true
+#           upstream: "10.0.0.31:9092"
+
 # 管理/观测面(只绑内网,与数据面端口隔离):/healthz /readyz(+ 后续 /metrics、admin API)。
 admin:
   listen: "127.0.0.1:18080"
@@ -225,6 +285,17 @@ kubernetes_routes:
   ingress_classes: ["gateway"]
   gateway_api_enabled: true
   gateway_controller_name: "gateway.rust.dev/controller"
+  gateway_api_version: "v1.5.1" # 固定 CRD 与 conformance 契约，版本不匹配时拒绝启动 controller
+  gateway_bind_address: "0.0.0.0" # HTTP/HTTPS listener 物化为数据面 socket 时使用的本地地址
+  gateway_stream_bind_address: "0.0.0.0" # TLS/TCP/UDP listener 的绑定地址；同端口混用 L7/L4 时应隔离
+  gateway_stream_bind_addresses: [] # 非空时逐 Gateway 分配独立 stream 地址；池耗尽的 Gateway 不进入数据面
+  grpc_backend_protocol: "h2c"    # 明文集群用 h2c；后端启用 TLS 时改为 h2
+  status_updates_enabled: false    # 开启前需授予 Route/Gateway/GatewayClass status patch 权限
+  finalizers_enabled: false        # 开启前需授予 Route metadata patch 权限
+  watch_enabled: true              # LIST 后从同一 resourceVersion watch，事件只负责唤醒完整 relist
+  watch_timeout_seconds: 30
+  deletion_drain_timeout_ms: 5000  # 数据面快照确认撤销后才解除删除 finalizer
+  max_status_updates: 4096         # 单轮 status/finalizer 外部副作用预算
   namespaces: []           # 空 = 全部 namespace
   poll_interval_ms: 5000
   request_timeout_ms: 2000
@@ -249,7 +320,7 @@ config_source:
     materialized_dir: ".gateway-nacos-config"
     reconnect_backoff_ms: 1000
 
-# V3 运行态共享后端。默认 file/local,无外部依赖。
+# 运行态共享后端。默认 file/local，无外部依赖；Nacos 真实传输需 nacos-sdk feature。
 runtime_state:
   store:
     backend: file
@@ -260,6 +331,15 @@ runtime_state:
       namespace: "gateway"
       profile: "RustV2"
       prefix: "gw:dynamic"
+    nacos:
+      server_addr: ""
+      namespace: ""
+      group: "DEFAULT_GROUP"
+      app_name: "naway-dynamic-store"
+      username: ""
+      password: ""
+      data_id_prefix: "naway.dynamic"
+      max_document_bytes: 1048576
   blacklist:
     enabled: false
     collection: "acl_blacklist"
@@ -379,8 +459,9 @@ upstreams:
 #       max_body_bytes: 8192
 #       variables:
 #         id: { source: path, name: id, kind: string, required: true, max_value_bytes: 256 }
-#   # V7 原生 Dubbo2 JSON generic invocation。公网 body 只有 arguments；interface、method、
-#   # Java 类型和 attachments 都由可信 route 固定。provider 必须显式支持 JSON(id=6)。
+#   # 原生 Dubbo2 generic invocation。公网 body 只有 arguments；interface、method、Java 类型
+#   # 和 attachments 都由可信 route 固定。JSON 使用 id=6；Hessian2(id=2) 需编译
+#   # `dubbo-hessian2` feature，并把下方 serialization 改为 hessian2。
 #   - id: dubbo-greet
 #     uri: "http://127.0.0.1:20880"
 #     predicates: ["PathExact=/rpc/greet", "Method=POST"]
@@ -390,7 +471,12 @@ upstreams:
 #       parameter_types: [java.lang.String]
 #       serialization: json
 #       max_request_body_bytes: 1048576
+#       max_request_frame_bytes: 4194304
 #       max_response_body_bytes: 4194304
+#       max_hessian_string_bytes: 1048576
+#       max_hessian_binary_bytes: 1048576
+#       max_hessian_collection_items: 65536
+#       max_hessian_depth: 32
 #       connect_timeout_ms: 1000
 #       request_timeout_ms: 3000
 #       max_idle_connections: 8
@@ -405,9 +491,9 @@ upstreams:
 #     uri: lb://canary
 #     order: 10
 #     predicates: ["Path=/api/", "Weight=release,10"]
-#   # V7 OPA Data API 授权：先完成本地认证，再把有界 head-only input 发给 OPA。
-#   # 业务 body、Authorization/Cookie/API-Key 不会复制给 OPA；显式 allowlist 头位于
-#   # request_headers_untrusted，不能在 Rego 中把它们直接当作可信 principal。
+#   # OPA 授权：先完成本地认证，再把有界 input 发给外部 Data API 或签名 embedded bundle。
+#   # 默认不读取业务 body/完整 JWT claims；Authorization/Cookie/API-Key 永不复制给 OPA。
+#   # 显式 include_headers 位于 request_headers_untrusted，不能作为可信 principal。
 #   - id: opa-protected
 #     uri: "${GW_PROTECTED_UPSTREAM:http://127.0.0.1:9002}"
 #     predicates:
@@ -426,10 +512,43 @@ upstreams:
 #       max_response_bytes: 65536
 #       require_identity: true
 #       cache:
-#         ttl_ms: 1000
+#         ttl_ms: 1000            # allow TTL
+#         deny_ttl_ms: 250
 #         max_entries: 10000
-#         # 每次 Rego/bundle 语义变化必须更新；新 snapshot 不复用旧 allow/deny。
+#         singleflight: true
+#         singleflight_wait_ms: 1000
+#         singleflight_max_keys: 1024
+#         distributed: false      # 开启时通过当前 DynamicStore 跨节点复用
+#         distributed_collection: opa_decisions
+#         distributed_max_entries: 100000
+#         # 外部 OPA 必须显式声明；embedded 自动取 bundle manifest revision 或 SHA-256。
 #         policy_revision: bundle-sha256-or-release-id
+#       input:
+#         include_body: false
+#         max_body_bytes: 65536
+#         content_types: [application/json]
+#         include_jwt_claims: false
+#       obligations:
+#         request_headers: [X-Verified-Tenant]
+#         response_headers: [X-Policy-Decision]
+#         audit_metadata: [reason]
+#         max_entries: 32
+#         max_value_bytes: 4096
+#         max_bytes: 32768
+#       backoff_initial_ms: 100
+#       backoff_max_ms: 5000
+#   # `--features opa-embedded` 可执行标准 `.tar.gz` Rego bundle；签名覆盖压缩原始字节。
+#   # bundle、detached signature 或 public key 文件替换均触发同一 build-then-swap；坏候选保留旧策略。
+#   # opa_authorization:
+#   #   engine: embedded
+#   #   bundle:
+#   #     source: policies/gateway.tar.gz
+#   #     signature: file://policies/gateway.tar.gz.sig.b64
+#   #     public_key: file://policies/opa-ed25519.pub.b64
+#   #     query: data.gateway.authz
+#   #     max_bundle_bytes: 8388608
+#   #     max_expanded_bytes: 33554432
+#   #     max_files: 256
 #   # V7 内嵌 Casbin RBAC/ABAC。model/policy 热更重建整个只读 Enforcer，旧快照
 #   # 不被就地修改。consumer 只取本地已验认证结果；header:* 永远是不可信 ABAC 属性。
 #   - id: casbin-protected
@@ -446,9 +565,10 @@ upstreams:
 #       max_argument_bytes: 4096
 #       max_input_bytes: 16384
 #       fail_open: false
-#   # V7 Proxy-Wasm ABI v0.2.1 头部插件。替换 module_file 会触发 build-then-swap，
+#   # V7 Proxy-Wasm ABI v0.2.1 HTTP 插件。替换 module_file 会触发 build-then-swap，
 #   # 无需重编/重启 gateway；旧 snapshot 继续服务在途请求。沙箱不挂 WASI，
-#   # 不提供文件或网络，当前只开放 request_headers/response_headers，不缓冲 body。
+#   # 不提供文件或网络。request_body/response_body 是显式有界聚合慢路径；
+#   # PAUSE 必须注册 timer，并在统一 timeout 内由 proxy_on_tick 调用 continue_stream。
 #   - id: wasm-protected
 #     uri: "${GW_WASM_UPSTREAM:http://127.0.0.1:9003}"
 #     predicates:
@@ -465,13 +585,14 @@ upstreams:
 #         timeout_ms: 10
 #         max_mutations: 64
 #         max_header_bytes: 65536
+#         max_body_bytes: 1048576
 #         max_local_response_body_bytes: 65536
 #       - id: response-policy
 #         module_file: plugins/response-policy.wasm
 #         phase: response_headers
 #         config: { add_security_headers: true }
 #         fail_open: false
-#   # V6 OpenAI-compatible 统一入口。该 route 不再配置 uri；模型/embedding 各自声明后端与凭据。
+#   # OpenAI-compatible 统一入口。该 route 不再配置 uri；模型/moderation/embedding 各自声明后端与凭据。
 #   - id: llm-chat
 #     predicates:
 #       - "Path=/v1/chat/completions"
@@ -494,6 +615,15 @@ upstreams:
 #         system_prompt: "Follow the audited gateway policy."
 #         blocked_substrings: ["ignore previous instructions"]
 #         blocked_response_substrings: ["private-output-marker"]
+#       moderation:
+#         uri: "${GW_MODERATION_URI:http://127.0.0.1:8001}"
+#         model: omni-moderation-latest
+#         path: /v1/moderations
+#         api_key: "env://GW_MODERATION_API_KEY"
+#         timeout_ms: 2000
+#         max_request_bytes: 1048576
+#         max_response_bytes: 1048576
+#         fail_mode: closed
 #       semantic_cache:
 #         ttl_ms: 300000
 #         max_entries: 10000
@@ -521,6 +651,14 @@ upstreams:
 #           uri: "${GW_LLM_FALLBACK_URI:http://127.0.0.1:9000}"
 #           model: claude-fallback
 #           api_key: "env://GW_LLM_FALLBACK_API_KEY"
+#           capabilities: [json]
+#           weight: 10
+#         - id: gemini
+#           provider: google
+#           uri: "${GW_GEMINI_URI:https://generativelanguage.googleapis.com}"
+#           model: gemini-2.5-flash
+#           api_key: "env://GW_GEMINI_API_KEY"
+#           # 默认自动生成 generateContent 与 streamGenerateContent?alt=sse path。
 #           capabilities: [json]
 #           weight: 10
 routes: []

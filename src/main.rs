@@ -16,6 +16,8 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::IoSlice;
+#[cfg(feature = "http3")]
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -44,6 +46,8 @@ use tracing::{info, warn};
 
 use gateway::access_log::{AccessLogger, AccessMethod, AccessPath, AccessRecord};
 use gateway::admin;
+#[cfg(feature = "http3")]
+use gateway::config::model::Http3RetryCfg;
 use gateway::config::model::{ServerLimitsCfg, TimeoutCfg};
 use gateway::config::{
     load_snapshot_with_dynamic, GatewaySnapshot, ProxyListenTopology, ProxyProtocolRuntimeCfg,
@@ -56,7 +60,7 @@ use gateway::proxy::{
 };
 use gateway::proxy_protocol::{encode_proxy_protocol_header, strip_proxy_protocol, ConnInfo};
 use gateway::reload;
-use gateway::tls::{build_server_config, spawn_cert_watcher, SharedServerConfig};
+use gateway::tls::{build_server_config, spawn_cert_watcher_until, SharedServerConfig};
 use gateway::upstream::{DynamicUpstreamStore, PassiveHealthPolicy};
 
 #[derive(Debug, Parser)]
@@ -79,6 +83,8 @@ struct Args {
 enum RunMode {
     /// 只运行数据面与最小观测/节点运维入口。
     Data,
+    /// 运行本地 service-mesh sidecar 数据面；业务 listener 强制只绑定 loopback。
+    Sidecar,
     /// 只运行完整管理面；不绑定 public HTTP/TLS/L4 listener。
     Admin,
     /// 同一进程同时运行数据面与完整管理面，兼容旧启动方式。
@@ -86,18 +92,36 @@ enum RunMode {
 }
 
 impl RunMode {
-    /// 当前模式是否承载真实业务流量。
+    /// 业务作用：判断当前进程是否需要创建业务数据面资源。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：`data`、`sidecar`、`all-in-one` 返回 true，纯 `admin` 返回 false。
     fn runs_data(self) -> bool {
-        matches!(self, Self::Data | Self::AllInOne)
+        matches!(self, Self::Data | Self::Sidecar | Self::AllInOne)
     }
 
-    /// 映射为 library 管理面权限边界，避免 admin 模块依赖 binary CLI 类型。
+    /// 业务作用：把 CLI 部署模式映射到管理 API 权限边界，避免 admin 模块依赖 binary 类型。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：sidecar 与 data 均只开放数据面最小运维权限，其余模式保持原管理边界。
     fn admin_plane_mode(self) -> admin::AdminPlaneMode {
         match self {
             Self::Data => admin::AdminPlaneMode::Data,
+            Self::Sidecar => admin::AdminPlaneMode::Sidecar,
             Self::Admin => admin::AdminPlaneMode::Admin,
             Self::AllInOne => admin::AdminPlaneMode::AllInOne,
         }
+    }
+
+    /// 业务作用：标记是否启用 sidecar 专属 listener 暴露门禁。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：仅 `sidecar` 模式返回 true。
+    fn is_sidecar(self) -> bool {
+        self == Self::Sidecar
     }
 }
 
@@ -116,6 +140,9 @@ struct DataPlaneState {
     proxy: Arc<GatewayProxy>,
     /// 按 proxy id 隔离的物理连接预算。
     connection_budget: Arc<ConnectionBudget>,
+    /// HTTP/3 按 proxy+来源 IP 隔离的连接硬门；跨 listener generation 常驻，防止 reload 绕限。
+    #[cfg(feature = "http3")]
+    http3_peer_connection_budget: Arc<Http3PeerConnectionBudget>,
     /// HTTP + stream 共用的进程级在途连接数，供停机 drain 判断。
     active_connections: Arc<AtomicU64>,
     /// 数据面低基数指标。
@@ -139,7 +166,11 @@ struct DownstreamWriteTimeoutIo<I> {
 }
 
 impl<I> DownstreamWriteTimeoutIo<I> {
-    /// 包装一个下游 IO；`timeout_ms=0` 保持原行为且不创建 timer。
+    /// 业务作用：为下游 IO 建立只约束连续写阻塞的 deadline 状态，不改变读取和 body 流式语义。
+    ///
+    /// 参数说明：`inner` 是已完成接入校验的下游 IO；`timeout_ms=0` 表示关闭写超时。
+    ///
+    /// 返回：返回尚未启动计时的 IO wrapper；计时器只在第一次写 `Pending` 时惰性创建。
     fn new(inner: I, timeout_ms: u64) -> Self {
         Self {
             inner,
@@ -149,7 +180,11 @@ impl<I> DownstreamWriteTimeoutIo<I> {
         }
     }
 
-    /// 在 inner write 持续 Pending 时推进 deadline。
+    /// 业务作用：在 inner write 持续 `Pending` 时启动或推进 deadline，防止停读客户端永久占用连接。
+    ///
+    /// 参数说明：`cx` 提供当前 IO task 的唤醒器。
+    ///
+    /// 返回：deadline 未到时保持 `Pending`；到期后返回 `TimedOut` 并终止 Hyper 连接驱动。
     fn poll_pending_timeout(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), io::Error>> {
         let Some(timeout) = self.timeout else {
             return Poll::Pending;
@@ -174,11 +209,29 @@ impl<I> DownstreamWriteTimeoutIo<I> {
         }
     }
 
-    /// 任一 write/flush/shutdown 完成后重新从下一次 Pending 起计时。
+    /// 业务作用：复验已经进入阻塞段的单调时钟 deadline，避免 task 延迟调度后被一次偶然可写绕过超时。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：阻塞段已超过 deadline 时返回 `TimedOut`；未计时或尚未到期时返回 `None`。
+    fn expired_write_timeout(&self) -> Option<io::Error> {
+        (self.write_blocked
+            && self
+                .timer
+                .as_ref()
+                .is_some_and(|timer| timer.deadline() <= tokio::time::Instant::now()))
+        .then(|| io::Error::new(io::ErrorKind::TimedOut, "downstream write timed out"))
+    }
+
+    /// 业务作用：在 write/flush/shutdown 实际完成后结束当前阻塞段，使下一次 `Pending` 使用新 deadline。
     ///
     /// 保留已分配的 `Sleep` 很重要：h2 会在小 DATA/HEADERS 帧间频繁经历短 Pending，若每次
     /// Ready 都 drop，数据面会反复进入 Tokio timer wheel 的分配/锁路径。旧 deadline 后续即使
     /// 产生一次多余 wake 也不会报超时，因为下一段 Pending 会先 reset 到自己的新 deadline。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；只清除当前阻塞标记并保留计时器分配。
     fn write_progressed(&mut self) {
         self.write_blocked = false;
     }
@@ -200,6 +253,9 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for DownstreamWriteTimeoutIo<I> {
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
+        if let Some(error) = self.expired_write_timeout() {
+            return Poll::Ready(Err(error));
+        }
         match Pin::new(&mut self.inner).poll_write(cx, buf) {
             Poll::Pending => self
                 .poll_pending_timeout(cx)
@@ -215,6 +271,9 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for DownstreamWriteTimeoutIo<I> {
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
     ) -> Poll<Result<(), io::Error>> {
+        if let Some(error) = self.expired_write_timeout() {
+            return Poll::Ready(Err(error));
+        }
         match Pin::new(&mut self.inner).poll_flush(cx) {
             Poll::Pending => self.poll_pending_timeout(cx),
             Poll::Ready(result) => {
@@ -228,6 +287,9 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for DownstreamWriteTimeoutIo<I> {
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
     ) -> Poll<Result<(), io::Error>> {
+        if let Some(error) = self.expired_write_timeout() {
+            return Poll::Ready(Err(error));
+        }
         match Pin::new(&mut self.inner).poll_shutdown(cx) {
             Poll::Pending => self.poll_pending_timeout(cx),
             Poll::Ready(result) => {
@@ -242,6 +304,9 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for DownstreamWriteTimeoutIo<I> {
         cx: &mut TaskContext<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<Result<usize, io::Error>> {
+        if let Some(error) = self.expired_write_timeout() {
+            return Poll::Ready(Err(error));
+        }
         match Pin::new(&mut self.inner).poll_write_vectored(cx, bufs) {
             Poll::Pending => self
                 .poll_pending_timeout(cx)
@@ -283,11 +348,27 @@ struct ConnectionSlot {
     entry: Arc<ConnectionBudgetEntry>,
 }
 
+/// HTTP/3 来源 IP 连接预算；计数表只包含已有全局名额的 Initial/connection，规模受全局硬门约束。
+#[cfg(feature = "http3")]
+#[derive(Default)]
+struct Http3PeerConnectionBudget {
+    /// proxy id -> 来源 IP -> 当前握手或已建立连接数；reload 不替换这张表。
+    entries: ParkingMutex<HashMap<String, HashMap<IpAddr, u64>>>,
+}
+
+/// 单条 QUIC handshake/connection 占用的来源 IP 名额。
+#[cfg(feature = "http3")]
+struct Http3PeerConnectionSlot {
+    budget: Arc<Http3PeerConnectionBudget>,
+    proxy_id: Arc<str>,
+    peer_ip: IpAddr,
+}
+
 /// 单条已接收连接从同一份不可变 Snapshot 固化的配置。
 ///
-/// 连接建立后只保留真正需要的三个紧凑配置值，不持有整个 [`GatewaySnapshot`]，因此旧快照不会被
-/// keep-alive/WS 长连接长期钉住。PROXY protocol 策略与预算上限也来自同一版本，避免 reload
-/// 恰好发生在两次独立读取之间时拼出混合配置。
+/// PROXY protocol 策略与预算上限来自同一版本，避免 reload 恰好发生在两次独立读取之间时拼出
+/// 混合配置。listener 快照只作为“该 listener 已被删除”后的排空兜底；同 id 仍存在时每个请求
+/// 继续读取最新版，避免普通 keep-alive 长期绕过策略更新。
 struct AcceptedConnection {
     /// 已占用的物理连接名额；任何后续失败都通过 Drop 自动归还。
     slot: ConnectionSlot,
@@ -299,6 +380,8 @@ struct AcceptedConnection {
     limits: ServerLimitsCfg,
     /// 下游写、请求头读取与总连接超时。
     timeouts: TimeoutCfg,
+    /// accept 时的 listener generation；删除 listener 后只服务该物理连接上的在途/排空请求。
+    listener_snapshot: Arc<GatewaySnapshot>,
 }
 
 /// Hyper connection driver 只保留共享协议 Builder 与连接期超时，不钉住完整路由快照。
@@ -307,6 +390,14 @@ struct DownstreamConnectionConfig {
     server: Arc<auto::Builder<TokioExecutor>>,
     /// 写超时与总连接超时仍由各 connection future 直接读取。
     timeouts: TimeoutCfg,
+}
+
+/// 一条已准入连接交给 Hyper driver 的协议参数与 listener 排空 generation。
+struct DownstreamConnectionDispatch {
+    /// 可按 Snapshot version 共享 Builder 的紧凑连接配置。
+    config: DownstreamConnectionConfig,
+    /// listener 删除后的连接排空兜底；同 id 存在时请求仍使用最新 Snapshot。
+    listener_snapshot: Arc<GatewaySnapshot>,
 }
 
 /// accept loop 的协议 Builder cache。Builder 在 `serve_connection_with_upgrades` 后只读，因此
@@ -324,12 +415,24 @@ struct ConnectionLifetime {
     _slot: ConnectionSlot,
     active_connections: Arc<AtomicU64>,
     metrics: Arc<Metrics>,
+    #[cfg(feature = "http3")]
+    quic: bool,
 }
 
 impl Drop for ConnectionLifetime {
+    /// 业务作用：在 TCP 或 QUIC 下游 connection 完整退出时一次性归还全局连接
+    /// 计数，避免错误/取消分支泄漏 gauge。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；QUIC generation 额外归还 `gw_quic_connections_active`。
     fn drop(&mut self) {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
         self.metrics.dec_active_connection();
+        #[cfg(feature = "http3")]
+        if self.quic {
+            self.metrics.dec_quic_connection();
+        }
     }
 }
 
@@ -408,7 +511,7 @@ impl ConnectionBudget {
             }
             // 单次原子读取内同时取得 limit、PROXY 与 Hyper 参数。只有 CAS 成功才 clone 配置，
             // 达到上限的等待循环不制造临时 Vec/Arc 或延长旧 Snapshot 生命周期。
-            let snapshot = snap.load();
+            let snapshot = snap.load_full();
             let proxy = snapshot.proxy(proxy_id)?;
             let limit = proxy.limits.max_connections;
             let changed = entry.changed.notified();
@@ -419,6 +522,7 @@ impl ConnectionBudget {
                     snapshot_version: snapshot.version,
                     limits: proxy.limits.clone(),
                     timeouts: proxy.timeouts.clone(),
+                    listener_snapshot: snapshot.clone(),
                 });
             }
             drop(snapshot);
@@ -434,11 +538,72 @@ impl ConnectionBudget {
     }
 }
 
+#[cfg(feature = "http3")]
+impl Http3PeerConnectionBudget {
+    /// 非阻塞占用一个来源 IP 名额。
+    ///
+    /// 业务作用：在 QUIC handshake task 创建前限制单一来源的连接占用，并让计数跨 reload
+    /// generation 连续，避免攻击者借热更得到第二份预算。
+    ///
+    /// 参数说明：`proxy_id` 是逻辑 listener；`peer_ip` 取自 Initial 源地址；`limit` 是同版硬门。
+    ///
+    /// 返回：未达上限时返回 RAII 名额；达到上限返回 None，调用方必须协议级拒绝 Initial。
+    fn try_acquire(
+        self: &Arc<Self>,
+        proxy_id: &Arc<str>,
+        peer_ip: IpAddr,
+        limit: usize,
+    ) -> Option<Http3PeerConnectionSlot> {
+        let limit = limit.min(u64::MAX as usize) as u64;
+        let mut entries = self.entries.lock();
+        let peers = entries.entry(proxy_id.to_string()).or_default();
+        let active = peers.entry(peer_ip).or_default();
+        if *active >= limit {
+            return None;
+        }
+        *active = active.saturating_add(1);
+        Some(Http3PeerConnectionSlot {
+            budget: self.clone(),
+            proxy_id: proxy_id.clone(),
+            peer_ip,
+        })
+    }
+}
+
 impl Drop for ConnectionSlot {
     /// 归还名额并唤醒所有等待 listener；等待方会用 CAS 竞争最新可用名额。
     fn drop(&mut self) {
         self.entry.active.fetch_sub(1, Ordering::AcqRel);
         self.entry.changed.notify_waiters();
+    }
+}
+
+#[cfg(feature = "http3")]
+impl Drop for Http3PeerConnectionSlot {
+    /// 业务作用：在握手失败、连接结束或 task 取消的同一个 Drop 边界归还来源 IP 名额。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；最后一个名额释放时同时删除 IP/proxy 空表，避免长期积累来源键。
+    fn drop(&mut self) {
+        let mut entries = self.budget.entries.lock();
+        let remove_proxy = if let Some(peers) = entries.get_mut(self.proxy_id.as_ref()) {
+            let remove_peer = if let Some(active) = peers.get_mut(&self.peer_ip) {
+                *active = active.saturating_sub(1);
+                *active == 0
+            } else {
+                false
+            };
+            if remove_peer {
+                peers.remove(&self.peer_ip);
+            }
+            peers.is_empty()
+        } else {
+            false
+        };
+        if remove_proxy {
+            entries.remove(self.proxy_id.as_ref());
+        }
     }
 }
 
@@ -453,25 +618,26 @@ mod connection_budget_tests;
 struct StreamLbState {
     /// 上游 health_key -> 当前 stream 会话数。
     inflight: Arc<ParkingMutex<HashMap<Arc<str>, Arc<AtomicU64>>>>,
-    /// 服务名 -> round_robin 单调游标。
+    /// 逻辑服务名或 route id -> round_robin 单调游标。
     rr: Arc<ParkingMutex<HashMap<String, u64>>>,
     /// 上游 health_key -> 被动健康失败状态。
     failures: Arc<ParkingMutex<HashMap<String, StreamUpstreamFailureState>>>,
 }
 
 impl StreamLbState {
-    /// 取某 stream 服务的下一个 round_robin 序号。
+    /// 业务作用：为 stream 逻辑服务或带权 route 分配跨 reload 连续的 round-robin 序号。
     ///
-    /// # 参数
-    /// - `service`: `lb://service` 的逻辑服务名。
-    fn next_rr(&self, service: &str) -> u64 {
+    /// 参数说明：`scope` 是 `lb://service` 的逻辑服务名或带权 route id。
+    ///
+    /// 返回：返回当前序号并以 wrapping 语义推进游标；同一 scope 的并发调用串行化。
+    fn next_rr(&self, scope: &str) -> u64 {
         let mut map = self.rr.lock();
-        // 服务名来自快照且长期命中；只在首次出现时拥有一份 key。
-        let counter = match map.get_mut(service) {
+        // scope 来自已验证快照且长期命中；只在首次出现时拥有一份 key。
+        let counter = match map.get_mut(scope) {
             Some(counter) => counter,
             None => {
-                map.insert(service.to_owned(), 0);
-                map.get_mut(service).expect("inserted stream rr counter")
+                map.insert(scope.to_owned(), 0);
+                map.get_mut(scope).expect("inserted stream rr counter")
             }
         };
         let current = *counter;
@@ -579,6 +745,180 @@ struct StreamPlaneState {
     metrics: Arc<Metrics>,
     /// 非阻塞 access log。
     access_log: AccessLogger,
+    /// MQTT listener 级连接预算；只在协议治理制品中存在。
+    #[cfg(feature = "mqtt-governance")]
+    mqtt_connections: MqttConnectionBudget,
+    /// Kafka listener 级连接预算；只在协议治理制品中存在。
+    #[cfg(feature = "kafka-governance")]
+    kafka_connections: KafkaConnectionBudget,
+}
+
+/// MQTT listener 连接数快照外常驻状态；热更降低上限时新连接立即按新值拒绝。
+#[cfg(feature = "mqtt-governance")]
+#[derive(Clone, Default)]
+struct MqttConnectionBudget {
+    usage: Arc<ParkingMutex<HashMap<Arc<str>, MqttListenerUsage>>>,
+}
+
+/// 一个 MQTT listener 跨快照连接共享的实时预留量。
+#[cfg(feature = "mqtt-governance")]
+#[derive(Clone, Copy, Default)]
+struct MqttListenerUsage {
+    connections: usize,
+    buffered_bytes: usize,
+}
+
+#[cfg(feature = "mqtt-governance")]
+impl MqttConnectionBudget {
+    /// 业务作用：在 TLS/CONNECT preread 之前预留 listener 级 MQTT 连接名额，慢握手也不能绕过硬门。
+    ///
+    /// 参数说明：`listener_id` 是快照内稳定标识；`maximum` 是连接上限；
+    /// `buffer_reservation` 是新连接双向最大 packet 预留；`maximum_buffered_bytes` 是 listener 聚合上限。
+    ///
+    /// 返回：余额充足时返回 RAII guard；已达上限时返回 None 且不改变计数。
+    fn try_acquire(
+        &self,
+        listener_id: &str,
+        maximum: usize,
+        buffer_reservation: usize,
+        maximum_buffered_bytes: usize,
+    ) -> Option<MqttConnectionGuard> {
+        let mut usage = self.usage.lock();
+        let current = usage.get(listener_id).copied().unwrap_or_default();
+        let next_buffered = current.buffered_bytes.checked_add(buffer_reservation)?;
+        if current.connections >= maximum || next_buffered > maximum_buffered_bytes {
+            return None;
+        }
+        let key: Arc<str> = usage
+            .get_key_value(listener_id)
+            .map(|(key, _)| key.clone())
+            .unwrap_or_else(|| Arc::from(listener_id));
+        usage.insert(
+            key.clone(),
+            MqttListenerUsage {
+                connections: current.connections + 1,
+                buffered_bytes: next_buffered,
+            },
+        );
+        Some(MqttConnectionGuard {
+            usage: self.usage.clone(),
+            listener_id: key,
+            buffer_reservation,
+        })
+    }
+}
+
+/// MQTT 连接名额；任务取消、握手失败与正常断开都由 Drop 统一归还。
+#[cfg(feature = "mqtt-governance")]
+struct MqttConnectionGuard {
+    usage: Arc<ParkingMutex<HashMap<Arc<str>, MqttListenerUsage>>>,
+    listener_id: Arc<str>,
+    buffer_reservation: usize,
+}
+
+#[cfg(feature = "mqtt-governance")]
+impl Drop for MqttConnectionGuard {
+    /// 业务作用：在任意退出路径归还 MQTT listener 名额，避免错误分支泄漏导致永久拒绝。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；当前 listener 连接计数减一并归还双向 buffer 预留，归零时移除 map 项。
+    fn drop(&mut self) {
+        let mut usage = self.usage.lock();
+        if let Some(current) = usage.get_mut(self.listener_id.as_ref()) {
+            current.connections = current.connections.saturating_sub(1);
+            current.buffered_bytes = current
+                .buffered_bytes
+                .saturating_sub(self.buffer_reservation);
+            if current.connections == 0 {
+                usage.remove(self.listener_id.as_ref());
+            }
+        }
+    }
+}
+
+/// Kafka listener 连接数快照外常驻状态；热更降低上限时新连接立即按新值拒绝。
+#[cfg(feature = "kafka-governance")]
+#[derive(Clone, Default)]
+struct KafkaConnectionBudget {
+    usage: Arc<ParkingMutex<HashMap<Arc<str>, KafkaListenerUsage>>>,
+}
+
+/// 一个 Kafka listener 跨快照连接共享的实时预留量。
+#[cfg(feature = "kafka-governance")]
+#[derive(Clone, Copy, Default)]
+struct KafkaListenerUsage {
+    connections: usize,
+    buffered_bytes: usize,
+}
+
+#[cfg(feature = "kafka-governance")]
+impl KafkaConnectionBudget {
+    /// 业务作用：在 PROXY/TLS/首 frame 前预留 Kafka 连接与双向 frame buffer，阻断慢握手绕过资源门。
+    ///
+    /// 参数说明：`listener_id` 是稳定 listener 标识；`maximum` 是连接上限；
+    /// `buffer_reservation` 是单连接双向预留；`maximum_buffered_bytes` 是 listener 聚合上限。
+    ///
+    /// 返回：预算充足时返回 RAII guard；连接或聚合 buffer 达上限时返回 None 且不改变计数。
+    fn try_acquire(
+        &self,
+        listener_id: &str,
+        maximum: usize,
+        buffer_reservation: usize,
+        maximum_buffered_bytes: usize,
+    ) -> Option<KafkaConnectionGuard> {
+        let mut usage = self.usage.lock();
+        let current = usage.get(listener_id).copied().unwrap_or_default();
+        let next_buffered = current.buffered_bytes.checked_add(buffer_reservation)?;
+        if current.connections >= maximum || next_buffered > maximum_buffered_bytes {
+            return None;
+        }
+        let key: Arc<str> = usage
+            .get_key_value(listener_id)
+            .map(|(key, _)| key.clone())
+            .unwrap_or_else(|| Arc::from(listener_id));
+        usage.insert(
+            key.clone(),
+            KafkaListenerUsage {
+                connections: current.connections + 1,
+                buffered_bytes: next_buffered,
+            },
+        );
+        Some(KafkaConnectionGuard {
+            usage: self.usage.clone(),
+            listener_id: key,
+            buffer_reservation,
+        })
+    }
+}
+
+/// Kafka 连接名额；任务取消、握手失败与正常断开都由 Drop 统一归还。
+#[cfg(feature = "kafka-governance")]
+struct KafkaConnectionGuard {
+    usage: Arc<ParkingMutex<HashMap<Arc<str>, KafkaListenerUsage>>>,
+    listener_id: Arc<str>,
+    buffer_reservation: usize,
+}
+
+#[cfg(feature = "kafka-governance")]
+impl Drop for KafkaConnectionGuard {
+    /// 业务作用：在任意退出路径归还 Kafka listener 名额，防止错误分支泄漏后永久拒绝新连接。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；连接计数与双向 buffer 预留同步归还，归零时移除 listener 项。
+    fn drop(&mut self) {
+        let mut usage = self.usage.lock();
+        if let Some(current) = usage.get_mut(self.listener_id.as_ref()) {
+            current.connections = current.connections.saturating_sub(1);
+            current.buffered_bytes = current
+                .buffered_bytes
+                .saturating_sub(self.buffer_reservation);
+            if current.connections == 0 {
+                usage.remove(self.listener_id.as_ref());
+            }
+        }
+    }
 }
 
 /// 主配置文件路径解析，优先级：`--config` > `NATE_CONFIG` > 兼容 `GW_CONFIG` >
@@ -658,17 +998,17 @@ fn parse_reload_pid(raw: &str) -> Result<i32> {
     Ok(pid)
 }
 
-/// 把同一 listener、同一 Snapshot 版本的 Hyper Builder 构造成本摊薄到一次。
+/// 业务作用：把同一 listener、同一 Snapshot 版本的 Hyper Builder 构造成本摊薄到一次，
+/// 避免连接规模增长时重复保留等价协议配置。
 ///
 /// `auto::Builder` 内含 HTTP/1 parser 与 HTTP/2 flow-control 配置。旧实现把它放在每条
 /// connection task 内，10k 长连接会同时保留 10k 份完全相同的 Builder。这里按 listener
 /// 缓存只读实例：命中只做一次 `Arc` 增计数；reload 后首条新连接重建，旧连接继续持有旧版本。
 ///
-/// # 参数
-/// - `cache`: 当前 accept loop 私有的单项 cache，无锁且不会跨 listener 争用。
-/// - `snapshot_version`: 本连接读取配置时的原子快照版本。
-/// - `limits`: 请求头、HTTP/2 stream 与 flow-control 的硬预算。
-/// - `timeouts`: header timer 写入 Builder，其余连接期超时随返回值移动。
+/// 参数说明：`cache` 是当前 accept loop 私有单项缓存；`snapshot_version` 是连接读取的原子配置
+/// 版本；`limits` 提供请求头、HTTP/2 stream 与 flow-control 硬预算；`timeouts` 提供协议计时门。
+///
+/// 返回：可供本连接使用的共享 server 与连接期 timeout；版本变化时先换缓存，旧连接继续持有旧值。
 fn downstream_connection_config(
     cache: &mut Option<CachedDownstreamServer>,
     snapshot_version: u64,
@@ -719,7 +1059,8 @@ fn downstream_connection_config(
 /// 可信客户端地址缓存和 Upgrade 生命周期绑定到同一个可取消 task。
 ///
 /// 参数说明：`stream` 是已完成监听层握手的 IO；`conn`/`proxy_id`/`downstream_proto` 标识
-/// 本连接的可信入口上下文；`state`/`config` 提供数据面与同版 server；`slot` 持有连接预算。
+/// 本连接的可信入口上下文；`state`/`dispatch` 提供数据面、同版 server 与 listener 排空快照；
+/// `slot` 持有连接预算。
 ///
 /// 返回：无返回值；函数成功 spawn 连接驱动，连接结束、超时或 task 取消时通过 Drop 归还预算。
 fn spawn_downstream_connection<I>(
@@ -728,21 +1069,26 @@ fn spawn_downstream_connection<I>(
     proxy_id: Arc<str>,
     downstream_proto: &'static str,
     state: DataPlaneState,
-    config: DownstreamConnectionConfig,
+    dispatch: DownstreamConnectionDispatch,
     slot: ConnectionSlot,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let DownstreamConnectionConfig { server, timeouts } = config;
+    let DownstreamConnectionDispatch {
+        config: DownstreamConnectionConfig { server, timeouts },
+        listener_snapshot,
+    } = dispatch;
     // IP header 只依赖已完成 PROXY protocol 校验的连接地址。提前到 accept/connection 层构造，
     // 让 H2 多路复用的每个 RPC 只 clone 不可变 HeaderValue；trusted XFF 改写仍由请求层核对。
-    let connection_client_ip_header = ConnectionClientIpHeader::new(conn);
+    let connection_client_ip_header = ConnectionClientIpHeader::new(&conn);
     state.active_connections.fetch_add(1, Ordering::Relaxed);
     state.metrics.inc_active_connection();
     let connection_lifetime = DownstreamConnectionLease::new(ConnectionLifetime {
         _slot: slot,
         active_connections: state.active_connections.clone(),
         metrics: state.metrics.clone(),
+        #[cfg(feature = "http3")]
+        quic: false,
     });
     tokio::spawn(async move {
         let io = TokioIo::new(DownstreamWriteTimeoutIo::new(
@@ -752,6 +1098,8 @@ fn spawn_downstream_connection<I>(
         let proxy = state.proxy.clone();
         let request_connection_lifetime = connection_lifetime.clone();
         let request_client_ip_header = connection_client_ip_header;
+        let request_listener_snapshot = listener_snapshot;
+        let request_conn = conn.clone();
         let svc = service_fn(move |mut req: hyper::Request<Incoming>| {
             // 只有带 Upgrade 头的候选请求才 clone/分配 Extensions。普通 HTTP/1 keep-alive 与
             // HTTP/2 热路径完全不承担 WS 生命周期修复成本；proxy::handle 仍完整校验 GET、h1、
@@ -765,10 +1113,11 @@ fn spawn_downstream_connection<I>(
             // 请求/响应 body 仍按 Bytes 零拷贝流转，取消时 Drop 该 Box 仍同步取消原状态机。
             Box::pin(proxy.clone().handle_with_connection_ip_header(
                 req,
-                conn,
+                request_conn.clone(),
                 downstream_proto,
                 proxy_id.clone(),
                 request_client_ip_header.clone(),
+                request_listener_snapshot.clone(),
             ))
         });
         // Builder 按 listener/Snapshot 共享且在 serve 阶段只读。连接 future 借用 `server`，本 task
@@ -841,13 +1190,17 @@ fn spawn_plain_accept_loop(
                 snapshot_version,
                 limits,
                 timeouts,
+                listener_snapshot,
             } = accepted;
-            let downstream = downstream_connection_config(
-                &mut server_cache,
-                snapshot_version,
-                &limits,
-                timeouts,
-            );
+            let downstream = DownstreamConnectionDispatch {
+                config: downstream_connection_config(
+                    &mut server_cache,
+                    snapshot_version,
+                    &limits,
+                    timeouts,
+                ),
+                listener_snapshot,
+            };
             if !proxy_protocol.enabled {
                 // 绝大多数直连 listener 不启用 PROXY protocol。旧路径仍为每个连接 spawn 一个
                 // 只会立即返回的 strip task，随后 `spawn_downstream_connection` 再 spawn Hyper
@@ -919,13 +1272,17 @@ fn spawn_tls_accept_loop(
                 snapshot_version,
                 limits,
                 timeouts,
+                listener_snapshot,
             } = accepted;
-            let downstream = downstream_connection_config(
-                &mut server_cache,
-                snapshot_version,
-                &limits,
-                timeouts,
-            );
+            let downstream = DownstreamConnectionDispatch {
+                config: downstream_connection_config(
+                    &mut server_cache,
+                    snapshot_version,
+                    &limits,
+                    timeouts,
+                ),
+                listener_snapshot,
+            };
             // ★廉价:从 ArcSwap 取当前证书配置(仅 Arc clone),不再每条连接读盘 + 解析证书(去 DoS 放大 + 去阻塞)。
             let acceptor = TlsAcceptor::from(tls_config.load_full());
             let state = state.clone();
@@ -941,6 +1298,12 @@ fn spawn_tls_accept_loop(
                                 .1
                                 .peer_certificates()
                                 .is_some_and(|certs| !certs.is_empty());
+                            // SNI 是 TLS 连接级权威证据；请求 Host 不能覆盖它。共享 HTTPS
+                            // socket 后续据此拒绝跨 Gateway listener 的 H2 连接合并。
+                            conn.tls_server_name =
+                                tls_stream.get_ref().1.server_name().map(|name| {
+                                    Arc::from(name.trim_end_matches('.').to_ascii_lowercase())
+                                });
                             spawn_downstream_connection(
                                 tls_stream, conn, proxy_id, "https", state, downstream, slot,
                             )
@@ -954,6 +1317,235 @@ fn spawn_tls_accept_loop(
             });
         }
     });
+}
+
+/// 启动 HTTP/3/QUIC accept loop。
+///
+/// 业务作用：在握手 task 创建前同时执行 HTTP/3 专属连接上限、全 proxy 共享连接预算与 Retry
+/// 地址验证；停机或 reload 时先关闭 endpoint 的新连接入口，已建立连接仍按统一 drain 计数收尾。
+///
+/// 参数说明：`endpoint` 是 prepare 阶段已绑定的 UDP endpoint；`runtime` 是同版 H3 硬预算；
+/// `certificate_updates` 串行接收新握手配置；`proxy_id` 标识逻辑 listener；`state` 提供统一
+/// 代理、预算和指标；`shutdown` 是 generation 停收广播。
+///
+/// 返回：无同步返回值；函数派生一个受 shutdown 管理的 accept task。
+#[cfg(feature = "http3")]
+fn spawn_http3_accept_loop(
+    endpoint: quinn::Endpoint,
+    runtime: gateway::config::Http3RuntimeCfg,
+    mut certificate_updates: watch::Receiver<Option<quinn::ServerConfig>>,
+    proxy_id: Arc<str>,
+    state: DataPlaneState,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let budget_entry = state.connection_budget.entry(&proxy_id);
+    tokio::spawn(async move {
+        let local = endpoint.local_addr().ok();
+        info!(?local, proxy = %proxy_id, "HTTP/3 QUIC data plane listening");
+        let mut certificate_updates_open = true;
+        loop {
+            let incoming = tokio::select! {
+                incoming = endpoint.accept() => match incoming {
+                    Some(incoming) => incoming,
+                    None => break,
+                },
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        // 先撤销 server config，旧 generation 不再接受 Initial；已握手连接仍持有
+                        // 自己的 endpoint/connection 状态，交给统一 drain 而不是粗暴 CONNECTION_CLOSE。
+                        endpoint.set_server_config(None);
+                        info!(proxy = %proxy_id, "stop accepting new HTTP/3 connections (shutdown)");
+                        break;
+                    }
+                    continue;
+                }
+                changed = certificate_updates.changed(), if certificate_updates_open => {
+                    if changed.is_err() {
+                        certificate_updates_open = false;
+                    } else if let Some(config) = certificate_updates.borrow_and_update().clone() {
+                        // 与停机分支在同一个 accept task 串行执行；一旦 shutdown 把 server config
+                        // 置空并 break，证书 watcher 再也没有机会重新开放旧 generation。
+                        endpoint.set_server_config(Some(config));
+                        info!(proxy = %proxy_id, "HTTP/3 certificate reloaded for new handshakes");
+                    }
+                    continue;
+                }
+            };
+            let peer = incoming.remote_address();
+            if endpoint.open_connections() >= runtime.max_connections {
+                // HTTP/3 专属上限必须在握手 task 前拒绝，否则攻击者可绕过配置制造无界 task。
+                state.metrics.inc_quic_handshake_rejected();
+                incoming.refuse();
+                continue;
+            }
+            if should_retry_http3(&incoming, &runtime, endpoint.open_connections()) {
+                match incoming.retry() {
+                    Ok(()) => state.metrics.inc_quic_handshake_retry(),
+                    Err(error) => {
+                        state.metrics.inc_quic_handshake_error();
+                        tracing::debug!(%peer, %error, "HTTP/3 Retry could not be issued");
+                    }
+                }
+                continue;
+            }
+
+            // QUIC 与同 proxy 的 TCP/TLS 共用 limits.max_connections。用非阻塞 CAS 在握手前
+            // 占位，预算耗尽时直接拒绝 Initial，不能像 TCP 那样持有一个已 accept socket 等待。
+            let snapshot = state.snap.load();
+            let Some(proxy_runtime) = snapshot.proxy(&proxy_id) else {
+                state.metrics.inc_quic_handshake_rejected();
+                incoming.refuse();
+                continue;
+            };
+            let Some(slot) = ConnectionBudget::try_acquire_entry(
+                &budget_entry,
+                proxy_runtime.limits.max_connections,
+            ) else {
+                state.metrics.inc_quic_handshake_rejected();
+                incoming.refuse();
+                continue;
+            };
+            let Some(peer_slot) = state.http3_peer_connection_budget.try_acquire(
+                &proxy_id,
+                peer.ip(),
+                runtime.max_connections_per_ip,
+            ) else {
+                // 单来源门必须在 handshake task 前执行；拒绝时全局 slot 随本分支 Drop 归还，
+                // 不给同一 IP 建排队 task，也不影响其它来源争用剩余容量。
+                state.metrics.inc_quic_handshake_rejected();
+                incoming.refuse();
+                continue;
+            };
+            let connection_timeout_ms = proxy_runtime.timeouts.connection_timeout_ms;
+            drop(snapshot);
+
+            let connecting = match incoming.accept() {
+                Ok(connecting) => connecting,
+                Err(error) => {
+                    state.metrics.inc_quic_handshake_error();
+                    tracing::debug!(%peer, %error, "HTTP/3 QUIC Initial rejected");
+                    continue;
+                }
+            };
+            let proxy = state.proxy.clone();
+            let proxy_id = proxy_id.clone();
+            let active_connections = state.active_connections.clone();
+            let metrics = state.metrics.clone();
+            let max_header_bytes = runtime.max_request_header_bytes;
+            let mut connection_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                // 从 Initial 到 connection task 完整结束都计入来源预算，握手失败/取消也由 RAII 归还。
+                let _peer_slot = peer_slot;
+                let connection = tokio::select! {
+                    result = connecting => match result {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            metrics.inc_quic_handshake_error();
+                            tracing::debug!(%peer, %error, "HTTP/3 QUIC handshake failed");
+                            return;
+                        }
+                    },
+                    changed = connection_shutdown.changed() => {
+                        if changed.is_err() || *connection_shutdown.borrow() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+                active_connections.fetch_add(1, Ordering::Relaxed);
+                metrics.inc_active_connection();
+                metrics.inc_quic_connection();
+                let _lifetime = ConnectionLifetime {
+                    _slot: slot,
+                    active_connections,
+                    metrics: metrics.clone(),
+                    quic: true,
+                };
+                let serving = gateway::http3::serve_connection(
+                    connection,
+                    proxy,
+                    proxy_id,
+                    peer,
+                    max_header_bytes,
+                    metrics,
+                    connection_shutdown,
+                );
+                let result = if connection_timeout_ms == 0 {
+                    serving.await
+                } else {
+                    match tokio::time::timeout(
+                        Duration::from_millis(connection_timeout_ms),
+                        serving,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::debug!(%peer, "HTTP/3 connection closed by total timeout");
+                            return;
+                        }
+                    }
+                };
+                if let Err(error) = result {
+                    tracing::debug!(%peer, %error, "HTTP/3 connection closed with error");
+                }
+            });
+        }
+    });
+}
+
+/// 判断一个未完成握手的 QUIC Initial 是否必须先经过 Retry 地址验证。
+///
+/// 业务作用：`always` 强制抗源地址伪造，`auto` 在连接占用达到 75% 后开启验证以降低正常期额外
+/// RTT；已经携带有效 token 的连接绝不重复 Retry，避免形成握手循环。
+///
+/// 参数说明：`incoming` 提供地址验证状态；`runtime` 提供策略与连接硬门；`open_connections`
+/// 是 endpoint 当前已打开连接数。
+///
+/// 返回：true 表示调用方应发送 Retry 并停止本次握手，false 表示可继续预算校验。
+#[cfg(feature = "http3")]
+fn should_retry_http3(
+    incoming: &quinn::Incoming,
+    runtime: &gateway::config::Http3RuntimeCfg,
+    open_connections: usize,
+) -> bool {
+    http3_retry_required(
+        runtime.retry,
+        incoming.remote_address_validated(),
+        incoming.may_retry(),
+        open_connections,
+        runtime.max_connections,
+    )
+}
+
+/// 对纯地址验证状态执行 HTTP/3 Retry 策略判定。
+///
+/// 业务作用：把压力水位和防重复 Retry 不变量集中为可单测的纯函数，避免 accept loop 分支在
+/// 后续调优时把已验证客户端重新送入 Retry 循环。
+///
+/// 参数说明：`policy` 是配置策略；`address_validated`/`may_retry` 来自 Quinn；
+/// `open_connections`/`max_connections` 是当前占用与 H3 专属硬上限。
+///
+/// 返回：true 表示必须先发 Retry；false 表示本层允许继续进入连接预算校验。
+#[cfg(feature = "http3")]
+fn http3_retry_required(
+    policy: Http3RetryCfg,
+    address_validated: bool,
+    may_retry: bool,
+    open_connections: usize,
+    max_connections: usize,
+) -> bool {
+    if address_validated || !may_retry {
+        return false;
+    }
+    match policy {
+        Http3RetryCfg::Off => false,
+        Http3RetryCfg::Always => true,
+        // 3/4 是明确的资源保护水位；乘法使用饱和运算，极端配置也不会溢出后关闭保护。
+        Http3RetryCfg::Auto => {
+            open_connections.saturating_mul(4) >= max_connections.saturating_mul(3)
+        }
+    }
 }
 
 /// 为 L7 下游 TCP socket 启用小帧低延迟模式。
@@ -971,26 +1563,22 @@ fn configure_downstream_tcp(stream: &TcpStream, peer: SocketAddr) {
     }
 }
 
-/// 等待 ACME 首签 keypair 落盘后，在同一进程激活已经绑定的 TLS listener。
+/// 业务作用：等待 ACME 首签 keypair 落盘后激活已绑定 TLS socket，并把任务限制在 listener generation 内。
 ///
-/// # 参数
-/// - `listener`: 启动期已绑定的 TLS socket，避免签发完成时端口被其它进程抢占。
-/// - `proxy_id`: listener 所属 proxy id。
-/// - `tls_cfg`: cert/key、SNI、mTLS 与激活轮询配置。
-/// - `state`: L7 数据面共享状态。
-/// - `shutdown`: 停机广播；首签未完成时也必须及时释放已绑定 socket。
-/// - `pending_tls`: 全进程尚未激活的 TLS listener 数。
-/// - `ready`: 全部 deferred TLS 激活后置 true，使 `/readyz` 与实际服务能力一致。
+/// 参数说明：`listener` 防止首签期间端口被抢；`proxy_id` 用于观测；`tls_cfg` 描述材料和轮询；
+/// `state` 是数据面状态；`shutdown` 撤销本代；`readiness` 统一约束 pending、就绪与停机事实。
+///
+/// 返回：无同步返回值；后台仅在证书完整可用后启动 accept，取消或坏材料均保持端口不服务。
 fn spawn_deferred_tls_accept_loop(
     listener: TcpListener,
     proxy_id: Arc<str>,
     tls_cfg: gateway::config::TlsRuntimeCfg,
     state: DataPlaneState,
     mut shutdown: watch::Receiver<bool>,
-    pending_tls: Arc<AtomicU64>,
-    ready: Arc<AtomicBool>,
+    readiness: DeferredTlsReadiness,
 ) {
     tokio::spawn(async move {
+        let _pending = PendingTlsActivation::new(readiness);
         let poll_ms = tls_cfg
             .acme
             .as_ref()
@@ -999,16 +1587,15 @@ fn spawn_deferred_tls_accept_loop(
             .max(1);
         let mut last_error = None;
         loop {
+            if *shutdown.borrow() {
+                return;
+            }
             match build_server_config(&tls_cfg) {
                 Ok(server_config) => {
                     let shared_tls: SharedServerConfig = Arc::new(ArcSwap::new(server_config));
-                    spawn_cert_watcher(tls_cfg.clone(), shared_tls.clone());
+                    spawn_cert_watcher_until(tls_cfg.clone(), shared_tls.clone(), shutdown.clone());
                     let listen = listener.local_addr().ok();
                     spawn_tls_accept_loop(listener, proxy_id.clone(), shared_tls, state, shutdown);
-                    let previous = pending_tls.fetch_sub(1, Ordering::AcqRel);
-                    if previous == 1 {
-                        ready.store(true, Ordering::Release);
-                    }
                     info!(proxy = %proxy_id, ?listen, "ACME bootstrap keypair installed; TLS listener activated without restart");
                     return;
                 }
@@ -1034,6 +1621,44 @@ fn spawn_deferred_tls_accept_loop(
             }
         }
     });
+}
+
+/// 一个 deferred TLS generation 对全进程 pending/readiness 事实的 RAII 占位。
+struct PendingTlsActivation {
+    readiness: DeferredTlsReadiness,
+}
+
+/// 无 seed TLS listener 共享的就绪状态；generation 热换与进程停机必须操作同一组原子事实。
+#[derive(Clone)]
+struct DeferredTlsReadiness {
+    pending: Arc<AtomicU64>,
+    ready: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
+}
+
+impl PendingTlsActivation {
+    /// 业务作用：接管调用方已增加的 deferred TLS 计数，保证所有退出路径都能归还。
+    ///
+    /// 参数说明：`readiness` 统一持有全进程待激活数、就绪位和停机位。
+    ///
+    /// 返回：返回只应在对应 activation task 内持有的 RAII guard。
+    fn new(readiness: DeferredTlsReadiness) -> Self {
+        Self { readiness }
+    }
+}
+
+impl Drop for PendingTlsActivation {
+    /// 业务作用：在激活、热移除、取消或 panic 后归还 pending 事实，避免 readiness 永久卡住。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；最后一个 pending 退出且进程未停机时发布 ready=true。
+    fn drop(&mut self) {
+        let previous = self.readiness.pending.fetch_sub(1, Ordering::AcqRel);
+        if previous == 1 && !self.readiness.stopping.load(Ordering::Acquire) {
+            self.readiness.ready.store(true, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1362,13 +1987,13 @@ fn spawn_stream_accept_loop(
     });
 }
 
-/// 处理一条 L4 stream TCP 连接。
+/// 业务作用：为一条 L4 TCP 连接固定建连时路由/上游，执行可选 TLS、preread、
+/// MQTT 治理和双向背压；热更不会把已建连接中途改道。
 ///
-/// # 参数
-/// - `downstream`: 下游 TCP socket。
-/// - `peer`: 下游对端地址。
-/// - `bound_runtime`: 启动期绑定 socket 的 stream 配置,仅作为当前快照缺失时的兜底。
-/// - `state`: stream 数据面共享状态。
+/// 参数说明：`downstream` 是下游 TCP socket；`peer` 是直连对端；`bound_runtime` 是绑定
+/// socket 的启动期兜底配置；`tls` 是可热换的服务端 TLS；`state` 是 stream 共享状态。
+///
+/// 返回：无；函数创建可取消任务，所有成功/失败路径均归还连接计数并记录低基数结果。
 fn spawn_stream_connection(
     downstream: TcpStream,
     peer: SocketAddr,
@@ -1393,6 +2018,50 @@ fn spawn_stream_connection(
             peer: peer.to_string(),
             started,
         };
+        #[cfg(feature = "mqtt-governance")]
+        let _mqtt_connection_guard = if let Some(policy) = runtime.mqtt.as_ref() {
+            // 必须先抢连接名额再做 PROXY/TLS/CONNECT preread，否则慢握手可在解析前堆积无界 task。
+            let Some(guard) = state.mqtt_connections.try_acquire(
+                &runtime.id,
+                policy.max_connections(),
+                policy.connection_buffer_reservation(),
+                policy.max_buffered_bytes(),
+            ) else {
+                warn!(stream = %runtime.id, peer = %peer, "stream MQTT connection budget exhausted");
+                state
+                    .metrics
+                    .inc_stream_mqtt_rejection(gateway::mqtt::MqttViolationKind::ResourceLimit);
+                state.metrics.inc_stream_error();
+                log_stream_access(&state.access_log, &log_ctx, 429, 0, 0);
+                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+                return;
+            };
+            Some(guard)
+        } else {
+            None
+        };
+        #[cfg(feature = "kafka-governance")]
+        let _kafka_connection_guard = if let Some(policy) = runtime.kafka.as_ref() {
+            // 连接名额必须覆盖 PROXY/TLS 和首 frame deadline，否则攻击者可在 parser 前堆积无界 task。
+            let Some(guard) = state.kafka_connections.try_acquire(
+                &runtime.id,
+                policy.max_connections(),
+                policy.connection_buffer_reservation(),
+                policy.max_buffered_bytes(),
+            ) else {
+                warn!(stream = %runtime.id, peer = %peer, "stream Kafka connection budget exhausted");
+                state
+                    .metrics
+                    .inc_stream_kafka_rejection(gateway::kafka::KafkaViolationKind::ResourceLimit);
+                state.metrics.inc_stream_error();
+                log_stream_access(&state.access_log, &log_ctx, 429, 0, 0);
+                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+                return;
+            };
+            Some(guard)
+        } else {
+            None
+        };
         let (stream, conn) = match strip_proxy_protocol(downstream, peer, &runtime.proxy_protocol)
             .await
         {
@@ -1405,8 +2074,8 @@ fn spawn_stream_connection(
                 return;
             }
         };
-        let mut downstream: BoxStreamIo = match tls {
-            Some(config) => {
+        let mut downstream: BoxStreamIo = match tls.as_ref() {
+            Some(config) if !runtime.preread.ssl_preread => {
                 // 先剥可信 PROXY header，再开始 TLS；这与前置 L4 LB 的 wire 顺序一致。
                 // acceptor 只 clone 当前 ArcSwap 证书指针，热路径不读盘/解析 PEM。
                 let accept = TlsAcceptor::from(config.load_full()).accept(stream);
@@ -1439,11 +2108,11 @@ fn spawn_stream_connection(
                     }
                 }
             }
-            None => Box::new(stream),
+            _ => Box::new(stream),
         };
         let peer = conn.real_peer;
         log_ctx.peer = peer.to_string();
-        let preread = if runtime.preread.ssl_preread {
+        let mut preread = if runtime.preread.ssl_preread {
             match stream_preread_sni(
                 &mut downstream,
                 runtime.preread.timeout_ms,
@@ -1474,6 +2143,12 @@ fn spawn_stream_connection(
                 Ok(result) => result,
                 Err(error) => {
                     warn!(stream = %runtime.id, peer = %peer, %error, "stream MQTT CONNECT preread failed");
+                    #[cfg(feature = "mqtt-governance")]
+                    if runtime.mqtt.is_some() {
+                        state
+                            .metrics
+                            .inc_stream_mqtt_rejection(gateway::mqtt::MqttViolationKind::Malformed);
+                    }
                     state.metrics.inc_stream_error();
                     log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
                     finish_stream_connection(
@@ -1487,9 +2162,72 @@ fn spawn_stream_connection(
             StreamPrereadResult {
                 sni: None,
                 mqtt_client_id: None,
+                #[cfg(feature = "mqtt-governance")]
+                mqtt_protocol_level: None,
+                #[cfg(feature = "mqtt-governance")]
+                mqtt_packet_len: None,
+                #[cfg(feature = "mqtt-governance")]
+                mqtt_clean_start: None,
                 bytes: Vec::new(),
             }
         };
+        #[cfg(feature = "mqtt-governance")]
+        if let Some(policy) = runtime.mqtt.as_ref() {
+            let Some(client_id) = preread.mqtt_client_id.as_deref() else {
+                warn!(stream = %runtime.id, peer = %peer, "stream MQTT governance missing CONNECT client id");
+                state
+                    .metrics
+                    .inc_stream_mqtt_rejection(gateway::mqtt::MqttViolationKind::Malformed);
+                state.metrics.inc_stream_error();
+                log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+                return;
+            };
+            if !policy.allows_client_id(client_id) {
+                // client ACL 在 upstream resolve/dial 之前执行，被拒绝身份不得触达 broker 也不污染被动健康。
+                warn!(stream = %runtime.id, peer = %peer, "stream MQTT client id rejected by ACL");
+                state
+                    .metrics
+                    .inc_stream_mqtt_rejection(gateway::mqtt::MqttViolationKind::NotAuthorized);
+                state.metrics.inc_stream_error();
+                log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
+                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+                return;
+            }
+            if !matches!(preread.mqtt_protocol_level, Some(4 | 5)) {
+                warn!(stream = %runtime.id, peer = %peer, level = ?preread.mqtt_protocol_level, "stream MQTT governance rejects unsupported protocol level");
+                state
+                    .metrics
+                    .inc_stream_mqtt_rejection(gateway::mqtt::MqttViolationKind::Protocol);
+                state.metrics.inc_stream_error();
+                log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+                return;
+            }
+            if preread.mqtt_packet_len != Some(preread.bytes.len()) {
+                // CONNECT 之后的 pipelined 字节尚未经状态机，不能随 preread buffer 整段回放绕过 ACL/QoS 门。
+                warn!(stream = %runtime.id, peer = %peer, "stream MQTT client sent packets before CONNACK");
+                state
+                    .metrics
+                    .inc_stream_mqtt_rejection(gateway::mqtt::MqttViolationKind::Protocol);
+                state.metrics.inc_stream_error();
+                log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+                return;
+            }
+            if preread.mqtt_clean_start != Some(true) {
+                // 跨连接 persistent session 的订阅/QoS2 状态由 broker 持有，本地单连接硬门无法安全重建；
+                // 治理 profile 因此只接受 Clean Session/Start，需持久会话时应显式使用透明 TCP profile。
+                warn!(stream = %runtime.id, peer = %peer, "stream MQTT governance requires Clean Session/Start");
+                state
+                    .metrics
+                    .inc_stream_mqtt_rejection(gateway::mqtt::MqttViolationKind::Protocol);
+                state.metrics.inc_stream_error();
+                log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+                return;
+            }
+        }
         let Some(route) = select_stream_route(
             &runtime,
             preread.sni.as_deref(),
@@ -1502,6 +2240,47 @@ fn spawn_stream_connection(
             return;
         };
         log_ctx.stream_id = Arc::from(format!("{}:{}", runtime.id, route.id));
+        if route.terminate_tls {
+            let Some(config) = tls.as_ref() else {
+                warn!(stream = %runtime.id, peer = %peer, "stream route TLS termination has no server identity");
+                state.metrics.inc_stream_error();
+                log_stream_access(&state.access_log, &log_ctx, 500, 0, 0);
+                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+                return;
+            };
+            // ClientHello 已用于 SNI 权威选路，必须在同一连接内原样回放给 rustls 后再开放
+            // 明文上游；直接丢弃会让握手失败，先建上游则会让未认证连接触达业务端口。
+            let replay = ReplayStreamIo::new(std::mem::take(&mut preread.bytes), downstream);
+            let accept = TlsAcceptor::from(config.load_full()).accept(replay);
+            downstream = match tokio::time::timeout(
+                Duration::from_millis(runtime.tls_handshake_timeout_ms),
+                accept,
+            )
+            .await
+            {
+                Ok(Ok(stream)) => Box::new(stream),
+                Ok(Err(error)) => {
+                    warn!(stream = %runtime.id, peer = %peer, %error, "stream selected-route TLS handshake failed");
+                    state.metrics.inc_stream_error();
+                    log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                    finish_stream_connection(
+                        state.active_connections.clone(),
+                        state.metrics.clone(),
+                    );
+                    return;
+                }
+                Err(_) => {
+                    warn!(stream = %runtime.id, peer = %peer, "stream selected-route TLS handshake timeout");
+                    state.metrics.inc_stream_error();
+                    log_stream_access(&state.access_log, &log_ctx, 408, 0, 0);
+                    finish_stream_connection(
+                        state.active_connections.clone(),
+                        state.metrics.clone(),
+                    );
+                    return;
+                }
+            };
+        }
         let current_snap = state.snap.load();
         let reservation = match resolve_stream_upstream(
             &current_snap,
@@ -1553,6 +2332,9 @@ fn spawn_stream_connection(
                 return;
             }
         };
+        // TCP 建连及可选上游 TLS 握手成功已经证明实例可达，应立即清除此前被动失败；后续
+        // 会话级 reset/timeout 可能由任一客户端主动关闭触发，不能摘除共享实例并放大为全局故障。
+        record_stream_upstream_success(&state, &reservation);
         if runtime.proxy_protocol_to_upstream.enabled {
             let header = match encode_proxy_protocol_header(
                 peer,
@@ -1580,6 +2362,210 @@ fn spawn_stream_connection(
                 return;
             }
         }
+        #[cfg(feature = "mqtt-governance")]
+        if let Some(policy) = runtime.mqtt.clone() {
+            let protocol_level = preread
+                .mqtt_protocol_level
+                .expect("MQTT governance preread level validated before upstream resolve");
+            // CONNECT 是唯一枚在上游建连前已解析的 packet；先精确回放它，后续字节必须全部经状态机。
+            if let Err(error) = upstream.write_all(&preread.bytes).await {
+                warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, %error, "stream MQTT CONNECT replay failed");
+                record_stream_upstream_failure(&state, &reservation);
+                state.metrics.inc_stream_error();
+                log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
+                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+                return;
+            }
+            let governed = gateway::mqtt::proxy(downstream, upstream, protocol_level, policy);
+            let result = if runtime.timeout_ms == 0 {
+                governed.await
+            } else {
+                match tokio::time::timeout(Duration::from_millis(runtime.timeout_ms), governed)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(stream = %runtime.id, peer = %peer, elapsed_ms = started.elapsed().as_millis(), "stream MQTT session timeout");
+                        state.metrics.inc_stream_mqtt_rejection(
+                            gateway::mqtt::MqttViolationKind::ResourceLimit,
+                        );
+                        state.metrics.inc_stream_error();
+                        log_stream_access(
+                            &state.access_log,
+                            &log_ctx,
+                            504,
+                            preread.bytes.len() as u64,
+                            0,
+                        );
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                }
+            };
+            match result {
+                Ok(report) => {
+                    let down = report
+                        .downstream_to_upstream_bytes
+                        .saturating_add(preread.bytes.len() as u64);
+                    let up = report.upstream_to_downstream_bytes;
+                    record_stream_upstream_success(&state, &reservation);
+                    state.metrics.add_stream_bytes(down, up);
+                    state.metrics.add_stream_mqtt_packets(
+                        report.downstream_to_upstream_packets,
+                        report.upstream_to_downstream_packets,
+                    );
+                    log_stream_access(&state.access_log, &log_ctx, 200, down, up);
+                    tracing::debug!(
+                        stream = %runtime.id,
+                        peer = %peer,
+                        upstream = %upstream_addr,
+                        mqtt_packets_downstream_to_upstream = report.downstream_to_upstream_packets,
+                        mqtt_packets_upstream_to_downstream = report.upstream_to_downstream_packets,
+                        bytes_downstream_to_upstream = down,
+                        bytes_upstream_to_downstream = up,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "stream MQTT governed session closed"
+                    );
+                }
+                Err(error) => {
+                    let report = error.report();
+                    let down = report
+                        .downstream_to_upstream_bytes
+                        .saturating_add(preread.bytes.len() as u64);
+                    let up = report.upstream_to_downstream_bytes;
+                    if error.peer() == gateway::mqtt::MqttPeer::Broker {
+                        record_stream_upstream_failure(&state, &reservation);
+                    }
+                    let status = match error.kind() {
+                        gateway::mqtt::MqttViolationKind::NotAuthorized => 403,
+                        gateway::mqtt::MqttViolationKind::PacketTooLarge => 413,
+                        gateway::mqtt::MqttViolationKind::ResourceLimit => 429,
+                        gateway::mqtt::MqttViolationKind::Malformed
+                        | gateway::mqtt::MqttViolationKind::Protocol => 400,
+                    };
+                    state.metrics.inc_stream_error();
+                    state.metrics.add_stream_bytes(down, up);
+                    state.metrics.add_stream_mqtt_packets(
+                        report.downstream_to_upstream_packets,
+                        report.upstream_to_downstream_packets,
+                    );
+                    state.metrics.inc_stream_mqtt_rejection(error.kind());
+                    log_stream_access(&state.access_log, &log_ctx, status, down, up);
+                    warn!(
+                        stream = %runtime.id,
+                        peer = %peer,
+                        upstream = %upstream_addr,
+                        mqtt_peer = ?error.peer(),
+                        mqtt_violation = %error.kind(),
+                        %error,
+                        "stream MQTT governance terminated session"
+                    );
+                }
+            }
+            finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+            return;
+        }
+        #[cfg(feature = "kafka-governance")]
+        if let Some(policy) = runtime.kafka.clone() {
+            // Kafka profile 禁止 preread，确保首枚 request 也必须经过 header/ACL/correlation 状态机。
+            debug_assert!(preread.bytes.is_empty());
+            let governed = gateway::kafka::proxy(downstream, upstream, policy);
+            let result = if runtime.timeout_ms == 0 {
+                governed.await
+            } else {
+                match tokio::time::timeout(Duration::from_millis(runtime.timeout_ms), governed)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(stream = %runtime.id, peer = %peer, elapsed_ms = started.elapsed().as_millis(), "stream Kafka session timeout");
+                        state.metrics.inc_stream_kafka_rejection(
+                            gateway::kafka::KafkaViolationKind::ResourceLimit,
+                        );
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 504, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                }
+            };
+            match result {
+                Ok(report) => {
+                    record_stream_upstream_success(&state, &reservation);
+                    state.metrics.add_stream_bytes(
+                        report.downstream_to_upstream_bytes,
+                        report.upstream_to_downstream_bytes,
+                    );
+                    state.metrics.add_stream_kafka_frames(
+                        report.downstream_to_upstream_frames,
+                        report.upstream_to_downstream_frames,
+                    );
+                    log_stream_access(
+                        &state.access_log,
+                        &log_ctx,
+                        200,
+                        report.downstream_to_upstream_bytes,
+                        report.upstream_to_downstream_bytes,
+                    );
+                    tracing::debug!(
+                        stream = %runtime.id,
+                        peer = %peer,
+                        upstream = %upstream_addr,
+                        kafka_frames_downstream_to_upstream = report.downstream_to_upstream_frames,
+                        kafka_frames_upstream_to_downstream = report.upstream_to_downstream_frames,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "stream Kafka governed session closed"
+                    );
+                }
+                Err(error) => {
+                    let report = error.report();
+                    if error.peer() == gateway::kafka::KafkaPeer::Broker {
+                        record_stream_upstream_failure(&state, &reservation);
+                    }
+                    let status = match error.kind() {
+                        gateway::kafka::KafkaViolationKind::NotAuthorized => 403,
+                        gateway::kafka::KafkaViolationKind::FrameTooLarge => 413,
+                        gateway::kafka::KafkaViolationKind::ResourceLimit => 429,
+                        gateway::kafka::KafkaViolationKind::Malformed
+                        | gateway::kafka::KafkaViolationKind::Protocol => 400,
+                    };
+                    state.metrics.inc_stream_error();
+                    state.metrics.add_stream_bytes(
+                        report.downstream_to_upstream_bytes,
+                        report.upstream_to_downstream_bytes,
+                    );
+                    state.metrics.add_stream_kafka_frames(
+                        report.downstream_to_upstream_frames,
+                        report.upstream_to_downstream_frames,
+                    );
+                    state.metrics.inc_stream_kafka_rejection(error.kind());
+                    log_stream_access(
+                        &state.access_log,
+                        &log_ctx,
+                        status,
+                        report.downstream_to_upstream_bytes,
+                        report.upstream_to_downstream_bytes,
+                    );
+                    warn!(
+                        stream = %runtime.id,
+                        peer = %peer,
+                        upstream = %upstream_addr,
+                        kafka_peer = ?error.peer(),
+                        kafka_violation = %error.kind(),
+                        %error,
+                        "stream Kafka governance terminated session"
+                    );
+                }
+            }
+            finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+            return;
+        }
         if !preread.bytes.is_empty() {
             if let Err(e) = upstream.write_all(&preread.bytes).await {
                 warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, error = %e, "stream preread replay to upstream failed");
@@ -1599,7 +2585,6 @@ fn spawn_stream_connection(
                 Ok(result) => result,
                 Err(_) => {
                     warn!(stream = %runtime.id, peer = %peer, elapsed_ms = started.elapsed().as_millis(), "stream session timeout");
-                    record_stream_upstream_failure(&state, &reservation);
                     state.metrics.inc_stream_error();
                     log_stream_access(&state.access_log, &log_ctx, 504, 0, 0);
                     finish_stream_connection(
@@ -1627,7 +2612,8 @@ fn spawn_stream_connection(
                 );
             }
             Err(e) => {
-                record_stream_upstream_failure(&state, &reservation);
+                // 建连后的双向 relay 错误无法可靠归因于上游；客户端 reset 也会让
+                // copy_bidirectional 返回错误，因此这里只终止当前会话，不污染实例健康状态。
                 state.metrics.inc_stream_error();
                 log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
                 tracing::debug!(stream = %runtime.id, peer = %peer, error = %e, "stream session closed with error")
@@ -1643,15 +2629,25 @@ struct StreamPrereadResult {
     sni: Option<String>,
     /// MQTT CONNECT 中的 client id。
     mqtt_client_id: Option<String>,
+    /// CONNECT 声明的 MQTT protocol level。
+    #[cfg(feature = "mqtt-governance")]
+    mqtt_protocol_level: Option<u8>,
+    /// CONNECT packet 的精确 wire 长度，用于拒绝未经治理的 pipelined packet。
+    #[cfg(feature = "mqtt-governance")]
+    mqtt_packet_len: Option<usize>,
+    /// CONNECT 的 Clean Session(v3.1.1)/Clean Start(v5) 位。
+    #[cfg(feature = "mqtt-governance")]
+    mqtt_clean_start: Option<bool>,
     /// 已从下游读取、必须原样写给上游的字节。
     bytes: Vec<u8>,
 }
 
-/// 根据 preread SNI 选择 stream route。
+/// 业务作用：根据 TLS preread SNI 或 MQTT client id 选择唯一 stream route，保证精确
+/// SNI 优先于 wildcard，且更长的 wildcard suffix 优先，避免流量落入宽泛租户路由。
 ///
-/// # 参数
-/// - `runtime`: stream listener 运行配置。
-/// - `sni`: preread 得到的 SNI。
+/// 参数说明：`runtime` 是当前 stream listener 快照；`sni` 与 `mqtt_client_id` 来自有界 preread。
+///
+/// 返回：返回优先级最高的匹配路由；没有显式匹配时返回 default，仍无匹配则拒绝连接。
 fn select_stream_route<'a>(
     runtime: &'a StreamRuntime,
     sni: Option<&str>,
@@ -1659,11 +2655,7 @@ fn select_stream_route<'a>(
 ) -> Option<&'a gateway::config::StreamRouteRuntime> {
     let sni = sni.map(|value| value.trim().trim_end_matches('.').to_ascii_lowercase());
     if let Some(sni) = sni.as_deref() {
-        if let Some(route) = runtime
-            .routes
-            .iter()
-            .find(|route| route.sni.as_deref() == Some(sni))
-        {
+        if let Some(route) = select_stream_sni_route(&runtime.routes, sni) {
             return Some(route);
         }
     }
@@ -1677,6 +2669,51 @@ fn select_stream_route<'a>(
         }
     }
     runtime.routes.iter().find(|route| route.default)
+}
+
+/// 业务作用：按 Gateway API hostname 语义匹配 stream SNI，并固定 exact、最长 wildcard
+/// suffix 的优先顺序，避免配置顺序改变实际后端。
+///
+/// 参数说明：`routes` 是同一 listener 的已验证 route；`sni` 是规范化的小写 hostname。
+///
+/// 返回：精确路由存在时返回精确路由；否则返回最具体 wildcard；没有匹配时返回 None。
+fn select_stream_sni_route<'a>(
+    routes: &'a [gateway::config::StreamRouteRuntime],
+    sni: &str,
+) -> Option<&'a gateway::config::StreamRouteRuntime> {
+    routes
+        .iter()
+        .find(|route| route.sni.as_deref() == Some(sni))
+        .or_else(|| {
+            routes
+                .iter()
+                .filter(|route| {
+                    route
+                        .sni
+                        .as_deref()
+                        .is_some_and(|pattern| stream_sni_matches(pattern, sni))
+                })
+                .max_by_key(|route| route.sni.as_deref().map_or(0, str::len))
+        })
+}
+
+/// 业务作用：判断 stream route 的 Gateway API suffix wildcard 是否覆盖实际 SNI，且不把
+/// `*.example.com` 错误扩展到 apex `example.com`。
+///
+/// 参数说明：`pattern` 是已小写化的 route SNI；`sni` 是已小写化的 ClientHello SNI。
+///
+/// 返回：精确或合法 `*.` suffix 匹配时返回 true，其余模式与 apex 返回 false。
+fn stream_sni_matches(pattern: &str, sni: &str) -> bool {
+    if pattern == sni {
+        return true;
+    }
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    !suffix.is_empty()
+        && sni.len() > suffix.len()
+        && sni.ends_with(suffix)
+        && sni.as_bytes().get(sni.len() - suffix.len() - 1) == Some(&b'.')
 }
 
 /// 读取当前快照里的 stream listener 配置。
@@ -1726,11 +2763,11 @@ impl Drop for StreamUpstreamReservation {
     }
 }
 
-/// 记录 stream 上游成功。
+/// 业务作用：在上游连接或 TLS 握手成功后清除 stream 被动健康失败，避免客户端后续断开误伤共享实例。
 ///
-/// # 参数
-/// - `state`: stream 数据面共享状态。
-/// - `reservation`: 本次选中的上游 reservation。
+/// 参数说明：`state` 是 stream 数据面共享状态；`reservation` 是本次选中的上游 reservation。
+///
+/// 返回：无返回值；逻辑服务目标会更新被动健康状态，直连目标不产生副作用。
 fn record_stream_upstream_success(
     state: &StreamPlaneState,
     reservation: &StreamUpstreamReservation,
@@ -1756,20 +2793,20 @@ fn record_stream_upstream_failure(
     }
 }
 
-/// 解析 stream route 的上游目标。
+/// 业务作用：为 stream route 选择带权逻辑目标和健康实例，并登记连接级负载均衡 reservation。
 ///
-/// # 参数
-/// - `snap`: 当前配置快照。
-/// - `target`: route 上的 `upstream`,支持直连地址或 `lb://service`。
-/// - `stream_lb`: stream 负载均衡常驻状态。
-/// - `active_health`: 主动健康探测器。
+/// 参数说明：`snap` 是当前配置快照；`route` 是已匹配路由；`stream_lb` 保存游标、失败与在途状态；
+/// `active_health` 提供主动健康排除集合。
+///
+/// 返回：目标可解析且存在健康实例时返回必须在连接结束时释放的 reservation；引用缺失、
+/// 地址非法或没有健康实例时返回错误且不建立上游连接。
 fn resolve_stream_upstream(
     snap: &GatewaySnapshot,
     route: &StreamRouteRuntime,
     stream_lb: &StreamLbState,
     active_health: &gateway::health::ActiveHealthChecker,
 ) -> Result<StreamUpstreamReservation> {
-    let target = route.upstream.as_str();
+    let target = select_weighted_stream_upstream(route, stream_lb);
     if let Some(service) = target.strip_prefix("lb://") {
         if service.is_empty() || !snap.upstreams.has_service(service) {
             anyhow::bail!("unknown stream upstream service `{service}`");
@@ -1859,6 +2896,36 @@ fn resolve_stream_upstream(
     })
 }
 
+/// 业务作用：按 Gateway API backendRef 权重为每条 TCP 连接或 UDP session 选择逻辑上游，
+/// 并让零权重后端永不进入数据面。
+///
+/// 参数说明：`route` 是不可变路由快照；`stream_lb` 持有跨 reload 单调游标。
+///
+/// 返回：带权集合非空时返回按累计权重命中的目标；否则返回兼容单一 `upstream`。
+fn select_weighted_stream_upstream<'a>(
+    route: &'a StreamRouteRuntime,
+    stream_lb: &StreamLbState,
+) -> &'a str {
+    if route.weighted_upstreams.is_empty() {
+        return route.upstream.as_str();
+    }
+    let total = route
+        .weighted_upstreams
+        .iter()
+        .map(|(_, weight)| u64::from(*weight))
+        .sum::<u64>();
+    debug_assert!(total > 0);
+    let mut ticket = stream_lb.next_rr(&route.id) % total;
+    for (upstream, weight) in route.weighted_upstreams.iter() {
+        let weight = u64::from(*weight);
+        if ticket < weight {
+            return upstream.as_str();
+        }
+        ticket -= weight;
+    }
+    unreachable!("validated stream backend weights must cover the selection ticket")
+}
+
 /// 把上游服务实例 URI 转换为 stream TCP dial 地址。
 ///
 /// # 参数
@@ -1938,8 +3005,14 @@ async fn connect_stream_upstream(reservation: &StreamUpstreamReservation) -> Res
     Ok(Box::new(tls))
 }
 
-/// 有界 preread MQTT CONNECT 并解析 client id。读取的 wire bytes 原样回放给上游，
-/// parser 只借用当前 Vec，不为字段切片分配；最终仅为 route key 创建一个小 String。
+/// 业务作用：有界 preread 首个 MQTT CONNECT，为 client-id 路由和可选协议治理提供
+/// 版本/精确 packet 边界；原始 wire 仅在选定上游后回放。
+///
+/// 参数说明：`downstream` 是已完成 PROXY/TLS 的下游流；`timeout_ms` 是整个 CONNECT deadline；
+/// `max_bytes` 是 preread 累计硬门。
+///
+/// 返回：完整合法 CONNECT 的 client id、level、packet 长度和已读 wire；慢包、超长、截断或
+/// 畸形 CONNECT 返回错误，不连接上游。
 async fn stream_preread_mqtt_connect(
     downstream: &mut (impl AsyncRead + Unpin),
     timeout_ms: u64,
@@ -1950,10 +3023,16 @@ async fn stream_preread_mqtt_connect(
         let mut buffer = [0_u8; 1024];
         loop {
             match parse_mqtt_connect_client_id(&bytes)? {
-                MqttConnectParse::Complete(client_id) => {
+                MqttConnectParse::Complete(info) => {
                     return Ok(StreamPrereadResult {
                         sni: None,
-                        mqtt_client_id: Some(client_id.to_owned()),
+                        mqtt_client_id: Some(info.client_id.to_owned()),
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_protocol_level: Some(info.protocol_level),
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_packet_len: Some(info.packet_len),
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_clean_start: Some(info.clean_start),
                         bytes,
                     })
                 }
@@ -1984,11 +3063,27 @@ async fn stream_preread_mqtt_connect(
 
 enum MqttConnectParse<'a> {
     NeedMore,
-    Complete(&'a str),
+    Complete(MqttConnectInfo<'a>),
 }
 
-/// 解析 MQTT 3.1/3.1.1/5 CONNECT variable header 与 client id。只接受首包 CONNECT，
-/// 拒绝畸形 remaining-length/properties/UTF-8，避免恶意长度让 preread 路由走 default。
+/// CONNECT preread 只借用当前有界 buffer 的解析结果。
+struct MqttConnectInfo<'a> {
+    client_id: &'a str,
+    #[cfg(feature = "mqtt-governance")]
+    protocol_level: u8,
+    #[cfg(feature = "mqtt-governance")]
+    packet_len: usize,
+    #[cfg(feature = "mqtt-governance")]
+    clean_start: bool,
+}
+
+/// 业务作用：解析 MQTT 3.1/3.1.1/5 CONNECT 的协议名、level、flags、properties 边界与 client id，
+/// 防止畸形长度被误当 default route。
+///
+/// 参数说明：`bytes` 是从连接起始累积的有界 preread buffer。
+///
+/// 返回：字段尚未到齐时 NeedMore；完整时返回借用 client id、level 和 CONNECT wire 终点；
+/// 非 CONNECT、非法 VBI/flags/protocol/UTF-8 返回错误。
 fn parse_mqtt_connect_client_id(bytes: &[u8]) -> Result<MqttConnectParse<'_>> {
     if bytes.is_empty() {
         return Ok(MqttConnectParse::NeedMore);
@@ -2036,6 +3131,10 @@ fn parse_mqtt_connect_client_id(bytes: &[u8]) -> Result<MqttConnectParse<'_>> {
         !(flags & 0x04 == 0 && flags & 0x38 != 0),
         "MQTT will flags are inconsistent"
     );
+    anyhow::ensure!(
+        !(flags & 0x04 != 0 && flags & 0x18 == 0x18),
+        "MQTT will QoS must not be 3"
+    );
     cursor = cursor.checked_add(2).context("MQTT keepalive overflow")?;
     anyhow::ensure!(cursor <= packet_end, "MQTT CONNECT missing keepalive");
     if level == 5 {
@@ -2055,10 +3154,49 @@ fn parse_mqtt_connect_client_id(bytes: &[u8]) -> Result<MqttConnectParse<'_>> {
         client_id.len() <= 256 && !client_id.is_empty() && !client_id.chars().any(|ch| ch == '\0'),
         "MQTT client id must be 1..=256 UTF-8 bytes without NUL"
     );
-    Ok(MqttConnectParse::Complete(client_id))
+    if flags & 0x04 != 0 {
+        if level == 5 {
+            let Some((properties_len, next)) = decode_mqtt_variable_byte_integer(bytes, cursor)?
+            else {
+                return Ok(MqttConnectParse::NeedMore);
+            };
+            cursor = next
+                .checked_add(properties_len)
+                .context("MQTT will properties length overflow")?;
+            anyhow::ensure!(
+                cursor <= packet_end,
+                "MQTT will properties exceed CONNECT packet"
+            );
+        }
+        let _will_topic = mqtt_utf8(bytes, &mut cursor, packet_end)?;
+        let _will_payload = mqtt_binary(bytes, &mut cursor, packet_end)?;
+    }
+    if flags & 0x80 != 0 {
+        let _username = mqtt_utf8(bytes, &mut cursor, packet_end)?;
+    }
+    if flags & 0x40 != 0 {
+        let _password = mqtt_binary(bytes, &mut cursor, packet_end)?;
+    }
+    anyhow::ensure!(
+        cursor == packet_end,
+        "MQTT CONNECT contains trailing payload bytes"
+    );
+    Ok(MqttConnectParse::Complete(MqttConnectInfo {
+        client_id,
+        #[cfg(feature = "mqtt-governance")]
+        protocol_level: level,
+        #[cfg(feature = "mqtt-governance")]
+        packet_len: packet_end,
+        #[cfg(feature = "mqtt-governance")]
+        clean_start: flags & 0x02 != 0,
+    }))
 }
 
-/// MQTT variable byte integer；返回 `(value,next_cursor)`，输入尚未完整时返回 None。
+/// 业务作用：有界解码 MQTT Variable Byte Integer，不让恶意 continuation 制造溢出或无界等待。
+///
+/// 参数说明：`bytes` 是 preread buffer；`start` 是 VBI 起始偏移。
+///
+/// 返回：完整时返回 `(value,next_cursor)`，字节未到齐返回 None，超四字节/溢出返回错误。
 fn decode_mqtt_variable_byte_integer(bytes: &[u8], start: usize) -> Result<Option<(usize, usize)>> {
     let mut value = 0usize;
     let mut multiplier = 1usize;
@@ -2071,6 +3209,10 @@ fn decode_mqtt_variable_byte_integer(bytes: &[u8], start: usize) -> Result<Optio
             .checked_add(((byte & 0x7f) as usize).saturating_mul(multiplier))
             .context("MQTT variable integer overflow")?;
         if byte & 0x80 == 0 {
+            anyhow::ensure!(
+                mqtt_variable_integer_len(value) == offset + 1,
+                "MQTT variable integer is not minimally encoded"
+            );
             return Ok(Some((value, index + 1)));
         }
         multiplier = multiplier.saturating_mul(128);
@@ -2078,6 +3220,25 @@ fn decode_mqtt_variable_byte_integer(bytes: &[u8], start: usize) -> Result<Optio
     anyhow::bail!("MQTT variable integer exceeds four bytes")
 }
 
+/// 业务作用：计算 MQTT Variable Byte Integer 唯一最短编码长度，供 preread 拒绝非 canonical 长度。
+///
+/// 参数说明：`value` 是已有界解码的非负整数。
+///
+/// 返回：编码该值需要的 1–4 字节数。
+fn mqtt_variable_integer_len(mut value: usize) -> usize {
+    let mut length = 1;
+    while value >= 128 {
+        value /= 128;
+        length += 1;
+    }
+    length
+}
+
+/// 业务作用：从 CONNECT packet 边界内读取两字节长度前缀的 UTF-8 字段。
+///
+/// 参数说明：`bytes` 是 preread buffer；`cursor` 会移到字段末尾；`end` 是 CONNECT 精确终点。
+///
+/// 返回：边界内的借用 UTF-8 字符串；长度越界或非 UTF-8 返回错误。
 fn mqtt_utf8<'a>(bytes: &'a [u8], cursor: &mut usize, end: usize) -> Result<&'a str> {
     let length_end = cursor
         .checked_add(2)
@@ -2089,15 +3250,46 @@ fn mqtt_utf8<'a>(bytes: &'a [u8], cursor: &mut usize, end: usize) -> Result<&'a 
         .context("MQTT UTF-8 field overflow")?;
     anyhow::ensure!(value_end <= end, "MQTT UTF-8 field exceeds CONNECT packet");
     *cursor = value_end;
-    std::str::from_utf8(&bytes[length_end..value_end]).context("MQTT field is not UTF-8")
+    let value =
+        std::str::from_utf8(&bytes[length_end..value_end]).context("MQTT field is not UTF-8")?;
+    anyhow::ensure!(
+        !value.chars().any(|character| {
+            character == '\0'
+                || matches!(character as u32, 0xfdd0..=0xfdef)
+                || character as u32 & 0xffff == 0xfffe
+                || character as u32 & 0xffff == 0xffff
+        }),
+        "MQTT UTF-8 field contains a forbidden code point"
+    );
+    Ok(value)
 }
 
-/// preread TLS ClientHello 并解析 SNI。
+/// 业务作用：在 CONNECT 精确 packet 边界内跳过 will/password 二进制字段，不复制敏感内容。
 ///
-/// # 参数
-/// - `downstream`: 下游 TCP socket。
-/// - `timeout_ms`: preread 超时(ms),0 表示不限制。
-/// - `max_bytes`: 最多读取字节数。
+/// 参数说明：`bytes` 是 preread buffer；`cursor` 会移到字段末尾；`end` 是 CONNECT 终点。
+///
+/// 返回：边界内的借用 binary 切片；长度截断或溢出返回错误。
+fn mqtt_binary<'a>(bytes: &'a [u8], cursor: &mut usize, end: usize) -> Result<&'a [u8]> {
+    let length_end = cursor
+        .checked_add(2)
+        .context("MQTT binary length overflow")?;
+    anyhow::ensure!(length_end <= end, "MQTT binary field missing length");
+    let length = u16::from_be_bytes([bytes[*cursor], bytes[*cursor + 1]]) as usize;
+    let value_end = length_end
+        .checked_add(length)
+        .context("MQTT binary field overflow")?;
+    anyhow::ensure!(value_end <= end, "MQTT binary field exceeds CONNECT packet");
+    *cursor = value_end;
+    Ok(&bytes[length_end..value_end])
+}
+
+/// 业务作用：有界 preread TLS ClientHello 并只提取 SNI，为 passthrough route 选择上游，
+/// 不终止 TLS 也不消费需回放的原始 wire。
+///
+/// 参数说明：`downstream` 是下游 TCP 字节流；`timeout_ms` 是整个 preread deadline，0 表示
+/// 不限制；`max_bytes` 是 ClientHello 累计读取硬门。
+///
+/// 返回：解析到的可选 SNI 和必须回放给上游的原始字节；读取 IO/deadline 失败返回错误。
 async fn stream_preread_sni(
     downstream: &mut (impl AsyncRead + Unpin),
     timeout_ms: u64,
@@ -2111,6 +3303,12 @@ async fn stream_preread_sni(
                 return Ok(StreamPrereadResult {
                     sni: None,
                     mqtt_client_id: None,
+                    #[cfg(feature = "mqtt-governance")]
+                    mqtt_protocol_level: None,
+                    #[cfg(feature = "mqtt-governance")]
+                    mqtt_packet_len: None,
+                    #[cfg(feature = "mqtt-governance")]
+                    mqtt_clean_start: None,
                     bytes,
                 });
             }
@@ -2123,6 +3321,12 @@ async fn stream_preread_sni(
                 return Ok(StreamPrereadResult {
                     sni: None,
                     mqtt_client_id: None,
+                    #[cfg(feature = "mqtt-governance")]
+                    mqtt_protocol_level: None,
+                    #[cfg(feature = "mqtt-governance")]
+                    mqtt_packet_len: None,
+                    #[cfg(feature = "mqtt-governance")]
+                    mqtt_clean_start: None,
                     bytes,
                 });
             }
@@ -2132,6 +3336,12 @@ async fn stream_preread_sni(
                     return Ok(StreamPrereadResult {
                         sni,
                         mqtt_client_id: None,
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_protocol_level: None,
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_packet_len: None,
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_clean_start: None,
                         bytes,
                     })
                 }
@@ -2140,6 +3350,12 @@ async fn stream_preread_sni(
                     return Ok(StreamPrereadResult {
                         sni: None,
                         mqtt_client_id: None,
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_protocol_level: None,
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_packet_len: None,
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_clean_start: None,
                         bytes,
                     })
                 }
@@ -2334,13 +3550,28 @@ fn log_stream_access(
 struct BoundProxy {
     id: String,
     listen: SocketAddr,
-    listener: TcpListener,
+    listener: Option<TcpListener>,
     tls: Option<BoundTlsProxy>,
+    #[cfg(feature = "http3")]
+    http3: Option<BoundHttp3Proxy>,
+}
+
+/// prepare 阶段已经完整构建、等待 commit 激活的 HTTP/3 endpoint。
+#[cfg(feature = "http3")]
+struct BoundHttp3Proxy {
+    /// 与 TLS TCP listener 相同的逻辑地址/端口，仅 transport 为 UDP。
+    listen: SocketAddr,
+    /// 已绑定 UDP 但 server config 为空的候选；commit 前不会抢旧 generation 的 QUIC Initial。
+    endpoint: gateway::http3::PreparedServerEndpoint,
+    /// 与 endpoint 同版的 HTTP/3 运行计划。
+    runtime: gateway::config::Http3RuntimeCfg,
 }
 
 struct BoundTlsProxy {
     listen: SocketAddr,
     listener: TcpListener,
+    /// watcher/延迟激活共用的完整 TLS 材料来源。
+    runtime: gateway::config::TlsRuntimeCfg,
     mode: BoundTlsMode,
 }
 
@@ -2349,15 +3580,20 @@ enum BoundTlsMode {
     /// 启动期已构建可用 rustls 配置。
     Ready(SharedServerConfig),
     /// socket 已绑定，但 cert/key 尚不存在；后台检测到完整 keypair 后才开始 accept。
-    Deferred(Box<gateway::config::TlsRuntimeCfg>),
+    Deferred,
 }
 
 struct BoundStream {
     runtime: StreamRuntime,
     listen: SocketAddr,
     socket: BoundStreamSocket,
-    /// TCP TLS termination config. ArcSwap watcher hot-swaps certs without rebinding the socket.
-    tls: Option<SharedServerConfig>,
+    /// prepare 只构建 TLS；文件 watcher 要等 generation commit 后再启动。
+    tls: Option<BoundStreamTls>,
+}
+
+struct BoundStreamTls {
+    runtime: gateway::config::TlsRuntimeCfg,
+    config: SharedServerConfig,
 }
 
 enum BoundStreamSocket {
@@ -2370,15 +3606,25 @@ struct ActiveListenerGeneration {
     stop: watch::Sender<bool>,
 }
 
-/// V7 数据面 listener supervisor。所有可能失败的 bind/TLS build 都在 reload 的 prepare
+struct ActiveAdminGeneration {
+    listen: SocketAddr,
+    stop: watch::Sender<bool>,
+}
+
+/// 数据面 listener supervisor。所有可能失败的 bind/TLS build 都在 reload 的 prepare
 /// 阶段完成；active map 仅在 commit 的短临界区替换 stop handle，不持锁执行 I/O。
 #[derive(Clone)]
 struct ListenerSupervisor {
     active: Arc<Mutex<HashMap<String, ActiveListenerGeneration>>>,
+    active_admin: Arc<Mutex<Option<ActiveAdminGeneration>>>,
+    active_acme: Arc<Mutex<Option<gateway::acme::AcmeWorkerGeneration>>>,
+    active_acme_runtime_signature: Arc<Mutex<String>>,
     data_plane: DataPlaneState,
     stream_plane: StreamPlaneState,
-    pending_tls: Arc<AtomicU64>,
-    ready: Arc<AtomicBool>,
+    admin_state: Arc<admin::AdminState>,
+    acme_http01: Arc<gateway::acme::Http01ChallengeStore>,
+    manages_data: bool,
+    deferred_tls: DeferredTlsReadiness,
 }
 
 struct PreparedListenerSwitch {
@@ -2386,31 +3632,55 @@ struct PreparedListenerSwitch {
     candidate_topologies: HashMap<String, ProxyListenTopology>,
     proxies: Vec<BoundProxy>,
     streams: Vec<BoundStream>,
+    admin: Option<(SocketAddr, TcpListener)>,
+    acme: Option<(gateway::acme::PreparedAcmeWorkers, String)>,
     removed: Vec<String>,
 }
 
 impl ListenerSupervisor {
+    /// 业务作用：创建统一管理 data、stream、admin listener 与 ACME worker generation 的两阶段协调器。
+    ///
+    /// 参数说明：`data_plane`/`stream_plane` 是 accept loop 共享状态；`admin_state` 是管理面状态；
+    /// `acme_http01` 是 challenge 事实表；`manages_data` 区分 admin-only 进程；`deferred_tls`
+    /// 共同约束无 seed TLS 的就绪发布。
+    ///
+    /// 返回：返回尚未接管任何 listener generation 的 supervisor。
     fn new(
         data_plane: DataPlaneState,
         stream_plane: StreamPlaneState,
-        pending_tls: Arc<AtomicU64>,
-        ready: Arc<AtomicBool>,
+        admin_state: Arc<admin::AdminState>,
+        acme_http01: Arc<gateway::acme::Http01ChallengeStore>,
+        manages_data: bool,
+        deferred_tls: DeferredTlsReadiness,
     ) -> Self {
         Self {
             active: Arc::new(Mutex::new(HashMap::new())),
+            active_admin: Arc::new(Mutex::new(None)),
+            active_acme: Arc::new(Mutex::new(None)),
+            active_acme_runtime_signature: Arc::new(Mutex::new(String::new())),
             data_plane,
             stream_plane,
-            pending_tls,
-            ready,
+            admin_state,
+            acme_http01,
+            manages_data,
+            deferred_tls,
         }
     }
 
-    /// 激活启动期已经绑定完成的 listener，并把每组 accept loop 收口到独立 stop channel。
+    /// 业务作用：激活启动期已经绑定完成的 listener，并把每组 accept loop 收口到独立 stop channel。
+    ///
+    /// 参数说明：`snapshot` 提供已验证拓扑及 ACME 锁连接签名；`proxies`/`streams`/`admin_listener`
+    /// 是启动前绑定资源；`admin_listen` 是规范化管理地址；`acme` 是不含签发副作用的候选 worker。
+    ///
+    /// 返回：返回 proxy 与 stream 的低基数启动摘要；所有 generation 已归 supervisor 管理。
     fn install_initial(
         &self,
         snapshot: &GatewaySnapshot,
         proxies: Vec<BoundProxy>,
         streams: Vec<BoundStream>,
+        admin_listener: TcpListener,
+        admin_listen: SocketAddr,
+        acme: Option<gateway::acme::PreparedAcmeWorkers>,
     ) -> (Vec<String>, Vec<String>) {
         let topologies = snapshot
             .listen_topology()
@@ -2435,45 +3705,157 @@ impl ListenerSupervisor {
                 .clone();
             stream_log.push(self.activate_stream(bound, topology));
         }
+        self.activate_admin(admin_listener, admin_listen);
+        if let Some(acme) = acme {
+            self.activate_acme(
+                acme,
+                gateway::runtime_state::rate_limiter_config_signature(&snapshot.runtime_state),
+            );
+        }
         (proxy_log, stream_log)
     }
 
+    /// 业务作用：先启动候选管理面 generation，再停止旧 accept 并让既有连接优雅 drain。
+    ///
+    /// 参数说明：`listener` 是 prepare 完成的 socket；`listen` 是规范化地址摘要。
+    ///
+    /// 返回：无返回值；候选启动不再含可失败 I/O，旧代只在新代获得任务所有权后停止。
+    fn activate_admin(&self, listener: TcpListener, listen: SocketAddr) {
+        let (stop, stop_rx) = watch::channel(false);
+        tokio::spawn(admin::serve_until(
+            listener,
+            self.admin_state.clone(),
+            stop_rx,
+        ));
+        let old = self
+            .active_admin
+            .lock()
+            .expect("admin listener supervisor poisoned")
+            .replace(ActiveAdminGeneration { listen, stop });
+        if let Some(old) = old {
+            // 新管理面已经持有监听任务后才撤销旧代，避免热换窗口失去 /readyz 与配置控制面。
+            let _ = old.stop.send(true);
+        }
+    }
+
+    /// 业务作用：激活候选 ACME worker generation，并立即撤销旧代签发权威。
+    ///
+    /// 参数说明：`prepared` 已在快照发布前完成 provider 与锁后端初始化；
+    /// `runtime_signature` 记录本代锁连接参数，供后续 reload 判定是否必须重建。
+    ///
+    /// 返回：无返回值；旧代取消会触发 challenge lease 清理，新代成为唯一续期所有者。
+    fn activate_acme(
+        &self,
+        prepared: gateway::acme::PreparedAcmeWorkers,
+        runtime_signature: String,
+    ) {
+        let count = prepared.len();
+        let next = prepared.activate();
+        let old = self
+            .active_acme
+            .lock()
+            .expect("ACME worker supervisor poisoned")
+            .replace(next);
+        *self
+            .active_acme_runtime_signature
+            .lock()
+            .expect("ACME runtime signature poisoned") = runtime_signature;
+        drop(old);
+        if count > 0 {
+            info!(
+                workers = count,
+                "ACME certificate worker generation activated"
+            );
+        }
+    }
+
+    /// 激活一组已经 prepare 成功的 HTTP/TLS/HTTP3 listener。
+    ///
+    /// 业务作用：先启动候选 generation 的全部 accept loop，再原子替换 stop handle 并停收旧
+    /// generation，保证 reload 不出现 TCP 已换版但 QUIC 仍指向旧治理快照的半切换状态。
+    ///
+    /// 参数说明：`bound` 持有已绑定 socket/endpoint；`topology` 是与候选快照同版的比较摘要。
+    ///
+    /// 返回：用于启动日志的 listener 地址列表。
     fn activate_proxy(&self, bound: BoundProxy, topology: ProxyListenTopology) -> Vec<String> {
         let key = topology.id.clone();
         let (stop, stop_rx) = watch::channel(false);
         let proxy_id: Arc<str> = Arc::from(bound.id.clone());
-        let mut log = vec![format!("{}@{}", bound.id, bound.listen)];
-        spawn_plain_accept_loop(
-            bound.listener,
-            proxy_id.clone(),
-            self.data_plane.clone(),
-            stop_rx.clone(),
-        );
+        let mut log = Vec::new();
+        #[cfg(feature = "http3")]
+        let http3 = bound.http3.map(|http3| {
+            let endpoint = http3.endpoint.activate();
+            (http3.listen, http3.runtime, endpoint)
+        });
+        #[cfg(feature = "http3")]
+        let mut http3_certificate_updates = None;
+        if let Some(listener) = bound.listener {
+            log.push(format!("{}@{}", bound.id, bound.listen));
+            spawn_plain_accept_loop(
+                listener,
+                proxy_id.clone(),
+                self.data_plane.clone(),
+                stop_rx.clone(),
+            );
+        }
         if let Some(tls) = bound.tls {
             match tls.mode {
                 BoundTlsMode::Ready(config) => {
                     log.push(format!("{}@{}(tls)", bound.id, tls.listen));
+                    if tls.runtime.in_memory.is_none() {
+                        // 文件 watcher 只能在 commit 后启动；prepare 中启动会让失败候选泄漏后台
+                        // task。SDS 材料随 Snapshot generation 原子切换，不创建文件 watcher。
+                        spawn_cert_watcher_until(
+                            tls.runtime.clone(),
+                            config.clone(),
+                            stop_rx.clone(),
+                        );
+                        #[cfg(feature = "http3")]
+                        if let Some((_, runtime, _)) = &http3 {
+                            http3_certificate_updates = Some(gateway::http3::spawn_cert_watcher(
+                                tls.runtime.clone(),
+                                runtime.clone(),
+                                stop_rx.clone(),
+                            ));
+                        }
+                    }
                     spawn_tls_accept_loop(
                         tls.listener,
-                        proxy_id,
+                        proxy_id.clone(),
                         config,
                         self.data_plane.clone(),
-                        stop_rx,
+                        stop_rx.clone(),
                     );
                 }
-                BoundTlsMode::Deferred(tls_cfg) => {
+                BoundTlsMode::Deferred => {
                     log.push(format!("{}@{}(tls-pending)", bound.id, tls.listen));
+                    // 候选快照已声明 TLS 能力但证书尚未就绪；在任务启动前先关闭 readiness，
+                    // 防止新 generation 只开放 challenge/明文半边时被前置 LB 当成完整节点。
+                    self.deferred_tls.ready.store(false, Ordering::Release);
+                    self.deferred_tls.pending.fetch_add(1, Ordering::AcqRel);
                     spawn_deferred_tls_accept_loop(
                         tls.listener,
-                        proxy_id,
-                        *tls_cfg,
+                        proxy_id.clone(),
+                        tls.runtime,
                         self.data_plane.clone(),
-                        stop_rx,
-                        self.pending_tls.clone(),
-                        self.ready.clone(),
+                        stop_rx.clone(),
+                        self.deferred_tls.clone(),
                     );
                 }
             }
+        }
+        #[cfg(feature = "http3")]
+        if let Some((listen, runtime, endpoint)) = http3 {
+            log.push(format!("{}@{}(h3/udp)", bound.id, listen));
+            spawn_http3_accept_loop(
+                endpoint,
+                runtime,
+                http3_certificate_updates
+                    .expect("HTTP/3 listener always has a ready TLS certificate watcher"),
+                proxy_id,
+                self.data_plane.clone(),
+                stop_rx,
+            );
         }
         let old = self
             .active
@@ -2486,20 +3868,30 @@ impl ListenerSupervisor {
         log
     }
 
+    /// 业务作用：激活已 prepare 的 L4 listener，并在新代持有 accept 权后停止同标识旧代。
+    ///
+    /// 参数说明：`bound` 持有候选 socket/TLS 材料；`topology` 是与候选快照同版的比较摘要。
+    ///
+    /// 返回：返回用于启动日志的 listener 地址摘要。
     fn activate_stream(&self, bound: BoundStream, topology: ProxyListenTopology) -> String {
         let key = topology.id.clone();
+        let tls_enabled = bound.tls.is_some();
         let log = format!(
             "{}@{}{}",
             bound.runtime.id,
             bound.listen,
-            if bound.tls.is_some() { "(tls)" } else { "" }
+            if tls_enabled { "(tls)" } else { "" }
         );
         let (stop, stop_rx) = watch::channel(false);
+        let tls = bound.tls.map(|tls| {
+            spawn_cert_watcher_until(tls.runtime, tls.config.clone(), stop_rx.clone());
+            tls.config
+        });
         match bound.socket {
             BoundStreamSocket::Tcp(listener) => spawn_stream_accept_loop(
                 listener,
                 bound.runtime,
-                bound.tls,
+                tls,
                 self.stream_plane.clone(),
                 stop_rx,
             ),
@@ -2518,6 +3910,11 @@ impl ListenerSupervisor {
         log
     }
 
+    /// 业务作用：在候选 generation 全部激活后停收已从新快照删除的 listener。
+    ///
+    /// 参数说明：`keys` 是 prepare 阶段基于旧/新拓扑差集冻结的 listener 标识。
+    ///
+    /// 返回：无返回值；既有连接仍独立持有 IO 并按正常 drain 规则结束。
     fn stop_removed(&self, keys: &[String]) {
         let removed = {
             let mut active = self
@@ -2533,7 +3930,15 @@ impl ListenerSupervisor {
         }
     }
 
+    /// 业务作用：撤销进程内全部 listener 与 ACME generation 的新增工作权，并保持 readiness 关闭。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；已建立连接继续由全局 drain 预算管理。
     fn shutdown(&self) {
+        // 停机事实必须先于取消 deferred TLS；否则最后一个 RAII guard 退出会短暂重开 readiness。
+        self.deferred_tls.stopping.store(true, Ordering::Release);
+        self.deferred_tls.ready.store(false, Ordering::Release);
         let listeners = self
             .active
             .lock()
@@ -2544,10 +3949,27 @@ impl ListenerSupervisor {
         for listener in listeners {
             let _ = listener.stop.send(true);
         }
+        if let Some(admin) = self
+            .active_admin
+            .lock()
+            .expect("admin listener supervisor poisoned")
+            .take()
+        {
+            let _ = admin.stop.send(true);
+        }
+        self.active_acme
+            .lock()
+            .expect("ACME worker supervisor poisoned")
+            .take();
     }
 }
 
 impl gateway::reload::ListenerTopologyReconciler for ListenerSupervisor {
+    /// 业务作用：完成 data/stream/admin socket、TLS 材料和 ACME provider/锁的候选期准备。
+    ///
+    /// 参数说明：`candidate` 是尚未发布且已完成语义校验的完整快照。
+    ///
+    /// 返回：全部可失败资源就绪时返回切换事务；任一 bind/build/connect 失败则保留所有在线代。
     fn prepare<'a>(
         &'a self,
         candidate: &'a GatewaySnapshot,
@@ -2559,11 +3981,15 @@ impl gateway::reload::ListenerTopologyReconciler for ListenerSupervisor {
         >,
     > {
         Box::pin(async move {
-            let candidate_topologies = candidate
-                .listen_topology()
-                .into_iter()
-                .map(|topology| (topology.id.clone(), topology))
-                .collect::<HashMap<_, _>>();
+            let candidate_topologies = if self.manages_data {
+                candidate
+                    .listen_topology()
+                    .into_iter()
+                    .map(|topology| (topology.id.clone(), topology))
+                    .collect::<HashMap<_, _>>()
+            } else {
+                HashMap::new()
+            };
             let current_topologies = self
                 .active
                 .lock()
@@ -2582,19 +4008,17 @@ impl gateway::reload::ListenerTopologyReconciler for ListenerSupervisor {
                 .filter(|id| !candidate_topologies.contains_key(*id))
                 .cloned()
                 .collect::<Vec<_>>();
-
-            // ACME worker 的 challenge/renewal 生命周期目前仍按证书 identity 常驻；没有 stop
-            // handle，故不能假装 listener 已热切而旧签发 worker 也完成交接。普通 TLS/明文/L4
-            // 均支持热切，ACME 拓扑变更 fail-fast 保留旧版。
-            for id in changed.iter().chain(removed.iter()) {
-                if current_topologies.get(id).is_some_and(topology_uses_acme)
+            let acme_changed = changed.iter().chain(removed.iter()).any(|id| {
+                current_topologies.get(id).is_some_and(topology_uses_acme)
                     || candidate_topologies.get(id).is_some_and(topology_uses_acme)
-                {
-                    anyhow::bail!(
-                        "listener `{id}` uses ACME; changing/removing its topology requires restart"
-                    );
-                }
-            }
+            }) || (candidate_topologies.values().any(topology_uses_acme)
+                && *self
+                    .active_acme_runtime_signature
+                    .lock()
+                    .expect("ACME runtime signature poisoned")
+                    != gateway::runtime_state::rate_limiter_config_signature(
+                        &candidate.runtime_state,
+                    ));
 
             let mut proxies = Vec::new();
             for proxy in candidate.proxies.iter() {
@@ -2610,11 +4034,51 @@ impl gateway::reload::ListenerTopologyReconciler for ListenerSupervisor {
                     streams.push(bind_stream(stream).await?);
                 }
             }
+            let candidate_admin: SocketAddr = candidate
+                .admin_listen
+                .parse()
+                .with_context(|| format!("invalid admin.listen `{}`", candidate.admin_listen))?;
+            let current_admin = self
+                .active_admin
+                .lock()
+                .expect("admin listener supervisor poisoned")
+                .as_ref()
+                .map(|active| active.listen)
+                .context("admin listener generation is missing")?;
+            let admin = if candidate_admin != current_admin {
+                Some((
+                    candidate_admin,
+                    TcpListener::bind(candidate_admin).await.with_context(|| {
+                        format!("bind candidate admin.listen {candidate_admin}")
+                    })?,
+                ))
+            } else {
+                None
+            };
+            let acme = if acme_changed {
+                Some((
+                    gateway::acme::prepare_acme_workers(
+                        candidate
+                            .proxies
+                            .iter()
+                            .filter_map(|proxy| proxy.tls.clone()),
+                        candidate.runtime_state.clone(),
+                        self.acme_http01.clone(),
+                    )
+                    .await
+                    .context("prepare candidate ACME worker generation")?,
+                    gateway::runtime_state::rate_limiter_config_signature(&candidate.runtime_state),
+                ))
+            } else {
+                None
+            };
             Ok(Box::new(PreparedListenerSwitch {
                 supervisor: self.clone(),
                 candidate_topologies,
                 proxies,
                 streams,
+                admin,
+                acme,
                 removed,
             })
                 as Box<dyn gateway::reload::PreparedListenerTopology>)
@@ -2623,7 +4087,15 @@ impl gateway::reload::ListenerTopologyReconciler for ListenerSupervisor {
 }
 
 impl gateway::reload::PreparedListenerTopology for PreparedListenerSwitch {
+    /// 业务作用：在候选快照已发布后交接 listener 与签发权威，先开放新代再停收旧代。
+    ///
+    /// 参数说明：无；事务自身持有 prepare 成功的候选资源和旧/新差集。
+    ///
+    /// 返回：无返回值；commit 不执行可失败外部初始化，旧连接继续优雅 drain。
     fn commit(mut self: Box<Self>) {
+        if let Some((listen, listener)) = self.admin.take() {
+            self.supervisor.activate_admin(listener, listen);
+        }
         for bound in self.proxies.drain(..) {
             let key = format!("proxy:{}", bound.id);
             let topology = self
@@ -2640,10 +4112,19 @@ impl gateway::reload::PreparedListenerTopology for PreparedListenerSwitch {
                 .expect("prepared stream topology remains available");
             self.supervisor.activate_stream(bound, topology);
         }
+        if let Some((acme, runtime_signature)) = self.acme.take() {
+            // 候选 listener 已启动且快照已经发布，此时交接 worker 权威；旧 challenge 会在取消分支清理。
+            self.supervisor.activate_acme(acme, runtime_signature);
+        }
         self.supervisor.stop_removed(self.removed.as_slice());
     }
 }
 
+/// 业务作用：为 TCP/UDP stream listener 生成跨 reload 稳定且不会协议碰撞的 supervisor 标识。
+///
+/// 参数说明：`stream` 是已编译的 L4 listener 运行配置。
+///
+/// 返回：返回包含业务 id 与 transport 的内部 key。
 fn stream_topology_key(stream: &StreamRuntime) -> String {
     format!(
         "stream:{}:{}",
@@ -2655,6 +4136,11 @@ fn stream_topology_key(stream: &StreamRuntime) -> String {
     )
 }
 
+/// 业务作用：判断 listener 拓扑是否依赖 ACME worker，用于限定签发代际重建范围。
+///
+/// 参数说明：`topology` 是当前或候选 proxy listener 摘要。
+///
+/// 返回：TLS 配置含 ACME 时返回 true，否则返回 false。
 fn topology_uses_acme(topology: &ProxyListenTopology) -> bool {
     topology.tls.as_ref().is_some_and(|tls| tls.acme.is_some())
 }
@@ -2666,6 +4152,91 @@ trait StreamIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> StreamIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 type BoxStreamIo = Box<dyn StreamIo>;
 
+/// 在不复制后续载荷的前提下，将 preread 字节先回放给协议栈，再继续读取真实下游连接。
+struct ReplayStreamIo {
+    /// 尚未回放完的有界 preread 缓冲。
+    prefix: Vec<u8>,
+    /// 下一次回放位置。
+    offset: usize,
+    /// preread 后的真实下游 IO。
+    inner: BoxStreamIo,
+}
+
+impl ReplayStreamIo {
+    /// 业务作用：把已消费的 ClientHello 与原连接重新拼成连续 TLS 字节流。
+    ///
+    /// 参数说明：`prefix` 是有界 preread 字节；`inner` 是读取位置已经越过该前缀的连接。
+    ///
+    /// 返回：返回从前缀起始位置读取、写操作直达原连接的 IO wrapper。
+    fn new(prefix: Vec<u8>, inner: BoxStreamIo) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            inner,
+        }
+    }
+}
+
+impl AsyncRead for ReplayStreamIo {
+    /// 业务作用：优先回放 preread 前缀，耗尽后无缝转交真实连接读取。
+    ///
+    /// 参数说明：`cx` 与 `buf` 遵循 Tokio `AsyncRead` 契约。
+    ///
+    /// 返回：前缀或真实连接产生数据时返回 Ready；底层等待时返回 Pending。
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.offset < this.prefix.len() {
+            let count = buf.remaining().min(this.prefix.len() - this.offset);
+            buf.put_slice(&this.prefix[this.offset..this.offset + count]);
+            this.offset += count;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut *this.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ReplayStreamIo {
+    /// 业务作用：将 TLS 握手及后续响应直接写回原连接，不经过 preread 缓冲。
+    ///
+    /// 参数说明：`cx` 与 `buf` 遵循 Tokio `AsyncWrite` 契约。
+    ///
+    /// 返回：透传底层写入进度或错误。
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut *self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    /// 业务作用：刷新原连接的待发送 TLS 记录。
+    ///
+    /// 参数说明：`cx` 遵循 Tokio `AsyncWrite` 契约。
+    ///
+    /// 返回：透传底层刷新结果。
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+
+    /// 业务作用：关闭原连接的写半部，保持 TLS shutdown 的传输语义。
+    ///
+    /// 参数说明：`cx` 遵循 Tokio `AsyncWrite` 契约。
+    ///
+    /// 返回：透传底层关闭结果。
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// 业务作用：完成 Naway 进程 bootstrap、控制面/数据面装配、readiness 开放与有序停机。
+///
+/// 参数说明：无；CLI 与环境变量由 `Args`/配置加载器读取。
+///
+/// 返回：全部启动与停机步骤成功时返回成功；bootstrap 或不可恢复运行错误返回失败退出。
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -2693,6 +4264,12 @@ async fn main() -> Result<()> {
     let discovery = NacosDiscoveryManager::with_metrics(dynamic_upstreams.clone(), metrics.clone());
     let snapshot = load_snapshot_with_dynamic(&cfg_path, 1, dynamic_upstreams.clone())
         .with_context(|| format!("load initial config from {}", cfg_path.display()))?;
+    if run_mode.is_sidecar() {
+        // sidecar 的本地边界必须在打开任何外部资源前成立；失败直接退出，不能先短暂暴露端口。
+        snapshot
+            .validate_sidecar_listeners()
+            .context("validate sidecar listener isolation")?;
+    }
     // 审计 hash-chain/client 是 bootstrap 资源；启动时完整验旧 spool，篡改或 endpoint 配置错误均 fail-fast。
     let admin_audit = gateway::admin_audit::AdminAuditLog::open(&snapshot.admin_audit)
         .context("open admin audit log")?;
@@ -2796,6 +4373,21 @@ async fn main() -> Result<()> {
         .await
         .context("build HTTP cache runtime")?;
     let snap = Arc::new(ArcSwap::from_pointee(snapshot));
+    let apply_coordinator = Arc::new(reload::SnapshotApplyCoordinator::default());
+    // xDS bootstrap/owner 已在打开 socket 前锁定。状态先接入 admin/readiness，但网络 task
+    // 必须等 listener supervisor 建好后才启动；否则 LDS response 会缺少 two-phase bind 权威。
+    #[cfg(feature = "xds-client")]
+    let xds_bootstrap = if run_mode.runs_data() && snap.load().control_plane.xds.enabled {
+        let initial = snap.load();
+        let specs = initial.upstreams.xds_watch_specs();
+        let xds_cfg = initial.control_plane.xds.clone();
+        drop(initial);
+        Some((xds_cfg, specs))
+    } else {
+        None
+    };
+    #[cfg(feature = "xds-client")]
+    let xds_status = xds_bootstrap.as_ref().map(|_| gateway::xds::new_status());
     http_cache.spawn_invalidation_worker(snap.clone());
     let history_root = cfg_path
         .parent()
@@ -2821,7 +4413,7 @@ async fn main() -> Result<()> {
     let access_log_shutdown = access_log.clone();
     let stream_access_log = access_log.clone();
     // 管理/观测面(独立内网监听:/healthz /readyz;端口与数据面隔离,§14.1)。
-    // 监听在启动期绑定,失败即 fatal(据 Codex 审查记录 P2#1:健康端点是容器部署关键依赖);
+    // 监听在启动期绑定，失败即 fatal；健康端点是容器部署关键依赖，不能静默缺席。
     // 之后的 accept 循环若 runtime 出错,不影响数据面转发。
     let admin_listener = TcpListener::bind(admin_listen)
         .await
@@ -2847,13 +4439,14 @@ async fn main() -> Result<()> {
             interface_disable: interface_disable.clone(),
             http_cache: http_cache.clone(),
             audit: admin_audit,
+            #[cfg(feature = "xds-client")]
+            xds_status: xds_status.clone(),
         },
     );
     // V8:proxy 构造在 admin serve 之后,提前留一份句柄以便把边缘订阅索引注入
     // /metrics 渲染;未编 feature 时零残留。
     #[cfg(feature = "grpc-edge")]
     let admin_state_for_edge = admin_state.clone();
-    tokio::spawn(admin::serve(admin_listener, admin_state));
 
     // 代理(持有原子快照 + 常驻上游连接池 + 长连接注册表 + 主动健康检查器)。
     let proxy = GatewayProxy::new(
@@ -2983,6 +4576,8 @@ async fn main() -> Result<()> {
         snap: snap.clone(),
         proxy: proxy.clone(),
         connection_budget: Arc::new(ConnectionBudget::default()),
+        #[cfg(feature = "http3")]
+        http3_peer_connection_budget: Arc::new(Http3PeerConnectionBudget::default()),
         active_connections: active_connections.clone(),
         metrics: metrics.clone(),
     };
@@ -2994,6 +4589,10 @@ async fn main() -> Result<()> {
         active_connections: active_connections.clone(),
         metrics: metrics.clone(),
         access_log: stream_access_log,
+        #[cfg(feature = "mqtt-governance")]
+        mqtt_connections: MqttConnectionBudget::default(),
+        #[cfg(feature = "kafka-governance")]
+        kafka_connections: KafkaConnectionBudget::default(),
     };
 
     let mut bound_proxies = Vec::with_capacity(initial_proxies.len());
@@ -3011,30 +4610,64 @@ async fn main() -> Result<()> {
     std::fs::write(&pf, std::process::id().to_string())
         .with_context(|| format!("write pidfile {}", pf.display()))?;
 
-    let pending_tls = Arc::new(AtomicU64::new(
-        bound_proxies
-            .iter()
-            .filter(|bound| {
-                bound
-                    .tls
-                    .as_ref()
-                    .is_some_and(|tls| matches!(&tls.mode, BoundTlsMode::Deferred(_)))
-            })
-            .count() as u64,
-    ));
+    let deferred_tls = DeferredTlsReadiness {
+        pending: Arc::new(AtomicU64::new(0)),
+        ready: ready.clone(),
+        stopping: Arc::new(AtomicBool::new(false)),
+    };
+    // ACME 的 provider 与分布式锁也属于候选资源：启动 generation 前完整 prepare，避免 listener
+    // 已开放后才发现续期权威不可用。真正签发任务要等 HTTP listener 激活后再启动。
+    let initial_acme = if run_mode.runs_data() {
+        Some(
+            gateway::acme::prepare_acme_workers(
+                initial_proxies.iter().filter_map(|proxy| proxy.tls.clone()),
+                runtime_state_cfg.clone(),
+                proxy.acme_http01_store(),
+            )
+            .await
+            .context("prepare initial ACME workers")?,
+        )
+    } else {
+        None
+    };
     let listener_supervisor = Arc::new(ListenerSupervisor::new(
         data_plane,
         stream_plane,
-        pending_tls.clone(),
-        ready.clone(),
+        admin_state,
+        proxy.acme_http01_store(),
+        run_mode.runs_data(),
+        deferred_tls.clone(),
     ));
     let initial_snapshot = snap.load_full();
     let (proxy_log, stream_log) = listener_supervisor.install_initial(
         initial_snapshot.as_ref(),
         bound_proxies,
         bound_streams,
+        admin_listener,
+        admin_listen,
+        initial_acme,
     );
     drop(initial_snapshot);
+
+    #[cfg(feature = "xds-client")]
+    if let Some((xds_cfg, specs)) = xds_bootstrap {
+        gateway::xds::start_with_snapshot_status(
+            xds_cfg,
+            specs,
+            dynamic_upstreams.clone(),
+            gateway::xds::XdsSnapshotRuntime {
+                snap: snap.clone(),
+                version: version.clone(),
+                apply_coordinator: apply_coordinator.clone(),
+                cfg_path: cfg_path.clone(),
+                listener_topology: Some(listener_supervisor.clone()),
+            },
+            xds_status
+                .as_ref()
+                .expect("enabled xDS has a pre-created status")
+                .clone(),
+        );
+    }
 
     // listener 已进入 supervisor 后再启动唯一 reload worker；从此数据面拓扑也遵守
     // bind/build → ArcSwap publish → accept generation handoff 的同一事务边界。
@@ -3043,6 +4676,7 @@ async fn main() -> Result<()> {
         snap.clone(),
         version.clone(),
         reload::ReloadRuntime {
+            apply_coordinator: apply_coordinator.clone(),
             dynamic_upstreams: dynamic_upstreams.clone(),
             discovery: discovery.clone(),
             rate_limiter: rate_limiter.clone(),
@@ -3054,41 +4688,37 @@ async fn main() -> Result<()> {
             interface_disable: interface_disable.clone(),
             conn_registry: conn_registry.clone(),
             proxy: Some(proxy.clone()),
-            listener_topology: if run_mode.runs_data() {
-                Some(listener_supervisor.clone())
-            } else {
-                None
-            },
+            sidecar_mode: run_mode.is_sidecar(),
+            listener_topology: Some(listener_supervisor.clone()),
         },
         config_history.clone(),
         reload_cfg,
     );
     // Kubernetes 对象只在后台编译成物化候选，并通过上面的唯一 reload worker 发布。
     gateway::kubernetes_routes::spawn_controller(snap.clone(), cfg_path.clone(), reload_handle);
-    // HTTP listeners 已开始服务后再启动 ACME：CA 在 `set_ready` 后才能命中 HTTP-01 临时响应。
-    // ACME 配置属于 bootstrap 拓扑，reload 不会悄悄留下旧 worker；签发成功写 cert/key 后由既有 watcher 热换。
-    let acme_workers = if run_mode.runs_data() {
-        gateway::acme::spawn_acme_workers(
-            initial_proxies.iter().filter_map(|proxy| proxy.tls.clone()),
-            runtime_state_cfg.clone(),
-            proxy.acme_http01_store(),
-        )
-        .await
-        .context("start ACME workers")?
-    } else {
-        0
-    };
-    if acme_workers > 0 {
-        info!(workers = acme_workers, "ACME certificate workers started");
-    }
     // 无 seed ACME 首签期间 TLS socket 虽已绑定但尚不 accept；readiness 必须保持 503，避免 LB
     // 把业务流量送到只有 challenge 能力的半就绪节点。最后一个 deferred listener 激活时会置 true。
-    if pending_tls.load(Ordering::Acquire) == 0 {
+    if deferred_tls.pending.load(Ordering::Acquire) == 0 {
         ready.store(true, Ordering::Release);
     }
     // V4 网关节点自注册:后台只感知快照变化并写注册中心,请求热路径不访问 Nacos。
+    #[cfg(feature = "xds-client")]
+    let registration_control_ready: Arc<dyn Fn() -> bool + Send + Sync> = match &xds_status {
+        Some(status) => {
+            let status = status.clone();
+            Arc::new(move || status.ready())
+        }
+        None => Arc::new(|| true),
+    };
+    #[cfg(not(feature = "xds-client"))]
+    let registration_control_ready: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
     let self_registration = run_mode.runs_data().then(|| {
-        GatewaySelfRegistration::spawn(snap.clone(), ready.clone(), active_health.clone())
+        GatewaySelfRegistration::spawn(
+            snap.clone(),
+            ready.clone(),
+            active_health.clone(),
+            registration_control_ready,
+        )
     });
     info!(
         proxies = %proxy_log.join(","),
@@ -3148,13 +4778,27 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// 在 listener two-phase prepare 阶段绑定一个 proxy 的全部 transport。
+///
+/// 业务作用：只有明文 TCP、TLS TCP 和可选 QUIC UDP 全部绑定且证书可构建时才返回候选，任何
+/// 一项失败都会阻止快照发布，避免同一逻辑入口出现协议能力分裂。
+///
+/// 参数说明：`proxy` 是候选快照中已完成语义校验的 listener 运行配置。
+///
+/// 返回：成功时返回等待 commit 的 socket 集；失败时释放本次 prepare 已绑定资源并保留旧代。
 async fn bind_proxy(proxy: &ProxyRuntime) -> Result<BoundProxy> {
     let listen: SocketAddr = proxy
         .listen
         .parse()
         .with_context(|| format!("invalid proxy `{}` listen `{}`", proxy.id, proxy.listen))?;
-    let listener = bind_reuseport_tcp(listen)
-        .with_context(|| format!("bind proxy `{}` listen {listen}", proxy.id))?;
+    let listener = if proxy.plain_enabled {
+        Some(
+            bind_reuseport_tcp(listen)
+                .with_context(|| format!("bind proxy `{}` listen {listen}", proxy.id))?,
+        )
+    } else {
+        None
+    };
     let tls = match &proxy.tls {
         Some(tls_cfg) => {
             let tls_listen: SocketAddr = tls_cfg.listen.parse().with_context(|| {
@@ -3167,33 +4811,69 @@ async fn bind_proxy(proxy: &ProxyRuntime) -> Result<BoundProxy> {
             // 并且签发后无法在同一进程安全激活 listener。
             let tls_listener = bind_reuseport_tcp(tls_listen)
                 .with_context(|| format!("bind proxy `{}` tls.listen {tls_listen}", proxy.id))?;
-            let mode = if tls_cfg.acme.as_ref().is_some_and(|acme| {
-                acme.bootstrap_without_seed
-                    && (!tls_cfg.cert_file.is_file() || !tls_cfg.key_file.is_file())
-            }) {
+            let mode = if tls_cfg.in_memory.is_none()
+                && tls_cfg.acme.as_ref().is_some_and(|acme| {
+                    acme.bootstrap_without_seed
+                        && (!tls_cfg.cert_file.is_file() || !tls_cfg.key_file.is_file())
+                }) {
                 warn!(proxy = %proxy.id, %tls_listen, "ACME bootstrap: seed certificate missing; TLS socket bound and awaiting first issuance");
-                BoundTlsMode::Deferred(Box::new(tls_cfg.clone()))
+                BoundTlsMode::Deferred
             } else {
                 let server_config = build_server_config(tls_cfg).with_context(|| {
                     format!("build initial tls server config for proxy `{}`", proxy.id)
                 })?;
                 let shared_tls: SharedServerConfig = Arc::new(ArcSwap::new(server_config));
-                spawn_cert_watcher(tls_cfg.clone(), shared_tls.clone());
                 BoundTlsMode::Ready(shared_tls)
             };
             Some(BoundTlsProxy {
                 listen: tls_listen,
                 listener: tls_listener,
+                runtime: tls_cfg.clone(),
                 mode,
             })
         }
         None => None,
+    };
+    #[cfg(feature = "http3")]
+    let http3 = if proxy.http3.enabled {
+        let tls_cfg = proxy
+            .tls
+            .as_ref()
+            .expect("HTTP/3 TLS presence was validated during snapshot build");
+        let h3_listen: SocketAddr = tls_cfg.listen.parse().with_context(|| {
+            format!(
+                "invalid proxy `{}` HTTP/3 tls.listen `{}`",
+                proxy.id, tls_cfg.listen
+            )
+        })?;
+        // 首版不允许 QUIC 在 ACME 无 seed 阶段静默缺席；需要等证书完整落盘再 reload，保证
+        // TCP TLS 与 UDP H3 在同一次 two-phase commit 中共同可服务。
+        anyhow::ensure!(
+            tls_cfg.cert_file.is_file() && tls_cfg.key_file.is_file(),
+            "proxy `{}` HTTP/3 requires an installed TLS keypair before listener activation",
+            proxy.id
+        );
+        let socket = bind_reuseport_udp(h3_listen)
+            .with_context(|| format!("bind proxy `{}` HTTP/3 UDP {h3_listen}", proxy.id))?
+            .into_std()
+            .context("convert HTTP/3 UDP socket for Quinn")?;
+        let endpoint = gateway::http3::build_server_endpoint(tls_cfg, &proxy.http3, socket)
+            .with_context(|| format!("build proxy `{}` HTTP/3 endpoint", proxy.id))?;
+        Some(BoundHttp3Proxy {
+            listen: h3_listen,
+            endpoint,
+            runtime: proxy.http3.clone(),
+        })
+    } else {
+        None
     };
     Ok(BoundProxy {
         id: proxy.id.clone(),
         listen,
         listener,
         tls,
+        #[cfg(feature = "http3")]
+        http3,
     })
 }
 
@@ -3219,8 +4899,10 @@ async fn bind_stream(stream: &StreamRuntime) -> Result<BoundStream> {
             let config = build_server_config(tls)
                 .with_context(|| format!("build stream `{}` TLS config", stream.id))?;
             let shared: SharedServerConfig = Arc::new(ArcSwap::new(config));
-            spawn_cert_watcher(tls.clone(), shared.clone());
-            Ok::<_, anyhow::Error>(shared)
+            Ok::<_, anyhow::Error>(BoundStreamTls {
+                runtime: tls.clone(),
+                config: shared,
+            })
         })
         .transpose()?;
     Ok(BoundStream {

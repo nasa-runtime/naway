@@ -104,6 +104,15 @@ pub(crate) enum ExternalPluginMetric {
     InvalidInput,
 }
 
+/// LLM external moderation 的固定终态；endpoint、model、route 与 prompt 不进入 label。
+#[derive(Clone, Copy)]
+pub(crate) enum LlmModerationMetric {
+    Allowed,
+    Blocked,
+    FailOpen,
+    Error,
+}
+
 /// V7 Usage Plan 的固定数据面结果；consumer、plan、route 均不进入 label。
 #[derive(Clone, Copy)]
 pub(crate) enum UsagePlanMetric {
@@ -172,6 +181,10 @@ pub struct Metrics {
     upstream_retry_status_total: AtomicU64,
     upstream_retry_error_total: AtomicU64,
     upstream_retry_exhausted_total: AtomicU64,
+    upstream_hedge_started_total: AtomicU64,
+    upstream_hedge_primary_won_total: AtomicU64,
+    upstream_hedge_secondary_won_total: AtomicU64,
+    upstream_hedge_failed_total: AtomicU64,
     /// `limits.upstream_pending_limit` 已满而快速拒绝的请求总数。
     upstream_overloaded_total: AtomicU64,
     interface_blocked_total: AtomicU64,
@@ -187,6 +200,10 @@ pub struct Metrics {
     llm_cache_exact_l2_hits_total: AtomicU64,
     llm_cache_semantic_l1_hits_total: AtomicU64,
     llm_cache_semantic_l2_hits_total: AtomicU64,
+    llm_moderation_allowed_total: AtomicU64,
+    llm_moderation_blocked_total: AtomicU64,
+    llm_moderation_fail_open_total: AtomicU64,
+    llm_moderation_error_total: AtomicU64,
     acl_denied_total: AtomicU64,
     blacklist_denied_total: AtomicU64,
     ext_authz_allowed_total: AtomicU64,
@@ -310,6 +327,47 @@ pub struct Metrics {
     stream_udp_downstream_datagrams_total: AtomicU64,
     stream_udp_upstream_datagrams_total: AtomicU64,
     stream_udp_dropped_datagrams_total: AtomicU64,
+    /// MQTT 协议治理只进入 feature 制品；方向和违规原因都是固定集。
+    #[cfg(feature = "mqtt-governance")]
+    stream_mqtt_downstream_packets_total: AtomicU64,
+    #[cfg(feature = "mqtt-governance")]
+    stream_mqtt_upstream_packets_total: AtomicU64,
+    #[cfg(feature = "mqtt-governance")]
+    stream_mqtt_rejections_total: [AtomicU64; 5],
+    /// Kafka 协议治理只进入 feature 制品；方向和违规原因均为固定集。
+    #[cfg(feature = "kafka-governance")]
+    stream_kafka_downstream_frames_total: AtomicU64,
+    #[cfg(feature = "kafka-governance")]
+    stream_kafka_upstream_frames_total: AtomicU64,
+    #[cfg(feature = "kafka-governance")]
+    stream_kafka_rejections_total: [AtomicU64; 5],
+    /// V9 QUIC/H3 只在 `http3` 制品中存在；结果集合固定，不将 IP/SNI/route 写入 label。
+    #[cfg(feature = "http3")]
+    quic_connections_active: AtomicU64,
+    #[cfg(feature = "http3")]
+    quic_handshake_success_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    quic_handshake_error_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    quic_handshake_retry_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    quic_handshake_rejected_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    quic_migrations_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    http3_requests_success_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    http3_requests_error_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    http3_streams_active: AtomicU64,
+    #[cfg(feature = "http3")]
+    upstream_http3_connections_active: AtomicU64,
+    #[cfg(feature = "http3")]
+    upstream_http3_connections_created_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    upstream_http3_connection_errors_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    upstream_http3_goaway_total: AtomicU64,
     /// 主动健康探测当前判定为不健康的上游实例数(§5.1);后台探测任务每轮刷新。
     active_health_unhealthy: AtomicU64,
     /// 主动健康探测累计:可达次数(§5.1 / N5)。
@@ -348,6 +406,11 @@ struct LlmMetricStats {
 }
 
 impl Default for Metrics {
+    /// 业务作用：创建全部低基数计数器为零的进程级 metrics 容器，feature 指标只进对应制品。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：可供数据面并发更新的空 metrics 集；不创建后台任务或高基数表项。
     fn default() -> Self {
         Self {
             requests_total: ShardedCounter::default(),
@@ -364,6 +427,10 @@ impl Default for Metrics {
             upstream_retry_status_total: AtomicU64::new(0),
             upstream_retry_error_total: AtomicU64::new(0),
             upstream_retry_exhausted_total: AtomicU64::new(0),
+            upstream_hedge_started_total: AtomicU64::new(0),
+            upstream_hedge_primary_won_total: AtomicU64::new(0),
+            upstream_hedge_secondary_won_total: AtomicU64::new(0),
+            upstream_hedge_failed_total: AtomicU64::new(0),
             upstream_overloaded_total: AtomicU64::new(0),
             interface_blocked_total: AtomicU64::new(0),
             no_route_total: AtomicU64::new(0),
@@ -374,6 +441,10 @@ impl Default for Metrics {
             llm_cache_exact_l2_hits_total: AtomicU64::new(0),
             llm_cache_semantic_l1_hits_total: AtomicU64::new(0),
             llm_cache_semantic_l2_hits_total: AtomicU64::new(0),
+            llm_moderation_allowed_total: AtomicU64::new(0),
+            llm_moderation_blocked_total: AtomicU64::new(0),
+            llm_moderation_fail_open_total: AtomicU64::new(0),
+            llm_moderation_error_total: AtomicU64::new(0),
             acl_denied_total: AtomicU64::new(0),
             blacklist_denied_total: AtomicU64::new(0),
             ext_authz_allowed_total: AtomicU64::new(0),
@@ -477,6 +548,44 @@ impl Default for Metrics {
             stream_udp_downstream_datagrams_total: AtomicU64::new(0),
             stream_udp_upstream_datagrams_total: AtomicU64::new(0),
             stream_udp_dropped_datagrams_total: AtomicU64::new(0),
+            #[cfg(feature = "mqtt-governance")]
+            stream_mqtt_downstream_packets_total: AtomicU64::new(0),
+            #[cfg(feature = "mqtt-governance")]
+            stream_mqtt_upstream_packets_total: AtomicU64::new(0),
+            #[cfg(feature = "mqtt-governance")]
+            stream_mqtt_rejections_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            #[cfg(feature = "kafka-governance")]
+            stream_kafka_downstream_frames_total: AtomicU64::new(0),
+            #[cfg(feature = "kafka-governance")]
+            stream_kafka_upstream_frames_total: AtomicU64::new(0),
+            #[cfg(feature = "kafka-governance")]
+            stream_kafka_rejections_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            #[cfg(feature = "http3")]
+            quic_connections_active: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            quic_handshake_success_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            quic_handshake_error_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            quic_handshake_retry_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            quic_handshake_rejected_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            quic_migrations_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            http3_requests_success_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            http3_requests_error_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            http3_streams_active: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            upstream_http3_connections_active: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            upstream_http3_connections_created_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            upstream_http3_connection_errors_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            upstream_http3_goaway_total: AtomicU64::new(0),
             active_health_unhealthy: AtomicU64::new(0),
             active_health_probe_ok: AtomicU64::new(0),
             active_health_probe_fail: AtomicU64::new(0),
@@ -544,6 +653,40 @@ impl Metrics {
     /// 记录一次重试预算或候选实例耗尽。
     pub fn inc_upstream_retry_exhausted(&self) {
         self.upstream_retry_exhausted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一次真正启动了第二实例副本的 hedge；仅配置存在但主请求提前成功不计数。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；低基数总量增加。
+    pub fn inc_upstream_hedge_started(&self) {
+        self.upstream_hedge_started_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录已启动副本后的首个成功响应来自主 attempt 还是副本 attempt。
+    ///
+    /// 参数说明：`secondary` 为 true 表示第二实例副本获胜，false 表示主请求获胜。
+    ///
+    /// 返回：无；对应固定 winner 计数增加。
+    pub fn inc_upstream_hedge_winner(&self, secondary: bool) {
+        let counter = if secondary {
+            &self.upstream_hedge_secondary_won_total
+        } else {
+            &self.upstream_hedge_primary_won_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录主、副两个 hedge attempt 都未得到非 5xx 响应的请求。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；低基数失败总量增加。
+    pub fn inc_upstream_hedge_failed(&self) {
+        self.upstream_hedge_failed_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -660,6 +803,21 @@ impl Metrics {
             (false, true) => &self.llm_cache_exact_l2_hits_total,
             (true, false) => &self.llm_cache_semantic_l1_hits_total,
             (true, true) => &self.llm_cache_semantic_l2_hits_total,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录 external moderation 的固定终态，供安全告警区分放行、拦截与依赖降级。
+    ///
+    /// 参数说明：`result` 是内部固定枚举，不携带请求或配置动态值。
+    ///
+    /// 返回：无；对应单调计数器增加一次。
+    pub(crate) fn inc_llm_moderation(&self, result: LlmModerationMetric) {
+        match result {
+            LlmModerationMetric::Allowed => &self.llm_moderation_allowed_total,
+            LlmModerationMetric::Blocked => &self.llm_moderation_blocked_total,
+            LlmModerationMetric::FailOpen => &self.llm_moderation_fail_open_total,
+            LlmModerationMetric::Error => &self.llm_moderation_error_total,
         }
         .fetch_add(1, Ordering::Relaxed);
     }
@@ -1094,6 +1252,211 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 业务作用：累加 MQTT 状态机已成功转发的固定方向 packet，不使用 topic/client label。
+    ///
+    /// 参数说明：`downstream_to_upstream`/`upstream_to_downstream` 是本次会话新增 packet 数。
+    ///
+    /// 返回：无；两个单调计数器分别累加。
+    #[cfg(feature = "mqtt-governance")]
+    pub fn add_stream_mqtt_packets(
+        &self,
+        downstream_to_upstream: u64,
+        upstream_to_downstream: u64,
+    ) {
+        self.stream_mqtt_downstream_packets_total
+            .fetch_add(downstream_to_upstream, Ordering::Relaxed);
+        self.stream_mqtt_upstream_packets_total
+            .fetch_add(upstream_to_downstream, Ordering::Relaxed);
+    }
+
+    /// 业务作用：按固定 MQTT 违规类型记录断连，让 ACL/畸形/资源攻击可区分且无高基数。
+    ///
+    /// 参数说明：`kind` 是编译期固定的五类违规之一。
+    ///
+    /// 返回：无；对应分类计数器增加一。
+    #[cfg(feature = "mqtt-governance")]
+    pub fn inc_stream_mqtt_rejection(&self, kind: crate::mqtt::MqttViolationKind) {
+        let index = match kind {
+            crate::mqtt::MqttViolationKind::Malformed => 0,
+            crate::mqtt::MqttViolationKind::Protocol => 1,
+            crate::mqtt::MqttViolationKind::NotAuthorized => 2,
+            crate::mqtt::MqttViolationKind::PacketTooLarge => 3,
+            crate::mqtt::MqttViolationKind::ResourceLimit => 4,
+        };
+        self.stream_mqtt_rejections_total[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：累加 Kafka 状态机已成功转发的固定方向 frame，不使用 API/topic/client label。
+    ///
+    /// 参数说明：`downstream_to_upstream`/`upstream_to_downstream` 是本次会话新增 frame 数。
+    ///
+    /// 返回：无；两个单调计数器分别累加。
+    #[cfg(feature = "kafka-governance")]
+    pub fn add_stream_kafka_frames(
+        &self,
+        downstream_to_upstream: u64,
+        upstream_to_downstream: u64,
+    ) {
+        self.stream_kafka_downstream_frames_total
+            .fetch_add(downstream_to_upstream, Ordering::Relaxed);
+        self.stream_kafka_upstream_frames_total
+            .fetch_add(upstream_to_downstream, Ordering::Relaxed);
+    }
+
+    /// 业务作用：按固定 Kafka 违规类型记录断连，使授权、畸形和资源攻击可区分且无高基数。
+    ///
+    /// 参数说明：`kind` 是编译期固定的五类违规之一。
+    ///
+    /// 返回：无；对应分类计数器增加一。
+    #[cfg(feature = "kafka-governance")]
+    pub fn inc_stream_kafka_rejection(&self, kind: crate::kafka::KafkaViolationKind) {
+        let index = match kind {
+            crate::kafka::KafkaViolationKind::Malformed => 0,
+            crate::kafka::KafkaViolationKind::Protocol => 1,
+            crate::kafka::KafkaViolationKind::NotAuthorized => 2,
+            crate::kafka::KafkaViolationKind::FrameTooLarge => 3,
+            crate::kafka::KafkaViolationKind::ResourceLimit => 4,
+        };
+        self.stream_kafka_rejections_total[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一条已完成握手、正在服务的下游 QUIC connection。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；同时增加握手成功累计与活跃连接 gauge。
+    #[cfg(feature = "http3")]
+    pub fn inc_quic_connection(&self) {
+        self.quic_handshake_success_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.quic_connections_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：在 QUIC connection 完整退出时归还活跃 gauge。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；只减少当前值，不改写累计握手结果。
+    #[cfg(feature = "http3")]
+    pub fn dec_quic_connection(&self) {
+        self.quic_connections_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录 QUIC 握手或 H3 初始化失败。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；固定 `result=error` 计数增加。
+    #[cfg(feature = "http3")]
+    pub fn inc_quic_handshake_error(&self) {
+        self.quic_handshake_error_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一次因地址验证策略发出的 QUIC Retry。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；固定 `result=retry` 计数增加。
+    #[cfg(feature = "http3")]
+    pub fn inc_quic_handshake_retry(&self) {
+        self.quic_handshake_retry_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一次在创建握手 task 前被资源硬门拒绝的 Initial。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；固定 `result=rejected` 计数增加。
+    #[cfg(feature = "http3")]
+    pub fn inc_quic_handshake_rejected(&self) {
+        self.quic_handshake_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：每条 connection 首次观察到对端地址变化时记录一次 QUIC migration。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；不使用 IP/connection id 作 label。
+    #[cfg(feature = "http3")]
+    pub fn inc_quic_migration(&self) {
+        self.quic_migrations_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：在 H3 request stream 进入统一代理管线前增加活跃 stream gauge。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无。
+    #[cfg(feature = "http3")]
+    pub fn inc_http3_stream(&self) {
+        self.http3_streams_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：在 H3 request stream 退出时归还 gauge 并记录固定成功/失败结果。
+    ///
+    /// 参数说明：`success` 表示响应已完整写出 FIN。
+    ///
+    /// 返回：无。
+    #[cfg(feature = "http3")]
+    pub fn finish_http3_stream(&self, success: bool) {
+        self.http3_streams_active.fetch_sub(1, Ordering::Relaxed);
+        let counter = if success {
+            &self.http3_requests_success_total
+        } else {
+            &self.http3_requests_error_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一条新建且可多路复用的上游 H3 connection。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；同时更新 created counter 与 active gauge。
+    #[cfg(feature = "http3")]
+    pub fn inc_upstream_http3_connection(&self) {
+        self.upstream_http3_connections_created_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.upstream_http3_connections_active
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：上游 H3 connection generation 完整释放时归还 active gauge。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无。
+    #[cfg(feature = "http3")]
+    pub fn dec_upstream_http3_connection(&self) {
+        self.upstream_http3_connections_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一次上游 H3 DNS/TLS/QUIC/H3 连接或运行错误。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无。
+    #[cfg(feature = "http3")]
+    pub fn inc_upstream_http3_connection_error(&self) {
+        self.upstream_http3_connection_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录上游 H3 driver 进入 GOAWAY/close 换代边界。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无。
+    #[cfg(feature = "http3")]
+    pub fn inc_upstream_http3_goaway(&self) {
+        self.upstream_http3_goaway_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// 记录 L4 stream 双向转发字节数。
     ///
     /// # 参数
@@ -1139,7 +1502,12 @@ impl Metrics {
             .store(budgets as u64, Ordering::Relaxed);
     }
 
-    /// 将当前快照和低基数运行态渲染成 Prometheus text exposition。
+    /// 业务作用：将当前快照和低基数运行态渲染成 Prometheus text exposition，不暴露租户、
+    /// topic、client id 或 upstream URI。
+    ///
+    /// 参数说明：`config_version` 是已发布快照版本；`upstream_services` 是当前低基数服务数。
+    ///
+    /// 返回：完整 Prometheus text；读取为弱一致快照，不阻塞数据面更新。
     pub fn render_prometheus(&self, config_version: u64, upstream_services: usize) -> String {
         let lines = [
             ("gw_requests_total", self.requests_total.load()),
@@ -1171,6 +1539,24 @@ impl Metrics {
             (
                 "gw_upstream_retry_exhausted_total",
                 self.upstream_retry_exhausted_total.load(Ordering::Relaxed),
+            ),
+            (
+                "gw_upstream_hedge_started_total",
+                self.upstream_hedge_started_total.load(Ordering::Relaxed),
+            ),
+            (
+                "gw_upstream_hedge_primary_won_total",
+                self.upstream_hedge_primary_won_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "gw_upstream_hedge_secondary_won_total",
+                self.upstream_hedge_secondary_won_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "gw_upstream_hedge_failed_total",
+                self.upstream_hedge_failed_total.load(Ordering::Relaxed),
             ),
             (
                 "gw_interface_blocked_total",
@@ -1278,6 +1664,149 @@ impl Metrics {
             self.stream_udp_dropped_datagrams_total
                 .load(Ordering::Relaxed),
         );
+        #[cfg(feature = "mqtt-governance")]
+        {
+            out.push_str(
+                "# HELP gw_stream_mqtt_packets_total MQTT packets forwarded by fixed direction.\n",
+            );
+            out.push_str("# TYPE gw_stream_mqtt_packets_total counter\n");
+            out.push_str(&format!(
+                "gw_stream_mqtt_packets_total{{direction=\"downstream_to_upstream\"}} {}\n",
+                self.stream_mqtt_downstream_packets_total
+                    .load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!(
+                "gw_stream_mqtt_packets_total{{direction=\"upstream_to_downstream\"}} {}\n",
+                self.stream_mqtt_upstream_packets_total
+                    .load(Ordering::Relaxed)
+            ));
+            out.push_str("# HELP gw_stream_mqtt_rejections_total MQTT session terminations by fixed reason.\n");
+            out.push_str("# TYPE gw_stream_mqtt_rejections_total counter\n");
+            for (index, reason) in [
+                "malformed",
+                "protocol",
+                "not_authorized",
+                "packet_too_large",
+                "resource_limit",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                out.push_str(&format!(
+                    "gw_stream_mqtt_rejections_total{{reason=\"{reason}\"}} {}\n",
+                    self.stream_mqtt_rejections_total[index].load(Ordering::Relaxed)
+                ));
+            }
+        }
+        #[cfg(feature = "kafka-governance")]
+        {
+            out.push_str(
+                "# HELP gw_stream_kafka_frames_total Kafka frames forwarded by fixed direction.\n",
+            );
+            out.push_str("# TYPE gw_stream_kafka_frames_total counter\n");
+            out.push_str(&format!(
+                "gw_stream_kafka_frames_total{{direction=\"downstream_to_upstream\"}} {}\n",
+                self.stream_kafka_downstream_frames_total
+                    .load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!(
+                "gw_stream_kafka_frames_total{{direction=\"upstream_to_downstream\"}} {}\n",
+                self.stream_kafka_upstream_frames_total
+                    .load(Ordering::Relaxed)
+            ));
+            out.push_str("# HELP gw_stream_kafka_rejections_total Kafka session terminations by fixed reason.\n");
+            out.push_str("# TYPE gw_stream_kafka_rejections_total counter\n");
+            for (index, reason) in [
+                "malformed",
+                "protocol",
+                "not_authorized",
+                "frame_too_large",
+                "resource_limit",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                out.push_str(&format!(
+                    "gw_stream_kafka_rejections_total{{reason=\"{reason}\"}} {}\n",
+                    self.stream_kafka_rejections_total[index].load(Ordering::Relaxed)
+                ));
+            }
+        }
+        #[cfg(feature = "http3")]
+        {
+            render_gauge(
+                &mut out,
+                "gw_quic_connections_active",
+                self.quic_connections_active.load(Ordering::Relaxed),
+            );
+            out.push_str("# HELP gw_quic_handshakes_total QUIC handshakes by fixed result.\n");
+            out.push_str("# TYPE gw_quic_handshakes_total counter\n");
+            for (result, value) in [
+                (
+                    "success",
+                    self.quic_handshake_success_total.load(Ordering::Relaxed),
+                ),
+                (
+                    "error",
+                    self.quic_handshake_error_total.load(Ordering::Relaxed),
+                ),
+                (
+                    "retry",
+                    self.quic_handshake_retry_total.load(Ordering::Relaxed),
+                ),
+                (
+                    "rejected",
+                    self.quic_handshake_rejected_total.load(Ordering::Relaxed),
+                ),
+            ] {
+                out.push_str(&format!(
+                    "gw_quic_handshakes_total{{result=\"{result}\"}} {value}\n"
+                ));
+            }
+            render_counter(
+                &mut out,
+                "gw_quic_migrations_total",
+                self.quic_migrations_total.load(Ordering::Relaxed),
+            );
+            render_gauge(
+                &mut out,
+                "gw_http3_streams_active",
+                self.http3_streams_active.load(Ordering::Relaxed),
+            );
+            out.push_str("# HELP gw_http3_requests_total HTTP/3 requests by fixed result.\n");
+            out.push_str("# TYPE gw_http3_requests_total counter\n");
+            out.push_str(&format!(
+                "gw_http3_requests_total{{result=\"success\"}} {}\n",
+                self.http3_requests_success_total.load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!(
+                "gw_http3_requests_total{{result=\"error\"}} {}\n",
+                self.http3_requests_error_total.load(Ordering::Relaxed)
+            ));
+            render_gauge(
+                &mut out,
+                "gw_upstream_http3_connections_active",
+                self.upstream_http3_connections_active
+                    .load(Ordering::Relaxed),
+            );
+            render_counter(
+                &mut out,
+                "gw_upstream_http3_connections_created_total",
+                self.upstream_http3_connections_created_total
+                    .load(Ordering::Relaxed),
+            );
+            render_counter(
+                &mut out,
+                "gw_upstream_http3_connection_errors_total",
+                self.upstream_http3_connection_errors_total
+                    .load(Ordering::Relaxed),
+            );
+            render_counter(
+                &mut out,
+                "gw_upstream_http3_goaway_total",
+                self.upstream_http3_goaway_total.load(Ordering::Relaxed),
+            );
+        }
         render_gauge(&mut out, "gw_config_version", config_version);
         render_gauge(&mut out, "gw_upstream_services", upstream_services as u64);
         render_gauge(
@@ -1878,6 +2407,34 @@ fn render_llm_metrics(out: &mut String, metrics: &Metrics) {
         "# HELP gw_llm_cache_hit_total LLM exact or semantic cache hits by local/Redis tier.\n",
     );
     out.push_str("# TYPE gw_llm_cache_hit_total counter\n");
+    out.push_str(
+        "# HELP gw_llm_moderation_total External moderation decisions by bounded result.\n",
+    );
+    out.push_str("# TYPE gw_llm_moderation_total counter\n");
+    for (result, value) in [
+        (
+            "allowed",
+            metrics.llm_moderation_allowed_total.load(Ordering::Relaxed),
+        ),
+        (
+            "blocked",
+            metrics.llm_moderation_blocked_total.load(Ordering::Relaxed),
+        ),
+        (
+            "fail_open",
+            metrics
+                .llm_moderation_fail_open_total
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "error",
+            metrics.llm_moderation_error_total.load(Ordering::Relaxed),
+        ),
+    ] {
+        out.push_str(&format!(
+            "gw_llm_moderation_total{{result=\"{result}\"}} {value}\n"
+        ));
+    }
     for (level, tier, value) in [
         (
             "exact",

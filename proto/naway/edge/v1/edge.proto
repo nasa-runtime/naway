@@ -71,6 +71,9 @@ message SubReq {}
 // 向后端补拉——网关不做重传。
 message FramePush {
   bytes payload = 1;
+  // latest_by_key 队列的有界合并键；网关只读取本字段，不解析 payload。
+  // 未配置 latest_by_key 时可省略；配置后空键在该订阅队列上按 drop_new 处理。
+  bytes coalesce_key = 2;
 }
 
 // 群播回执。

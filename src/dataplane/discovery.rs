@@ -4,7 +4,7 @@
 //! Consul/Eureka/DNS/Kubernetes, translate provider-neutral instances into gateway
 //! upstream instances, and publish immutable snapshots into [`DynamicUpstreamStore`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -212,21 +212,23 @@ pub struct GatewaySelfRegistration {
 }
 
 impl GatewaySelfRegistration {
-    /// 启动网关节点自注册后台任务。
+    /// 业务作用：启动网关节点自注册后台任务，并确保注册广告与所有 readiness 权威门一致。
     ///
-    /// # 参数
-    /// - `snap`: 当前配置快照指针,用于感知 self_register 配置热更。
-    /// - `ready`: listener/ACME 基础就绪状态。
-    /// - `active_health`: 与 `/readyz` 共用的 critical upstream 健康事实。
+    /// 参数说明：`snap` 感知配置热更；`ready`/`active_health`/`additional_ready` 分别提供
+    /// listener、关键上游和 xDS 等附加控制权门禁。
+    ///
+    /// 返回：持有后台 task 与当前 Nacos registration guard 的管理器。
     pub fn spawn(
         snap: Arc<ArcSwap<GatewaySnapshot>>,
         ready: Arc<AtomicBool>,
         active_health: Arc<crate::health::ActiveHealthChecker>,
+        additional_ready: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Self {
         let guard = Arc::new(AsyncMutex::new(None));
         let task_guard = guard.clone();
         let task = tokio::spawn(async move {
-            run_gateway_self_registration(snap, ready, active_health, task_guard).await;
+            run_gateway_self_registration(snap, ready, active_health, additional_ready, task_guard)
+                .await;
         });
         Self { guard, task }
     }
@@ -322,10 +324,17 @@ fn registration_action(
     }
 }
 
+/// 业务作用：持续把“真实可接流量”的本节点广告到 Nacos，并在任一 readiness 门关闭时注销。
+///
+/// 参数说明：`snap`/`ready`/`active_health`/`additional_ready` 共同形成有效就绪证据；`guard`
+/// 持有当前外部注册副作用，供换身份与停机补偿。
+///
+/// 返回：后台循环正常不返回；task 被取消时由上层显式注销残留 registration。
 async fn run_gateway_self_registration(
     snap: Arc<ArcSwap<GatewaySnapshot>>,
     ready: Arc<AtomicBool>,
     active_health: Arc<crate::health::ActiveHealthChecker>,
+    additional_ready: Arc<dyn Fn() -> bool + Send + Sync>,
     guard: Arc<AsyncMutex<Option<nasa::discovery::nacos::RegistrationGuard>>>,
 ) {
     let mut registered: Option<GatewayRegistrationSpec> = None;
@@ -335,6 +344,7 @@ async fn run_gateway_self_registration(
             current.as_ref(),
             ready.load(Ordering::Acquire),
             &active_health,
+            additional_ready(),
         ) {
             build_gateway_registration_spec(current.as_ref())
         } else {
@@ -442,12 +452,20 @@ async fn refresh_gateway_registration(
     Ok(())
 }
 
+/// 业务作用：统一 self-registration 与 `/readyz` 的 listener、控制权和关键上游门禁口径。
+///
+/// 参数说明：`snap`/`active_health` 计算关键依赖；两个 bool 分别表示 listener 与附加控制面门。
+///
+/// 返回：所有门禁同时通过时才允许对外广告节点。
 fn gateway_advertised_ready(
     snap: &GatewaySnapshot,
     listener_ready: bool,
     active_health: &crate::health::ActiveHealthChecker,
+    additional_ready: bool,
 ) -> bool {
-    listener_ready && crate::health::critical_upstreams_not_ready(snap, active_health).is_empty()
+    listener_ready
+        && additional_ready
+        && crate::health::critical_upstreams_not_ready(snap, active_health).is_empty()
 }
 
 async fn deregister_current_gateway(
@@ -1126,46 +1144,42 @@ async fn fetch_kubernetes(
         "{}/api/v1/namespaces/{encoded_namespace}/endpoints/{service}",
         cfg.api_server
     );
-    let mut request = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "application/json");
-    if !cfg.bearer_token.is_empty() {
-        request = request.bearer_auth(&cfg.bearer_token);
-    }
-    let value = fetch_bounded_json(request, cfg.max_response_bytes).await?;
-    if value.is_null() {
-        return Ok(Vec::new());
-    }
+    let value = fetch_kubernetes_object(client, cfg, url).await?;
+    let port_selector = match (spec.port_name.as_deref(), spec.port) {
+        (Some(name), _) => KubernetesEndpointPortSelector::Name(name.to_owned()),
+        (None, Some(port)) => {
+            resolve_kubernetes_service_port(client, cfg, namespace, &spec.registry_service, port)
+                .await?
+        }
+        (None, None) => KubernetesEndpointPortSelector::Single,
+    };
     let subsets = value
         .get("subsets")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    if subsets.is_empty() {
+        let selector = format!("kubernetes.io/service-name={}", spec.registry_service);
+        let encoded_selector =
+            percent_encoding::utf8_percent_encode(&selector, percent_encoding::NON_ALPHANUMERIC);
+        let slices_url = format!(
+            "{}/apis/discovery.k8s.io/v1/namespaces/{encoded_namespace}/endpointslices?labelSelector={encoded_selector}",
+            cfg.api_server
+        );
+        let slices = fetch_kubernetes_object(client, cfg, slices_url).await?;
+        if let Some(instances) =
+            parse_kubernetes_endpoint_slices(&slices, &port_selector, namespace, cfg.max_instances)?
+        {
+            return Ok(instances);
+        }
+    }
     let mut instances = Vec::new();
     for subset in subsets {
         let ports = subset
             .get("ports")
             .and_then(Value::as_array)
             .context("Kubernetes endpoint subset missing ports")?;
-        let port = if let Some(name) = spec.port_name.as_deref() {
-            ports
-                .iter()
-                .find(|port| string_field(port, "name").as_deref() == Some(name))
-                .and_then(|port| u16_field(port.get("port")))
-                .with_context(|| format!("Kubernetes endpoint has no port named `{name}`"))?
-        } else if let Some(number) = spec.port {
-            ports
-                .iter()
-                .find(|port| u16_field(port.get("port")) == Some(number))
-                .and_then(|port| u16_field(port.get("port")))
-                .with_context(|| format!("Kubernetes endpoint has no numeric port `{number}`"))?
-        } else {
-            anyhow::ensure!(
-                ports.len() == 1,
-                "Kubernetes endpoint has multiple ports; registry_port_name is required"
-            );
-            u16_field(ports[0].get("port")).context("Kubernetes endpoint port invalid")?
-        };
+        let port = select_kubernetes_endpoint_port(ports, &port_selector)?;
         let addresses = subset
             .get("addresses")
             .and_then(Value::as_array)
@@ -1199,6 +1213,215 @@ async fn fetch_kubernetes(
         }
     }
     Ok(instances)
+}
+
+/// 业务作用：解析 discovery.k8s.io/v1 EndpointSlice，为无 legacy Endpoints 的
+/// selectorless、headless 和新集群 Service 提供真实后端。
+///
+/// 参数说明：`value` 是按 service-name label 筛选后的 LIST；`port_selector` 已由
+/// Service port/targetPort 解析；`namespace` 进入低基数 metadata；`max_instances` 是硬上限。
+///
+/// 返回：API 不可用或 LIST 无对象时返回 None 以允许 legacy 结果；存在 slice 时返回
+/// 去重后的 ready、非 terminating 地址（可为空）；坏结构或超限返回错误并保留 LKG。
+fn parse_kubernetes_endpoint_slices(
+    value: &Value,
+    port_selector: &KubernetesEndpointPortSelector,
+    namespace: &str,
+    max_instances: usize,
+) -> anyhow::Result<Option<Vec<RegistryInstance>>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .context("Kubernetes EndpointSlice LIST missing items")?;
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let mut instances = Vec::new();
+    let mut seen = HashSet::new();
+    for slice in items {
+        let ports = slice
+            .get("ports")
+            .and_then(Value::as_array)
+            .context("Kubernetes EndpointSlice missing ports")?;
+        let port = match select_kubernetes_endpoint_port(ports, port_selector) {
+            Ok(port) => port,
+            Err(_) => continue,
+        };
+        // EndpointSlice 使用 omitempty；单栈集群中另一地址族的空 slice 会完全省略
+        // endpoints。这里必须把缺省视为空集合，否则一个合法空 slice 会连带屏蔽同组
+        // 已就绪地址，令整个 Service 错误进入无上游状态。
+        let endpoints = slice
+            .get("endpoints")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for endpoint in endpoints {
+            let ready = endpoint
+                .pointer("/conditions/ready")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let terminating = endpoint
+                .pointer("/conditions/terminating")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !ready || terminating {
+                continue;
+            }
+            let addresses = endpoint
+                .get("addresses")
+                .and_then(Value::as_array)
+                .context("Kubernetes EndpointSlice endpoint missing addresses")?;
+            for address in addresses {
+                let host = address
+                    .as_str()
+                    .filter(|host| !host.is_empty() && host.len() <= 253)
+                    .context("Kubernetes EndpointSlice address is invalid")?;
+                if !seen.insert((host.to_owned(), port)) {
+                    continue;
+                }
+                anyhow::ensure!(
+                    instances.len() < max_instances,
+                    "Kubernetes EndpointSlice response exceeds max_instances"
+                );
+                let mut metadata = HashMap::from([
+                    ("registry".to_owned(), "kubernetes".to_owned()),
+                    ("namespace".to_owned(), namespace.to_owned()),
+                ]);
+                if let Some(name) = endpoint
+                    .get("targetRef")
+                    .and_then(|target| string_field(target, "name"))
+                {
+                    metadata.insert("target".to_owned(), name);
+                }
+                instances.push(RegistryInstance {
+                    host: host.to_owned(),
+                    port,
+                    weight: 1,
+                    down: false,
+                    backup: false,
+                    metadata,
+                });
+            }
+        }
+    }
+    anyhow::ensure!(
+        !instances.is_empty()
+            || items.iter().all(|slice| {
+                slice
+                    .get("endpoints")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+            }),
+        "Kubernetes EndpointSlice set has no usable port or ready endpoint"
+    );
+    Ok(Some(instances))
+}
+
+/// 业务作用：按已解析的 Service port 选择 Endpoints/EndpointSlice 中的实际端口，
+/// 保证两种发现对象使用相同 targetPort 语义。
+///
+/// 参数说明：`ports` 是对象端口数组；`selector` 是 name、number 或唯一端口门禁。
+///
+/// 返回：匹配且合法的端口返回 u16；缺失、歧义或坏值返回错误。
+fn select_kubernetes_endpoint_port(
+    ports: &[Value],
+    selector: &KubernetesEndpointPortSelector,
+) -> anyhow::Result<u16> {
+    match selector {
+        KubernetesEndpointPortSelector::Name(name) => ports
+            .iter()
+            .find(|port| string_field(port, "name").as_deref() == Some(name.as_str()))
+            .and_then(|port| u16_field(port.get("port")))
+            .with_context(|| format!("Kubernetes endpoint has no port named `{name}`")),
+        KubernetesEndpointPortSelector::Number(number) => ports
+            .iter()
+            .find(|port| u16_field(port.get("port")) == Some(*number))
+            .and_then(|port| u16_field(port.get("port")))
+            .with_context(|| format!("Kubernetes endpoint has no target port `{number}`")),
+        KubernetesEndpointPortSelector::Single => {
+            anyhow::ensure!(
+                ports.len() == 1,
+                "Kubernetes endpoint has multiple ports; registry_port_name is required"
+            );
+            u16_field(ports[0].get("port")).context("Kubernetes endpoint port invalid")
+        }
+    }
+}
+
+enum KubernetesEndpointPortSelector {
+    Name(String),
+    Number(u16),
+    Single,
+}
+
+/// 业务作用：将 Gateway/Ingress 引用的 Service port 编号解析为 Endpoints 中的
+/// port name 或 Pod targetPort，避免把虚拟 Service port 与实际端点端口误作相等。
+///
+/// 参数说明：transport 参数限定 API 和凭据；`namespace`/`service_name` 是已验证
+/// Kubernetes 身份；`service_port` 是 Route backendRef 的数字端口。
+///
+/// 返回：Service port 存在时优先返回稳定 port name，无 name 时返回数字或命名
+/// targetPort；Service 缺失、结构坏或端口不存在时保留上游 LKG。
+async fn resolve_kubernetes_service_port(
+    client: &reqwest::Client,
+    cfg: &KubernetesDiscoveryCfg,
+    namespace: &str,
+    service_name: &str,
+    service_port: u16,
+) -> anyhow::Result<KubernetesEndpointPortSelector> {
+    let encoded_namespace =
+        percent_encoding::utf8_percent_encode(namespace, percent_encoding::NON_ALPHANUMERIC);
+    let service =
+        percent_encoding::utf8_percent_encode(service_name, percent_encoding::NON_ALPHANUMERIC);
+    let url = format!(
+        "{}/api/v1/namespaces/{encoded_namespace}/services/{service}",
+        cfg.api_server
+    );
+    let value = fetch_kubernetes_object(client, cfg, url).await?;
+    anyhow::ensure!(!value.is_null(), "Kubernetes Service does not exist");
+    let ports = value
+        .pointer("/spec/ports")
+        .and_then(Value::as_array)
+        .context("Kubernetes Service missing spec.ports")?;
+    let port = ports
+        .iter()
+        .find(|port| u16_field(port.get("port")) == Some(service_port))
+        .with_context(|| format!("Kubernetes Service has no port `{service_port}`"))?;
+    if let Some(name) = string_field(port, "name").filter(|name| !name.is_empty()) {
+        return Ok(KubernetesEndpointPortSelector::Name(name));
+    }
+    match port.get("targetPort") {
+        Some(Value::String(name)) if !name.is_empty() => {
+            Ok(KubernetesEndpointPortSelector::Name(name.clone()))
+        }
+        Some(value) => u16_field(Some(value))
+            .map(KubernetesEndpointPortSelector::Number)
+            .context("Kubernetes Service targetPort is invalid"),
+        None => Ok(KubernetesEndpointPortSelector::Number(service_port)),
+    }
+}
+
+/// 业务作用：以统一凭据和响应大小门禁读取单个 Kubernetes core API 对象。
+///
+/// 参数说明：`url` 只由已 percent-encode 的 namespace/resource name 构造；`cfg`
+/// 提供 bearer token 和字节上限。
+///
+/// 返回：2xx 返回有界 JSON，404 返回 Null，transport、RBAC、超限或 JSON 错误失败。
+async fn fetch_kubernetes_object(
+    client: &reqwest::Client,
+    cfg: &KubernetesDiscoveryCfg,
+    url: String,
+) -> anyhow::Result<Value> {
+    let mut request = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json");
+    if !cfg.bearer_token.is_empty() {
+        request = request.bearer_auth(&cfg.bearer_token);
+    }
+    fetch_bounded_json(request, cfg.max_response_bytes).await
 }
 
 async fn fetch_bounded_json(

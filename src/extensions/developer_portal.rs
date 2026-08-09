@@ -375,6 +375,9 @@ fn build_catalog(
                     format!("Method={}", method.to_ascii_uppercase()),
                 ],
                 filters: cfg.filters.clone(),
+                preserve_host: false,
+                gateway_redirect: None,
+                hedge: None,
                 request_validation: Some(RequestValidationCfg {
                     openapi_file: Some(cfg.openapi_file.clone()),
                     operation_path: Some(path_template.clone()),
@@ -399,7 +402,10 @@ fn build_catalog(
                 usage_plan: cfg.usage_plan.clone(),
                 llm: None,
                 grpc_edge: None,
+                grpc_transcoding: None,
                 long_stream_idle_timeout_ms: None,
+                request_timeout_ms: None,
+                backend_request_timeout_ms: None,
                 long_stream_max_lifetime_ms: 0,
                 order: cfg.order,
             });

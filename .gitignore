@@ -16,3 +16,16 @@ scripts/
 *.log
 *.tmp
 *.pid
+
+# V9 HTTP/3 的协议、外部互操作与正式横评必须随源码版本化；旧规则继续忽略其它临时
+# tests 产物，但不能让发布硬门在提交时静默丢失。
+!/tests/
+!/tests/Dockerfile.h3-benchmark
+!/tests/http3_acceptance.rs
+!/tests/http3_live.rs
+!/tests/scripts/
+/tests/scripts/*
+!/tests/scripts/http3_compare.sh
+!/tests/support/
+/tests/support/*
+!/tests/support/local_h3_benchmark.rs

@@ -18,18 +18,25 @@
 //! 的消息就是没了**——这不是缺陷,是这条链路的设计取舍。
 
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use http::{HeaderName, HeaderValue, Request};
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
+use hyper::body::{Body, Frame, SizeHint};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
 /// gRPC message 前缀:1 字节压缩位 + 4 字节大端长度。
 const GRPC_PREFIX_BYTES: usize = 5;
+const MAX_COALESCE_KEY_BYTES: usize = 256;
 /// summary 是 7 个 varint 字段的平坦消息；保留演进余量但拒绝无界响应。
 const MAX_SUMMARY_MESSAGE_BYTES: usize = 4096;
+
+/// 统一请求 body 类型；unary 使用 Full，PublishStream 使用受 H2 flow-control 驱动的 channel body。
+type RequestBody = UnsyncBoxBody<Bytes, std::io::Error>;
 
 /// SDK 错误。
 #[derive(Debug)]
@@ -188,7 +195,96 @@ impl EdgeConfig {
 #[derive(Clone)]
 pub struct EdgeClient {
     cfg: Arc<EdgeConfig>,
-    http: Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>,
+    http: Client<hyper_util::client::legacy::connect::HttpConnector, RequestBody>,
+}
+
+/// 一条可携带 `latest_by_key` 合并键的 Publish/PublishStream 业务消息。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishFrame {
+    /// 业务 protobuf 字节，不含 FramePush 与 gRPC 前缀。
+    pub payload: Bytes,
+    /// 有界合并键；`None` 用于非 keyed 队列。
+    pub coalesce_key: Option<Bytes>,
+}
+
+impl PublishFrame {
+    /// 业务作用：构造不参与 keyed 合并的普通发布消息。
+    ///
+    /// 参数说明：`payload` 是业务 protobuf 字节。
+    ///
+    /// 返回：返回 `coalesce_key=None` 的消息。
+    pub fn new(payload: Bytes) -> Self {
+        Self {
+            payload,
+            coalesce_key: None,
+        }
+    }
+
+    /// 业务作用：构造显式参与 `latest_by_key` 合并的发布消息。
+    ///
+    /// 参数说明：`coalesce_key` 必须为 1..=256 字节，`payload` 是业务 protobuf 字节。
+    ///
+    /// 返回：返回尚未编码的 keyed 消息；长度门在发送前统一执行。
+    pub fn keyed(coalesce_key: Bytes, payload: Bytes) -> Self {
+        Self {
+            payload,
+            coalesce_key: Some(coalesce_key),
+        }
+    }
+}
+
+/// PublishStream 的增量请求体。每次 H2 请求更多 DATA 时才编码并产出下一条消息。
+struct PublishRequestBody {
+    receiver: tokio::sync::mpsc::Receiver<PublishFrame>,
+    max_message_bytes: usize,
+}
+
+impl Body for PublishRequestBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    /// 业务作用：把调用方逐条送入的业务 payload 按 H2 flow-control 节奏封成 FramePush DATA。
+    ///
+    /// 参数说明：`cx` 是 Hyper 请求体轮询上下文。
+    ///
+    /// 返回：有 payload 时返回恰一条 gRPC frame；发送端关闭后返回 EOS；越界消息返回错误并停止半完成流。
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(frame)) => Poll::Ready(Some(
+                encode_frame_push_with_key(
+                    &frame.payload,
+                    frame.coalesce_key.as_deref(),
+                    self.max_message_bytes,
+                )
+                .map(Frame::data)
+                .map_err(|error| std::io::Error::other(error.to_string())),
+            )),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.receiver.is_closed() && self.receiver.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+/// 业务作用：把小型 unary 请求统一装箱为 SDK 请求 body，供同一 H2 client 与流式请求复用。
+///
+/// 参数说明：`bytes` 是已经完成 gRPC/FramePush 编码的请求字节。
+///
+/// 返回：返回不会失败、写完即 EOS 的 boxed body。
+fn full_request_body(bytes: Bytes) -> RequestBody {
+    Full::new(bytes)
+        .map_err(|never| -> std::io::Error { match never {} })
+        .boxed_unsync()
 }
 
 impl EdgeClient {
@@ -242,6 +338,38 @@ impl EdgeClient {
         })
     }
 
+    /// 业务作用：群播一条带 `coalesce_key` 的消息，使 `latest_by_key` 队列可按业务实体合并旧状态。
+    ///
+    /// 参数说明：`group` 是授权 group；`coalesce_key` 必须为 1..=256 字节；`payload` 是业务字节。
+    ///
+    /// 返回：返回诚实入队回执；key 非法、越权或传输失败时返回对应错误。
+    pub async fn publish_keyed(
+        &self,
+        group: &str,
+        coalesce_key: Bytes,
+        payload: Bytes,
+    ) -> Result<PublishSummary> {
+        let body = self
+            .unary_frame(
+                &self.cfg.publish_path,
+                "publish",
+                &self.cfg.group_header,
+                group,
+                PublishFrame::keyed(coalesce_key, payload),
+            )
+            .await?;
+        let fields = decode_flat_message(&body)?;
+        Ok(PublishSummary {
+            accepted: fields.get(1),
+            dropped: fields.get(2),
+            closed_slow: fields.get(3),
+            messages: fields.get(4),
+            peers_accepted: fields.get(5),
+            peers_rejected: fields.get(6),
+            peers_unknown: fields.get(7),
+        })
+    }
+
     /// 定向单播给某 user 的全部在线 session。
     ///
     /// # 参数
@@ -270,6 +398,35 @@ impl EdgeClient {
         })
     }
 
+    /// 业务作用：定向推送一条带 `coalesce_key` 的状态消息，供目标会话的 keyed 队列只保留最新值。
+    ///
+    /// 参数说明：`target` 是授权 user；`coalesce_key` 必须为 1..=256 字节；`payload` 是业务字节。
+    ///
+    /// 返回：返回诚实入队回执；目标离线仍是 `accepted=0` 的正常结果。
+    pub async fn push_keyed(
+        &self,
+        target: &str,
+        coalesce_key: Bytes,
+        payload: Bytes,
+    ) -> Result<PushSummary> {
+        let body = self
+            .unary_frame(
+                &self.cfg.push_path,
+                "push",
+                &self.cfg.target_header,
+                target,
+                PublishFrame::keyed(coalesce_key, payload),
+            )
+            .await?;
+        let fields = decode_flat_message(&body)?;
+        Ok(PushSummary {
+            accepted: fields.get(1),
+            peers_accepted: fields.get(5),
+            peers_rejected: fields.get(6),
+            peers_unknown: fields.get(7),
+        })
+    }
+
     /// 以 client-streaming 长流持续群播,返回**本段**的聚合回执。
     ///
     /// # 参数
@@ -286,12 +443,85 @@ impl EdgeClient {
     /// 速率门是**背压节流**不是丢弃:令牌不足时网关暂停读体,经 H2 流控传导回来,
     /// 因此本调用可能比预期慢,但不会丢消息。
     pub async fn publish_stream(&self, group: &str, payloads: &[Bytes]) -> Result<PublishSummary> {
-        // 先全部编码再发:任何一条越界都应在**一条都没发出去**之前失败,
-        // 否则调用方会拿到"发了一半"的不确定状态,而流式面又没有逐条 ack 可对账。
-        let mut body = BytesMut::new();
+        // 固定 slice API 先做无分配长度预检，保留“本地参数错时一条都不发”的确定性；
+        // 真正 wire 编码仍在 body 被 H2 轮询时逐条发生，不再复制整段 payload。
         for payload in payloads {
-            body.extend_from_slice(&encode_frame_push(payload, self.cfg.max_message_bytes)?);
+            validate_frame_push_size(payload.len(), None, self.cfg.max_message_bytes)?;
         }
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let owned = payloads.to_vec();
+        tokio::spawn(async move {
+            for payload in owned {
+                if sender.send(PublishFrame::new(payload)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        self.publish_stream_keyed_receiver(group, receiver).await
+    }
+
+    /// 业务作用：用固定 slice 增量发送带可选 `coalesce_key` 的 PublishStream。
+    ///
+    /// 参数说明：`group` 是授权 group；`frames` 按顺序发送，每项 key 必须为空缺或 1..=256 字节。
+    ///
+    /// 返回：本地先完整预检以保证参数错误时零发送，随后按 H2 flow-control 增量编码并返回聚合回执。
+    pub async fn publish_stream_keyed(
+        &self,
+        group: &str,
+        frames: &[PublishFrame],
+    ) -> Result<PublishSummary> {
+        for frame in frames {
+            validate_frame_push_size(
+                frame.payload.len(),
+                frame.coalesce_key.as_deref(),
+                self.cfg.max_message_bytes,
+            )?;
+        }
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let owned = frames.to_vec();
+        tokio::spawn(async move {
+            for frame in owned {
+                if sender.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        self.publish_stream_keyed_receiver(group, receiver).await
+    }
+
+    /// 业务作用：从有界 channel 真正增量发送 PublishStream，允许生产方边生成边发布。
+    ///
+    /// 参数说明：`group` 是授权 group；`receiver` 每项是一条业务 payload，发送端 Drop 即 half-close。
+    ///
+    /// 返回：网关正常收尾时返回本段聚合回执；中途越界、传输失败或 gRPC 拒绝返回错误。
+    /// 调用方必须使用有界 channel；这样网关背压会经 H2 和本 receiver 传回生产方，不形成 SDK 内存堆积。
+    pub async fn publish_stream_receiver(
+        &self,
+        group: &str,
+        mut receiver: tokio::sync::mpsc::Receiver<Bytes>,
+    ) -> Result<PublishSummary> {
+        let (sender, keyed_receiver) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            while let Some(payload) = receiver.recv().await {
+                if sender.send(PublishFrame::new(payload)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        self.publish_stream_keyed_receiver(group, keyed_receiver)
+            .await
+    }
+
+    /// 业务作用：从有界 channel 增量发送可选 keyed 的 PublishStream，并把 H2 背压传回生产方。
+    ///
+    /// 参数说明：`group` 是授权 group；`receiver` 每项携带 payload 与可选 `coalesce_key`。
+    ///
+    /// 返回：网关正常收尾时返回本段聚合回执；非法 key、越界、传输失败或 gRPC 拒绝返回错误。
+    pub async fn publish_stream_keyed_receiver(
+        &self,
+        group: &str,
+        receiver: tokio::sync::mpsc::Receiver<PublishFrame>,
+    ) -> Result<PublishSummary> {
         let request = self
             .base_request(
                 &self.cfg.publish_stream_path,
@@ -299,8 +529,13 @@ impl EdgeClient {
                 &self.cfg.group_header,
                 group,
             )?
-            // Full 体写完自动 EOS,正好是"发完 half-close 等聚合 summary"的形状。
-            .body(Full::new(body.freeze()))
+            .body(
+                PublishRequestBody {
+                    receiver,
+                    max_message_bytes: self.cfg.max_message_bytes,
+                }
+                .boxed_unsync(),
+            )
             .map_err(|e| EdgeError::Protocol(format!("build publish stream: {e}")))?;
         let message = self.send_unary_reply(request).await?;
         let fields = decode_flat_message(&message)?;
@@ -349,10 +584,38 @@ impl EdgeClient {
         scope: &str,
         payload: Bytes,
     ) -> Result<Bytes> {
-        let framed = encode_frame_push(&payload, self.cfg.max_message_bytes)?;
+        self.unary_frame(
+            path,
+            action,
+            scope_header,
+            scope,
+            PublishFrame::new(payload),
+        )
+        .await
+    }
+
+    /// 业务作用：组装并发出一条可携带合并键的 unary FramePush 请求。
+    ///
+    /// 参数说明：head 参数定义 edge 方法与作用域，`frame` 提供业务 payload 和可选 key。
+    ///
+    /// 返回：成功返回已去 gRPC 前缀的 summary message；编码、传输或状态错误原样返回。
+    async fn unary_frame(
+        &self,
+        path: &str,
+        action: &str,
+        scope_header: &str,
+        scope: &str,
+        frame: PublishFrame,
+    ) -> Result<Bytes> {
+        let framed = match frame.coalesce_key.as_deref() {
+            Some(key) => {
+                encode_frame_push_with_key(&frame.payload, Some(key), self.cfg.max_message_bytes)?
+            }
+            None => encode_frame_push(&frame.payload, self.cfg.max_message_bytes)?,
+        };
         let request = self
             .base_request(path, action, scope_header, scope)?
-            .body(Full::new(framed))
+            .body(full_request_body(framed))
             .map_err(|e| EdgeError::Protocol(format!("build request: {e}")))?;
         self.send_unary_reply(request).await
     }
@@ -362,7 +625,7 @@ impl EdgeClient {
     /// unary Publish/Push 与 client-streaming PublishStream 的**响应侧契约完全相同**
     /// (都是一条 summary + 成功 trailer),差别只在请求体是一条还是多条,因此这里共用
     /// 一份状态与上界校验,避免两条路径各自漏掉某一项检查。
-    async fn send_unary_reply(&self, request: http::Request<Full<Bytes>>) -> Result<Bytes> {
+    async fn send_unary_reply(&self, request: http::Request<RequestBody>) -> Result<Bytes> {
         let response = self
             .http
             .request(request)
@@ -524,7 +787,7 @@ impl Subscription {
                 &self.group,
             )?
             // Full 体在写完后自动 EOS,正好满足"一条消息 + half-close"。
-            .body(Full::new(frame(&[])))
+            .body(full_request_body(frame(&[])))
             .map_err(|e| EdgeError::Protocol(format!("build subscribe: {e}")))?;
         let response = self
             .client
@@ -644,12 +907,65 @@ fn split_frame(bytes: &Bytes, max_message_bytes: usize) -> Result<(Bytes, Bytes)
 /// WHY:早期 SDK 只加了 5 字节 gRPC 前缀，把业务 bytes 直接冒充整个 protobuf message；
 /// 网关因 payload opaque 会照常转发，但 protoc 生成的订阅端无法把它解析成 FramePush。
 fn encode_frame_push(payload: &Bytes, max_message_bytes: usize) -> Result<Bytes> {
+    encode_frame_push_with_key(payload, None, max_message_bytes)
+}
+
+/// 业务作用：按统一 proto 编码 payload 与可选 `coalesce_key`，再添加 gRPC 前缀。
+///
+/// 参数说明：`payload` 是业务字节；`coalesce_key` 为空缺或 1..=256 字节；
+/// `max_message_bytes` 是完整 FramePush protobuf 上限。
+///
+/// 返回：合法时返回完整 gRPC 帧；key/总长非法时在分配前返回协议错误。
+fn encode_frame_push_with_key(
+    payload: &Bytes,
+    coalesce_key: Option<&[u8]>,
+    max_message_bytes: usize,
+) -> Result<Bytes> {
     let payload_len = u64::try_from(payload.len())
         .map_err(|_| EdgeError::Protocol("FramePush payload length does not fit u64".into()))?;
-    let protobuf_len = 1usize
-        .checked_add(varint_len(payload_len))
-        .and_then(|len| len.checked_add(payload.len()))
+    let protobuf_len = validate_frame_push_size(payload.len(), coalesce_key, max_message_bytes)?;
+    let mut out = BytesMut::with_capacity(GRPC_PREFIX_BYTES + protobuf_len);
+    out.put_u8(0);
+    out.put_u32(protobuf_len as u32);
+    out.put_u8(0x0a);
+    put_varint(payload_len, &mut out);
+    out.extend_from_slice(payload);
+    if let Some(key) = coalesce_key {
+        out.put_u8(0x12);
+        put_varint(key.len() as u64, &mut out);
+        out.extend_from_slice(key);
+    }
+    Ok(out.freeze())
+}
+
+/// 业务作用：在不分配编码缓冲的前提下验证一条 FramePush 的精确 wire 长度。
+///
+/// 参数说明：`payload_len` 是业务字节数；`max_message_bytes` 必须与 route 单消息门一致。
+///
+/// 返回：合法时返回 protobuf message 长度；算术溢出或超过任一协议上限时返回错误。
+fn validate_frame_push_size(
+    payload_len: usize,
+    coalesce_key: Option<&[u8]>,
+    max_message_bytes: usize,
+) -> Result<usize> {
+    let payload_len_u64 = u64::try_from(payload_len)
+        .map_err(|_| EdgeError::Protocol("FramePush payload length does not fit u64".into()))?;
+    let mut protobuf_len = 1usize
+        .checked_add(varint_len(payload_len_u64))
+        .and_then(|len| len.checked_add(payload_len))
         .ok_or_else(|| EdgeError::Protocol("FramePush length overflow".into()))?;
+    if let Some(key) = coalesce_key {
+        if key.is_empty() || key.len() > MAX_COALESCE_KEY_BYTES {
+            return Err(EdgeError::Protocol(format!(
+                "FramePush coalesce_key length {} is outside 1..={MAX_COALESCE_KEY_BYTES}",
+                key.len()
+            )));
+        }
+        protobuf_len = protobuf_len
+            .checked_add(1 + varint_len(key.len() as u64))
+            .and_then(|len| len.checked_add(key.len()))
+            .ok_or_else(|| EdgeError::Protocol("FramePush length overflow".into()))?;
+    }
     if max_message_bytes == 0
         || protobuf_len > max_message_bytes
         || protobuf_len > u32::MAX as usize
@@ -658,13 +974,7 @@ fn encode_frame_push(payload: &Bytes, max_message_bytes: usize) -> Result<Bytes>
             "FramePush wire length {protobuf_len} exceeds configured limit {max_message_bytes}"
         )));
     }
-    let mut out = BytesMut::with_capacity(GRPC_PREFIX_BYTES + protobuf_len);
-    out.put_u8(0);
-    out.put_u32(protobuf_len as u32);
-    out.put_u8(0x0a);
-    put_varint(payload_len, &mut out);
-    out.extend_from_slice(payload);
-    Ok(out.freeze())
+    Ok(protobuf_len)
 }
 
 /// 从统一 `FramePush` protobuf message 取出 field 1，未知字段按 protobuf 规则跳过。
@@ -830,6 +1140,55 @@ fn _assert_header_value(value: &str) -> Option<HeaderValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn publish_request_body_is_incremental_and_channel_backpressured() {
+        // 回归场景：PublishStream 不能预编码整段；body 只在生产方送入一条后产出一帧，
+        // channel 暂无下一条时保持 Pending，发送端 Drop 后才 half-close。
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let mut body = PublishRequestBody {
+            receiver,
+            max_message_bytes: 64,
+        };
+        sender
+            .send(PublishFrame::new(Bytes::from_static(b"one")))
+            .await
+            .expect("send first");
+        let first = body
+            .frame()
+            .await
+            .expect("frame")
+            .expect("encode")
+            .into_data()
+            .expect("data");
+        let (message, rest) = split_frame(&first, 64).expect("grpc frame");
+        assert!(rest.is_empty());
+        assert_eq!(decode_frame_push(&message).unwrap().as_ref(), b"one");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), body.frame())
+                .await
+                .is_err()
+        );
+        drop(sender);
+        assert!(body.frame().await.is_none(), "sender Drop 才产生 EOS");
+    }
+
+    /// 回归场景：SDK keyed API 必须把 `coalesce_key` 写成 FramePush field 2，并在分配前
+    /// 拒绝空键和超过 256 字节的键，避免网关把调用方以为可合并的消息按 drop_new 处理。
+    #[test]
+    fn keyed_frame_push_encodes_field_two_and_enforces_bound() {
+        let frame = encode_frame_push_with_key(&Bytes::from_static(b"v"), Some(b"device-1"), 64)
+            .expect("encode keyed frame");
+        let (message, rest) = split_frame(&frame, 64).expect("grpc frame");
+        assert!(rest.is_empty());
+        assert_eq!(
+            message.as_ref(),
+            b"\x0a\x01v\x12\x08device-1",
+            "field 2 必须跟随 payload 写入统一 proto wire"
+        );
+        assert!(encode_frame_push_with_key(&Bytes::new(), Some(b""), 512).is_err());
+        assert!(encode_frame_push_with_key(&Bytes::new(), Some(&[b'k'; 257]), 512).is_err());
+    }
 
     /// 回归场景:回执解析必须遵守 proto3 省零——**缺失字段是 0,不是未知**。
     /// 网关不会发送值为 0 的字段,SDK 若把缺失当成错误或 None,调用方会误判。

@@ -4,18 +4,22 @@
 //! opaque bytes 处理。Pub/Sub 没有持久化、背压和远端 ACK，因此 PUBLISH 成功不能
 //! 折算成 `peers_accepted`。
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
+use dashmap::DashMap;
 use nasa::redis::{
     CompatibilityProfile, RedisClient, RedisConfig, StreamAckPolicy, StreamMode, StreamStart,
     StreamSubscribeCfg, StreamSubscription,
 };
+use tokio::sync::{oneshot, Notify};
 
-use crate::edge_hub::EdgeHub;
+use crate::config::model::{GrpcEdgeOrderingCfg, GrpcEdgeSessionModeCfg};
+use crate::edge_hub::{EdgeHub, EdgeSessionControl, LocalFanoutOutcome};
 use crate::edge_relay::PeerBroadcastSummary;
 use crate::grpc_edge::{GrpcEdgeClusterPlan, GrpcEdgeRedisPubSubPlan, GrpcEdgeRedisStreamPlan};
 
@@ -23,12 +27,16 @@ const PROTOCOL_VERSION: u32 = 1;
 const GRPC_PREFIX_BYTES: usize = 5;
 const MAX_ROUTING_BYTES: usize = 256;
 const MAX_ENVELOPE_OVERHEAD: usize = 4 * 1024;
+const MIN_MEMBERSHIP_LEASE_MS: u64 = 3_000;
 pub const REDIS_STREAM_FIELD: &str = "naway";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RedisFanoutAction {
     Publish = 1,
     Push = 2,
+    SessionFence = 3,
+    SessionFenceAck = 4,
+    SessionRelease = 5,
 }
 
 #[derive(Default)]
@@ -77,6 +85,477 @@ struct DecodedEnvelope {
     scope: String,
     message: Bytes,
     origin_node_id: String,
+    correlation_id: u64,
+    revision: u64,
+}
+
+struct PendingFanoutEntry {
+    sender: oneshot::Sender<Result<LocalFanoutOutcome, ()>>,
+    limits: crate::grpc_edge::GrpcEdgeLimitsPlan,
+    reassembled: u64,
+}
+
+type PendingFanout = DashMap<u64, PendingFanoutEntry>;
+
+struct FenceAckWaiter {
+    revision: u64,
+    expected: HashSet<String>,
+    received: parking_lot::Mutex<HashSet<String>>,
+    notify: Notify,
+}
+
+impl FenceAckWaiter {
+    /// 业务作用：创建一次 claim 的固定 membership ACK 门，后加入节点不反向扩大本次事务。
+    ///
+    /// 参数说明：`revision` 是 fencing token，`expected` 是 Redis 线性化快照中的活跃节点。
+    ///
+    /// 返回：返回尚未收到任何 ACK 的等待器。
+    fn new(revision: u64, expected: HashSet<String>) -> Self {
+        Self {
+            revision,
+            expected,
+            received: parking_lot::Mutex::new(HashSet::new()),
+            notify: Notify::new(),
+        }
+    }
+
+    /// 业务作用：记录一个节点完成本地 fence 的证据，并唤醒 claim 复验。
+    ///
+    /// 参数说明：`node_id` 是 ACK envelope 中经过路由字符门校验的节点身份。
+    ///
+    /// 返回：无返回值；非本次 membership 的 ACK 被忽略。
+    fn acknowledge(&self, node_id: String) {
+        if self.expected.contains(&node_id) && self.received.lock().insert(node_id) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// 业务作用：判断固定 membership 是否已经全部先保护、后 ACK。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：全部预期节点均有唯一 ACK 时返回 `true`。
+    fn complete(&self) -> bool {
+        let received = self.received.lock();
+        self.expected.is_subset(&received)
+    }
+}
+
+/// Redis Pub/Sub/Stream 共用的 single-session 权威控制面。
+struct RedisStrongControl {
+    cluster: Arc<GrpcEdgeClusterPlan>,
+    redis: Arc<RedisClient>,
+    channel: Box<str>,
+    membership_key: Box<str>,
+    fence_counter_key: Box<str>,
+    command_timeout: Duration,
+    reconnect_backoff: Duration,
+    membership_lease_ms: u64,
+    hub: Arc<EdgeHub>,
+    subscription_connected: AtomicBool,
+    ready: AtomicBool,
+    next_correlation: AtomicU64,
+    pending_fences: DashMap<u64, Arc<FenceAckWaiter>>,
+}
+
+impl RedisStrongControl {
+    /// 业务作用：在数据面 ready 前建立独立控制订阅并登记带租约的 Redis membership。
+    ///
+    /// 参数说明：`cluster` 提供节点/超时语义，`redis` 是与数据总线同配置的客户端，
+    /// `data_key` 用于派生隔离的控制频道，`command_timeout`/`reconnect_backoff` 约束失效窗口，
+    /// `hub` 承接本地 fencing 副作用。
+    ///
+    /// 返回：订阅与首次 membership 心跳均成功后返回控制面；任一步失败则拒绝启动。
+    async fn start(
+        cluster: Arc<GrpcEdgeClusterPlan>,
+        redis: Arc<RedisClient>,
+        data_key: &str,
+        command_timeout: Duration,
+        reconnect_backoff: Duration,
+        hub: Arc<EdgeHub>,
+    ) -> Result<Arc<Self>> {
+        let channel = format!("{data_key}:naway-strong-control");
+        let mut subscription = redis
+            .sub(&[channel.as_str()])
+            .await
+            .context("subscribe edge Redis strong-control channel")?;
+        let slot = hex_component(cluster.cluster_id.as_bytes());
+        let membership_lease_ms = reconnect_backoff
+            .as_millis()
+            .saturating_mul(3)
+            .max(u128::from(cluster.ack_deadline_ms.saturating_mul(3)))
+            .max(u128::from(MIN_MEMBERSHIP_LEASE_MS))
+            .min(u128::from(u64::MAX)) as u64;
+        let control = Arc::new(Self {
+            cluster,
+            redis,
+            channel: channel.into_boxed_str(),
+            membership_key: format!("naway:edge:{{{slot}}}:strong:members").into_boxed_str(),
+            fence_counter_key: format!("naway:edge:{{{slot}}}:strong:fence-seq").into_boxed_str(),
+            command_timeout,
+            reconnect_backoff,
+            membership_lease_ms,
+            hub,
+            subscription_connected: AtomicBool::new(true),
+            ready: AtomicBool::new(false),
+            next_correlation: AtomicU64::new(1),
+            pending_fences: DashMap::new(),
+        });
+        // 只有控制订阅已经存在且 membership 首次写入成功，节点才有资格参与 claim。
+        control.refresh_membership().await?;
+        control.ready.store(true, Ordering::Release);
+        let session_control: Arc<dyn EdgeSessionControl> = control.clone();
+        control
+            .hub
+            .attach_session_control(Arc::downgrade(&session_control));
+
+        let consumer = control.clone();
+        tokio::spawn(async move {
+            loop {
+                match subscription.next_message().await {
+                    Some(message) => {
+                        if message.channel == consumer.channel.as_ref() {
+                            if let Err(error) =
+                                consumer.consume_control(Bytes::from(message.payload)).await
+                            {
+                                tracing::warn!(
+                                    error = %format!("{error:#}"),
+                                    "edge Redis strong-control envelope rejected"
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        // 控制订阅一旦失联，旧会话必须先保护再退出 membership；否则其他节点
+                        // 会在租约过期后放行新会话，而本节点仍保留旧连接，形成多活。
+                        consumer
+                            .subscription_connected
+                            .store(false, Ordering::Release);
+                        consumer.enter_protection();
+                        tokio::time::sleep(consumer.reconnect_backoff).await;
+                        if subscription
+                            .reconnect_timeout(consumer.command_timeout)
+                            .await
+                            .is_ok()
+                        {
+                            consumer
+                                .subscription_connected
+                                .store(true, Ordering::Release);
+                            if consumer.refresh_membership().await.is_ok() {
+                                consumer.ready.store(true, Ordering::Release);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let heartbeat = control.clone();
+        tokio::spawn(async move {
+            let period = Duration::from_millis((heartbeat.membership_lease_ms / 3).max(100));
+            let mut ticker = tokio::time::interval(period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if !heartbeat.subscription_connected.load(Ordering::Acquire) {
+                    continue;
+                }
+                match heartbeat.refresh_membership().await {
+                    Ok(()) => heartbeat.ready.store(true, Ordering::Release),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "edge Redis strong-control membership heartbeat failed"
+                        );
+                        // 心跳失败意味着节点即将从权威快照消失；立即停止本地旧 token。
+                        heartbeat.enter_protection();
+                    }
+                }
+            }
+        });
+        Ok(control)
+    }
+
+    /// 业务作用：用 Redis TIME 刷新本节点 membership score，避免应用节点时钟偏差改变租约生死。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：Redis 在命令期限内接受心跳时成功，否则返回错误且调用方进入保护态。
+    async fn refresh_membership(&self) -> Result<()> {
+        const SCRIPT: &str = r#"
+local now = redis.call('TIME')
+local ms = now[1] * 1000 + math.floor(now[2] / 1000)
+redis.call('ZADD', KEYS[1], ms, ARGV[1])
+return ms
+"#;
+        let _: i64 = tokio::time::timeout(
+            self.command_timeout,
+            self.redis.eval(
+                SCRIPT,
+                &[self.membership_key.as_ref()],
+                &[self.cluster.node_id.as_ref()],
+            ),
+        )
+        .await
+        .context("refresh edge Redis membership timeout")??;
+        Ok(())
+    }
+
+    /// 业务作用：把控制权丢失原子映射为本地保护态，并唤醒所有等待中的 claim 立即失败。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；重复调用幂等。
+    fn enter_protection(&self) {
+        self.ready.store(false, Ordering::Release);
+        self.hub.protect_single_sessions();
+        for waiter in &self.pending_fences {
+            waiter.notify.notify_waiters();
+        }
+    }
+
+    /// 业务作用：由 Redis 原子分配全局单调 token、截取活跃 membership，并等待全体节点先落 fence 后 ACK。
+    ///
+    /// 参数说明：`tenant`/`user` 是已经通过身份与长度门的 single-session 作用域。
+    ///
+    /// 返回：全体快照节点 ACK、Redis 当前 token 与本地 fence 三重复验通过后返回 token；
+    /// 控制失联、节点缺席、并发新 claim 或超时均 fail closed。
+    async fn claim_single_session(
+        &self,
+        tenant: Arc<str>,
+        user: Arc<str>,
+    ) -> Result<u64, &'static str> {
+        if !self.ready.load(Ordering::Acquire) {
+            return Err("edge-redis-session-control-unavailable");
+        }
+        const CLAIM_SCRIPT: &str = r#"
+local now = redis.call('TIME')
+local ms = now[1] * 1000 + math.floor(now[2] / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ms - tonumber(ARGV[1]))
+local token = redis.call('INCR', KEYS[2])
+redis.call('SET', KEYS[3], token)
+local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+return {token, members}
+"#;
+        let fence_key = self.fence_key(&tenant, &user);
+        let lease = self.membership_lease_ms.to_string();
+        let claim: (i64, Vec<String>) = match tokio::time::timeout(
+            self.command_timeout,
+            self.redis.eval(
+                CLAIM_SCRIPT,
+                &[
+                    self.membership_key.as_ref(),
+                    self.fence_counter_key.as_ref(),
+                    fence_key.as_str(),
+                ],
+                &[lease.as_str()],
+            ),
+        )
+        .await
+        {
+            Ok(Ok(claim)) => claim,
+            _ => return Err("edge-redis-session-claim-failed"),
+        };
+        let token = u64::try_from(claim.0)
+            .ok()
+            .filter(|token| *token != 0)
+            .ok_or("edge-redis-session-token-invalid")?;
+        let expected: HashSet<String> = claim.1.into_iter().collect();
+        if expected.is_empty() || !expected.contains(self.cluster.node_id.as_ref()) {
+            return Err("edge-redis-session-membership-incomplete");
+        }
+        let correlation_id = next_correlation(&self.next_correlation);
+        let waiter = Arc::new(FenceAckWaiter::new(token, expected));
+        let payload = encode_envelope(
+            RedisFanoutAction::SessionFence,
+            self.cluster.cluster_id.as_ref(),
+            &tenant,
+            &user,
+            self.cluster.node_id.as_ref(),
+            &[],
+            EnvelopeControl {
+                correlation_id,
+                revision: token,
+            },
+        )
+        .map_err(|_| "edge-redis-session-envelope-invalid")?;
+        self.pending_fences.insert(correlation_id, waiter.clone());
+        let published = tokio::time::timeout(
+            self.command_timeout,
+            self.redis.r#pub(self.channel.as_ref(), payload.as_ref()),
+        )
+        .await;
+        if !matches!(published, Ok(Ok(_))) {
+            self.pending_fences.remove(&correlation_id);
+            return Err("edge-redis-session-fence-publish-failed");
+        }
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(self.cluster.ack_deadline_ms);
+        let acknowledged = loop {
+            if waiter.complete() {
+                break true;
+            }
+            if !self.ready.load(Ordering::Acquire) {
+                break false;
+            }
+            if tokio::time::timeout_at(deadline, waiter.notify.notified())
+                .await
+                .is_err()
+            {
+                break false;
+            }
+        };
+        self.pending_fences.remove(&correlation_id);
+        if !acknowledged {
+            return Err("edge-redis-session-fence-ack-timeout");
+        }
+        // ACK 只证明各节点处理过本次 fence；必须再读 Redis 权威值并复验本地 token，
+        // 才能阻止并发更新更高 token 后旧 claim 反过来登记会话。
+        let current =
+            tokio::time::timeout(self.command_timeout, self.redis.get::<i64>(&fence_key)).await;
+        if !matches!(current, Ok(Ok(Some(value))) if value == claim.0)
+            || !self.hub.session_fence_matches(&tenant, &user, token)
+            || !self.ready.load(Ordering::Acquire)
+        {
+            return Err("edge-redis-session-claim-lost");
+        }
+        Ok(token)
+    }
+
+    /// 业务作用：消费 fence/ACK/release 控制 envelope，并保持“先本地保护、后发 ACK”的安全时序。
+    ///
+    /// 参数说明：`payload` 是独立控制频道收到的版本化 envelope。
+    ///
+    /// 返回：合法控制动作完成时成功；畸形、跨 cluster 或数据动作混入时返回错误。
+    async fn consume_control(&self, payload: Bytes) -> Result<()> {
+        let envelope = decode_envelope(payload, self.cluster.fanout_limits.max_msg_bytes)?;
+        if envelope.cluster_id != self.cluster.cluster_id.as_ref() {
+            bail!("Redis strong-control cluster_id mismatch");
+        }
+        match envelope.action {
+            RedisFanoutAction::SessionFence => {
+                if envelope.correlation_id == 0
+                    || envelope.revision == 0
+                    || envelope.origin_node_id.is_empty()
+                {
+                    bail!("invalid Redis session fence");
+                }
+                // 旧会话必须在 ACK 前关闭；否则 claim 看到 ACK 后放行新连接会制造短暂多活。
+                self.hub.fence_single_session(
+                    Arc::from(envelope.tenant.as_str()),
+                    Arc::from(envelope.scope.as_str()),
+                    envelope.revision,
+                );
+                let ack = encode_envelope(
+                    RedisFanoutAction::SessionFenceAck,
+                    self.cluster.cluster_id.as_ref(),
+                    &envelope.tenant,
+                    &envelope.scope,
+                    self.cluster.node_id.as_ref(),
+                    &[],
+                    EnvelopeControl {
+                        correlation_id: envelope.correlation_id,
+                        revision: envelope.revision,
+                    },
+                )?;
+                tokio::time::timeout(
+                    self.command_timeout,
+                    self.redis.r#pub(self.channel.as_ref(), ack.as_ref()),
+                )
+                .await
+                .context("publish Redis session fence ACK timeout")??;
+            }
+            RedisFanoutAction::SessionFenceAck => {
+                if let Some(waiter) = self.pending_fences.get(&envelope.correlation_id) {
+                    if waiter.revision == envelope.revision {
+                        waiter.acknowledge(envelope.origin_node_id);
+                    }
+                }
+            }
+            RedisFanoutAction::SessionRelease => {
+                self.hub.release_session_fence(
+                    &envelope.tenant,
+                    &envelope.scope,
+                    envelope.revision,
+                );
+            }
+            RedisFanoutAction::Publish | RedisFanoutAction::Push => {
+                bail!("data action received on Redis strong-control channel")
+            }
+        }
+        Ok(())
+    }
+
+    /// 业务作用：构造与 membership/counter 同 Redis Cluster slot 的用户当前-token key。
+    ///
+    /// 参数说明：`tenant`/`user` 是已验证身份；编码后不会把业务字符解释成 Redis hashtag。
+    ///
+    /// 返回：返回可安全用于多 key Lua 的同槽 key。
+    fn fence_key(&self, tenant: &str, user: &str) -> String {
+        let slot = hex_component(self.cluster.cluster_id.as_bytes());
+        format!(
+            "naway:edge:{{{slot}}}:strong:fence:{}:{}",
+            hex_component(tenant.as_bytes()),
+            hex_component(user.as_bytes())
+        )
+    }
+}
+
+impl EdgeSessionControl for RedisStrongControl {
+    /// 业务作用：条件删除仍属于已结束会话的 Redis 当前 token，并广播本地 fence 清理。
+    ///
+    /// 参数说明：`tenant`/`user` 标识用户，`token` 是结束会话持有的版本。
+    ///
+    /// 返回：无返回值；迟到 release 遇到更高 token 时 Lua 不删除也不广播。
+    fn session_closed(&self, tenant: Arc<str>, user: Arc<str>, token: u64) {
+        self.hub.release_session_fence(&tenant, &user, token);
+        let redis = self.redis.clone();
+        let command_timeout = self.command_timeout;
+        let fence_key = self.fence_key(&tenant, &user);
+        let channel = self.channel.clone();
+        let cluster_id = self.cluster.cluster_id.clone();
+        let node_id = self.cluster.node_id.clone();
+        let token_text = token.to_string();
+        let payload = encode_envelope(
+            RedisFanoutAction::SessionRelease,
+            &cluster_id,
+            &tenant,
+            &user,
+            &node_id,
+            &[],
+            EnvelopeControl {
+                correlation_id: 0,
+                revision: token,
+            },
+        );
+        tokio::spawn(async move {
+            const RELEASE_SCRIPT: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"#;
+            let deleted = tokio::time::timeout(
+                command_timeout,
+                redis.eval::<i64>(
+                    RELEASE_SCRIPT,
+                    &[fence_key.as_str()],
+                    &[token_text.as_str()],
+                ),
+            )
+            .await;
+            if matches!(deleted, Ok(Ok(1))) {
+                if let Ok(payload) = payload {
+                    let _ = tokio::time::timeout(
+                        command_timeout,
+                        redis.r#pub(channel.as_ref(), payload.as_ref()),
+                    )
+                    .await;
+                }
+            }
+        });
+    }
 }
 
 #[derive(Default)]
@@ -116,9 +595,17 @@ pub struct EdgeRedisBus {
     redis_plan: GrpcEdgeRedisPubSubPlan,
     hub: Arc<EdgeHub>,
     metrics: Arc<EdgeRedisBusMetrics>,
+    next_correlation: AtomicU64,
+    pending_fanout: PendingFanout,
+    strong_control: Option<Arc<RedisStrongControl>>,
 }
 
 impl EdgeRedisBus {
+    /// 业务作用：建立 Redis Pub/Sub 数据订阅，并在启用 single-session 时先启动强控制面。
+    ///
+    /// 参数说明：`cluster` 是已校验集群计划，`hub` 是进程唯一订阅索引。
+    ///
+    /// 返回：数据与所需控制订阅均 ready 后返回总线；连接或订阅失败则拒绝启动。
     pub async fn start(cluster: Arc<GrpcEdgeClusterPlan>, hub: Arc<EdgeHub>) -> Result<Arc<Self>> {
         let redis_plan = cluster
             .redis_pubsub
@@ -148,12 +635,30 @@ impl EdgeRedisBus {
             .sub(&[redis_plan.channel.as_ref()])
             .await
             .context("subscribe edge Redis Pub/Sub channel")?;
+        let strong_control = if cluster.session_mode == GrpcEdgeSessionModeCfg::SingleSession {
+            Some(
+                RedisStrongControl::start(
+                    cluster.clone(),
+                    redis.clone(),
+                    redis_plan.channel.as_ref(),
+                    redis_plan.command_timeout,
+                    redis_plan.reconnect_backoff,
+                    hub.clone(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let bus = Arc::new(Self {
             cluster,
             redis,
             redis_plan,
             hub,
             metrics: Arc::new(EdgeRedisBusMetrics::default()),
+            next_correlation: AtomicU64::new(1),
+            pending_fanout: DashMap::new(),
+            strong_control,
         });
         bus.metrics.connected.store(true, Ordering::Relaxed);
         let consumer = bus.clone();
@@ -199,8 +704,47 @@ impl EdgeRedisBus {
         Ok(bus)
     }
 
+    /// 业务作用：暴露 Pub/Sub 数据面低基数指标快照句柄。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回与总线同生命周期的指标共享引用。
     pub fn metrics(&self) -> Arc<EdgeRedisBusMetrics> {
         self.metrics.clone()
+    }
+
+    /// 业务作用：判断发布入口是否必须把 Redis channel 当作唯一排序权威。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：配置为 `group_owner` 时返回 `true`。
+    pub fn group_owner_enabled(&self) -> bool {
+        self.cluster.ordering == GrpcEdgeOrderingCfg::GroupOwner
+    }
+
+    /// 业务作用：判断订阅入口是否必须先完成 Redis 全网 fencing claim。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：配置为 `single_session` 时返回 `true`。
+    pub fn single_session_enabled(&self) -> bool {
+        self.cluster.session_mode == GrpcEdgeSessionModeCfg::SingleSession
+    }
+
+    /// 业务作用：通过 Redis 强控制面完成 single-session claim 与全节点 fencing。
+    ///
+    /// 参数说明：`tenant`/`user` 是已验证作用域。
+    ///
+    /// 返回：全网 ACK 与最终复验成功后返回 token；未启用或控制失效时 fail closed。
+    pub async fn claim_single_session(
+        &self,
+        tenant: Arc<str>,
+        user: Arc<str>,
+    ) -> Result<u64, &'static str> {
+        let Some(control) = &self.strong_control else {
+            return Err("edge-redis-session-control-disabled");
+        };
+        control.claim_single_session(tenant, user).await
     }
 
     pub async fn broadcast_publish(
@@ -211,6 +755,70 @@ impl EdgeRedisBus {
     ) -> PeerBroadcastSummary {
         self.broadcast(RedisFanoutAction::Publish, tenant, group, frame)
             .await
+    }
+
+    /// 业务作用：把群播先写入 Redis 全局顺序，再等待本节点从同一订阅序列应用该消息。
+    ///
+    /// 参数说明：`limits` 约束本地 fanout，`tenant`/`group` 是作用域，`frame` 是完整 gRPC 帧，
+    /// `reassembled` 是入口跨 DATA 重组字节。
+    ///
+    /// 返回：本地回环在 ACK deadline 内完成时返回真实散出结果；发布、失联或超时返回静态错误。
+    pub async fn publish_group_owned(
+        &self,
+        limits: &crate::grpc_edge::GrpcEdgeLimitsPlan,
+        tenant: Arc<str>,
+        group: Arc<str>,
+        frame: Bytes,
+        reassembled: u64,
+    ) -> Result<(LocalFanoutOutcome, PeerBroadcastSummary), &'static str> {
+        if !self.metrics.connected.load(Ordering::Acquire) {
+            return Err("edge-redis-group-order-unavailable");
+        }
+        let correlation_id = next_correlation(&self.next_correlation);
+        let payload = encode_from_grpc_frame_with_control(
+            RedisFanoutAction::Publish,
+            self.cluster.cluster_id.as_ref(),
+            &tenant,
+            &group,
+            self.cluster.node_id.as_ref(),
+            &frame,
+            EnvelopeControl {
+                correlation_id,
+                revision: 0,
+            },
+        )
+        .map_err(|_| "edge-redis-group-envelope-invalid")?;
+        let (tx, rx) = oneshot::channel();
+        self.pending_fanout.insert(
+            correlation_id,
+            PendingFanoutEntry {
+                sender: tx,
+                limits: limits.clone(),
+                reassembled,
+            },
+        );
+        let published = tokio::time::timeout(
+            self.redis_plan.command_timeout,
+            self.redis
+                .r#pub(self.redis_plan.channel.as_ref(), payload.as_ref()),
+        )
+        .await;
+        if !matches!(published, Ok(Ok(_))) {
+            self.pending_fanout.remove(&correlation_id);
+            self.metrics
+                .publish_failed_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err("edge-redis-group-publish-failed");
+        }
+        self.metrics.published_total.fetch_add(1, Ordering::Relaxed);
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(self.cluster.ack_deadline_ms), rx).await;
+        self.pending_fanout.remove(&correlation_id);
+        match outcome {
+            Ok(Ok(Ok(outcome))) => Ok((outcome, PeerBroadcastSummary::default())),
+            Ok(Ok(Err(()))) => Err("edge-redis-group-local-fanout-rejected"),
+            Ok(Err(_)) | Err(_) => Err("edge-redis-group-local-ack-timeout"),
+        }
     }
 
     pub async fn broadcast_push(
@@ -271,25 +879,49 @@ impl EdgeRedisBus {
         if envelope.cluster_id != self.cluster.cluster_id.as_ref() {
             bail!("Redis envelope cluster_id mismatch");
         }
-        // gRPC ingress 已先完成本地散出；跳过自己的 Redis 回环，避免本机收到两次。
-        if envelope.origin_node_id == self.cluster.node_id.as_ref() {
+        let own_group_order = self.group_owner_enabled()
+            && envelope.action == RedisFanoutAction::Publish
+            && envelope.origin_node_id == self.cluster.node_id.as_ref()
+            && envelope.correlation_id != 0;
+        // 普通模式仍是 local-first，必须跳过自身回环；group_owner 则恰好相反：本机也只能
+        // 从 Redis 排序序列散出，任何入口直发都会破坏跨节点同序。
+        if envelope.origin_node_id == self.cluster.node_id.as_ref() && !own_group_order {
             return Ok(());
         }
         let frame = grpc_frame(envelope.message)?;
         match envelope.action {
             RedisFanoutAction::Publish => {
-                self.hub
+                let pending = own_group_order
+                    .then(|| self.pending_fanout.remove(&envelope.correlation_id))
+                    .flatten()
+                    .map(|(_, pending)| pending);
+                let limits = pending
+                    .as_ref()
+                    .map_or(&self.cluster.fanout_limits, |pending| &pending.limits);
+                let reassembled = pending.as_ref().map_or(0, |pending| pending.reassembled);
+                let result = self
+                    .hub
                     .publish_group(
-                        &self.cluster.fanout_limits,
+                        limits,
                         Arc::from(envelope.tenant.as_str()),
                         Arc::from(envelope.scope.as_str()),
                         frame,
-                        0,
+                        reassembled,
                     )
-                    .await
-                    .map_err(|error| {
-                        anyhow!("Redis publish fanout rejected: {}", error.reason())
-                    })?;
+                    .await;
+                match result {
+                    Ok(outcome) => {
+                        if let Some(pending) = pending {
+                            let _ = pending.sender.send(Ok(outcome));
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(pending) = pending {
+                            let _ = pending.sender.send(Err(()));
+                        }
+                        return Err(anyhow!("Redis publish fanout rejected: {}", error.reason()));
+                    }
+                }
             }
             RedisFanoutAction::Push => {
                 self.hub
@@ -302,6 +934,11 @@ impl EdgeRedisBus {
                     )
                     .await
                     .map_err(|error| anyhow!("Redis push fanout rejected: {}", error.reason()))?;
+            }
+            RedisFanoutAction::SessionFence
+            | RedisFanoutAction::SessionFenceAck
+            | RedisFanoutAction::SessionRelease => {
+                bail!("control action received on Redis data channel")
             }
         }
         Ok(())
@@ -317,9 +954,17 @@ pub struct EdgeRedisStreamBus {
     hub: Arc<EdgeHub>,
     subscription: std::sync::OnceLock<StreamSubscription>,
     metrics: Arc<EdgeRedisStreamMetrics>,
+    next_correlation: AtomicU64,
+    pending_fanout: PendingFanout,
+    strong_control: std::sync::OnceLock<Arc<RedisStrongControl>>,
 }
 
 impl EdgeRedisStreamBus {
+    /// 业务作用：建立每节点独立 XREAD cursor，并在所需时追加 Redis strong-control 订阅。
+    ///
+    /// 参数说明：`cluster` 是已校验集群计划，`hub` 是进程唯一订阅索引。
+    ///
+    /// 返回：Stream 消费器与所需控制面均 ready 后返回；任一步失败则拒绝启动。
     pub async fn start(cluster: Arc<GrpcEdgeClusterPlan>, hub: Arc<EdgeHub>) -> Result<Arc<Self>> {
         let redis_plan = cluster
             .redis_stream
@@ -371,6 +1016,9 @@ impl EdgeRedisStreamBus {
             hub,
             subscription: std::sync::OnceLock::new(),
             metrics: Arc::new(EdgeRedisStreamMetrics::default()),
+            next_correlation: AtomicU64::new(1),
+            pending_fanout: DashMap::new(),
+            strong_control: std::sync::OnceLock::new(),
         });
         let weak = Arc::downgrade(&bus);
         let cfg = StreamSubscribeCfg {
@@ -399,6 +1047,18 @@ impl EdgeRedisStreamBus {
             .await
             .context("start edge Redis Stream XREAD subscription")?;
         let _ = bus.subscription.set(subscription);
+        if bus.cluster.session_mode == GrpcEdgeSessionModeCfg::SingleSession {
+            let control = RedisStrongControl::start(
+                bus.cluster.clone(),
+                bus.redis.clone(),
+                bus.redis_plan.stream.as_ref(),
+                bus.redis_plan.command_timeout,
+                bus.redis_plan.reconnect_backoff,
+                bus.hub.clone(),
+            )
+            .await?;
+            let _ = bus.strong_control.set(control);
+        }
         if trim_gap {
             bus.metrics.trim_gap_total.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
@@ -412,8 +1072,47 @@ impl EdgeRedisStreamBus {
         Ok(bus)
     }
 
+    /// 业务作用：暴露 Redis Stream 数据面低基数指标快照句柄。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回与总线同生命周期的指标共享引用。
     pub fn metrics(&self) -> Arc<EdgeRedisStreamMetrics> {
         self.metrics.clone()
+    }
+
+    /// 业务作用：判断发布入口是否必须把 Redis Stream entry 顺序当作唯一排序权威。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：配置为 `group_owner` 时返回 `true`。
+    pub fn group_owner_enabled(&self) -> bool {
+        self.cluster.ordering == GrpcEdgeOrderingCfg::GroupOwner
+    }
+
+    /// 业务作用：判断订阅入口是否必须先完成 Redis 全网 fencing claim。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：配置为 `single_session` 时返回 `true`。
+    pub fn single_session_enabled(&self) -> bool {
+        self.cluster.session_mode == GrpcEdgeSessionModeCfg::SingleSession
+    }
+
+    /// 业务作用：通过 Redis 强控制面完成 single-session claim 与全节点 fencing。
+    ///
+    /// 参数说明：`tenant`/`user` 是已验证作用域。
+    ///
+    /// 返回：全网 ACK 与最终复验成功后返回 token；未启用或控制失效时 fail closed。
+    pub async fn claim_single_session(
+        &self,
+        tenant: Arc<str>,
+        user: Arc<str>,
+    ) -> Result<u64, &'static str> {
+        let Some(control) = self.strong_control.get() else {
+            return Err("edge-redis-session-control-disabled");
+        };
+        control.claim_single_session(tenant, user).await
     }
 
     pub async fn broadcast_publish(
@@ -424,6 +1123,68 @@ impl EdgeRedisStreamBus {
     ) -> PeerBroadcastSummary {
         self.broadcast(RedisFanoutAction::Publish, tenant, group, frame)
             .await
+    }
+
+    /// 业务作用：把群播先 XADD 到 Redis 全局顺序，再等待本节点 XREAD 应用同一 entry。
+    ///
+    /// 参数说明：`limits` 约束入口本地 fanout，`tenant`/`group` 是作用域，`frame` 是完整 gRPC 帧，
+    /// `reassembled` 是入口跨 DATA 重组字节。
+    ///
+    /// 返回：本地 cursor 消费在 ACK deadline 内完成时返回真实散出结果；写入、消费或超时失败则 fail closed。
+    pub async fn publish_group_owned(
+        &self,
+        limits: &crate::grpc_edge::GrpcEdgeLimitsPlan,
+        tenant: Arc<str>,
+        group: Arc<str>,
+        frame: Bytes,
+        reassembled: u64,
+    ) -> Result<(LocalFanoutOutcome, PeerBroadcastSummary), &'static str> {
+        let correlation_id = next_correlation(&self.next_correlation);
+        let payload = encode_from_grpc_frame_with_control(
+            RedisFanoutAction::Publish,
+            self.cluster.cluster_id.as_ref(),
+            &tenant,
+            &group,
+            self.cluster.node_id.as_ref(),
+            &frame,
+            EnvelopeControl {
+                correlation_id,
+                revision: 0,
+            },
+        )
+        .map_err(|_| "edge-redis-group-envelope-invalid")?;
+        let (tx, rx) = oneshot::channel();
+        self.pending_fanout.insert(
+            correlation_id,
+            PendingFanoutEntry {
+                sender: tx,
+                limits: limits.clone(),
+                reassembled,
+            },
+        );
+        let fields = [(REDIS_STREAM_FIELD, payload.as_ref())];
+        let published = tokio::time::timeout(
+            self.redis_plan.command_timeout,
+            self.redis
+                .x_add_bytes(self.redis_plan.stream.as_ref(), "*", &fields),
+        )
+        .await;
+        if !matches!(published, Ok(Ok(_))) {
+            self.pending_fanout.remove(&correlation_id);
+            self.metrics
+                .publish_failed_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err("edge-redis-group-publish-failed");
+        }
+        self.metrics.published_total.fetch_add(1, Ordering::Relaxed);
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(self.cluster.ack_deadline_ms), rx).await;
+        self.pending_fanout.remove(&correlation_id);
+        match outcome {
+            Ok(Ok(Ok(outcome))) => Ok((outcome, PeerBroadcastSummary::default())),
+            Ok(Ok(Err(()))) => Err("edge-redis-group-local-fanout-rejected"),
+            Ok(Err(_)) | Err(_) => Err("edge-redis-group-local-ack-timeout"),
+        }
     }
 
     pub async fn broadcast_push(
@@ -516,24 +1277,50 @@ impl EdgeRedisStreamBus {
         if envelope.cluster_id != self.cluster.cluster_id.as_ref() {
             bail!("Redis Stream envelope cluster_id mismatch");
         }
-        if envelope.origin_node_id == self.cluster.node_id.as_ref() {
+        let own_group_order = self.group_owner_enabled()
+            && envelope.action == RedisFanoutAction::Publish
+            && envelope.origin_node_id == self.cluster.node_id.as_ref()
+            && envelope.correlation_id != 0;
+        if envelope.origin_node_id == self.cluster.node_id.as_ref() && !own_group_order {
             return Ok(());
         }
         let frame = grpc_frame(envelope.message)?;
         match envelope.action {
             RedisFanoutAction::Publish => {
-                self.hub
+                let pending = own_group_order
+                    .then(|| self.pending_fanout.remove(&envelope.correlation_id))
+                    .flatten()
+                    .map(|(_, pending)| pending);
+                let limits = pending
+                    .as_ref()
+                    .map_or(&self.cluster.fanout_limits, |pending| &pending.limits);
+                let reassembled = pending.as_ref().map_or(0, |pending| pending.reassembled);
+                let result = self
+                    .hub
                     .publish_group(
-                        &self.cluster.fanout_limits,
+                        limits,
                         Arc::from(envelope.tenant.as_str()),
                         Arc::from(envelope.scope.as_str()),
                         frame,
-                        0,
+                        reassembled,
                     )
-                    .await
-                    .map_err(|error| {
-                        anyhow!("Redis Stream publish fanout rejected: {}", error.reason())
-                    })?;
+                    .await;
+                match result {
+                    Ok(outcome) => {
+                        if let Some(pending) = pending {
+                            let _ = pending.sender.send(Ok(outcome));
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(pending) = pending {
+                            let _ = pending.sender.send(Err(()));
+                        }
+                        return Err(anyhow!(
+                            "Redis Stream publish fanout rejected: {}",
+                            error.reason()
+                        ));
+                    }
+                }
             }
             RedisFanoutAction::Push => {
                 self.hub
@@ -549,6 +1336,11 @@ impl EdgeRedisStreamBus {
                         anyhow!("Redis Stream push fanout rejected: {}", error.reason())
                     })?;
             }
+            RedisFanoutAction::SessionFence
+            | RedisFanoutAction::SessionFenceAck
+            | RedisFanoutAction::SessionRelease => {
+                bail!("control action received on Redis Stream data key")
+            }
         }
         Ok(())
     }
@@ -560,6 +1352,35 @@ fn compatibility_profile(raw: &str) -> CompatibilityProfile {
         "legacyv1" => CompatibilityProfile::LegacyV1,
         _ => unreachable!("profile was validated while building the cluster plan"),
     }
+}
+
+/// 业务作用：生成进程内非零 correlation id，供 pending map 与 Redis 回环唯一关联。
+///
+/// 参数说明：`counter` 是对应总线或控制面的单调计数器。
+///
+/// 返回：返回非零 id；u64 回绕到零时跳过零值，保留零作为“无需本地回执”的协议标记。
+fn next_correlation(counter: &AtomicU64) -> u64 {
+    loop {
+        let value = counter.fetch_add(1, Ordering::Relaxed);
+        if value != 0 {
+            return value;
+        }
+    }
+}
+
+/// 业务作用：把业务身份编码成不会注入 Redis key 分隔符或 hashtag 的稳定 ASCII 组件。
+///
+/// 参数说明：`bytes` 是已经过业务长度门的 UTF-8/ASCII 身份字节。
+///
+/// 返回：返回小写十六进制字符串。
+fn hex_component(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// 业务侧直接发布群消息时使用；`origin_node_id` 固定为空，使每个 Naway 节点都消费。
@@ -576,7 +1397,15 @@ pub fn encode_external_publish(
         group,
         "",
         frame_push_message,
+        EnvelopeControl::default(),
     )
+}
+
+/// Redis envelope 中只供强顺序/fencing 使用的控制元数据。
+#[derive(Clone, Copy, Default)]
+struct EnvelopeControl {
+    correlation_id: u64,
+    revision: u64,
 }
 
 fn encode_from_grpc_frame(
@@ -586,6 +1415,32 @@ fn encode_from_grpc_frame(
     scope: &str,
     origin_node_id: &str,
     frame: &[u8],
+) -> Result<Bytes> {
+    encode_from_grpc_frame_with_control(
+        action,
+        cluster_id,
+        tenant,
+        scope,
+        origin_node_id,
+        frame,
+        EnvelopeControl::default(),
+    )
+}
+
+/// 业务作用：校验完整 gRPC 帧并编码带排序 correlation/fencing revision 的 Redis envelope。
+///
+/// 参数说明：`action`/`cluster_id`/`tenant`/`scope`/`origin_node_id` 定义路由，`frame` 是
+/// identity-compression gRPC 帧，`control` 关联本地排序回执并承载 fencing 版本。
+///
+/// 返回：帧合法时返回版本化 envelope；压缩、长度不符或路由非法时返回错误。
+fn encode_from_grpc_frame_with_control(
+    action: RedisFanoutAction,
+    cluster_id: &str,
+    tenant: &str,
+    scope: &str,
+    origin_node_id: &str,
+    frame: &[u8],
+    control: EnvelopeControl,
 ) -> Result<Bytes> {
     if frame.len() < GRPC_PREFIX_BYTES || frame[0] != 0 {
         bail!("edge frame is not an uncompressed gRPC message");
@@ -601,9 +1456,16 @@ fn encode_from_grpc_frame(
         scope,
         origin_node_id,
         &frame[GRPC_PREFIX_BYTES..],
+        control,
     )
 }
 
+/// 业务作用：生成 Redis 数据/控制面共享的向后兼容 protobuf envelope。
+///
+/// 参数说明：前六个参数定义动作、作用域与 opaque message；`control` 仅在强排序或
+/// fencing 控制动作中携带非零 correlation/revision。
+///
+/// 返回：路由字段合法时返回编码；非法身份立即拒绝，避免污染共享 channel/stream。
 fn encode_envelope(
     action: RedisFanoutAction,
     cluster_id: &str,
@@ -611,6 +1473,7 @@ fn encode_envelope(
     scope: &str,
     origin_node_id: &str,
     message: &[u8],
+    control: EnvelopeControl,
 ) -> Result<Bytes> {
     validate_routing("cluster_id", cluster_id)?;
     validate_routing("tenant", tenant)?;
@@ -629,9 +1492,20 @@ fn encode_envelope(
     if !origin_node_id.is_empty() {
         put_bytes_field(&mut out, 7, origin_node_id.as_bytes());
     }
+    if control.correlation_id != 0 {
+        put_varint_field(&mut out, 8, control.correlation_id);
+    }
+    if control.revision != 0 {
+        put_varint_field(&mut out, 9, control.revision);
+    }
     Ok(out.freeze())
 }
 
+/// 业务作用：有界解码 Redis envelope，拒绝重复字段、非法 wire、跨上限 message 与未知动作。
+///
+/// 参数说明：`input` 是 Redis payload，`max_message_bytes` 是业务 protobuf message 硬上限。
+///
+/// 返回：合法时返回独立路由字段与零拷贝 message slice；畸形输入返回错误且不会触发 fanout。
 fn decode_envelope(input: Bytes, max_message_bytes: usize) -> Result<DecodedEnvelope> {
     if input.len() > max_message_bytes.saturating_add(MAX_ENVELOPE_OVERHEAD) {
         bail!("Redis envelope exceeds configured message limit");
@@ -644,6 +1518,8 @@ fn decode_envelope(input: Bytes, max_message_bytes: usize) -> Result<DecodedEnve
     let mut scope = None;
     let mut message = None;
     let mut origin_node_id = None;
+    let mut correlation_id = None;
+    let mut revision = None;
     while pos < input.len() {
         let key = take_varint(&input, &mut pos)?;
         let field = (key >> 3) as u32;
@@ -664,6 +1540,12 @@ fn decode_envelope(input: Bytes, max_message_bytes: usize) -> Result<DecodedEnve
                 take_string(&input, &mut pos)?,
                 "origin_node_id",
             )?,
+            8 if wire == 0 => set_once(
+                &mut correlation_id,
+                take_varint(&input, &mut pos)?,
+                "correlation_id",
+            )?,
+            9 if wire == 0 => set_once(&mut revision, take_varint(&input, &mut pos)?, "revision")?,
             _ => skip_field(&input, &mut pos, wire)?,
         }
     }
@@ -673,6 +1555,9 @@ fn decode_envelope(input: Bytes, max_message_bytes: usize) -> Result<DecodedEnve
     let action = match action {
         Some(1) => RedisFanoutAction::Publish,
         Some(2) => RedisFanoutAction::Push,
+        Some(3) => RedisFanoutAction::SessionFence,
+        Some(4) => RedisFanoutAction::SessionFenceAck,
+        Some(5) => RedisFanoutAction::SessionRelease,
         _ => bail!("invalid Redis envelope action"),
     };
     let cluster_id = cluster_id.ok_or_else(|| anyhow!("missing cluster_id"))?;
@@ -696,6 +1581,8 @@ fn decode_envelope(input: Bytes, max_message_bytes: usize) -> Result<DecodedEnve
         scope,
         message,
         origin_node_id,
+        correlation_id: correlation_id.unwrap_or(0),
+        revision: revision.unwrap_or(0),
     })
 }
 
@@ -869,12 +1756,18 @@ mod tests {
             "room.1",
             "node-a",
             b"\x0a\x03raw",
+            EnvelopeControl {
+                correlation_id: 17,
+                revision: 23,
+            },
         )
         .unwrap();
         let decoded = decode_envelope(encoded, 1024).unwrap();
         assert_eq!(decoded.action, RedisFanoutAction::Publish);
         assert_eq!(decoded.message.as_ref(), b"\x0a\x03raw");
         assert_eq!(decoded.origin_node_id, "node-a");
+        assert_eq!(decoded.correlation_id, 17);
+        assert_eq!(decoded.revision, 23);
     }
 
     #[test]
@@ -935,6 +1828,57 @@ mod tests {
         );
         assert!(plan.redis_pubsub.is_none());
         assert!(plan.redis_stream.is_some());
+    }
+
+    /// 回归场景：Redis Pub/Sub 与 Stream 都必须接受 `group_owner + single_session`，
+    /// 不得退回旧的“构建期未实现”拒绝；同时计划必须保留两项强语义供运行时选择路径。
+    #[test]
+    fn redis_cluster_modes_accept_strong_ordering_and_session_semantics() {
+        for (mode, transport) in [
+            (
+                "redis_pubsub",
+                r#""redis_pubsub": { "url": "redis://127.0.0.1:6379" }"#,
+            ),
+            (
+                "redis_stream",
+                r#""redis_stream": { "url": "redis://127.0.0.1:6379" }"#,
+            ),
+        ] {
+            let raw = format!(
+                r#"{{
+  "mode": "{mode}",
+  "cluster_id": "cluster-a",
+  "node_id": "node-a",
+  "ordering": "group_owner",
+  "session_mode": "single_session",
+  {transport}
+}}"#
+            );
+            let cfg: crate::config::model::GrpcEdgeClusterCfg = serde_json::from_str(&raw).unwrap();
+            let plan = GrpcEdgeClusterPlan::build(Some(&cfg), false, std::path::Path::new("."))
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.ordering, GrpcEdgeOrderingCfg::GroupOwner);
+            assert_eq!(plan.session_mode, GrpcEdgeSessionModeCfg::SingleSession);
+        }
+    }
+
+    /// 回归场景：fencing ACK 必须来自 claim 快照中的每个不同 node_id；重复 ACK、
+    /// 非成员 ACK 或只到部分节点都不能提前放行新会话。
+    #[test]
+    fn fence_waiter_requires_every_distinct_snapshot_member() {
+        let waiter = FenceAckWaiter::new(
+            9,
+            ["node-a".to_string(), "node-b".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        waiter.acknowledge("node-a".to_string());
+        waiter.acknowledge("node-a".to_string());
+        waiter.acknowledge("node-x".to_string());
+        assert!(!waiter.complete());
+        waiter.acknowledge("node-b".to_string());
+        assert!(waiter.complete());
     }
 
     #[test]

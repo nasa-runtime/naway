@@ -3,6 +3,7 @@
 //! 该协议头在 TCP 建连后、TLS/HTTP 之前由前置 L4 LB 写入,用于把真实客户端地址传给网关。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -25,7 +26,7 @@ pub enum ProxyProtocolWriteVersion {
 }
 
 /// 连接级地址信息。`real_peer` 优先来自可信 PROXY 头,否则等于 TCP 对端。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ConnInfo {
     /// 内核 accept 得到的直接 TCP 对端。
     pub tcp_peer: SocketAddr,
@@ -36,6 +37,9 @@ pub struct ConnInfo {
     /// mTLS(§19):本连接是否出示了【经 CA 校验通过】的客户端证书。TLS 握手后由 accept loop 置位;
     /// 明文/无 client_auth 恒 false。数据面据此向上游注入 `X-Client-Cert-Verified`。
     pub client_cert_verified: bool,
+    /// TLS 握手完成后由 rustls 提供的规范化 SNI；明文、HTTP/3 或未携带 SNI 时为 None。
+    /// 该值来自 ClientHello，不能由同一连接上的 HTTP 请求头覆盖。
+    pub tls_server_name: Option<Arc<str>>,
 }
 
 /// 按配置剥离 PROXY protocol 头。禁用时不读流,直接返回 TCP 对端。
@@ -69,6 +73,7 @@ impl ConnInfo {
             real_peer: peer,
             via_proxy_protocol: false,
             client_cert_verified: false,
+            tls_server_name: None,
         }
     }
 }
@@ -192,6 +197,7 @@ async fn parse_v1(stream: &mut TcpStream, peer: SocketAddr, mut line: Vec<u8>) -
         real_peer: SocketAddr::new(src_ip, src_port),
         via_proxy_protocol: true,
         client_cert_verified: false,
+        tls_server_name: None,
     })
 }
 
@@ -228,6 +234,7 @@ async fn parse_v2(stream: &mut TcpStream, peer: SocketAddr) -> Result<ConnInfo> 
                 real_peer: SocketAddr::new(IpAddr::V4(src), port),
                 via_proxy_protocol: true,
                 client_cert_verified: false,
+                tls_server_name: None,
             })
         }
         0x21 if payload.len() >= 36 => {
@@ -238,6 +245,7 @@ async fn parse_v2(stream: &mut TcpStream, peer: SocketAddr) -> Result<ConnInfo> 
                 real_peer: SocketAddr::new(IpAddr::V6(src), port),
                 via_proxy_protocol: true,
                 client_cert_verified: false,
+                tls_server_name: None,
             })
         }
         0x00 => Ok(ConnInfo::plain(peer)),

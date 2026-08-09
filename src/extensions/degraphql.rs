@@ -245,7 +245,7 @@ impl DegraphqlPlan {
             .headers
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         parts.headers.insert(CONTENT_LENGTH, content_length);
-        DegraphqlOutcome::Transformed(ForwardBody::Boxed(full_body(bytes)))
+        DegraphqlOutcome::Transformed(full_body(bytes))
     }
 }
 

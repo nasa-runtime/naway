@@ -24,12 +24,14 @@ use crate::tls::{build_upstream_tls_profile, UpstreamTlsProfile};
 use crate::upstream::{DynamicUpstreamStore, UpstreamDirectory};
 use crate::variable::VariablePlan;
 use model::{
-    AcmeCfg, AdminAction, AdminCfg, AdminResource, AdminRole, ConfigSourceCfg, DiscoveryCfg,
-    GatewayConfig, GuardFile, ProxyCfg, ProxyProtocolCfg, RuntimeStateCfg, SentinelFile, ServerCfg,
-    ServerLimitsCfg, StreamCfg, TimeoutCfg,
+    AcmeCfg, AdminAction, AdminCfg, AdminResource, AdminRole, ConfigSourceCfg, ControlPlaneCfg,
+    ControlPlaneModeCfg, DiscoveryCfg, GatewayConfig, GuardFile, Http3Cfg, ProxyCfg,
+    ProxyProtocolCfg, RuntimeStateCfg, SentinelFile, ServerCfg, ServerLimitsCfg, StreamCfg,
+    TimeoutCfg, XdsResourceOwnerCfg, XdsStartupPolicyCfg,
 };
 
 /// 一次请求要读的全部配置的不可变快照(路由 + 接口守卫)。换版 = 造新的、`ArcSwap` 原子替换指针。
+#[derive(Clone)]
 pub struct GatewaySnapshot {
     /// 单调递增的成功配置版本。
     pub version: u64,
@@ -39,13 +41,13 @@ pub struct GatewaySnapshot {
     pub config_fingerprint: Option<u64>,
     /// 配置 schema 版本(§6),用于演进期迁移/告警。
     pub schema_version: u32,
-    /// 数据面监听地址(启动期绑定一次;§6 中 listen 属 bootstrap 层,热更不重绑)。
+    /// 主数据面监听地址；拓扑变化由 listener supervisor 在快照发布前 prepare 并在发布后换代。
     pub listen: String,
     /// 可选 TLS 数据面监听(明文/TLS 分 socket)。
     pub tls: Option<TlsRuntimeCfg>,
-    /// 管理/观测面监听地址(§14.1);同样启动期绑定一次、热更不重绑。
+    /// 管理/观测面监听地址；变更时先绑定候选端口，发布后启动新代并优雅停收旧代。
     pub admin_listen: String,
-    /// 是否暴露 /metrics(V2-B 起生效)。
+    /// 是否在管理面暴露 `/metrics`。
     pub expose_metrics: bool,
     /// 管理面自身认证策略。随配置快照热更新,但不影响 admin listener 绑定。
     pub admin_auth: AdminAuthRuntimeCfg,
@@ -59,6 +61,8 @@ pub struct GatewaySnapshot {
     pub kubernetes_routes: model::KubernetesRouteSourceCfg,
     /// 统一配置来源。热路径不用它,只供 reload/config source worker 与 admin 展示。
     pub config_source: ConfigSourceCfg,
+    /// xDS bootstrap 与资源域 owner；请求热路径不读取。
+    pub control_plane: ControlPlaneCfg,
     /// 运行态共享后端配置。启动装配读取它创建 RateLimiter/DynamicStore 后端。
     pub runtime_state: RuntimeStateCfg,
     /// access log 运行参数。构建期已编译格式/条件表达式。
@@ -87,8 +91,7 @@ pub struct GatewaySnapshot {
     pub stream_listeners: Arc<Vec<StreamRuntime>>,
     /// V7 开发者门户/API 目录；OpenAPI 文档和 operation 摘要均随快照原子换版。
     pub developer_portal: Arc<crate::developer_portal::DeveloperPortalRuntime>,
-    /// V8 gRPC 边缘模式集群中继计划;None = 未配置/显式单机。V8-0 仅构建期定型与
-    /// 接线,不绑定 relay 端口、不建 peer 连接(V8-3 落地)。
+    /// gRPC 边缘模式集群中继计划；None = 未配置或显式单机，不绑定 relay 端口、不建 peer 连接。
     pub grpc_edge_cluster: Option<Arc<crate::grpc_edge::GrpcEdgeClusterPlan>>,
 }
 
@@ -115,6 +118,10 @@ pub struct GatewaySnapshotSummary {
     pub grpc_edge_routes: usize,
     /// V8:是否配置了边缘集群中继面。
     pub grpc_edge_cluster: bool,
+    /// 启用 descriptor 转码的 route 数；0 表示普通 native gRPC 零反射计划。
+    pub grpc_transcoding_routes: usize,
+    /// 所有 descriptor route 白名单内的 RPC 数，不暴露高基数 method 名称。
+    pub grpc_transcoding_methods: usize,
 }
 
 /// 单个 TLS listener 的运行期配置；路径已相对主配置解析，域名等字符串已构建期规范化。
@@ -134,6 +141,61 @@ pub struct TlsRuntimeCfg {
     pub client_auth: Option<ClientAuthRuntime>,
     /// ACME 自动签发/续期策略；None 表示静态证书模式。
     pub acme: Option<AcmeRuntimeCfg>,
+    /// SDS 下发且仅驻留内存的证书材料；存在时禁止回退到文件、manifest、SNI 文件或 ACME。
+    pub in_memory: Option<Arc<InMemoryTlsMaterial>>,
+}
+
+/// SDS listener 使用的进程内 TLS 材料。
+///
+/// 该类型不实现 `Debug`/`Serialize`，避免私钥或 CA 被配置转储、日志和错误链意外输出。
+#[derive(Clone, PartialEq, Eq)]
+pub struct InMemoryTlsMaterial {
+    /// PEM 证书链；只交给 rustls parser。
+    pub certificate_chain: Arc<[u8]>,
+    /// PEM 私钥；只交给 rustls parser。
+    pub private_key: Arc<[u8]>,
+    /// 可选 mTLS 客户端 CA PEM。
+    pub client_ca: Option<Arc<[u8]>>,
+    /// 存在客户端 CA 时，是否强制客户端出示合法证书。
+    pub require_client_certificate: bool,
+}
+
+/// 构建期校验后的 HTTP/3/QUIC listener 计划。
+///
+/// 业务作用：把 feature 门、安全默认和资源硬上限固化进不可变快照，供 listener supervisor
+/// prepare UDP endpoint；关闭态为零值计划，不创建 transport task。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Http3RuntimeCfg {
+    /// 是否启用 HTTP/3 listener。
+    pub enabled: bool,
+    /// readiness 后是否发布 Alt-Svc。
+    pub advertise_alt_svc: bool,
+    /// 已在构建期编码的本 listener Alt-Svc；关闭广告时为 None。
+    pub alt_svc_header: Option<http::HeaderValue>,
+    /// QUIC connection idle timeout。
+    pub max_idle_timeout_ms: u64,
+    /// QUIC 物理连接上限。
+    pub max_connections: usize,
+    /// 单握手来源 IP 的 QUIC 物理连接上限。
+    pub max_connections_per_ip: usize,
+    /// endpoint 未决 Initial/handshake 数量上限。
+    pub max_pending_handshakes: usize,
+    /// 单条未决 handshake 的追加 datagram 缓冲上限。
+    pub max_pending_handshake_bytes: u64,
+    /// 单连接 request stream 上限。
+    pub max_bidi_streams_per_connection: u32,
+    /// H3 header section 上限。
+    pub max_request_header_bytes: usize,
+    /// 单 stream 内部 buffer/queue 字节上限。
+    pub max_stream_buffer_bytes: usize,
+    /// Retry 地址验证策略。
+    pub retry: model::Http3RetryCfg,
+    /// Retry token 有效期。
+    pub retry_token_lifetime_seconds: u64,
+    /// Retry token 认证主密钥轮换周期。
+    pub retry_token_rotation_seconds: u64,
+    /// 首版恒为 false；字段保留是为了显式拒绝危险配置。
+    pub zero_rtt: bool,
 }
 
 /// 构建期校验并规范化后的 ACME worker 配置。
@@ -200,6 +262,8 @@ pub struct AcmeDns01RuntimeCfg {
 pub struct ClientAuthRuntime {
     /// true = require(握手必须出示合法客户端证书);false = optional(出示才校验)。
     pub require: bool,
+    /// true = 请求客户端证书但不按 CA 信任链拒绝，仍校验握手签名以证明私钥持有。
+    pub allow_untrusted: bool,
     /// 受信任的客户端 CA PEM 路径。
     pub ca_file: PathBuf,
 }
@@ -237,10 +301,16 @@ pub struct ProxyRuntime {
     pub id: String,
     /// 明文监听地址。
     pub listen: String,
+    /// 是否在 `listen` 上启动明文 HTTP accept；LDS TLS listener 为 false，避免同一地址双绑。
+    pub plain_enabled: bool,
     /// 可选 TLS 监听配置。
     pub tls: Option<TlsRuntimeCfg>,
+    /// HTTP/3/QUIC listener 计划；启用时 UDP 端口复用 `tls.listen`。
+    pub http3: Http3RuntimeCfg,
     /// 该代理允许的 SNI 名称。
     pub server_names: Arc<Vec<String>>,
+    /// Gateway API 共享 HTTP/HTTPS socket 的逻辑 listener 选择表。
+    pub gateway_listeners: Arc<Vec<GatewayListenerRuntime>>,
     /// PROXY 协议策略。
     pub proxy_protocol: ProxyProtocolRuntimeCfg,
     /// 可信前置代理网段(review L6 / §12):决定是否信任入站 XFF / traceparent。构建期预解析。
@@ -255,6 +325,15 @@ pub struct ProxyRuntime {
     pub hsts_header: Option<http::HeaderValue>,
     /// 路由表快照。
     pub router: Arc<Router>,
+}
+
+/// 已规范化、可直接执行精确/通配优先级选择的 Gateway API HTTP/HTTPS listener。
+#[derive(Clone)]
+pub struct GatewayListenerRuntime {
+    /// listener 稳定身份，用于比较 SNI 与 Host 是否落到同一权威边界。
+    pub id: Arc<str>,
+    /// 小写且去尾点的精确或最左通配 hostname；None 是兜底 listener。
+    pub hostname: Option<Arc<str>>,
 }
 
 /// HTTP→HTTPS 跳转运行期(§19):明文入口收到请求即跳到本 proxy 的 TLS 端口。
@@ -373,6 +452,12 @@ pub struct StreamRuntime {
     pub upstream: String,
     /// TLS preread 配置。
     pub preread: StreamPrereadRuntime,
+    /// 显式启用的 MQTT 协议治理计划；未开 feature 时该字段不进入制品。
+    #[cfg(feature = "mqtt-governance")]
+    pub mqtt: Option<Arc<crate::mqtt::MqttPolicy>>,
+    /// 显式启用的 Kafka 协议治理计划；未开 feature 时该字段不进入制品。
+    #[cfg(feature = "kafka-governance")]
+    pub kafka: Option<Arc<crate::kafka::KafkaPolicy>>,
     /// stream route 列表。旧版单 upstream 会被编译成一条 default route。
     pub routes: Arc<Vec<StreamRouteRuntime>>,
     /// PROXY protocol v1/v2 解析策略。
@@ -412,14 +497,18 @@ pub struct StreamProxyProtocolUpstreamRuntime {
 pub struct StreamRouteRuntime {
     /// route 唯一标识。
     pub id: String,
-    /// SNI 精确匹配值,已小写化。
+    /// SNI 精确值或 `*.` 前缀的 suffix wildcard，已小写化。
     pub sni: Option<String>,
     /// MQTT client id 精确匹配。
     pub mqtt_client_id: Option<String>,
     /// 是否默认路由。
     pub default: bool,
+    /// 选中后是否终止下游 TLS；false 保持 ClientHello 及后续字节透传。
+    pub terminate_tls: bool,
     /// 上游 TCP 地址。
     pub upstream: String,
+    /// 按连接或 UDP session 选择的带权上游；空集合沿用单一 `upstream`。
+    pub weighted_upstreams: Arc<[(String, u32)]>,
     /// 直连 stream 上游 TLS profile。`lb://` 路由在选实例后继承 service profile。
     pub upstream_tls: Option<UpstreamTlsProfile>,
 }
@@ -462,6 +551,13 @@ impl GatewaySnapshot {
 
     /// 生成当前快照的低基数摘要,供 Admin dry-run 和状态展示使用。
     pub fn summary(&self) -> GatewaySnapshotSummary {
+        let (grpc_transcoding_routes, grpc_transcoding_methods) = self
+            .proxies
+            .iter()
+            .map(|proxy| proxy.router.grpc_transcoding_summary())
+            .fold((0, 0), |(routes, methods), current| {
+                (routes + current.0, methods + current.1)
+            });
         GatewaySnapshotSummary {
             version: self.version,
             schema_version: self.schema_version,
@@ -476,6 +572,8 @@ impl GatewaySnapshot {
                 .map(|proxy| proxy.router.grpc_edge_route_count())
                 .sum(),
             grpc_edge_cluster: self.grpc_edge_cluster.is_some(),
+            grpc_transcoding_routes,
+            grpc_transcoding_methods,
         }
     }
 
@@ -486,7 +584,9 @@ impl GatewaySnapshot {
             .map(|proxy| ProxyListenTopology {
                 id: format!("proxy:{}", proxy.id),
                 listen: proxy.listen.clone(),
+                plain_enabled: proxy.plain_enabled,
                 tls: proxy.tls.clone(),
+                http3: proxy.http3.clone(),
                 proxy_protocol_enabled: proxy.proxy_protocol.enabled,
                 proxy_protocol_accept_from: proxy.proxy_protocol.accept_from.as_ref().clone(),
                 proxy_protocol_allow_v1: proxy.proxy_protocol.allow_v1,
@@ -505,7 +605,9 @@ impl GatewaySnapshot {
                             }
                         ),
                         listen: stream.listen.clone(),
+                        plain_enabled: true,
                         tls: stream.tls.clone(),
+                        http3: Http3RuntimeCfg::default(),
                         proxy_protocol_enabled: stream.proxy_protocol.enabled,
                         proxy_protocol_accept_from: stream
                             .proxy_protocol
@@ -518,6 +620,38 @@ impl GatewaySnapshot {
             )
             .collect()
     }
+
+    /// 业务作用：校验 service-mesh sidecar profile 的业务 listener 只绑定 loopback，
+    /// 防止启动或热更把原本仅供本 Pod/主机访问的代理端口暴露到外部网络。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：所有 HTTP/TLS/HTTP3/L4 listener 都是 loopback 时成功，否则返回定位到 listener 的错误。
+    pub fn validate_sidecar_listeners(&self) -> Result<()> {
+        for topology in self.listen_topology() {
+            validate_sidecar_listen(&topology.id, &topology.listen)?;
+            if let Some(tls) = topology.tls.as_ref() {
+                validate_sidecar_listen(&format!("{}:tls", topology.id), &tls.listen)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 业务作用：验证一个 sidecar 数据面 socket 地址不会监听非本机接口。
+///
+/// 参数说明：`listener_id` 用于错误定位；`listen` 是必须可解析为 `SocketAddr` 的监听地址。
+///
+/// 返回：地址是 IPv4/IPv6 loopback 时成功；解析失败或地址可被外部访问时失败。
+fn validate_sidecar_listen(listener_id: &str, listen: &str) -> Result<()> {
+    let address = listen.parse::<std::net::SocketAddr>().with_context(|| {
+        format!("sidecar listener `{listener_id}` has invalid address `{listen}`")
+    })?;
+    anyhow::ensure!(
+        address.ip().is_loopback(),
+        "sidecar listener `{listener_id}` must bind loopback, got `{listen}`"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -527,8 +661,12 @@ pub struct ProxyListenTopology {
     pub id: String,
     /// 明文监听地址。
     pub listen: String,
+    /// 是否实际绑定明文 TCP socket。
+    pub plain_enabled: bool,
     /// TLS 监听摘要。
     pub tls: Option<TlsRuntimeCfg>,
+    /// HTTP/3/QUIC UDP listener 摘要；参与 prepare/publish 拓扑比较。
+    pub http3: Http3RuntimeCfg,
     /// 是否启用 PROXY 协议。
     pub proxy_protocol_enabled: bool,
     /// 可信前置网段。
@@ -548,13 +686,14 @@ impl PartialEq for TlsRuntimeCfg {
             && self.certs == other.certs
             && self.client_auth == other.client_auth
             && self.acme == other.acme
+            && self.in_memory == other.in_memory
     }
 }
 
 impl Eq for TlsRuntimeCfg {}
 
 /// 缺省 schema 版本:配置缺 `schema_version` / 写了 `0` 时按此处理。
-/// **与 `SUPPORTED` 分开(据 Codex 审查记录 P1#2)**:未来 `SUPPORTED` 升到 2 后,缺省的老配置仍按 **v1** 走 v1→v2 迁移,
+/// 与 `SUPPORTED` 分开：未来 `SUPPORTED` 升到 2 后，缺省的老配置仍按 **v1** 走 v1→v2 迁移，
 /// 而不是被误当成最新版绕过迁移逻辑。
 const DEFAULT_SCHEMA_VERSION: u32 = 1;
 /// 当前支持的最高配置 schema 版本。新增破坏性配置格式时 +1,并在 `resolve_schema_version` 里实现迁移/拒绝(§6)。
@@ -634,6 +773,10 @@ fn build_snapshot_from_config(
     let developer_portal =
         crate::developer_portal::DeveloperPortalRuntime::build_and_apply(&mut cfg, config_dir)
             .context("build developer portal and generated OpenAPI routes")?;
+    validate_control_plane(&mut cfg.control_plane, &cfg.upstreams, config_dir)
+        .context("validate control_plane.xds bootstrap")?;
+    validate_xds_owned_native_domains(&cfg)
+        .context("validate control_plane.xds native domain isolation")?;
     let secret_files = collect_secret_dependencies(&cfg, config_dir);
     let admin_auth = build_admin_auth(&cfg.admin, config_dir).context("build admin auth/RBAC")?;
     let admin_audit = build_admin_audit(&cfg.admin, config_dir).context("build admin audit")?;
@@ -660,8 +803,35 @@ fn build_snapshot_from_config(
     let variables = VariablePlan::build(&cfg.variables).context("build variables")?;
     let usage_plans =
         crate::routing::UsagePlanCatalog::build(&cfg.usage_plans).context("build usage plans")?;
-    let proxies = build_proxies(cfg_path, &cfg, &sentinel, variables, usage_plans)
-        .context("build proxies")?;
+    let xds_listener_owned = cfg.control_plane.xds.enabled
+        && cfg.control_plane.xds.ownership.listeners == XdsResourceOwnerCfg::Xds;
+    let (proxies, bootstrap_router, bootstrap_limits, bootstrap_timeouts) = if xds_listener_owned {
+        // LDS 拥有 listener 时 bootstrap 只保留治理默认值，绝不能先绑定一份 native 业务入口；
+        // 首个完整 LDS/RDS/CDS/EDS/SDS 闭包会经 listener two-phase transaction 激活 socket。
+        sentinel.ensure_all_matched(&HashSet::new())?;
+        let router =
+            Router::build_with_usage_plans(&[], variables.clone(), config_dir, usage_plans.clone())
+                .context("build empty xDS bootstrap router")?;
+        (
+            Vec::new(),
+            Arc::new(router),
+            ServerLimitsCfg::default(),
+            TimeoutCfg::default(),
+        )
+    } else {
+        let proxies = build_proxies(cfg_path, &cfg, &sentinel, variables, usage_plans)
+            .context("build proxies")?;
+        let default_proxy = proxies
+            .first()
+            .cloned()
+            .context("gateway must have at least one proxy listener")?;
+        (
+            proxies,
+            default_proxy.router,
+            default_proxy.limits,
+            default_proxy.timeouts,
+        )
+    };
     crate::http_cache::validate_runtime_config(&cfg.runtime_state.http_cache)
         .context("validate runtime_state.http_cache")?;
     if proxies
@@ -688,11 +858,6 @@ fn build_snapshot_from_config(
     }
     let stream_listeners =
         build_stream_listeners(&cfg.stream, cfg_path).context("build stream listeners")?;
-    let default_proxy = proxies
-        .first()
-        .cloned()
-        .context("gateway must have at least one proxy listener")?;
-    let router = default_proxy.router.clone();
     let upstreams = UpstreamDirectory::build_with_dynamic_at_discovery(
         &cfg.upstreams,
         dynamic_upstreams,
@@ -717,8 +882,11 @@ fn build_snapshot_from_config(
         // 指纹覆盖主配置及其依赖;失败不阻断上线(集群视图显示未知即可)。
         config_fingerprint: config_fingerprint(cfg_path).ok(),
         schema_version,
-        listen: default_proxy.listen.clone(),
-        tls: default_proxy.tls.clone(),
+        listen: proxies
+            .first()
+            .map(|proxy| proxy.listen.clone())
+            .unwrap_or_else(|| "0.0.0.0:0".to_owned()),
+        tls: proxies.first().and_then(|proxy| proxy.tls.clone()),
         admin_listen: cfg.admin.listen,
         expose_metrics: cfg.admin.expose_metrics,
         admin_auth,
@@ -727,15 +895,16 @@ fn build_snapshot_from_config(
         discovery,
         kubernetes_routes: cfg.kubernetes_routes,
         config_source: cfg.config_source,
+        control_plane: cfg.control_plane,
         runtime_state: cfg.runtime_state,
         access_log,
         telemetry: cfg.telemetry,
         reload: cfg.reload,
         long_connections: cfg.long_connections,
         secret_files: secret_files.into(),
-        limits: default_proxy.limits.clone(),
-        timeouts: default_proxy.timeouts.clone(),
-        router,
+        limits: bootstrap_limits,
+        timeouts: bootstrap_timeouts,
+        router: bootstrap_router,
         interface_guard: Arc::new(guard),
         upstreams: Arc::new(upstreams),
         proxies: Arc::new(proxies),
@@ -743,6 +912,372 @@ fn build_snapshot_from_config(
         developer_portal,
         grpc_edge_cluster,
     })
+}
+
+/// 业务作用：在任何 ADS socket/task 创建前锁定本地 trust root、Node identity、资源预算与
+/// 单一 owner，避免未编 feature、明文远端或 native/xDS 双写进入运行期。
+///
+/// 参数说明：`control_plane` 是待规范化的 bootstrap；`upstreams` 用于核对 `source: xds`；
+/// `config_dir` 是证书文件的相对路径基准。
+///
+/// 返回：合法配置原地规范化文件路径并返回成功；任何越权、未支持阶段或资源风险均 fail closed。
+fn validate_control_plane(
+    control_plane: &mut ControlPlaneCfg,
+    upstreams: &model::UpstreamsCfg,
+    config_dir: &Path,
+) -> Result<()> {
+    let xds = &mut control_plane.xds;
+    let owners = &xds.ownership;
+    let all_native = [
+        owners.listeners,
+        owners.routes,
+        owners.clusters,
+        owners.endpoints,
+        owners.secrets,
+    ]
+    .into_iter()
+    .all(|owner| owner == XdsResourceOwnerCfg::Native);
+
+    if !xds.enabled {
+        anyhow::ensure!(
+            control_plane.mode == ControlPlaneModeCfg::Native,
+            "control_plane.mode must be native when control_plane.xds.enabled=false"
+        );
+        anyhow::ensure!(
+            all_native,
+            "control_plane.xds ownership must remain native while xDS is disabled"
+        );
+        anyhow::ensure!(
+            !upstreams.services.values().any(|service| {
+                service
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.eq_ignore_ascii_case("xds"))
+            }),
+            "upstream source xds requires control_plane.xds.enabled=true"
+        );
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        cfg!(feature = "xds-client"),
+        "control_plane.xds.enabled=true requires the `xds-client` feature"
+    );
+    anyhow::ensure!(
+        matches!(
+            control_plane.mode,
+            ControlPlaneModeCfg::Hybrid | ControlPlaneModeCfg::Xds
+        ),
+        "enabled xDS requires control_plane.mode=hybrid|xds"
+    );
+    anyhow::ensure!(
+        xds.startup_policy == XdsStartupPolicyCfg::RequireXds,
+        "control_plane.xds.startup_policy=signed_last_good is not supported"
+    );
+    let eds_only = owners.listeners == XdsResourceOwnerCfg::Native
+        && owners.routes == XdsResourceOwnerCfg::Native
+        && owners.clusters == XdsResourceOwnerCfg::Native
+        && owners.endpoints == XdsResourceOwnerCfg::Xds
+        && owners.secrets == XdsResourceOwnerCfg::Native;
+    let cds_rds = owners.listeners == XdsResourceOwnerCfg::Native
+        && owners.routes == XdsResourceOwnerCfg::Xds
+        && owners.clusters == XdsResourceOwnerCfg::Xds
+        && owners.endpoints == XdsResourceOwnerCfg::Xds
+        && owners.secrets == XdsResourceOwnerCfg::Native;
+    let full_xds = owners.listeners == XdsResourceOwnerCfg::Xds
+        && owners.routes == XdsResourceOwnerCfg::Xds
+        && owners.clusters == XdsResourceOwnerCfg::Xds
+        && owners.endpoints == XdsResourceOwnerCfg::Xds
+        && owners.secrets == XdsResourceOwnerCfg::Xds;
+    anyhow::ensure!(
+        eds_only || cds_rds || full_xds,
+        "xDS ownership must select EDS-only, native-listener policy, or the atomic LDS/RDS/CDS/EDS/SDS profile"
+    );
+    if full_xds {
+        anyhow::ensure!(
+            control_plane.mode == ControlPlaneModeCfg::Xds,
+            "full LDS/RDS/CDS/EDS/SDS ownership requires control_plane.mode=xds"
+        );
+    } else {
+        anyhow::ensure!(
+            control_plane.mode == ControlPlaneModeCfg::Hybrid,
+            "partial xDS ownership requires control_plane.mode=hybrid"
+        );
+    }
+
+    let server = reqwest::Url::parse(xds.server.trim())
+        .context("control_plane.xds.server must be an absolute http(s) URI")?;
+    anyhow::ensure!(
+        matches!(server.scheme(), "http" | "https") && server.host_str().is_some(),
+        "control_plane.xds.server must use http or https with an authority"
+    );
+    anyhow::ensure!(
+        server.username().is_empty() && server.password().is_none(),
+        "control_plane.xds.server must not embed credentials"
+    );
+    anyhow::ensure!(
+        server.path() == "/" && server.query().is_none() && server.fragment().is_none(),
+        "control_plane.xds.server must contain only scheme and authority"
+    );
+    let loopback = xds_server_is_loopback(&server);
+    if server.scheme() == "http" {
+        anyhow::ensure!(
+            loopback,
+            "plaintext xDS is allowed only for a loopback management server"
+        );
+        anyhow::ensure!(
+            xds.tls.ca.file.trim().is_empty()
+                && xds.tls.cert.file.trim().is_empty()
+                && xds.tls.key.file.trim().is_empty()
+                && xds.tls.server_name.trim().is_empty(),
+            "control_plane.xds.tls must be empty for loopback plaintext xDS"
+        );
+    } else {
+        anyhow::ensure!(
+            !xds.tls.server_name.trim().is_empty(),
+            "control_plane.xds.tls.server_name is required for HTTPS xDS"
+        );
+        validate_xds_identity(&xds.tls.server_name, "control_plane.xds.tls.server_name")?;
+        xds.tls.ca.file = normalize_xds_pem_file(
+            &xds.tls.ca.file,
+            config_dir,
+            "control_plane.xds.tls.ca.file",
+        )?;
+        xds.tls.cert.file = normalize_xds_pem_file(
+            &xds.tls.cert.file,
+            config_dir,
+            "control_plane.xds.tls.cert.file",
+        )?;
+        xds.tls.key.file = normalize_xds_pem_file(
+            &xds.tls.key.file,
+            config_dir,
+            "control_plane.xds.tls.key.file",
+        )?;
+    }
+    xds.server = xds.server.trim_end_matches('/').to_owned();
+
+    validate_xds_identity(&xds.node.id, "control_plane.xds.node.id")?;
+    validate_xds_identity(&xds.node.cluster, "control_plane.xds.node.cluster")?;
+    const METADATA_KEYS: &[&str] = &["region", "zone", "network", "namespace"];
+    anyhow::ensure!(
+        xds.node.metadata.len() <= METADATA_KEYS.len(),
+        "control_plane.xds.node.metadata exceeds the fixed allowlist"
+    );
+    for (key, value) in &xds.node.metadata {
+        anyhow::ensure!(
+            METADATA_KEYS.contains(&key.as_str()),
+            "control_plane.xds.node.metadata key `{key}` is not allowed"
+        );
+        validate_xds_identity(value, &format!("control_plane.xds.node.metadata.{key}"))?;
+    }
+
+    let initial_backoff = parse_xds_duration_ms(
+        &xds.reconnect.initial_backoff,
+        "control_plane.xds.reconnect.initial_backoff",
+    )?;
+    let max_backoff = parse_xds_duration_ms(
+        &xds.reconnect.max_backoff,
+        "control_plane.xds.reconnect.max_backoff",
+    )?;
+    anyhow::ensure!(
+        (10..=60_000).contains(&initial_backoff) && max_backoff >= initial_backoff,
+        "control_plane.xds reconnect backoff must be 10..=60000ms and max >= initial"
+    );
+    anyhow::ensure!(
+        xds.reconnect.jitter.is_finite() && (0.0..=1.0).contains(&xds.reconnect.jitter),
+        "control_plane.xds.reconnect.jitter must be finite within 0..=1"
+    );
+    let keepalive_interval = parse_xds_duration_ms(
+        &xds.keepalive.interval,
+        "control_plane.xds.keepalive.interval",
+    )?;
+    let keepalive_timeout = parse_xds_duration_ms(
+        &xds.keepalive.timeout,
+        "control_plane.xds.keepalive.timeout",
+    )?;
+    anyhow::ensure!(
+        (1_000..=3_600_000).contains(&keepalive_interval)
+            && (100..=60_000).contains(&keepalive_timeout)
+            && keepalive_timeout < keepalive_interval,
+        "control_plane.xds keepalive must use interval 1s..=1h and timeout 100ms..60s below interval"
+    );
+    let warming_timeout = parse_xds_duration_ms(
+        &xds.limits.warming_timeout,
+        "control_plane.xds.limits.warming_timeout",
+    )?;
+    anyhow::ensure!(
+        (100..=3_600_000).contains(&warming_timeout),
+        "control_plane.xds.limits.warming_timeout must be within 100ms..=1h"
+    );
+    anyhow::ensure!(
+        (1024..=64 * 1024 * 1024).contains(&xds.limits.max_response_bytes),
+        "control_plane.xds.limits.max_response_bytes must be within 1024..=67108864"
+    );
+    anyhow::ensure!(
+        (1..=100_000).contains(&xds.limits.max_resources_per_type),
+        "control_plane.xds.limits.max_resources_per_type must be within 1..=100000"
+    );
+    anyhow::ensure!(
+        (1..=4 * 1024 * 1024).contains(&xds.limits.max_resource_bytes)
+            && xds.limits.max_resource_bytes <= xds.limits.max_response_bytes,
+        "control_plane.xds.limits.max_resource_bytes must fit within response bytes and be <=4194304"
+    );
+    anyhow::ensure!(
+        (1..=100_000).contains(&xds.limits.max_warming_resources),
+        "control_plane.xds.limits.max_warming_resources must be within 1..=100000"
+    );
+    anyhow::ensure!(
+        (1..=1024).contains(&xds.limits.max_apply_queue),
+        "control_plane.xds.limits.max_apply_queue must be within 1..=1024"
+    );
+
+    let mut xds_services = 0usize;
+    for (logical_service, service) in &upstreams.services {
+        let source = service.source.as_deref().unwrap_or("static");
+        if !source.eq_ignore_ascii_case("xds") {
+            continue;
+        }
+        xds_services = xds_services.saturating_add(1);
+        anyhow::ensure!(
+            service.instances.is_empty(),
+            "xDS-owned service `{logical_service}` must not declare native instances"
+        );
+        if let Some(cluster) = service.registry_service.as_deref() {
+            validate_xds_identity(cluster, "upstreams.services[].registry_service")?;
+        }
+    }
+    if eds_only {
+        anyhow::ensure!(
+            xds_services > 0,
+            "xDS endpoint ownership requires at least one upstream service with source: xds"
+        );
+    } else {
+        anyhow::ensure!(
+            xds_services == 0,
+            "xDS CDS ownership derives services dynamically; native upstream declarations are forbidden"
+        );
+    }
+    Ok(())
+}
+
+/// 业务作用：在构建路由/上游前复验 xDS owner 域没有 native 影子声明，阻止双写或 reload 覆盖。
+///
+/// 参数说明：`cfg` 已完成 generated routes 合并与 xDS bootstrap 校验。
+///
+/// 返回：CDS/RDS profile 的 native routes/upstreams 全空时成功；任何影子声明都拒绝整份快照。
+fn validate_xds_owned_native_domains(cfg: &GatewayConfig) -> Result<()> {
+    if !cfg.control_plane.xds.enabled
+        || cfg.control_plane.xds.ownership.routes != XdsResourceOwnerCfg::Xds
+    {
+        return Ok(());
+    }
+    // routes/clusters/endpoints 必须作为一个原子依赖闭包交给 xDS；留下任一 native 声明都会
+    // 让两个控制面在同一 Snapshot 上竞争，造成 ACK 与真实数据面版本不一致。
+    anyhow::ensure!(
+        cfg.routes.is_empty()
+            && cfg.proxies.iter().all(|proxy| proxy.routes.is_empty())
+            && cfg.upstreams.services.is_empty(),
+        "xDS-owned routes/clusters require empty native routes and upstreams.services"
+    );
+    if cfg.control_plane.xds.ownership.listeners == XdsResourceOwnerCfg::Xds {
+        // LDS 是整个业务 socket 域的唯一 owner；即使 native listener 没有 route，也不能把它
+        // 当作“模板”留下，否则启动期 bind 会早于 xDS 依赖闭包并形成脏路由窗口。
+        anyhow::ensure!(
+            cfg.server.is_none() && cfg.proxies.is_empty() && cfg.stream.listeners.is_empty(),
+            "xDS-owned listeners require empty native server/proxies/stream listeners"
+        );
+    }
+    Ok(())
+}
+
+/// 判断 management server authority 是否严格属于本机 loopback。
+///
+/// 业务作用：只给测试/开发回环端点开放明文 ADS，防止误把生产 xDS 身份暴露到网络。
+///
+/// 参数说明：`url` 是已解析且含 host 的 xDS server URI。
+///
+/// 返回：localhost 或 loopback IP 返回 true；其它 host 返回 false。
+fn xds_server_is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// 校验一个会发给 xDS server 或用于资源映射的稳定标识。
+///
+/// 业务作用：限制 Node/cluster/metadata 的长度和字符集，避免秘密、控制字符或高熵任意环境值外泄。
+///
+/// 参数说明：`value` 是标识原值；`field` 用于返回可定位错误。
+///
+/// 返回：1..=256 bytes 且仅含安全 ASCII 字符时成功，否则拒绝配置。
+fn validate_xds_identity(value: &str, field: &str) -> Result<()> {
+    anyhow::ensure!(!value.is_empty(), "{field} cannot be empty");
+    anyhow::ensure!(value.len() <= 256, "{field} must be <= 256 bytes");
+    anyhow::ensure!(
+        value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
+        }),
+        "{field} contains unsupported characters"
+    );
+    Ok(())
+}
+
+/// 解析并检查 xDS bootstrap PEM 文件。
+///
+/// 业务作用：在启动 transport 前固定证书路径与 1 MiB 上限，拒绝目录、缺失文件和超大 secret。
+///
+/// 参数说明：`raw` 是配置路径；`config_dir` 是相对基准；`field` 用于错误定位。
+///
+/// 返回：成功时返回绝对或规范相对 PathBuf 字符串；失败时不创建任何网络资源。
+fn normalize_xds_pem_file(raw: &str, config_dir: &Path, field: &str) -> Result<String> {
+    anyhow::ensure!(!raw.trim().is_empty(), "{field} cannot be empty");
+    let configured = Path::new(raw.trim());
+    let path = if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        config_dir.join(configured)
+    };
+    let metadata =
+        fs::metadata(&path).with_context(|| format!("read {field} {}", path.display()))?;
+    anyhow::ensure!(metadata.is_file(), "{field} must be a regular file");
+    anyhow::ensure!(
+        metadata.len() <= 1024 * 1024,
+        "{field} must be <= 1048576 bytes"
+    );
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// 解析 xDS 配置中的紧凑 duration 字符串。
+///
+/// 业务作用：统一接受 `ms/s/m/h` 并在 checked arithmetic 下转换，避免溢出 timer 或不同模块口径漂移。
+///
+/// 参数说明：`raw` 是 duration；`field` 用于返回可定位错误。
+///
+/// 返回：成功时返回毫秒；空值、未知单位、零值和溢出返回错误。
+fn parse_xds_duration_ms(raw: &str, field: &str) -> Result<u64> {
+    let raw = raw.trim();
+    let (number, multiplier) = if let Some(number) = raw.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = raw.strip_suffix('s') {
+        (number, 1_000_u64)
+    } else if let Some(number) = raw.strip_suffix('m') {
+        (number, 60_000_u64)
+    } else if let Some(number) = raw.strip_suffix('h') {
+        (number, 3_600_000_u64)
+    } else {
+        bail!("{field} must use ms/s/m/h duration syntax");
+    };
+    let value = number
+        .parse::<u64>()
+        .with_context(|| format!("{field} contains an invalid integer"))?;
+    anyhow::ensure!(value > 0, "{field} must be greater than zero");
+    value
+        .checked_mul(multiplier)
+        .with_context(|| format!("{field} overflows milliseconds"))
 }
 
 /// 构建管理面运行期认证策略。
@@ -1159,10 +1694,13 @@ fn validate_auth_secret(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// 构建 L4 stream listener 运行期配置。
+/// 业务作用：把 L4 listener 配置编译为不可变运行时，并在发布快照前拒绝
+/// 协议/profile/feature 不匹配与越界资源预算。
 ///
-/// # 参数
-/// - `cfg`: 顶层 `stream` 配置。
+/// 参数说明：`cfg` 是顶层 stream 配置；`cfg_path` 为 TLS 等相对文件提供可信基目录。
+///
+/// 返回：全部 listener 都通过门禁时返回 runtime 列表；任一 listener 无效时返回错误，
+/// 旧快照不受影响。
 fn build_stream_listeners(cfg: &StreamCfg, cfg_path: &Path) -> Result<Vec<StreamRuntime>> {
     let mut out = Vec::with_capacity(cfg.listeners.len());
     let mut ids = HashSet::new();
@@ -1264,20 +1802,83 @@ fn build_stream_listeners(cfg: &StreamCfg, cfg_path: &Path) -> Result<Vec<Stream
                 listener.id
             );
         }
-        if tls.is_some() && listener.preread.ssl_preread {
-            anyhow::bail!(
-                "stream `{}` tls termination cannot combine with ssl_preread passthrough",
-                listener.id
-            );
-        }
         if listener.preread.ssl_preread && listener.preread.mqtt_connect {
             anyhow::bail!(
                 "stream `{}` cannot combine ssl_preread passthrough with MQTT CONNECT preread",
                 listener.id
             );
         }
+        #[cfg(not(feature = "mqtt-governance"))]
+        if listener.mqtt.enabled {
+            anyhow::bail!(
+                "stream `{}` MQTT governance requires binary feature `mqtt-governance`",
+                listener.id
+            );
+        }
+        #[cfg(feature = "mqtt-governance")]
+        let mqtt = if listener.mqtt.enabled {
+            anyhow::ensure!(
+                protocol == StreamProtocolRuntime::Tcp,
+                "stream `{}` MQTT governance requires protocol=tcp",
+                listener.id
+            );
+            anyhow::ensure!(
+                listener.preread.mqtt_connect,
+                "stream `{}` MQTT governance requires preread.mqtt_connect=true",
+                listener.id
+            );
+            Some(Arc::new(
+                crate::mqtt::MqttPolicy::build(&listener.mqtt)
+                    .with_context(|| format!("stream `{}` MQTT governance", listener.id))?,
+            ))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "kafka-governance"))]
+        if listener.kafka.enabled {
+            anyhow::bail!(
+                "stream `{}` Kafka governance requires binary feature `kafka-governance`",
+                listener.id
+            );
+        }
+        #[cfg(feature = "kafka-governance")]
+        let kafka = if listener.kafka.enabled {
+            anyhow::ensure!(
+                protocol == StreamProtocolRuntime::Tcp,
+                "stream `{}` Kafka governance requires protocol=tcp",
+                listener.id
+            );
+            anyhow::ensure!(
+                !listener.mqtt.enabled && !listener.preread.mqtt_connect,
+                "stream `{}` Kafka governance cannot share MQTT governance/preread",
+                listener.id
+            );
+            anyhow::ensure!(
+                !listener.preread.ssl_preread,
+                "stream `{}` Kafka governance cannot inspect encrypted ssl_preread traffic",
+                listener.id
+            );
+            Some(Arc::new(
+                crate::kafka::KafkaPolicy::build(&listener.kafka)
+                    .with_context(|| format!("stream `{}` Kafka governance", listener.id))?,
+            ))
+        } else {
+            None
+        };
         let routes = build_stream_routes(listener, cfg_path)
             .with_context(|| format!("stream `{}` routes", listener.id))?;
+        if routes.iter().any(|route| route.terminate_tls) {
+            anyhow::ensure!(
+                tls.is_some() && listener.preread.ssl_preread,
+                "stream `{}` route TLS termination requires listener tls and ssl_preread",
+                listener.id
+            );
+        } else if tls.is_some() && listener.preread.ssl_preread {
+            anyhow::bail!(
+                "stream `{}` tls with ssl_preread requires at least one terminate_tls route",
+                listener.id
+            );
+        }
         if routes.iter().any(|route| route.sni.is_some()) && !listener.preread.ssl_preread {
             anyhow::bail!(
                 "stream `{}` SNI routes require preread.ssl_preread=true",
@@ -1293,6 +1894,7 @@ fn build_stream_listeners(cfg: &StreamCfg, cfg_path: &Path) -> Result<Vec<Stream
             );
         }
         if protocol == StreamProtocolRuntime::Udp
+            && !listener.reject_all
             && (routes.len() != 1
                 || !routes[0].default
                 || routes[0].sni.is_some()
@@ -1329,6 +1931,10 @@ fn build_stream_listeners(cfg: &StreamCfg, cfg_path: &Path) -> Result<Vec<Stream
                 timeout_ms: listener.preread.timeout_ms,
                 max_bytes: listener.preread.max_bytes,
             },
+            #[cfg(feature = "mqtt-governance")]
+            mqtt,
+            #[cfg(feature = "kafka-governance")]
+            kafka,
             routes: Arc::new(routes),
             proxy_protocol: build_proxy_protocol(&listener.proxy_protocol)
                 .with_context(|| format!("stream `{}` proxy_protocol", listener.id))?,
@@ -1343,15 +1949,24 @@ fn build_stream_listeners(cfg: &StreamCfg, cfg_path: &Path) -> Result<Vec<Stream
     Ok(out)
 }
 
-/// 构建单个 stream listener 的 route 列表。
+/// 业务作用：构建单个 stream listener 的路由表，并区分旧版单上游、显式多路由和
+/// 全连接拒绝三种互斥形态，防止空配置意外开放默认转发。
 ///
-/// # 参数
-/// - `listener`: stream listener 原始配置。
+/// 参数说明：`listener` 是 stream listener 原始配置；`cfg_path` 为上游 TLS 文件提供可信基目录。
+///
+/// 返回：配置形态与路由约束均合法时返回运行时路由；冲突、重复或缺少安全默认路由时返回错误。
 fn build_stream_routes(
     listener: &model::StreamListenerCfg,
     cfg_path: &Path,
 ) -> Result<Vec<StreamRouteRuntime>> {
     let mut routes = Vec::new();
+    if listener.reject_all {
+        anyhow::ensure!(
+            listener.routes.is_empty() && listener.upstream.trim().is_empty(),
+            "reject_all cannot combine with upstream or routes[]"
+        );
+        return Ok(routes);
+    }
     if listener.routes.is_empty() {
         let upstream = normalize_stream_upstream(&listener.upstream)?;
         if upstream.trim().is_empty() {
@@ -1362,7 +1977,9 @@ fn build_stream_routes(
             sni: None,
             mqtt_client_id: None,
             default: true,
+            terminate_tls: false,
             upstream,
+            weighted_upstreams: Arc::from([]),
             upstream_tls: None,
         });
         return Ok(routes);
@@ -1424,22 +2041,59 @@ fn build_stream_routes(
                 route.id
             );
         }
+        let weighted_upstreams = route
+            .weighted_upstreams
+            .iter()
+            .map(|backend| {
+                Ok::<_, anyhow::Error>((
+                    normalize_stream_upstream(&backend.upstream)?,
+                    backend.weight,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !weighted_upstreams.is_empty() {
+            anyhow::ensure!(
+                route.tls.is_none()
+                    && weighted_upstreams
+                        .iter()
+                        .all(|(upstream, _)| upstream.starts_with("lb://")),
+                "stream route `{}` weighted_upstreams require service-level TLS on lb:// targets",
+                route.id
+            );
+            let total_weight = weighted_upstreams
+                .iter()
+                .map(|(_, weight)| u64::from(*weight))
+                .sum::<u64>();
+            anyhow::ensure!(
+                total_weight > 0 && total_weight <= u64::from(u32::MAX),
+                "stream route `{}` weighted_upstreams require a positive bounded total weight",
+                route.id
+            );
+        }
         routes.push(StreamRouteRuntime {
             id: route.id.clone(),
             sni,
             mqtt_client_id,
             default: route.default,
+            terminate_tls: route.terminate_tls,
             upstream: normalize_stream_upstream(&route.upstream)?,
+            weighted_upstreams: Arc::from(weighted_upstreams),
             upstream_tls: build_stream_upstream_tls(cfg_path, listener, route)?,
         });
     }
-    if !default_seen {
-        anyhow::bail!("stream routes require one `default: true` route");
-    }
+    anyhow::ensure!(
+        default_seen || (listener.preread.ssl_preread && routes.iter().all(|route| route.sni.is_some())),
+        "stream routes require one `default: true` route unless TLS preread routes cover only explicit SNI"
+    );
     Ok(routes)
 }
 
-/// 把 stream TLS 终止配置编译为与 L7 共用的 rustls server runtime。
+/// 业务作用：把 stream TLS 终止配置编译为与 L7 共用的 rustls server runtime，
+/// 保持默认身份、SNI 身份和客户端认证策略一致。
+///
+/// 参数说明：`cfg_path` 是路径信任根；`listener` 提供业务身份；`tls` 是待编译配置。
+///
+/// 返回：配置完整时返回可热换 TLS runtime；认证模式或路径语义无效时返回错误。
 fn build_stream_server_tls(
     cfg_path: &Path,
     listener: &model::StreamListenerCfg,
@@ -1449,16 +2103,19 @@ fn build_stream_server_tls(
         .client_auth
         .as_ref()
         .map(|auth| {
-            let require = match auth.mode.trim().to_ascii_lowercase().as_str() {
-                "require" => true,
-                "optional" => false,
+            let (require, allow_untrusted) =
+                match auth.mode.trim().to_ascii_lowercase().as_str() {
+                "require" => (true, false),
+                "optional" => (false, false),
+                "insecure_fallback" => (false, true),
                 other => anyhow::bail!(
-                    "stream `{}` tls.client_auth.mode must be require|optional, got `{other}`",
+                    "stream `{}` tls.client_auth.mode must be require|optional|insecure_fallback, got `{other}`",
                     listener.id
                 ),
             };
             Ok::<_, anyhow::Error>(ClientAuthRuntime {
                 require,
+                allow_untrusted,
                 ca_file: resolve_relative(cfg_path, &auth.ca_file),
             })
         })
@@ -1468,9 +2125,22 @@ fn build_stream_server_tls(
         cert_file: resolve_relative(cfg_path, &tls.cert_file),
         key_file: resolve_relative(cfg_path, &tls.key_file),
         keypair_manifest_file: None,
-        certs: Vec::new(),
+        certs: tls
+            .certs
+            .iter()
+            .map(|cert| SniCertRuntime {
+                server_names: cert
+                    .server_names
+                    .iter()
+                    .map(|name| name.trim_end_matches('.').to_ascii_lowercase())
+                    .collect(),
+                cert_file: resolve_relative(cfg_path, &cert.cert_file),
+                key_file: resolve_relative(cfg_path, &cert.key_file),
+            })
+            .collect(),
         client_auth,
         acme: None,
+        in_memory: None,
     })
 }
 
@@ -1646,7 +2316,10 @@ fn build_legacy_proxy(
         cfg_path,
         "default",
         &server.listen,
+        true,
         &server.tls,
+        &server.http3,
+        &[],
         &[],
         &server.trusted_proxies,
         &ProxyProtocolCfg::default(),
@@ -1675,8 +2348,11 @@ fn build_proxy(
         cfg_path,
         &proxy.id,
         &proxy.listen,
+        proxy.plain_enabled,
         &proxy.tls,
+        &proxy.http3,
         &proxy.server_names,
+        &proxy.gateway_listeners,
         &proxy.trusted_proxies,
         &proxy.proxy_protocol,
         &proxy.limits,
@@ -1874,13 +2550,67 @@ fn build_acme_runtime(cfg_path: &Path, proxy_id: &str, cfg: &AcmeCfg) -> Result<
     })
 }
 
+/// 业务作用：编译 Gateway API HTTPS 逻辑 listener 选择表，保证 SNI 与 Host 比较使用
+/// 唯一、规范化且确定的权威边界。
+///
+/// 参数说明：`proxy_id` 标识错误归属；`listeners` 是控制面生成的 listener 身份与 hostname。
+///
+/// 返回：配置唯一且 hostname 合法时返回运行期表；重复身份、重复 hostname 或非法通配时拒绝配置。
+fn build_gateway_listener_runtime(
+    proxy_id: &str,
+    listeners: &[model::GatewayListenerCfg],
+) -> Result<Vec<GatewayListenerRuntime>> {
+    anyhow::ensure!(
+        listeners.len() <= 128,
+        "proxy `{proxy_id}` exceeds 128 Gateway listeners"
+    );
+    let mut ids = HashSet::new();
+    let mut hostnames = HashSet::new();
+    let mut output = Vec::with_capacity(listeners.len());
+    for listener in listeners {
+        let id = listener.id.trim();
+        anyhow::ensure!(
+            !id.is_empty() && id.len() <= 253,
+            "proxy `{proxy_id}` Gateway listener id is invalid"
+        );
+        anyhow::ensure!(
+            ids.insert(id.to_owned()),
+            "proxy `{proxy_id}` has duplicate Gateway listener id `{id}`"
+        );
+        let hostname = listener
+            .hostname
+            .as_deref()
+            .map(normalize_sni)
+            .transpose()?;
+        if let Some(hostname) = hostname.as_deref() {
+            anyhow::ensure!(
+                !hostname.contains('*')
+                    || hostname.starts_with("*.") && !hostname[2..].contains('*'),
+                "proxy `{proxy_id}` Gateway listener hostname `{hostname}` has invalid wildcard"
+            );
+        }
+        anyhow::ensure!(
+            hostnames.insert(hostname.clone()),
+            "proxy `{proxy_id}` has duplicate Gateway listener hostname"
+        );
+        output.push(GatewayListenerRuntime {
+            id: Arc::from(id),
+            hostname: hostname.map(Arc::from),
+        });
+    }
+    Ok(output)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_proxy_from_parts(
     cfg_path: &Path,
     id: &str,
     listen: &str,
+    plain_enabled: bool,
     tls: &Option<model::TlsCfg>,
+    http3: &Http3Cfg,
     server_names: &[String],
+    gateway_listeners: &[model::GatewayListenerCfg],
     trusted_proxies: &[String],
     proxy_protocol: &ProxyProtocolCfg,
     limits: &ServerLimitsCfg,
@@ -1902,22 +2632,29 @@ fn build_proxy_from_parts(
     listen
         .parse::<std::net::SocketAddr>()
         .with_context(|| format!("invalid proxy `{id}` listen `{listen}`"))?;
+    anyhow::ensure!(
+        plain_enabled || tls.is_some(),
+        "proxy `{id}` plain_enabled=false requires a tls listener"
+    );
     let tls = match tls.as_ref() {
         None => None,
         Some(tls) => {
-            // mTLS(§19):mode 只允许 require|optional,坏值构建期拒绝。
+            // 客户端认证模式在构建期收敛，避免未知值把严格校验静默降级。
             let client_auth = match &tls.client_auth {
                 None => None,
                 Some(ca) => {
-                    let require = match ca.mode.trim().to_ascii_lowercase().as_str() {
-                        "require" => true,
-                        "optional" => false,
+                    let (require, allow_untrusted) =
+                        match ca.mode.trim().to_ascii_lowercase().as_str() {
+                        "require" => (true, false),
+                        "optional" => (false, false),
+                        "insecure_fallback" => (false, true),
                         other => anyhow::bail!(
-                            "proxy `{id}` tls.client_auth.mode must be require|optional, got `{other}`"
+                            "proxy `{id}` tls.client_auth.mode must be require|optional|insecure_fallback, got `{other}`"
                         ),
                     };
                     Some(ClientAuthRuntime {
                         require,
+                        allow_untrusted,
                         ca_file: resolve_relative(cfg_path, &ca.ca_file),
                     })
                 }
@@ -1950,6 +2687,7 @@ fn build_proxy_from_parts(
                     .as_ref()
                     .map(|acme| build_acme_runtime(cfg_path, id, acme))
                     .transpose()?,
+                in_memory: None,
             })
         }
     };
@@ -1958,6 +2696,7 @@ fn build_proxy_from_parts(
             .parse::<std::net::SocketAddr>()
             .with_context(|| format!("invalid proxy `{id}` tls.listen `{}`", tls.listen))?;
     }
+    let http3 = build_http3_runtime(id, http3, tls.as_ref(), proxy_protocol, limits)?;
     // HTTP→HTTPS 跳转(§19):派生跳转目标端口 = 本 proxy 的 TLS 监听端口;无 tls 却配 redirect_https → 坏配置拒上线。
     let redirect_https = if redirect_https {
         let tls = tls.as_ref().ok_or_else(|| {
@@ -1990,12 +2729,16 @@ fn build_proxy_from_parts(
         None
     };
     let routes = routes_with_sentinel(routes, sentinel, sentinel_matched_routes);
+    let gateway_listeners = build_gateway_listener_runtime(id, gateway_listeners)?;
     let config_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
     Ok(ProxyRuntime {
         id: id.to_string(),
         listen: listen.to_string(),
+        plain_enabled,
         tls,
+        http3,
         server_names: Arc::new(server_names.to_vec()),
+        gateway_listeners: Arc::new(gateway_listeners),
         proxy_protocol: build_proxy_protocol(proxy_protocol)
             .with_context(|| format!("proxy `{id}` proxy_protocol"))?,
         // 可信前置代理网段构建期解析成 Cidr(review L6),非法即拒配置。
@@ -2012,6 +2755,158 @@ fn build_proxy_from_parts(
                 .with_context(|| format!("proxy `{id}` routes"))?,
         ),
     })
+}
+
+/// 校验并编译 HTTP/3/QUIC listener 计划。
+///
+/// 业务作用：在绑定 UDP socket 前拒绝缺 TLS、缺编译 feature、0-RTT、PROXY protocol 语义
+/// 分叉和无界预算，确保坏候选不会进入 listener two-phase prepare。
+///
+/// 参数说明：`proxy_id` 用于错误定位；`cfg` 是声明配置；`tls` 是已规范化 TLS 身份；
+/// `proxy_protocol` 是 TCP 前置代理策略；`limits` 是同 proxy 的全局请求资源上限。
+///
+/// 返回：关闭时返回零值计划；启用且所有安全门通过时返回可直接构造 QUIC transport 的计划，
+/// 任一门失败则拒绝整个候选快照并保留 last-known-good。
+fn build_http3_runtime(
+    proxy_id: &str,
+    cfg: &Http3Cfg,
+    tls: Option<&TlsRuntimeCfg>,
+    proxy_protocol: &ProxyProtocolCfg,
+    limits: &ServerLimitsCfg,
+) -> Result<Http3RuntimeCfg> {
+    if !cfg.enabled {
+        return Ok(Http3RuntimeCfg::default());
+    }
+
+    #[cfg(not(feature = "http3"))]
+    {
+        // 默认制品不编译 transport；显式消费只在 feature 形态才使用的参数，保持默认构建
+        // `-D warnings` 干净，同时仍在任何 TLS/UDP 副作用前拒绝配置。
+        let _ = (tls, proxy_protocol, limits);
+        anyhow::bail!(
+            "proxy `{proxy_id}` http3.enabled=true requires a binary compiled with feature `http3`"
+        );
+    }
+
+    #[cfg(feature = "http3")]
+    {
+        anyhow::ensure!(
+            tls.is_some(),
+            "proxy `{proxy_id}` http3.enabled=true requires tls; QUIC only permits TLS 1.3"
+        );
+        // 现有 PROXY protocol parser 是 TCP stream 语义。让 QUIC 悄悄绕过会使同一 proxy 的
+        // ACL/rate/audit 得到不同客户端身份，因此在 datagram PROXY v2 profile 落地前拒绝组合。
+        anyhow::ensure!(
+            !proxy_protocol.enabled,
+            "proxy `{proxy_id}` HTTP/3 does not yet support PROXY protocol on QUIC datagrams"
+        );
+        // Early data 会在连接完全认证前重放请求；首版没有幂等 allowlist/anti-replay ledger，
+        // 必须构建期拒绝，不能只在运行时忽略配置制造虚假安全感。
+        anyhow::ensure!(
+            !cfg.zero_rtt,
+            "proxy `{proxy_id}` http3.zero_rtt is not supported; keep it false"
+        );
+        anyhow::ensure!(
+            (1..=31_536_000).contains(&cfg.alt_svc_max_age_seconds),
+            "proxy `{proxy_id}` http3.alt_svc_max_age_seconds must be within 1..=31536000"
+        );
+        validate_optional_duration(
+            &format!("proxy `{proxy_id}` http3.max_idle_timeout_ms"),
+            cfg.max_idle_timeout_ms,
+            MAX_RUNTIME_DURATION_MS,
+        )?;
+        anyhow::ensure!(
+            cfg.max_idle_timeout_ms > 0,
+            "proxy `{proxy_id}` http3.max_idle_timeout_ms must be within 1..={MAX_RUNTIME_DURATION_MS}"
+        );
+        anyhow::ensure!(
+            (1..=10_000_000).contains(&cfg.max_connections),
+            "proxy `{proxy_id}` http3.max_connections must be within 1..=10000000"
+        );
+        anyhow::ensure!(
+            (1..=10_000_000).contains(&cfg.max_connections_per_ip),
+            "proxy `{proxy_id}` http3.max_connections_per_ip must be within 1..=10000000"
+        );
+        anyhow::ensure!(
+            (1..=1_000_000).contains(&cfg.max_pending_handshakes),
+            "proxy `{proxy_id}` http3.max_pending_handshakes must be within 1..=1000000"
+        );
+        anyhow::ensure!(
+            (1200..=1024 * 1024).contains(&cfg.max_pending_handshake_bytes),
+            "proxy `{proxy_id}` http3.max_pending_handshake_bytes must be within 1200..=1048576"
+        );
+        anyhow::ensure!(
+            (cfg.max_pending_handshakes as u128)
+                .saturating_mul(u128::from(cfg.max_pending_handshake_bytes))
+                <= 512 * 1024 * 1024,
+            "proxy `{proxy_id}` HTTP/3 pending handshake memory budget must not exceed 536870912 bytes"
+        );
+        anyhow::ensure!(
+            (1..=1_000_000).contains(&cfg.max_bidi_streams_per_connection),
+            "proxy `{proxy_id}` http3.max_bidi_streams_per_connection must be within 1..=1000000"
+        );
+        anyhow::ensure!(
+            (8 * 1024..=16 * 1024 * 1024).contains(&cfg.max_request_header_bytes),
+            "proxy `{proxy_id}` http3.max_request_header_bytes must be within 8192..=16777216"
+        );
+        anyhow::ensure!(
+            cfg.max_request_header_bytes <= limits.max_header_bytes,
+            "proxy `{proxy_id}` http3.max_request_header_bytes cannot exceed limits.max_header_bytes"
+        );
+        anyhow::ensure!(
+            (4 * 1024..=1024 * 1024 * 1024).contains(&cfg.max_stream_buffer_bytes),
+            "proxy `{proxy_id}` http3.max_stream_buffer_bytes must be within 4096..=1073741824"
+        );
+        anyhow::ensure!(
+            (1..=60).contains(&cfg.retry_token_lifetime_seconds),
+            "proxy `{proxy_id}` http3.retry_token_lifetime_seconds must be within 1..=60"
+        );
+        anyhow::ensure!(
+            (60..=86_400).contains(&cfg.retry_token_rotation_seconds),
+            "proxy `{proxy_id}` http3.retry_token_rotation_seconds must be within 60..=86400"
+        );
+        anyhow::ensure!(
+            cfg.retry_token_rotation_seconds
+                >= cfg.retry_token_lifetime_seconds.saturating_mul(2),
+            "proxy `{proxy_id}` http3.retry_token_rotation_seconds must be at least twice retry_token_lifetime_seconds"
+        );
+        let alt_svc_header = if cfg.advertise_alt_svc {
+            let tls_listen: std::net::SocketAddr = tls
+                .expect("HTTP/3 TLS presence checked above")
+                .listen
+                .parse()
+                .with_context(|| {
+                    format!("proxy `{proxy_id}` HTTP/3 cannot derive Alt-Svc from tls.listen")
+                })?;
+            Some(
+                http::HeaderValue::from_str(&format!(
+                    "h3=\":{}\"; ma={}",
+                    tls_listen.port(),
+                    cfg.alt_svc_max_age_seconds
+                ))
+                .with_context(|| format!("proxy `{proxy_id}` HTTP/3 Alt-Svc header"))?,
+            )
+        } else {
+            None
+        };
+        Ok(Http3RuntimeCfg {
+            enabled: true,
+            advertise_alt_svc: cfg.advertise_alt_svc,
+            alt_svc_header,
+            max_idle_timeout_ms: cfg.max_idle_timeout_ms,
+            max_connections: cfg.max_connections,
+            max_connections_per_ip: cfg.max_connections_per_ip,
+            max_pending_handshakes: cfg.max_pending_handshakes,
+            max_pending_handshake_bytes: cfg.max_pending_handshake_bytes,
+            max_bidi_streams_per_connection: cfg.max_bidi_streams_per_connection,
+            max_request_header_bytes: cfg.max_request_header_bytes,
+            max_stream_buffer_bytes: cfg.max_stream_buffer_bytes,
+            retry: cfg.retry,
+            retry_token_lifetime_seconds: cfg.retry_token_lifetime_seconds,
+            retry_token_rotation_seconds: cfg.retry_token_rotation_seconds,
+            zero_rtt: false,
+        })
+    }
 }
 
 fn validate_timeout_cfg(proxy_id: &str, timeouts: &TimeoutCfg) -> Result<()> {
@@ -2172,7 +3067,7 @@ fn ensure_unique_proxy_topology(proxies: &[ProxyRuntime]) -> Result<()> {
         if !ids.insert(proxy.id.as_str()) {
             anyhow::bail!("duplicate proxy id `{}`", proxy.id);
         }
-        if !listens.insert(proxy.listen.as_str()) {
+        if proxy.plain_enabled && !listens.insert(proxy.listen.as_str()) {
             anyhow::bail!("duplicate proxy listen `{}`", proxy.listen);
         }
         if let Some(tls) = &proxy.tls {
@@ -2442,8 +3337,28 @@ pub(crate) fn reload_dependencies(main_cfg: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// 业务作用：收集当前配置实际依赖的文件型 secret/document，供指纹、reload watcher 与审计同源。
+///
+/// 参数说明：`cfg` 是已解析配置；`config_dir` 是尚未规范化相对路径的共同基准。
+///
+/// 返回：去重前的依赖路径集合；调用方按各自需要排序去重，函数不读取文件内容。
 fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    if cfg.control_plane.xds.enabled {
+        // xDS trust/identity 虽是不可由远端修改的 bootstrap authority，仍必须进入配置指纹和
+        // 文件 watcher；明文 loopback profile 没有 PEM，不能把空路径误当工作目录依赖。
+        // HTTPS 内容轮换不改变 owner/path，下一次 ADS reconnect 会有界读取新 PEM。
+        paths.extend(
+            [
+                cfg.control_plane.xds.tls.ca.file.as_str(),
+                cfg.control_plane.xds.tls.cert.file.as_str(),
+                cfg.control_plane.xds.tls.key.file.as_str(),
+            ]
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from),
+        );
+    }
     for raw in [
         cfg.admin.auth.bearer_token.as_str(),
         cfg.admin.auth.basic_password.as_str(),
@@ -2500,6 +3415,14 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
         .iter()
         .chain(cfg.proxies.iter().flat_map(|proxy| proxy.routes.iter()))
     {
+        if let Some(transcoding) = &route.grpc_transcoding {
+            let path = Path::new(&transcoding.descriptor_set_file);
+            paths.push(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                config_dir.join(path)
+            });
+        }
         for filter in &route.filters {
             paths.extend(crate::secret::filter_dependency_paths(filter, config_dir));
         }
@@ -2521,9 +3444,7 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
             }
         }
         if let Some(opa) = &route.opa_authorization {
-            if let Some(path) = crate::secret::dependency_path(&opa.authorization, config_dir) {
-                paths.push(path);
-            }
+            paths.extend(crate::opa::dependency_paths(config_dir, opa));
         }
         if let Some(casbin) = &route.casbin_authorization {
             paths.extend(crate::casbin_auth::dependency_paths(config_dir, casbin));
@@ -2554,6 +3475,12 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
             if let Some(cache) = &llm.semantic_cache {
                 if let Some(path) =
                     crate::secret::dependency_path(&cache.embedding.api_key, config_dir)
+                {
+                    paths.push(path);
+                }
+            }
+            if let Some(moderation) = &llm.moderation {
+                if let Some(path) = crate::secret::dependency_path(&moderation.api_key, config_dir)
                 {
                     paths.push(path);
                 }
