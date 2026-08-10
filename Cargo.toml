@@ -81,7 +81,8 @@ jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust
 josekit = { version = "0.10.3", optional = true } # JWE compact RSA-OAEP-256 + A256GCM；只用于嵌套签名 JWT 解密
 ldap3 = { version = "0.12.1", optional = true, default-features = false, features = ["tls-rustls-aws-lc-rs"] } # LDAPv3/LDAPS/StartTLS 企业目录认证
 libc = "0.2"                          # `-s reload` 向运行进程发 SIGHUP
-notify = "6"                          # 本地配置文件监听热更
+naml = { version = "1.0.2", features = ["watch"] } # 分层配置、来源追踪、有界读取与精确热更新
+notify = "8.2"                        # TLS 证书文件观察；YAML 配置观察由 naml 负责
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] } # V5 W3C context + server/client span API
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] } # V5 head sampling + bounded batch processor
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] } # V5 OTLP/HTTP protobuf exporter
@@ -97,7 +98,7 @@ rustls-native-certs = "0.8"           # BackendTLSPolicy System CA 与显式 SAN
 rustls-webpki = "0.103"               # BackendTLSPolicy 显式 SAN 时独立执行证书链与用途校验
 saml-rs = { version = "0.3.0", optional = true } # 纯 Rust SAML SP、严格 XML Signature/反 wrapping 校验
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"                      # 配置 tree(nasa::yml 产出 serde_json::Value)
+serde_json = "1"                      # 配置 tree 与管理 API 的 serde_json::Value
 serde_yml = "0.0.12"                  # Console 语义编辑与三文档 dry-run 工作区
 sha2 = "0.10"                         # V5 cache key 增量摘要；避免把 Vary/header 原值写进 L1/Redis key
 tar = "0.4"                           # 标准 OPA bundle archive；拒绝链接与路径穿越 entry
@@ -119,11 +120,11 @@ futures = "0.3"                       # 仅用于快照构建期驱动 Casbin �
 x509-parser = "0.18"                  # 控制面解析证书 notAfter，避免无条件重复下单
 wasmtime = { version = "46.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] } # V7 Proxy-Wasm 沙箱；无 WASI/文件/网络权限
 
-# —— 复用 nasa-runtime-rust 生态（yml 解析走 nasa::yml，日志走 nasa::log）——
+# —— 复用 nasa-runtime-rust 生态（YAML 直接使用 naml，日志走 nasa::log）——
 # 当前 path 用于联调尚未发布的 Nacos 首次 bundle API，version 仍锁定兼容基线。
 # 公开发布前必须先发布对应 nanacos/nasa 版本，再移除 path 并执行 cargo publish --dry-run；
 # 不能让 crates.io 制品依赖本机目录。V4 数据面 HMAC/JWT 验签复用 nasa::crypto。
-nasa = { version = "1.0.2", features = ["yml", "log", "base", "nacos", "crypto", "cache", "web"] }
+nasa = { version = "1.0.2", features = ["log", "base", "nacos", "crypto", "cache", "web"] }
 
 # 联调期把 nasa 的 crates.io nanacos 解析统一到 sibling 源码；否则 Cargo 会同时存在两个同名
 # package，Naway 编译到旧发布 API，而本地验证的 CAS/not-found 修复不会进入制品。

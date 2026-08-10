@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
+use naml::{LoadedYml, YmlLoader, YmlLocalSources};
 use serde::Serialize;
 
 use crate::access_log::AccessLogRuntime;
@@ -32,16 +33,57 @@ use model::{
     XdsStartupPolicyCfg,
 };
 
-/// 一次请求要读的全部配置的不可变快照(路由 + 接口守卫)。换版 = 造新的、`ArcSwap` 原子替换指针。
+/// 业务作用：承载一次成功候选的本地来源事实和附加依赖，禁止 watcher 自行猜测 profile 或观察目标。
+#[derive(Clone, Debug)]
+pub(crate) struct ConfigWatchPlan {
+    /// 与候选强类型配置来自同一次 naml tracked load 的本地来源事实。
+    sources: YmlLocalSources,
+    /// 已从候选模型收集、排序并去重的应用附加文件目标。
+    dependencies: Arc<[PathBuf]>,
+}
+
+impl ConfigWatchPlan {
+    /// 业务作用：冻结一次成功配置构建对应的 naml 来源与应用附加依赖，供发布前精确对账 watcher。
+    ///
+    /// 参数说明：`sources` 来自同一次 tracked load；`dependencies` 来自已展开并校验的候选配置。
+    ///
+    /// 返回：可随候选快照传递、不会再从磁盘重新推导的观察计划。
+    fn new(sources: YmlLocalSources, dependencies: Vec<PathBuf>) -> Self {
+        Self {
+            sources,
+            dependencies: dependencies.into(),
+        }
+    }
+
+    /// 业务作用：向 naml watcher 提供与候选加载完全一致的本地来源。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：主配置、活动 profile 和 profile 监听候选的只读来源事实。
+    pub(crate) fn sources(&self) -> &YmlLocalSources {
+        &self.sources
+    }
+
+    /// 业务作用：向 naml watcher 提供配置模型声明的精确附加文件集合。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：已排序去重的 guard、规则、Secret、schema、snippet 等依赖路径。
+    pub(crate) fn dependencies(&self) -> &[PathBuf] {
+        &self.dependencies
+    }
+}
+
+/// 一次请求要读的全部配置的不可变快照；换版通过构建新值并由 `ArcSwap` 原子替换指针完成。
 #[derive(Clone)]
 pub struct GatewaySnapshot {
     /// 单调递增的成功配置版本。
     pub version: u64,
-    /// **已上线**配置集指纹(P0-3 集群收敛判据)。与 admin `GET /api/config/current` 的 ETag
+    /// 已上线配置集指纹，用作集群收敛判据。与 admin `GET /api/config/current` 的 ETag
     /// 不同:那是"当前磁盘文件"的指纹(编辑基线),这里是"这份快照构建时读到的配置集"的指纹。
     /// 构建期算不出时为 None(不阻断上线,只让该节点在集群视图里显示为未知)。
     pub config_fingerprint: Option<u64>,
-    /// 配置 schema 版本(§6),用于演进期迁移/告警。
+    /// 配置 schema 版本，用于兼容性判断、迁移和告警。
     pub schema_version: u32,
     /// 主数据面监听地址；拓扑变化由 listener supervisor 在快照发布前 prepare 并在发布后换代。
     pub listen: String,
@@ -77,6 +119,8 @@ pub struct GatewaySnapshot {
     pub telemetry: model::TelemetryCfg,
     /// 热重载 worker 的有界队列/去抖参数；启动时固定，不进入数据面热路径。
     pub reload: model::ReloadCfg,
+    /// 与本快照同一次 tracked load 生成的本地文件观察计划。
+    pub(crate) config_watch: ConfigWatchPlan,
     /// WS/gRPC 长连接换版与宽限期策略。
     pub long_connections: model::LongConnectionCfg,
     /// 当前快照在构建期实际解析的文件型 SecretSource；reload watcher 据此独立轮换。
@@ -760,67 +804,81 @@ const MAX_SNIPPET_DEPTH: usize = 16;
 /// 一年已经覆盖连接/流/换版治理需求，同时拒绝 `u64::MAX` 一类会在不同平台触发时间溢出的配置。
 const MAX_RUNTIME_DURATION_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
 
-/// 读盘 + 解析 + 构建快照(事务化:任一步失败即整体 Err,调用方保留旧快照,§7.2)。
+/// 业务作用：从本地主配置构建新的不可变运行快照，并为动态上游使用独立事实源。
+///
+/// 参数说明：`cfg_path` 是主配置路径；`version` 是仅在成功发布后才生效的候选版本。
+///
+/// 返回：配置、profile 和全部依赖均可构建时返回快照；任一步失败返回错误且调用方保留旧快照。
 pub fn load_snapshot(cfg_path: &Path, version: u64) -> Result<GatewaySnapshot> {
     load_snapshot_with_dynamic(cfg_path, version, DynamicUpstreamStore::new())
 }
 
-/// 读取三份配置文件，并在同一个 build 事务中编译路由/安全规则/上游目录。
+/// 业务作用：在单一构建事务中加载主配置、profile 与附加文件，并编译路由、安全规则和上游目录。
 ///
-/// # 参数
-/// - `cfg_path`: `gateway.yml` 路径，相对 guard/sentinel/TLS 文件都以其目录解析。
-/// - `version`: 由唯一 reload worker 分配的候选版本。
-/// - `dynamic_upstreams`: 常驻 Nacos 实例事实源，reload 时不得重建丢状态。
+/// 参数说明：`cfg_path` 是主配置路径；`version` 是候选版本；`dynamic_upstreams` 是跨换版常驻的发现事实源。
 ///
-/// 返回：完整不可变候选快照；任一文件/语义校验失败返回 `Err`，调用方必须保留旧版。
+/// 返回：完整候选及其同源 watcher 计划；任一来源读取、解析或语义校验失败时返回错误且不产生快照。
 pub fn load_snapshot_with_dynamic(
     cfg_path: &Path,
     version: u64,
     dynamic_upstreams: Arc<DynamicUpstreamStore>,
 ) -> Result<GatewaySnapshot> {
-    let cfg = load_gateway_config(cfg_path)?;
-    build_snapshot_from_config(cfg_path, version, dynamic_upstreams, cfg)
+    let loaded = load_gateway_config_tracked(cfg_path)?;
+    build_snapshot_from_config(
+        cfg_path,
+        version,
+        dynamic_upstreams,
+        loaded.value,
+        loaded.sources,
+    )
 }
 
-/// 从同目录临时候选文件构建 dry-run 快照，但所有相对依赖/profile 都继续以真实 gateway.yml 为基准。
+/// 业务作用：从有界临时候选构建 dry-run 快照，同时保持 profile 和相对依赖以真实主配置为权威根。
 ///
-/// # 参数
-/// - `cfg_path`: 当前真实 gateway.yml；只作为相对依赖/profile 基准，绝不覆盖。
-/// - `candidate_path`: 控制面以 create_new 写出的 bounded 临时候选文件。
-/// - `version`: dry-run 候选版本。
+/// 参数说明：`cfg_path` 是真实主配置；`candidate_path` 是控制面临时候选；`version` 是 dry-run 版本。
+///
+/// 返回：候选与全部依赖可完整构建时返回快照；读取超限、变量未解析或语义非法时返回错误且不覆盖真实文件。
 pub fn load_candidate_snapshot(
     cfg_path: &Path,
     candidate_path: &Path,
     version: u64,
 ) -> Result<GatewaySnapshot> {
-    preflight_config_file(candidate_path, "candidate gateway config")?;
     let dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
     let stem = cfg_path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("gateway");
     let profile_pattern = dir.join(format!("{stem}-{{profile}}"));
-    let mut cfg: GatewayConfig = nasa::yml::YmlLoader::standard()
+    let loaded: LoadedYml<GatewayConfig> = YmlLoader::standard()
         .base_file(candidate_path)
         .profile_file_pattern(profile_pattern.to_string_lossy().to_string())
-        .load()
+        .max_file_bytes(MAX_FINGERPRINT_FILE_BYTES)
+        .preserve_unresolved_placeholders(true)
+        .load_tracked()
         .with_context(|| format!("load candidate config {}", candidate_path.display()))?;
+    let mut cfg = loaded.value;
     expand_config_snippets(&mut cfg, cfg_path, candidate_path)?;
-    build_snapshot_from_config(cfg_path, version, DynamicUpstreamStore::new(), cfg)
+    build_snapshot_from_config(
+        cfg_path,
+        version,
+        DynamicUpstreamStore::new(),
+        cfg,
+        loaded.sources,
+    )
 }
 
-/// 把已解析的主配置与真实同目录 guard/sentinel/secret 编译成不可变快照。
+/// 业务作用：把已解析配置与同目录 guard、规则和 secret 编译为不可变快照，并冻结同源观察计划。
 ///
-/// # 参数
-/// - `cfg_path`: 真实 gateway.yml 路径，用作所有相对文件基准。
-/// - `version`: 候选快照版本。
-/// - `dynamic_upstreams`: 常驻或 dry-run 临时的动态实例事实源。
-/// - `cfg`: 已由 nasa::yml 完成 profile/env/占位符解析的主配置。
+/// 参数说明：`cfg_path` 是相对路径根；`version` 是候选版本；`dynamic_upstreams` 是发现事实源；
+/// `cfg` 是完成分层合并的配置；`sources` 是同一次 naml tracked load 返回的本地来源。
+///
+/// 返回：全部运行态计划和资源预算合法时返回快照；任一依赖或安全门失败时返回错误。
 fn build_snapshot_from_config(
     cfg_path: &Path,
     version: u64,
     dynamic_upstreams: Arc<DynamicUpstreamStore>,
     mut cfg: GatewayConfig,
+    sources: YmlLocalSources,
 ) -> Result<GatewaySnapshot> {
     let schema_version = resolve_schema_version(cfg.schema_version, "gateway.yml")?;
     let config_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
@@ -864,8 +922,17 @@ fn build_snapshot_from_config(
     let access_log =
         AccessLogRuntime::build(&cfg.access_log, config_dir).context("build access log")?;
     crate::telemetry::validate_config(&cfg.telemetry).context("validate telemetry")?;
-    let guard = load_interface_guard(cfg_path, &cfg.interface_guard_file)?;
-    let sentinel = load_sentinel_rules(cfg_path, &cfg.sentinel_rules_file)?;
+    let (guard, guard_sources) = load_interface_guard(cfg_path, &cfg.interface_guard_file)?;
+    let (sentinel, sentinel_sources) = load_sentinel_rules(cfg_path, &cfg.sentinel_rules_file)?;
+    let config_watch = ConfigWatchPlan::new(
+        sources,
+        config_watch_dependencies(
+            cfg_path,
+            &cfg,
+            config_dir,
+            [&guard_sources, &sentinel_sources],
+        ),
+    );
     let variables = VariablePlan::build(&cfg.variables).context("build variables")?;
     let usage_plans =
         crate::routing::UsagePlanCatalog::build(&cfg.usage_plans).context("build usage plans")?;
@@ -968,6 +1035,7 @@ fn build_snapshot_from_config(
         access_log,
         telemetry: cfg.telemetry,
         reload: cfg.reload,
+        config_watch,
         long_connections: cfg.long_connections,
         secret_files: secret_files.into(),
         limits: bootstrap_limits,
@@ -3529,17 +3597,30 @@ fn resolve_schema_version(raw: Option<u32>, file: &str) -> Result<u32> {
     }
 }
 
+/// 业务作用：加载主配置并完成 profile、环境变量、占位符和 snippet 展开，供控制面读取强类型候选。
+///
+/// 参数说明：`cfg_path` 是本轮主配置路径，也是全部相对依赖的权威根。
+///
+/// 返回：所有来源和 snippet 合法时返回强类型配置；读取超限、解析或展开失败时返回错误。
 pub(crate) fn load_gateway_config(cfg_path: &Path) -> Result<GatewayConfig> {
+    load_gateway_config_tracked(cfg_path).map(LoadedYml::into_value)
+}
+
+/// 业务作用：在加载 Naway 主配置的同时保留 naml 解析出的真实本地来源，供指纹和 watcher 同源复用。
+///
+/// 参数说明：`cfg_path` 是本轮主配置路径，也是全部相对依赖的权威根。
+///
+/// 返回：强类型配置和本轮实际来源同时成功时返回；失败时不暴露部分配置或部分来源。
+fn load_gateway_config_tracked(cfg_path: &Path) -> Result<LoadedYml<GatewayConfig>> {
     // gateway.yml 内既允许普通配置占位符(`${GW_UPSTREAM:http://...}`),也允许 filter DSL 运行期变量
     // (`${remote_addr}` / `${request_id}`)。因此使用 naml 的宽松解析:能解析的配置占位符照常解析,
     // 未命中的运行期变量保留给 gateway 的变量系统解释。
-    preflight_config_file(cfg_path, "gateway config")?;
-    let mut cfg = loader(cfg_path)
+    let mut loaded: LoadedYml<GatewayConfig> = loader(cfg_path)
         .preserve_unresolved_placeholders(true)
-        .load()
+        .load_tracked()
         .with_context(|| format!("load gateway config {}", cfg_path.display()))?;
-    expand_config_snippets(&mut cfg, cfg_path, cfg_path)?;
-    Ok(cfg)
+    expand_config_snippets(&mut loaded.value, cfg_path, cfg_path)?;
+    Ok(loaded)
 }
 
 struct SnippetDefinition {
@@ -3825,7 +3906,15 @@ fn enforce_expanded_snippet_budget(route_id: &str, filters: &[String]) -> Result
     Ok(())
 }
 
-fn load_interface_guard(main_cfg: &Path, guard_file: &str) -> Result<InterfaceGuard> {
+/// 业务作用：加载并编译接口禁用规则，同时保留其基础文件和 profile 候选供统一 watcher 使用。
+///
+/// 参数说明：`main_cfg` 是相对路径根；`guard_file` 是主配置声明的守卫文件。
+///
+/// 返回：schema 与规则合法时返回运行态守卫及同次 naml 来源；缺失、超限或语义非法时返回错误。
+fn load_interface_guard(
+    main_cfg: &Path,
+    guard_file: &str,
+) -> Result<(InterfaceGuard, YmlLocalSources)> {
     let path = resolve_relative(main_cfg, guard_file);
     if !path.exists() {
         anyhow::bail!(
@@ -3833,21 +3922,28 @@ fn load_interface_guard(main_cfg: &Path, guard_file: &str) -> Result<InterfaceGu
             path.display()
         );
     }
-    preflight_config_file(&path, "interface guard")?;
-    let gf: GuardFile = loader(&path)
-        .load()
+    let loaded: LoadedYml<GuardFile> = loader(&path)
+        .load_tracked()
         .with_context(|| format!("load interface guard {}", path.display()))?;
-    // 按文件校验守卫配置的 schema 版本(§6):过新即拒绝,保留旧快照。
-    resolve_schema_version(gf.schema_version, "interface-guard.yml")?;
-    InterfaceGuard::build(gf)
-        .with_context(|| format!("build interface guard from {}", path.display()))
+    // 守卫文件独立复验 schema；未知新格式必须拒绝，不能把未理解的规则当成空保护发布。
+    resolve_schema_version(loaded.value.schema_version, "interface-guard.yml")?;
+    let guard = InterfaceGuard::build(loaded.value)
+        .with_context(|| format!("build interface guard from {}", path.display()))?;
+    Ok((guard, loaded.sources))
 }
 
+/// 业务作用：保存 Sentinel 文件编译后的 route→filter 索引，并在进入 Router 前校验引用完整性。
 struct SentinelRouteFilters {
+    /// route id 到按声明顺序编译出的限流和熔断 filter。
     by_route: HashMap<String, Vec<String>>,
 }
 
 impl SentinelRouteFilters {
+    /// 业务作用：拒绝引用不存在 route 的 Sentinel 规则，避免运维误以为保护策略已经生效。
+    ///
+    /// 参数说明：`matched` 是本轮全部真实 route id。
+    ///
+    /// 返回：所有规则均命中时成功；任一悬空引用返回错误并阻止候选发布。
     fn ensure_all_matched(&self, matched: &HashSet<String>) -> Result<()> {
         for route in self.by_route.keys() {
             if !matched.contains(route) {
@@ -3858,7 +3954,15 @@ impl SentinelRouteFilters {
     }
 }
 
-fn load_sentinel_rules(main_cfg: &Path, sentinel_file: &str) -> Result<SentinelRouteFilters> {
+/// 业务作用：加载 Sentinel 路由规则并编译为确定性 filter，同时保留其 profile 观察候选。
+///
+/// 参数说明：`main_cfg` 是相对路径根；`sentinel_file` 是主配置声明的规则文件。
+///
+/// 返回：schema、标识和规则合法时返回编译结果及 naml 来源；缺失、超限或非法时返回错误。
+fn load_sentinel_rules(
+    main_cfg: &Path,
+    sentinel_file: &str,
+) -> Result<(SentinelRouteFilters, YmlLocalSources)> {
     let path = resolve_relative(main_cfg, sentinel_file);
     if !path.exists() {
         anyhow::bail!(
@@ -3866,13 +3970,17 @@ fn load_sentinel_rules(main_cfg: &Path, sentinel_file: &str) -> Result<SentinelR
             path.display()
         );
     }
-    preflight_config_file(&path, "sentinel rules")?;
-    let sf: SentinelFile = loader(&path)
-        .load()
+    let loaded: LoadedYml<SentinelFile> = loader(&path)
+        .load_tracked()
         .with_context(|| format!("load sentinel rules {}", path.display()))?;
-    resolve_schema_version(sf.schema_version, "sentinel-rules.yml")?;
+    let SentinelFile {
+        schema_version,
+        flow,
+        degrade,
+    } = loaded.value;
+    resolve_schema_version(schema_version, "sentinel-rules.yml")?;
     let mut by_route: HashMap<String, Vec<String>> = HashMap::new();
-    for rule in sf.flow {
+    for rule in flow {
         if !rule.enabled {
             continue;
         }
@@ -3917,7 +4025,7 @@ fn load_sentinel_rules(main_cfg: &Path, sentinel_file: &str) -> Result<SentinelR
         };
         by_route.entry(rule.route).or_default().push(filter);
     }
-    for rule in sf.degrade {
+    for rule in degrade {
         if !rule.enabled {
             continue;
         }
@@ -3957,9 +4065,14 @@ fn load_sentinel_rules(main_cfg: &Path, sentinel_file: &str) -> Result<SentinelR
         );
         by_route.entry(rule.route).or_default().push(filter);
     }
-    Ok(SentinelRouteFilters { by_route })
+    Ok((SentinelRouteFilters { by_route }, loaded.sources))
 }
 
+/// 业务作用：校验 Sentinel DSL 的单 token 字段，避免空值或空白字符改变后续指令分词语义。
+///
+/// 参数说明：`label` 用于指出非法字段；`value` 是待进入 filter DSL 的原始值。
+///
+/// 返回：非空且不含空白字符时成功，否则返回错误并阻止候选发布。
 fn validate_sentinel_token(label: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
         anyhow::bail!("{label} `{value}` must be non-empty and contain no whitespace");
@@ -3967,29 +4080,29 @@ fn validate_sentinel_token(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// 构造 nasa::yml 加载器:主配置 = `path`,profile 文件名按【本文件名】派生
-/// (`gateway.yml` → `gateway-{profile}`),避免不同配置文件串用同一 profile。
-pub(crate) fn loader(path: &Path) -> nasa::yml::YmlLoader {
+/// 业务作用：为任一 Naway YAML 文件构造统一的 naml 加载器，固定 profile 派生和单文件读取上限。
+///
+/// 参数说明：`path` 是主文件；profile 名按该文件 stem 派生，避免不同配置文件串用 profile。
+///
+/// 返回：配置了主文件、profile pattern 和 32 MiB 单文件硬门的加载器。
+pub(crate) fn loader(path: &Path) -> YmlLoader {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("config");
     let pattern = dir.join(format!("{stem}-{{profile}}"));
-    nasa::yml::YmlLoader::standard()
+    YmlLoader::standard()
         .base_file(path)
         .profile_file_pattern(pattern.to_string_lossy().to_string())
+        .max_file_bytes(MAX_FINGERPRINT_FILE_BYTES)
 }
 
-/// 在交给 naml 按路径解析前执行同一文件句柄的有界预读。
+/// 业务作用：以主配置目录解析声明式文件引用，同时保留显式绝对路径的部署语义。
 ///
-/// 这会在常规启动/reload 上阻断超大静态配置；naml 当前仍会为 profile/env 合并重新打开
-/// base path，因此依赖层后续还应提供 reader/max-bytes API 来完全消除恶意并发替换竞态。
-fn preflight_config_file(path: &Path, kind: &str) -> Result<()> {
-    crate::bounded_io::read_file(path, MAX_FINGERPRINT_FILE_BYTES, kind).map(|_| ())
-}
-
-/// guard_file 相对主配置文件所在目录解析;绝对路径原样用。
+/// 参数说明：`main_cfg` 是相对路径根；`rel` 是配置中声明的文件路径。
+///
+/// 返回：绝对路径原样返回，相对路径返回与主配置父目录拼接后的路径。
 pub(crate) fn resolve_relative(main_cfg: &Path, rel: &str) -> PathBuf {
     let p = Path::new(rel);
     if p.is_absolute() {
@@ -4002,20 +4115,21 @@ pub(crate) fn resolve_relative(main_cfg: &Path, rel: &str) -> PathBuf {
     }
 }
 
-/// 配置文件内容指纹:用于热重载 worker 跳过编辑器触发的重复事件。
+/// 业务作用：计算本轮有效配置文件内容指纹，供 reload 去重和集群配置收敛比较。
 ///
-/// 指纹只覆盖当前实例的主配置和它声明的 `interface_guard_file`/`sentinel_rules_file`;同目录其它 yml
-/// 可能是旁路测试配置或备份文件,不能影响本实例的 reload 判定。事务化配置校验仍由
-/// `load_snapshot` 执行,指纹只做去重,不承担完整合法性判断。
+/// 参数说明：`main_cfg` 是主配置路径；活动 profile 由同一次 naml tracked load 决定。
+///
+/// 返回：主配置、活动 profile 和声明式依赖均可有界读取时返回内容哈希；任一来源失败时返回错误。
 pub(crate) fn config_fingerprint(main_cfg: &Path) -> Result<u64> {
     let mut hasher = DefaultHasher::new();
-    hash_config_file(&mut hasher, main_cfg)?;
+    let loaded = load_gateway_config_tracked(main_cfg)?;
+    hash_yml_sources(&mut hasher, &loaded.sources)?;
 
-    let cfg = load_gateway_config(main_cfg)?;
+    let cfg = loaded.value;
     let guard_path = resolve_relative(main_cfg, &cfg.interface_guard_file);
-    hash_config_file(&mut hasher, &guard_path)?;
+    hash_yml_sources(&mut hasher, &loader(&guard_path).local_sources()?)?;
     let sentinel_path = resolve_relative(main_cfg, &cfg.sentinel_rules_file);
-    hash_config_file(&mut hasher, &sentinel_path)?;
+    hash_yml_sources(&mut hasher, &loader(&sentinel_path).local_sources()?)?;
     let config_dir = main_cfg.parent().unwrap_or_else(|| Path::new("."));
     if let Some(path) = crate::kubernetes_routes::generated_dependency(&cfg, config_dir) {
         hash_optional_config_file(&mut hasher, &path)?;
@@ -4030,26 +4144,33 @@ pub(crate) fn config_fingerprint(main_cfg: &Path) -> Result<u64> {
     Ok(hasher.finish())
 }
 
-/// 读取声明式配置并返回所有能独立触发 reload 的文件依赖，供 notify watcher 动态对账。
+/// 业务作用：从已解析候选收集 watcher 精确目标，使观察范围与即将发布的配置模型保持一致。
 ///
-/// 主配置本身由 watcher 单独持有；这里覆盖 guard/sentinel、Kubernetes 物化文件以及
-/// SecretSource、OpenAPI/Casbin/WASM/外部插件等 route 依赖。只监听其中的精确目标路径，
-/// 既保留依赖热更新，又不会把同目录日志和编辑器临时文件误判成配置变更。
-pub(crate) fn reload_dependencies(main_cfg: &Path) -> Result<Vec<PathBuf>> {
-    let cfg = load_gateway_config(main_cfg)?;
-    let config_dir = main_cfg.parent().unwrap_or_else(|| Path::new("."));
+/// 参数说明：`main_cfg` 是相对路径根；`cfg` 是已展开候选；`config_dir` 是共同目录；
+/// `auxiliary_sources` 是 guard 与 Sentinel tracked load 返回的基础文件和 profile 候选。
+///
+/// 返回：guard、规则、Kubernetes 物化文件、SecretSource、schema、扩展和 snippet 的排序去重路径。
+fn config_watch_dependencies<'a>(
+    main_cfg: &Path,
+    cfg: &GatewayConfig,
+    config_dir: &Path,
+    auxiliary_sources: impl IntoIterator<Item = &'a YmlLocalSources>,
+) -> Vec<PathBuf> {
     let mut paths = vec![
         resolve_relative(main_cfg, &cfg.interface_guard_file),
         resolve_relative(main_cfg, &cfg.sentinel_rules_file),
     ];
-    if let Some(path) = crate::kubernetes_routes::generated_dependency(&cfg, config_dir) {
+    if let Some(path) = crate::kubernetes_routes::generated_dependency(cfg, config_dir) {
         paths.push(path);
     }
-    paths.extend(collect_secret_dependencies(&cfg, config_dir));
+    paths.extend(collect_secret_dependencies(cfg, config_dir));
     paths.extend(cfg.snippet_files.iter().cloned());
+    for sources in auxiliary_sources {
+        paths.extend(sources.watch_files().map(Path::to_path_buf));
+    }
     paths.sort();
     paths.dedup();
-    Ok(paths)
+    paths
 }
 
 /// 业务作用：收集当前配置实际依赖的文件型 secret/document，供指纹、reload watcher 与审计同源。
@@ -4233,6 +4354,23 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
     paths
 }
 
+/// 业务作用：把一次 naml tracked load 实际读取的基础文件和活动 profile 按稳定顺序加入配置指纹。
+///
+/// 参数说明：`hasher` 是当前候选摘要；`sources` 必须来自与该候选相同 loader 约定。
+///
+/// 返回：全部实际来源均可有界读取时成功；缺失、超限或读取失败时返回错误。
+fn hash_yml_sources(hasher: &mut DefaultHasher, sources: &YmlLocalSources) -> Result<()> {
+    for source in sources.loaded_files() {
+        hash_config_file(hasher, source)?;
+    }
+    Ok(())
+}
+
+/// 业务作用：有界读取单个声明式依赖并把内容加入配置指纹，部署绝对路径不参与集群收敛比较。
+///
+/// 参数说明：`hasher` 是当前候选摘要；`path` 是已按固定业务角色排序的文件。
+///
+/// 返回：文件可在硬上限内完整读取时成功；缺失、超限或读取失败时返回错误。
 fn hash_config_file(hasher: &mut DefaultHasher, path: &Path) -> Result<()> {
     // 集群收敛比较的是配置内容，不是每台机器的部署目录。调用方已经按
     // main/guard/sentinel/依赖的固定角色顺序喂入文件；把绝对路径也哈希进去会让
@@ -4242,6 +4380,11 @@ fn hash_config_file(hasher: &mut DefaultHasher, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：把可选物化配置的存在状态和内容加入指纹，使创建、删除和内容变化均能触发 reload。
+///
+/// 参数说明：`hasher` 是当前候选摘要；`path` 是允许暂时缺失的声明式依赖。
+///
+/// 返回：缺失时写入稳定空标记，存在且可有界读取时写入内容；其它读取失败返回错误。
 fn hash_optional_config_file(hasher: &mut DefaultHasher, path: &Path) -> Result<()> {
     match crate::bounded_io::read_optional_file(
         path,

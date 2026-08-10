@@ -3094,7 +3094,6 @@ where
         .ok()
 }
 
-
 const EDGE_META_PROTOCOL: &str = "gateway.edge.protocol";
 const EDGE_META_CLUSTER_ID: &str = "gateway.edge.cluster_id";
 const EDGE_META_NODE_ID: &str = "gateway.edge.node_id";

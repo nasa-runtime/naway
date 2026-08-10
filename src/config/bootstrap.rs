@@ -774,11 +774,20 @@ fn write_new(path: &Path, content: &str) -> Result<()> {
     }
 }
 
-/// 从(已存在的)主配置里读 `interface_guard_file` 字段名(用 nasa::yml 解析,占位符已解析;失败回退默认名)。
+/// 业务作用：从已存在的主配置读取 `interface_guard_file`，失败时让启动流程使用安全默认文件名。
+///
+/// 参数说明：`cfg_path` 是主配置路径。
+///
+/// 返回：naml 成功解析且字段为字符串时返回文件名，否则返回 `None`。
 fn guard_file_name(cfg_path: &Path) -> Option<String> {
     configured_file_name(cfg_path, "interface_guard_file")
 }
 
+/// 业务作用：通过统一 naml loader 读取主配置中的字符串文件引用，避免 bootstrap 自造解析语义。
+///
+/// 参数说明：`cfg_path` 是主配置路径；`key` 是待读取的顶层配置键。
+///
+/// 返回：字段存在且为字符串时返回其值；文件、profile、占位符或字段解析失败时返回 `None`。
 fn configured_file_name(cfg_path: &Path, key: &str) -> Option<String> {
     let tree = super::loader(cfg_path).load_tree().ok()?;
     tree.get(key)

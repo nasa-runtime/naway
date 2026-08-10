@@ -1,10 +1,10 @@
-//! 无感热重载(架构规范 §7)。
+//! 无感热重载。
 //!
-//! 两个触发通道(R1):① `notify` 监听配置**目录**(编辑器写临时文件+rename 会丢 inode 事件)+ 防抖;
-//! ② `SIGHUP` 信号(`kill -HUP <pid>` 或 `naway -s reload`)。
-//! 都汇入唯一的 reload worker:事务化 build 新快照 → `ArcSwap` 原子换版;坏配置保留旧快照,在线流量零影响。
+//! naml 精确观察主配置、profile 与附加依赖，`SIGHUP` 提供显式重载入口；两类事件汇入唯一
+//! reload worker。候选先完成配置构建、外部资源准备和 watcher 对账，再通过 `ArcSwap` 原子发布；
+//! 任一步失败都保留旧快照和旧观察目标。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -15,15 +15,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use naml::watch::{YmlWatchEvent, YmlWatchKind, YmlWatcher};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex, MutexGuard};
+use tokio::sync::{mpsc, oneshot, Mutex, MutexGuard};
 
 use crate::blacklist::BlacklistCache;
 use crate::config::model::{NacosConfigSourceCfg, ReloadCfg};
 use crate::config::{
     config_fingerprint, load_gateway_config, load_snapshot_with_dynamic, resolve_relative,
-    GatewaySnapshot,
+    ConfigWatchPlan, GatewaySnapshot,
 };
 use crate::config_history::ConfigHistory;
 use crate::conn_registry::ConnectionRegistry;
@@ -36,12 +36,50 @@ use crate::runtime_state::{
 };
 use crate::upstream::DynamicUpstreamStore;
 
+/// 业务作用：区分 reload 的内部触发来源；所有变体最终都必须经过同一候选构建和发布门禁。
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ReloadEvent {
+    /// 主配置或活动 profile 发生变化。
     File,
+    /// guard、规则、Secret、schema 或扩展等附加依赖发生变化。
     Dependency,
+    /// 运维通过进程信号请求重新读取本地配置。
     Sighup,
+    /// Nacos 已把完整配置 bundle 物化到私有候选路径。
     Nacos { cfg_path: PathBuf },
+}
+
+/// 业务作用：承载 watcher 管理任务的一次串行对账；回执决定候选是否允许进入快照发布点。
+struct ConfigWatchCommand {
+    /// 已完成业务构建、等待发布的候选观察计划。
+    plan: ConfigWatchPlan,
+    /// naml 对账结果回执；发送成功结果前 reload worker 不得发布候选快照。
+    completed: oneshot::Sender<Result<()>>,
+}
+
+/// 业务作用：协调本地配置 watcher 的发布前对账，并隔离 `YmlWatcher` 的单 owner 可变状态。
+#[derive(Clone)]
+struct ConfigWatchReconciler {
+    /// 发往唯一 watcher 管理任务的有界命令通道。
+    tx: mpsc::Sender<ConfigWatchCommand>,
+}
+
+impl ConfigWatchReconciler {
+    /// 业务作用：在候选快照发布前要求 naml watcher 原子切换到同一来源和依赖计划。
+    ///
+    /// 参数说明：`plan` 来自已完成全部配置构建和资源 prepare 的候选快照。
+    ///
+    /// 返回：新增目录全部可观察且目标集合已发布时成功；watcher 退出或对账失败时返回错误。
+    async fn reconcile(&self, plan: ConfigWatchPlan) -> Result<()> {
+        let (completed, result) = oneshot::channel();
+        self.tx
+            .send(ConfigWatchCommand { plan, completed })
+            .await
+            .context("local config watcher is unavailable")?;
+        result
+            .await
+            .context("local config watcher stopped during reconcile")?
+    }
 }
 
 /// 其它控制面 worker 向唯一 reload worker 提交候选变更的窄接口。
@@ -80,13 +118,43 @@ pub trait PreparedListenerTopology: Send {
 }
 
 impl ReloadHandle {
-    /// 通知唯一 worker 重新校验本地候选文件。队列有界，背压时异步等待而不丢最终状态。
+    /// 业务作用：通知唯一 worker 重新校验本地候选文件，禁止调用方绕过构建和发布门禁。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：事件成功进入有界队列时返回 true；worker 已停止时返回 false。
     pub async fn trigger_file(&self) -> bool {
         self.tx.send(ReloadEvent::File).await.is_ok()
     }
 }
 
 impl ReloadEvent {
+    /// 业务作用：把 naml 的来源分类映射为 Naway 的去抖与审计触发类型。
+    ///
+    /// 参数说明：`event` 是已经过 naml 精确路径过滤的文件变化。
+    ///
+    /// 返回：主配置和 profile 归为完整配置变化，附加文件归为依赖变化。
+    fn from_yml_watch(event: YmlWatchEvent) -> Self {
+        match event.kind {
+            YmlWatchKind::Base | YmlWatchKind::Profile => Self::File,
+            YmlWatchKind::Dependency => Self::Dependency,
+        }
+    }
+
+    /// 业务作用：判断候选是否来自本地配置权威，以决定是否必须在发布前对账本地 watcher。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：文件、依赖和 SIGHUP 返回 `true`；Nacos 物化候选返回 `false`。
+    fn uses_local_watch(&self) -> bool {
+        matches!(self, Self::File | Self::Dependency | Self::Sighup)
+    }
+
+    /// 业务作用：提供稳定低基数触发名，供日志和配置历史记录使用。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：与触发来源对应的静态名称，不包含文件路径或远端标识。
     fn as_str(&self) -> &'static str {
         match self {
             Self::File => "file",
@@ -96,6 +164,11 @@ impl ReloadEvent {
         }
     }
 
+    /// 业务作用：选择本轮候选的主配置来源，同时防止 Nacos 物化文件覆盖本地 bootstrap 路径。
+    ///
+    /// 参数说明：`local_cfg_path` 是进程启动时固定的本地主配置路径。
+    ///
+    /// 返回：本地事件使用 bootstrap，Nacos 事件使用其私有物化候选。
     fn cfg_path(&self, local_cfg_path: &Path) -> PathBuf {
         match self {
             Self::File | Self::Dependency | Self::Sighup => local_cfg_path.to_path_buf(),
@@ -165,15 +238,30 @@ pub struct ReloadRuntime {
     pub xds: Option<Arc<crate::xds::XdsGenerationManager>>,
 }
 
-/// 起热重载后台任务(notify + SIGHUP 汇入同一 reload)。
+/// 业务作用：聚合唯一 reload worker 持有的发布权威，避免同一事务状态被拆成可错配的松散参数。
+struct ReloadWorkerState {
+    /// 进程启动时固定的本地主配置路径。
+    cfg_path: PathBuf,
+    /// 当前活动不可变快照的原子指针。
+    snap: Arc<ArcSwap<GatewaySnapshot>>,
+    /// 成功发布版本的单调序列。
+    version: Arc<AtomicU64>,
+    /// 需要与快照共同 prepare、发布和换代的运行态资源。
+    runtime: ReloadRuntime,
+    /// 配置候选成功与拒绝的持久历史。
+    history: ConfigHistory,
+    /// 可用时在本地候选发布前对账 naml watcher；初始化失败时为空。
+    config_watcher: Option<ConfigWatchReconciler>,
+    /// 已发布首快照的配置内容指纹，用作去重基线。
+    initial_fingerprint: Option<u64>,
+}
+
+/// 业务作用：启动唯一 reload worker，并汇聚 naml 文件观察、SIGHUP 与 Nacos 配置事件。
 ///
-/// # 参数
-/// - `cfg_path`: 本地 bootstrap 配置路径，也是文件 watch 目标。
-/// - `snap`: 当前不可变配置快照，成功构建新版后原子替换。
-/// - `version`: 成功快照版本序列。
-/// - `runtime`: 需要随快照协调更新的运行态后端。
-/// - `history`: 重载审计历史。
-/// - `cfg`: 有界事件队列与去抖窗口；worker 启动后保持不变。
+/// 参数说明：`cfg_path` 是本地 bootstrap；`snap/version` 是活动快照权威；`runtime` 是换代资源；
+/// `history` 记录结果；`cfg` 固定有界事件队列和去抖窗口。
+///
+/// 返回：受限触发句柄；调用方只能提交本地候选变化，不能绕过构建和发布门禁。
 pub fn spawn(
     cfg_path: PathBuf,
     snap: Arc<ArcSwap<GatewaySnapshot>>,
@@ -183,15 +271,34 @@ pub fn spawn(
     cfg: ReloadCfg,
 ) -> ReloadHandle {
     let (tx, rx) = mpsc::channel::<ReloadEvent>(cfg.channel_capacity.max(1));
-    spawn_file_watch(cfg_path.clone(), tx.clone());
+    let initial_snapshot = snap.load();
+    let initial_watch = initial_snapshot.config_watch.clone();
+    let initial_fingerprint = initial_snapshot.config_fingerprint;
+    drop(initial_snapshot);
+    let config_watcher = spawn_file_watch(initial_watch, tx.clone());
+    match config_fingerprint(&cfg_path) {
+        Ok(current) if initial_fingerprint.is_some_and(|active| active != current) => {
+            // watcher 已先建立；首快照构建到观察启动之间若发生漂移，主动补一条事件，
+            // 不能把尚未发布的新内容误记成 worker 基线而永久跳过。
+            let _ = tx.try_send(ReloadEvent::File);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "initial config fingerprint recheck failed; first event will still be validated")
+        }
+    }
     spawn_sighup(tx.clone());
     spawn_nacos_config_watch(cfg_path.clone(), tx.clone());
     tokio::spawn(reload_worker(
-        cfg_path,
-        snap,
-        version,
-        runtime,
-        history,
+        ReloadWorkerState {
+            cfg_path,
+            snap,
+            version,
+            runtime,
+            history,
+            config_watcher,
+            initial_fingerprint,
+        },
         rx,
         Duration::from_millis(cfg.debounce_ms),
     ));
@@ -210,6 +317,23 @@ pub async fn apply_reload(
     runtime: &ReloadRuntime,
     trigger: &str,
     history: &ConfigHistory,
+) -> bool {
+    apply_reload_with_watch(cfg_path, snap, version, runtime, trigger, history, None).await
+}
+
+/// 业务作用：执行完整 reload 事务，并在最终发布点前把本地 watcher 切换到候选同源计划。
+///
+/// 参数说明：前六项组成既有发布事务；`config_watcher` 仅为本地权威候选提供发布前观察门禁。
+///
+/// 返回：候选资源与 watcher 均准备完成并发布时返回 true；任一步失败返回 false 并保留旧快照。
+async fn apply_reload_with_watch(
+    cfg_path: &std::path::Path,
+    snap: &ArcSwap<GatewaySnapshot>,
+    version: &AtomicU64,
+    runtime: &ReloadRuntime,
+    trigger: &str,
+    history: &ConfigHistory,
+    config_watcher: Option<&ConfigWatchReconciler>,
 ) -> bool {
     // 从版本分配前就取得写权；否则 xDS 与 reload 可能拿到同一 next version，并以最后 store 者
     // 覆盖对方已经 ACK/审计的快照，破坏“先完整构建、后单点发布”的控制面 fencing。
@@ -749,6 +873,24 @@ pub async fn apply_reload(
             } else {
                 None
             };
+            if let Some(config_watcher) = config_watcher {
+                // 新依赖目录必须在快照可见前完成观察；否则成功换版后立即发生的 Secret/schema
+                // 轮换可能落入空窗。naml 对账失败会保留旧目标，因此此处拒绝候选即可完整回滚。
+                if let Err(error) = config_watcher
+                    .reconcile(new_snap.config_watch.clone())
+                    .await
+                {
+                    tracing::error!(trigger, error = %error, "local config watcher reconcile failed; keeping old snapshot");
+                    history.record_rejected(
+                        trigger,
+                        cfg_path,
+                        old_version,
+                        next,
+                        format!("local config watcher reconcile failed: {error:#}"),
+                    );
+                    return false;
+                }
+            }
             if next_admin_audit.is_some() {
                 // 审计 sequence 是控制面安全边界；发布窗口先关闭新写入，再切 owner，
                 // 防止旧请求在候选代验证 spool 后迟到追加导致跨代 hash-chain。
@@ -759,7 +901,9 @@ pub async fn apply_reload(
                     .begin_transition();
             }
             let new_snap = Arc::new(new_snap);
-            snap.store(new_snap.clone()); // ★唯一的原子换版点(无锁、纳秒级)★
+            // 所有可失败的资源 prepare、权限复验和 watcher 对账均已完成；此处才发布唯一新事实，
+            // 避免请求看到尚未具备完整外部资源或观察能力的半完成快照。
+            snap.store(new_snap.clone());
             #[cfg(feature = "xds-client")]
             if let Some(prepared) = prepared_xds {
                 // 快照已关闭旧 authority 的业务语义；立即撤销旧 task，
@@ -986,23 +1130,28 @@ fn same_tls_secret_references(current: &GatewaySnapshot, candidate: &GatewaySnap
         )
 }
 
+/// 业务作用：串行消费所有配置来源事件，执行内容去重并确保全进程只有一条本地 reload 提交链。
+///
+/// 参数说明：`state` 聚合发布权威、watcher 和首版指纹；`rx/debounce` 控制有界事件合并。
+///
+/// 返回：任务持续运行至所有事件发送端关闭；单次失败只记录拒绝并继续服务后续候选。
 async fn reload_worker(
-    cfg_path: PathBuf,
-    snap: Arc<ArcSwap<GatewaySnapshot>>,
-    version: Arc<AtomicU64>,
-    runtime: ReloadRuntime,
-    history: ConfigHistory,
+    state: ReloadWorkerState,
     mut rx: mpsc::Receiver<ReloadEvent>,
     debounce: Duration,
 ) {
+    let ReloadWorkerState {
+        cfg_path,
+        snap,
+        version,
+        runtime,
+        history,
+        config_watcher,
+        initial_fingerprint,
+    } = state;
     let mut last_hashes = HashMap::new();
-    match config_fingerprint(&cfg_path) {
-        Ok(hash) => {
-            last_hashes.insert(cfg_path.clone(), hash);
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "initial config fingerprint failed; first reload will still be validated");
-        }
+    if let Some(hash) = initial_fingerprint {
+        last_hashes.insert(cfg_path.clone(), hash);
     }
 
     while let Some(first) = rx.recv().await {
@@ -1022,13 +1171,18 @@ async fn reload_worker(
                 continue;
             }
             Ok(hash) => {
-                if apply_reload(
+                let local_watcher = trigger
+                    .uses_local_watch()
+                    .then_some(config_watcher.as_ref())
+                    .flatten();
+                if apply_reload_with_watch(
                     &source_cfg_path,
                     &snap,
                     &version,
                     &runtime,
                     trigger.as_str(),
                     &history,
+                    local_watcher,
                 )
                 .await
                 {
@@ -1047,6 +1201,11 @@ async fn reload_worker(
     }
 }
 
+/// 业务作用：在去抖窗口后合并已经排队的 reload 事件，减少同一磁盘动作造成的重复候选构建。
+///
+/// 参数说明：`first` 是本轮首事件；`rx` 是唯一 worker 的事件接收端。
+///
+/// 返回：按来源优先级合并后的单一事件，不丢失 Nacos 私有候选路径。
 fn drain_reload_events(first: ReloadEvent, rx: &mut mpsc::Receiver<ReloadEvent>) -> ReloadEvent {
     let mut trigger = first;
     while let Ok(next) = rx.try_recv() {
@@ -1055,6 +1214,11 @@ fn drain_reload_events(first: ReloadEvent, rx: &mut mpsc::Receiver<ReloadEvent>)
     trigger
 }
 
+/// 业务作用：确定两个 reload 事件的合并优先级，防止本地噪声覆盖已物化的远端候选路径。
+///
+/// 参数说明：`current` 是当前聚合结果；`next` 是随后到达的事件。
+///
+/// 返回：Nacos 候选优先，其次主配置、附加依赖和 SIGHUP；保留被选事件携带的路径。
 fn merge_reload_events(current: ReloadEvent, next: ReloadEvent) -> ReloadEvent {
     match next {
         ReloadEvent::Nacos { .. } => next,
@@ -1070,168 +1234,46 @@ fn merge_reload_events(current: ReloadEvent, next: ReloadEvent) -> ReloadEvent {
     }
 }
 
-/// 通道①:notify 监听配置目录,事件交给统一 worker 防抖与换版。
-fn spawn_file_watch(cfg_path: PathBuf, tx: mpsc::Sender<ReloadEvent>) {
-    // macOS 的 `/var` 是 `/private/var` 符号链接：进程参数可能使用前者，而 FSEvents/notify
-    // 返回后者。监听前固定为真实路径，才能在精确过滤时仍识别主配置和依赖文件。
-    let cfg_path = canonical_watch_path(&cfg_path);
-    let config_dir = cfg_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    tokio::spawn(async move {
-        // notify 回调在同步线程；先递到本 watcher manager，由它区分主配置与 secret
-        // 轮换、并在主配置改变后对账新旧 secret 目录，避免常驻 watcher 无界累积。
-        let (event_tx, mut event_rx) = mpsc::channel::<notify::Event>(64);
-        let mut watcher = match RecommendedWatcher::new(
-            move |res: notify::Result<notify::Event>| {
-                if let Ok(ev) = res {
-                    if matches!(
-                        ev.kind,
-                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                    ) {
-                        let _ = event_tx.blocking_send(ev);
-                    }
-                }
-            },
-            notify::Config::default(),
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!(error = %e, "file watcher init failed; hot-reload-by-file disabled");
-                return;
-            }
-        };
-        if let Err(e) = watcher.watch(&config_dir, RecursiveMode::NonRecursive) {
-            tracing::error!(dir = %config_dir.display(), error = %e, "watch dir failed");
-            return;
+/// 业务作用：以当前活动快照的同源计划建立 naml watcher，并启动唯一可变 owner 处理后续对账。
+///
+/// 参数说明：`initial_plan` 来自启动成功快照；`tx` 是统一 reload worker 的有界事件入口。
+///
+/// 返回：初始化成功时返回发布前对账句柄；任一必需目录不可观察时返回 `None`，SIGHUP 仍可工作。
+fn spawn_file_watch(
+    initial_plan: ConfigWatchPlan,
+    tx: mpsc::Sender<ReloadEvent>,
+) -> Option<ConfigWatchReconciler> {
+    let event_tx = tx.clone();
+    let watcher = match YmlWatcher::new(
+        initial_plan.sources(),
+        initial_plan.dependencies(),
+        move |event| {
+            // naml 已完成符号链接等价和精确目标过滤；这里仅执行来源映射与有界背压，
+            // 不能在同步回调中加载或发布配置。
+            let _ = event_tx.blocking_send(ReloadEvent::from_yml_watch(event));
+        },
+    ) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            tracing::error!(error = %error, "local config watcher init failed; file hot reload disabled");
+            return None;
         }
-        let mut watched_dirs = HashSet::from([config_dir.clone()]);
-        let mut dependency_files = load_reload_dependencies(&cfg_path).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "initial config dependency scan failed; config dir watch remains active");
-            Vec::new()
-        });
-        reconcile_dependency_watches(
-            &mut watcher,
-            &config_dir,
-            &dependency_files,
-            &mut watched_dirs,
-        );
-        tracing::info!(
-            dir = %config_dir.display(),
-            dependency_files = dependency_files.len(),
-            "watching config dependency directories for changes"
-        );
-        while let Some(event) = event_rx.recv().await {
-            let Some(reload_event) =
-                classify_watched_paths(&event.paths, &cfg_path, &dependency_files)
-            else {
-                // notify 必须监听目录而不是 inode，才能观察编辑器的 temp+rename 原子发布；目录
-                // 同时会产生日志、证书旁路文件和临时文件事件。它们不属于当前配置依赖，不能
-                // 触发换版，否则会无故 drain WebSocket/gRPC 长连接并重建上游池。
-                continue;
-            };
-            if tx.send(reload_event).await.is_err() {
-                break;
-            }
-            match load_reload_dependencies(&cfg_path) {
-                Ok(next) => {
-                    reconcile_dependency_watches(
-                        &mut watcher,
-                        &config_dir,
-                        &next,
-                        &mut watched_dirs,
-                    );
-                    dependency_files = next;
-                }
-                Err(e) => tracing::debug!(
-                    error = %e,
-                    "config dependency rescan failed; keeping prior watches until config validates"
-                ),
-            }
+    };
+    let (command_tx, mut command_rx) = mpsc::channel::<ConfigWatchCommand>(1);
+    tokio::spawn(async move {
+        let mut watcher = watcher;
+        while let Some(command) = command_rx.recv().await {
+            let result = watcher.reconcile(command.plan.sources(), command.plan.dependencies());
+            let _ = command.completed.send(result);
         }
     });
-}
-
-/// 尽量把 watch 目标固定为操作系统事件返回的真实路径；目标短暂不存在时保留原路径，后续
-/// create/rename 仍可由已监听的父目录捕获。
-fn canonical_watch_path(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn load_reload_dependencies(cfg_path: &Path) -> Result<Vec<PathBuf>> {
-    crate::config::reload_dependencies(cfg_path).map(|mut paths| {
-        for path in &mut paths {
-            *path = canonical_watch_path(path);
-        }
-        paths.sort();
-        paths.dedup();
-        paths
-    })
-}
-
-/// 将目录级 notify 事件收窄为真实配置依赖事件。
-///
-/// watcher 监听父目录以兼容原子 rename，但 reload 权限只属于主配置目标和 loader 已解析出的
-/// `SecretSource` 文件。原子替换会在目标路径产生 create/rename 事件，因此无需接受同目录任意
-/// 文件；精确匹配也避免日志/临时文件变化造成无意义换版和长连接 drain。
-fn classify_watched_paths(
-    paths: &[PathBuf],
-    cfg_path: &Path,
-    dependency_files: &[PathBuf],
-) -> Option<ReloadEvent> {
-    if paths.iter().any(|path| path == cfg_path) {
-        return Some(ReloadEvent::File);
-    }
-    paths
-        .iter()
-        .any(|path| dependency_files.iter().any(|dependency| dependency == path))
-        .then_some(ReloadEvent::Dependency)
-}
-
-/// 把 notify 目录精确对账为“主配置目录 + 当前声明式文件依赖父目录”。
-fn reconcile_dependency_watches(
-    watcher: &mut RecommendedWatcher,
-    config_dir: &Path,
-    dependency_files: &[PathBuf],
-    watched_dirs: &mut HashSet<PathBuf>,
-) {
-    let mut desired = HashSet::from([config_dir.to_path_buf()]);
-    desired.extend(
-        dependency_files
-            .iter()
-            .filter_map(|path| path.parent().map(Path::to_path_buf)),
+    tracing::info!(
+        base = %initial_plan.sources().base_file().display(),
+        profile_candidates = initial_plan.sources().profile_watch_files().len(),
+        dependencies = initial_plan.dependencies().len(),
+        "watching naml configuration sources"
     );
-    for removed in watched_dirs
-        .difference(&desired)
-        .cloned()
-        .collect::<Vec<_>>()
-    {
-        match watcher.unwatch(&removed) {
-            Ok(()) => {
-                watched_dirs.remove(&removed);
-            }
-            Err(e) => {
-                // 保留在已观察集合中,下次对账继续重试,避免 bookkeeping 声称成功。
-                tracing::warn!(dir = %removed.display(), error = %e, "unwatch old SecretSource dir failed");
-            }
-        }
-    }
-    for added in desired
-        .difference(watched_dirs)
-        .cloned()
-        .collect::<Vec<_>>()
-    {
-        match watcher.watch(&added, RecursiveMode::NonRecursive) {
-            Ok(()) => {
-                watched_dirs.insert(added);
-            }
-            Err(e) => {
-                // 不记成成功;后续任一配置事件都会重新尝试挂 watch。
-                tracing::error!(dir = %added.display(), error = %e, "watch SecretSource dir failed");
-            }
-        }
-    }
+    Some(ConfigWatchReconciler { tx: command_tx })
 }
 
 /// 通道②:SIGHUP(nginx `-s reload` 风格)。
@@ -1644,7 +1686,6 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         )
     })
 }
-
 
 /// 比较当前与候选快照的 edge relay 常驻拓扑。
 #[cfg(feature = "grpc-edge")]

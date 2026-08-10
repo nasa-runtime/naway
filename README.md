@@ -3,7 +3,7 @@
 **Naway** 是面向高性能与有界资源的 Rust **流量网关 + 业务网关**。产品收敛目标是以单一 `naway` 制品覆盖 nginx + Spring Cloud Gateway 的主流场景：核心数据面主指标全部稳定达到 Envoy 的 90%，预声明的 h1、WebSocket、L4 TCP 主指标超过 Envoy；gRPC 提供按 service/method/header 治理的原生 L7 代理；独立管理端口内置 Higress 风格的 YML 编辑、CAS 发布、生效确认、集群收敛和回滚；同时保留无外部依赖可启动的轻量 all-in-one。量化口径由公开配置 schema、自动化验收和变更日志共同锁定，未过门项目不会标记完成。
 
 - 数据面:`hyper`/`tokio` 自建反向代理；h1/h2c、WebSocket/WSS、TLS/ALPN、SSE/gRPC streaming、证书热换和慢连接 deadline 已有真实 socket 自动测试，64 MiB 流式响应 RSS probe 已通过。
-- 控制面/发现/配置/限流/观测/管理:复用 nasa-runtime-rust 的 `nasa` 门面(Nacos/Redis/axum)。
+- 本地配置直接使用 `naml` 的分层加载、来源追踪和精确 watcher；Nacos、Redis、axum 等运行组件复用 nasa-runtime-rust 的 `nasa` 门面。
 
 实现行为以公开配置 schema、protobuf 契约、SDK 文档和自动化测试为准。
 
@@ -20,6 +20,14 @@
 配置路径优先级：`--config <路径>` > `NAWAY_CONFIG=<路径>` > `GW_CONFIG=<路径>` > `${NAWAY_CONFIG_DIR:-/data/naway}/naway.yml`。
 `interface-guard.yml` 相对主配置目录解析，因此与 `naway.yml` 同目录、一起挂载和热更。
 
+设置非空 `APP_PROFILE` 时，主配置、接口守卫和 Sentinel 规则分别加载同 stem 的
+`-{profile}` 文件；profile 不存在时保持可选，但其全部格式候选仍会被精确观察。每个本地 YAML、
+JSON 或 TOML 配置文件都有 32 MiB 单文件读取硬门，超限候选不会进入构建事务。
+
+naml watcher 只观察主配置、活动 profile 候选和已构建快照声明的 Secret、schema、策略及扩展文件，
+同目录日志和临时文件不会触发 reload。候选必须先完成运行态资源 prepare 和 watcher 对账，随后才
+原子发布快照；读取、校验、资源准备或新增目录观察失败时继续使用上一份有效配置。
+
 ## 快速开始
 
 ```bash
@@ -31,7 +39,7 @@ cargo run -- --config zcf/naway.yml
 # 生产：把 yml 放宿主 /data/naway，直接运行（默认读 /data/naway/naway.yml）
 naway
 
-# 热更(nginx 风格,向运行进程发 SIGHUP);或直接改 yml,notify 自动热加载(无感、零抖动)
+# 热更(nginx 风格,向运行进程发 SIGHUP);或直接改 yml,naml 自动热加载(无感、零抖动)
 naway -s reload
 ```
 

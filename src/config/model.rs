@@ -2111,7 +2111,7 @@ impl Default for AccessLogCfg {
 /// 新旧两个 reload worker。
 #[derive(Debug, Deserialize, Clone)]
 pub struct ReloadCfg {
-    /// `notify`/SIGHUP/Nacos 共用事件队列容量。0 按 1 处理，始终保持有界。
+    /// naml watcher、SIGHUP 与 Nacos 共用事件队列容量。0 按 1 处理，始终保持有界。
     #[serde(default = "default_reload_channel_capacity")]
     pub channel_capacity: usize,
     /// 收到首个变更事件后的聚合窗口(ms)。0 表示不等待，仍会排空已入队的重复事件。

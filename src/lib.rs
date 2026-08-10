@@ -7,7 +7,7 @@
 //! - [`upstream`] 上游发现抽象 + static `lb://` 目录
 //! - [`guard`]   接口级拦截(独立 yml → 直接响应)
 //! - [`proxy`]   反向代理数据面(请求管线 + 上游流式转发)
-//! - [`reload`]  无感热重载(notify 文件 + `SIGHUP`)
+//! - [`reload`]  无感热重载(naml 精确文件观察 + `SIGHUP`)
 //! - [`admin`]   管理/观测面(与数据面端口隔离:/healthz /readyz + 后续 /metrics、admin)
 //! - [`metrics`] 低基数运行指标(`/metrics`)
 //! - [`access_log`] 非阻塞 access log
