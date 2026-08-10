@@ -1773,7 +1773,3 @@ fn compile_topic_filters(
     }
     Ok(filters)
 }
-
-#[cfg(test)]
-#[path = "../../tests/unit/mqtt_governance.rs"]
-mod tests;

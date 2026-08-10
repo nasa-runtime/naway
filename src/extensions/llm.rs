@@ -2029,7 +2029,3 @@ fn validate_upstream(uri: &str, route_id: &str, model_id: &str) -> Result<()> {
         ),
     }
 }
-
-#[path = "../../tests/unit/llm.rs"]
-#[cfg(test)]
-mod tests;

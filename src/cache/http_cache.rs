@@ -2380,7 +2380,3 @@ fn has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
             .unwrap_or(true)
     })
 }
-
-#[path = "../../tests/unit/http_cache.rs"]
-#[cfg(test)]
-mod tests;

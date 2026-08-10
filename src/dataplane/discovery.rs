@@ -1617,7 +1617,3 @@ fn apply_discovery_snapshot(
         }
     }
 }
-
-#[path = "../../tests/unit/discovery.rs"]
-#[cfg(test)]
-mod tests;

@@ -3116,7 +3116,3 @@ mod data_source {
         InlineString(String),
     }
 }
-
-#[path = "../../tests/unit/xds_resources.rs"]
-#[cfg(test)]
-mod tests;

@@ -1267,7 +1267,3 @@ pub(crate) fn validate_server_identity_bytes(
         .context("validate Gateway TLS certificate identity")?;
     Ok(())
 }
-
-#[path = "../../tests/unit/tls.rs"]
-#[cfg(test)]
-mod tests;

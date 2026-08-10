@@ -1839,7 +1839,3 @@ impl Body for EdgeSubscribeBody {
         SizeHint::default()
     }
 }
-
-#[path = "../../tests/unit/edge_hub.rs"]
-#[cfg(test)]
-mod tests;

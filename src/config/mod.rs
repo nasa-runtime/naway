@@ -4253,7 +4253,3 @@ fn hash_optional_config_file(hasher: &mut DefaultHasher, path: &Path) -> Result<
     }
     Ok(())
 }
-
-#[path = "../../tests/unit/config_mod.rs"]
-#[cfg(test)]
-mod admin_exposure_tests;

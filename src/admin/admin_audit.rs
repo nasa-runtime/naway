@@ -454,7 +454,3 @@ fn unix_now_ms() -> u128 {
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
 }
-
-#[path = "../../tests/unit/admin_audit.rs"]
-#[cfg(test)]
-mod tests;

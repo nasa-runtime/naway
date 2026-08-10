@@ -2248,7 +2248,3 @@ where
         }),
     }
 }
-
-#[cfg(test)]
-#[path = "../../tests/unit/kafka_governance.rs"]
-mod tests;

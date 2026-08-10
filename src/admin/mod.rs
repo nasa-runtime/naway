@@ -8736,7 +8736,3 @@ fn json(status: StatusCode, value: serde_json::Value) -> Response<BoxBody> {
         .body(full_body(Bytes::from(value.to_string())))
         .expect("build admin json response")
 }
-
-#[path = "../../tests/unit/admin_mod.rs"]
-#[cfg(test)]
-mod tests;

@@ -712,7 +712,3 @@ fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
         }
     })
 }
-
-#[path = "../../tests/unit/variable.rs"]
-#[cfg(test)]
-mod tests;

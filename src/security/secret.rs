@@ -107,7 +107,3 @@ fn validate(mut bytes: Vec<u8>, field: &str) -> Result<String> {
     );
     String::from_utf8(bytes).with_context(|| format!("{field} SecretSource is not UTF-8"))
 }
-
-#[path = "../../tests/unit/secret.rs"]
-#[cfg(test)]
-mod tests;

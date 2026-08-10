@@ -3,7 +3,7 @@ name = "naway-edge-client"
 version = "0.1.0"
 edition = "2021"
 authors = ["Naway contributors"]
-description = "Naway gRPC 边缘模式(V8)客户端 SDK:订阅/群播/定向单播"
+description = "Naway gRPC 边缘模式客户端 SDK:订阅、群播与定向单播"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/nasa-runtime/naway"
 homepage = "https://github.com/nasa-runtime/naway"
@@ -11,9 +11,8 @@ readme = "../../README.md"
 keywords = ["grpc", "gateway", "pubsub", "edge"]
 categories = ["network-programming"]
 
-# 刻意不放进网关的 workspace:网关的 P1 制品门(strip 二进制 <=50 MiB、ready <=2s)
-# 依赖一份稳定的依赖解析,把 SDK 拉进同一个 lock 会让 feature 统一影响网关二进制。
-# SDK 自带 lock,单独构建与测试(见 tests/scripts/sdk_gates.sh)。
+# SDK 不放进网关 workspace，避免 feature 统一和依赖解析变化影响网关二进制。
+# SDK 自带 lock，并按自身 manifest 独立构建。
 
 [dependencies]
 # 与网关同版本族,避免同机开发时两套 h2 行为不一致。

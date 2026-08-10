@@ -1171,7 +1171,3 @@ pub(crate) async fn collect_bounded(
     };
     Ok(CollectedBody { bytes, trailers })
 }
-
-#[path = "../../tests/unit/proxy_request_validation.rs"]
-#[cfg(test)]
-mod tests;

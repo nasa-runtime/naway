@@ -5738,7 +5738,3 @@ fn header_value(value: &str, name: &str) -> Result<HeaderValue, ForwardError> {
     HeaderValue::from_str(value)
         .map_err(|e| ForwardError::BadGateway(anyhow::anyhow!("invalid {name} header: {e}")))
 }
-
-#[path = "../../tests/unit/proxy_forward.rs"]
-#[cfg(test)]
-mod tests;

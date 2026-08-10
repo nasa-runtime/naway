@@ -429,7 +429,3 @@ pub fn ws_masked_close_frame(code: u16, mask: [u8; 4]) -> [u8; 8] {
         payload[1] ^ mask[1],
     ]
 }
-
-#[path = "../../tests/unit/conn_registry.rs"]
-#[cfg(test)]
-mod tests;

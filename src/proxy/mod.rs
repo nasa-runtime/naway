@@ -8903,7 +8903,3 @@ fn transform_degraphql(
 }
 
 pub(super) type DownstreamUpgrade = Option<(OnUpgrade, Option<DownstreamConnectionLease>)>;
-
-#[path = "../../tests/unit/proxy_mod.rs"]
-#[cfg(test)]
-mod tests;

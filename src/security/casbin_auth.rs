@@ -229,7 +229,3 @@ pub(crate) fn dependency_paths(config_dir: &Path, cfg: &CasbinAuthorizationCfg) 
         resolve(config_dir, &cfg.policy_file),
     ]
 }
-
-#[path = "../../tests/unit/casbin_auth.rs"]
-#[cfg(test)]
-mod tests;

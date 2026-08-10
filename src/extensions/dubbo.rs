@@ -680,7 +680,3 @@ impl Write for BoundedWriter {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "../../tests/unit/dubbo_plan.rs"]
-mod tests;

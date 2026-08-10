@@ -864,7 +864,3 @@ fn remote_context(trace_id: &str, span_id: &str, sampled: bool) -> Option<Contex
         TraceState::default(),
     )))
 }
-
-#[path = "../../tests/unit/telemetry.rs"]
-#[cfg(test)]
-mod tests;

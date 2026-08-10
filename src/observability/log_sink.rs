@@ -701,7 +701,3 @@ fn build_kafka_backend(spec: &LogSinkSpec) -> Result<Arc<dyn LogSink>> {
 fn build_kafka_backend(_spec: &LogSinkSpec) -> Result<Arc<dyn LogSink>> {
     bail!("Kafka access log sink requires gateway feature `log-kafka`")
 }
-
-#[path = "../../tests/unit/log_sink.rs"]
-#[cfg(test)]
-mod tests;

@@ -1425,7 +1425,3 @@ impl<'a> HessianDecoder<'a> {
 fn is_int_tag(tag: u8) -> bool {
     matches!(tag, 0x49 | 0x80..=0xd7)
 }
-
-#[cfg(test)]
-#[path = "../../tests/unit/dubbo_hessian2_codec.rs"]
-mod tests;

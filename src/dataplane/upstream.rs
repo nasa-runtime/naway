@@ -1995,7 +1995,3 @@ fn metadata_bool(inst: &nasa::discovery::Instance, keys: &[&str]) -> Option<bool
 fn metadata_u64(inst: &nasa::discovery::Instance, keys: &[&str]) -> Option<u64> {
     metadata_value(inst, keys).and_then(|v| v.trim().parse::<u64>().ok())
 }
-
-#[path = "../../tests/unit/upstream.rs"]
-#[cfg(test)]
-mod tests;

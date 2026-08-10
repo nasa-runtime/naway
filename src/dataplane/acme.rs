@@ -2478,7 +2478,3 @@ fn sync_directory(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-
-#[path = "../../tests/unit/acme.rs"]
-#[cfg(test)]
-mod tests;

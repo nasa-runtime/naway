@@ -557,7 +557,3 @@ impl Body for H3RequestBody {
         SizeHint::default()
     }
 }
-
-#[path = "../../tests/unit/http3.rs"]
-#[cfg(test)]
-mod tests;

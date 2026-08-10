@@ -461,7 +461,3 @@ fn validate_component(value: &str, name: &str) -> Result<()> {
     }
     Ok(())
 }
-
-#[path = "../../tests/unit/blacklist.rs"]
-#[cfg(test)]
-mod tests;

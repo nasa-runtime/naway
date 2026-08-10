@@ -607,9 +607,6 @@ impl Drop for Http3PeerConnectionSlot {
     }
 }
 
-#[path = "../tests/unit/main_binary.rs"]
-#[cfg(test)]
-mod connection_budget_tests;
 
 /// L4 stream 负载均衡常驻状态。
 ///

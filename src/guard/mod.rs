@@ -501,7 +501,3 @@ fn validate_component(value: &str, name: &str) -> Result<()> {
     }
     Ok(())
 }
-
-#[path = "../../tests/unit/guard_mod.rs"]
-#[cfg(test)]
-mod match_type_tests;

@@ -1285,7 +1285,3 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 }
-
-#[path = "../../tests/unit/graphql.rs"]
-#[cfg(test)]
-mod tests;

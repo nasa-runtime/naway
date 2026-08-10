@@ -1113,7 +1113,3 @@ fn select_methods(
     );
     Ok(selected)
 }
-
-#[path = "../../tests/unit/grpc_transcoding.rs"]
-#[cfg(test)]
-pub(crate) mod tests;

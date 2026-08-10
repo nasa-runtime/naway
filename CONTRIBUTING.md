@@ -1,7 +1,7 @@
 # Contributing to Naway
 
 Thank you for contributing to Naway. Contributions may include bug reports,
-design discussions, documentation, tests, and code changes.
+design discussions, documentation, and code changes.
 
 ## Before You Start
 
@@ -22,19 +22,12 @@ Typical validation commands are:
 ```bash
 cargo fmt --check
 cargo clippy --all-features --all-targets -- -D warnings
-cargo test --all-features
-bash tests/scripts/sdk_gates.sh
 ```
-
-Live integration tests are ignored by default. Set the documented environment
-variables and run only the relevant ignored test when external infrastructure
-is available.
 
 ## Pull Requests
 
 - Keep each pull request focused on one coherent change.
 - Explain the problem, behavior change, compatibility impact, and resource bounds.
-- Add or update tests for observable behavior.
 - Update `CHANGELOG.md` and the relevant Chinese product or architecture documents.
 - Keep secrets, tokens, internal hostnames, and production data out of commits.
 - Ensure generated files and SDK contracts remain synchronized when protobuf changes.

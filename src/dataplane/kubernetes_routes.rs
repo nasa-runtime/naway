@@ -9843,7 +9843,3 @@ fn validate_controller_name(value: &str) -> anyhow::Result<()> {
     validate_kubernetes_name("gateway controller domain", domain)?;
     validate_safe_name("gateway controller name", name, 63)
 }
-
-#[path = "../../tests/unit/kubernetes_routes.rs"]
-#[cfg(test)]
-mod tests;

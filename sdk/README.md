@@ -1,7 +1,7 @@
 # Naway gRPC 边缘模式 SDK
 
 wire 契约见 [`../proto/naway/edge/v1/edge.proto`](../proto/naway/edge/v1/edge.proto)。
-字段号由网关侧的 `edge_proto_matches_wire_contract` 用例与实现锁死,两侧不会漂移。
+字段号由网关实现与 SDK 共同遵守，修改契约时必须同步更新两侧。
 
 ## 先读这三条产品语义
 
@@ -19,8 +19,8 @@ wire 契约见 [`../proto/naway/edge/v1/edge.proto`](../proto/naway/edge/v1/edge
 
 ## 两个 SDK 的共同取舍
 
-- **payload 是 `bytes`/`byte[]`,SDK 不做 protobuf 编解码。** 网关本就不解析业务 payload
-  (§25.2.2),SDK 也不该强迫使用方绑定某一种 protobuf 实现。
+- **payload 是 `bytes`/`byte[]`,SDK 不做 protobuf 编解码。** 网关本就不解析业务 payload，
+  SDK 也不该强迫使用方绑定某一种 protobuf 实现。
 - **身份不由客户端决定。** tenant/user 一律由网关从**已验证 principal**(JWT claim 或
   已认证 consumer)推导;客户端在 metadata 或消息体里放的任何身份字段都不作数。
   能碰哪个 group 由 route 的 `grpc_edge.authz` 决定,越权返回 `PERMISSION_DENIED(7)`。
@@ -80,15 +80,6 @@ channel 交给使用方自建,是为了让 TLS、名字解析、拦截器、连�
 构建与测试:`cd sdk/java && mvn test`。
 **不使用 protobuf 代码生成**——回执是平坦 varint 结构,手写 marshaller 避免了 protoc
 这个平台相关的构建期依赖,也与 Rust SDK 解析同一份契约。
-
-## 门禁
-
-两个 SDK 都在网关的构建单元之外(Rust SDK 不进 workspace,以免影响 P1 制品门的依赖解析),
-因此 `cargo test` 带不到它们。统一入口:
-
-```bash
-bash tests/scripts/sdk_gates.sh
-```
 
 ## 许可证
 

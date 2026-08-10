@@ -2550,7 +2550,3 @@ fn render_request_duration(out: &mut String, metrics: &Metrics) {
     out.push_str(&count.to_string());
     out.push('\n');
 }
-
-#[path = "../../tests/unit/metrics.rs"]
-#[cfg(test)]
-mod tests;

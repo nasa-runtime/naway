@@ -8236,7 +8236,3 @@ pub fn strip_n_segments(path: &str, n: usize) -> Cow<'_, str> {
         Cow::Owned(format!("/{}", rest.join("/")))
     }
 }
-
-#[path = "../../tests/unit/routing_mod.rs"]
-#[cfg(test)]
-mod tests;

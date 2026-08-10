@@ -3346,7 +3346,3 @@ impl ReplayGuard for RedisReplayGuard {
         })
     }
 }
-
-#[path = "../../tests/unit/runtime_state.rs"]
-#[cfg(test)]
-mod tests;

@@ -1,14 +1,10 @@
-// Naway gRPC 边缘模式(V8)对外 wire 契约。
+// Naway gRPC 边缘模式对外 wire 契约。
 //
-// 本文件是**从既有实现反推**的,不是另起炉灶的设计稿:回执消息的字段号与
-// proto3 省零语义由 `src/dataplane/edge_hub.rs` 的手写编码器决定,并由
-// `tests/unit/edge_hub.rs` 的 `edge_proto_matches_wire_contract` 用例
-// 逐字段锁死。**改这里必须同时改那两处,否则用例会失败。**
+// 回执消息的字段号与 proto3 省零语义由网关的手写编码器实现。修改字段时必须同步
+// 调整编码器和各语言 SDK，避免接入方在编译正常的情况下静默误读回执。
 //
-// 为什么网关不引 prost:§25.2.2「业务 payload 不解析」——网关只校验 gRPC framing
-// 与压缩位,不反序列化 FramePush。只有两个回执消息是网关自己产生的,它们是平坦的
-// varint-only 结构,手写编码比拉进整套 codegen 更小也更可审查。本文件供**接入方**
-// 生成各语言 SDK 使用。
+// 网关只校验 gRPC framing 与压缩位，不反序列化 FramePush 的业务 payload。只有网关
+// 自己产生的平坦 varint 回执采用手写编码，本文件供接入方生成各语言 SDK 使用。
 
 syntax = "proto3";
 

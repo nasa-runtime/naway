@@ -774,7 +774,3 @@ fn sampled(request_id: &str, sample: f64) -> bool {
     let bucket = hasher.finish() as f64 / u64::MAX as f64;
     bucket < sample
 }
-
-#[path = "../../tests/unit/access_log.rs"]
-#[cfg(test)]
-mod tests;

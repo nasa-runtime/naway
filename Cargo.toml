@@ -13,19 +13,6 @@ readme = "README.md"
 keywords = ["gateway", "grpc", "reverse-proxy", "redis", "service-mesh"]
 categories = ["network-programming", "web-programming::http-server"]
 
-[[bin]]
-name = "local_a2_benchmark"
-path = "tests/support/local_a2_benchmark.rs"
-
-[[bin]]
-name = "local_edge_benchmark"
-path = "tests/support/local_edge_benchmark.rs"
-
-[[bin]]
-name = "local_h3_benchmark"
-path = "tests/support/local_h3_benchmark.rs"
-required-features = ["http3"]
-
 [features]
 default = []
 # Compile the real nacos-sdk transport through the nasa facade. Without this

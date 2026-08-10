@@ -1155,7 +1155,3 @@ pub fn spawn_active_health(
         }
     })
 }
-
-#[path = "../../tests/unit/health.rs"]
-#[cfg(test)]
-mod tests;

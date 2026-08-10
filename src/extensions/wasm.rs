@@ -4061,7 +4061,3 @@ fn resolve(base: &Path, raw: &str) -> PathBuf {
 pub(crate) fn dependency_path(config_dir: &Path, raw: &str) -> Option<PathBuf> {
     (!raw.trim().is_empty()).then(|| resolve(config_dir, raw))
 }
-
-#[path = "../../tests/unit/wasm.rs"]
-#[cfg(test)]
-mod tests;

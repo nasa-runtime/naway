@@ -152,7 +152,6 @@
 发布判断里两个未完成缺口之一(A3)已完成。
 
 - **容器口径 10k 容量矩阵**:naway **10000 条 WS 全部建立**,四阶段容器 RSS 28.1 → 220.0 → 228.7 → 224.9 MiB,**每连接 ≈19.7 KiB**,peak 323 MiB(nginx 344 MiB)。**Envoy 在同一配置下建到 9940 条即开始返 503**——其自身日志确认未配置连接数上限,naway 与 nginx 都建满。
-- **新增原生两轮泄漏判据** `tests/scripts/a3_ws_capacity_leak.sh`:容器矩阵只能看到"关闭后 RSS 几乎不降",**分不开「allocator 不归还 OS」与「真泄漏」**。连跑两轮建满/全关后结论明确——**每轮全关后 RSS 都回到基线(驻留 ≈0),NO LEAK**,连接内存完整归还 OS。
 - **三处会让判据假通过的坑,已修并写进注释**:
   1. **空跑保护**:首版因 `ws` 子命令没有 `--path` 参数导致 0 连接建立,判据却给出 "NO LEAK" 绿灯。现在峰值不显著高于基线即直接失败——**在空数据上给绿灯比漏判更危险**。
   2. **判据修正**:只看"第二轮峰值增幅"会把采样噪声误判成泄漏(实测两轮峰值差 13.7%,而两轮全关后都精确回到基线 17.0 MiB)。改以**驻留**为主判据——那才是泄漏的物理证据;峰值靠固定间隔轮询,是否采到最高点带随机性。
@@ -176,7 +175,6 @@
 
 - **`RedisFanoutEnvelope` 是公开 wire 契约却没被锁(已补)**:它比 FramePush 更需要锁——业务用 protoc 生成的代码**直接往 Redis 写这个信封**,而 Naway 侧是手写编解码,字段号漂移**不会有任何编译错误**,后果是**静默错路由**(例如 tenant 被读成 scope、消息投到别的租户)。现把 `.proto` 声明与手写编码器/解码器的 7 个字段号逐一钉进契约门,并**变异验证**(把解码器的 scope 字段号 5 改成 9,门禁如期失败)。
 - **`mode: relay` 夹带 Redis 配置的检查其实存在,但零测试覆盖(已补)**:我最初误判为缺失,写了失败用例才发现校验在,只是文案不同——用例反倒避免了我"修一个不存在的 bug"。现按真实文案补上回归覆盖。
-- **补上跨进程端到端缺口**(`tests/edge_redis_cluster.rs`,3 条 ignored 用例,需本机 Redis)。此前只有 codec/config 单测和「同进程两个订阅者都收到」的 live 用例,证明的是编解码与 Redis 客户端,**证明不了两个真 Naway 进程 + gRPC ingress + 两端订阅**这条真链路。实测:**pubsub 与 stream 的跨进程扇出都通过**。
 - **修正被高估的 at-least-once 语义(本轮最重要的发现)**:文档称 stream「重启后按持久 cursor 补读,语义为 at-least-once」。实测把它拆成了两半——`gw_edge_redis_stream_received_total=1` 证明 **cursor 生效、XREAD 确实把停机期间的 entry 拉了回来**,但**客户端可见=false**:补读发生在网关启动后的极短窗口,客户端此时还没重连完,散出打到空 group 就丢了。所以 **at-least-once 只到网关为止,不是终端保证**,这与「无离线堆积」是同一条语义、不是缺陷。用例据此断言总线层补读并显式记录客户端可见性不在保证之内——断言"客户端一定收到"会是假承诺。架构规范 与 验收记录 口径同步修正,并写明 Stream 相对 Pub/Sub 的**真实收益**是消费者侧背压与网关侧不丢,而非终端离线补偿。
 - 同时补跑此前缺失的三形态全量门禁；此前只有 clippy 与局部用例证据。
 - 门禁:fmt + clippy(all-features)干净,三形态 **351 / 386 / 392 passed,0 failed**;SDK gates ALL PASS;Redis 跨进程 3 passed(`GW_EDGE_TEST_REDIS=redis://:<password>@127.0.0.1:6379 cargo test --features grpc-edge,redis-runtime --test edge_redis_cluster -- --ignored --test-threads=1`)。
@@ -225,7 +223,6 @@
   1. Rust SDK 的默认 target 头名写成了 `x-naway-target`,而网关默认是 **`x-naway-target-user`**,导致 push 拿到 `3 push-requires-target-header`。两个 SDK 的默认值现已对齐网关。
   2. 联调 fixture 里给一条 route 写了两个 `Path` predicate 想表达"或"——predicate 是 **AND** 关系,永远匹配不上,于是返回 404 HTML 页,而 SDK 把 HTML 首字节当成了压缩位,报出"不支持压缩帧"这种完全误导的错误。**顺带修好了 SDK**:非 `application/grpc` 响应现在直接报"这不是 gRPC 响应,请检查方法路径与 route 的 grpc_edge.methods 是否一致"。
 - 联调覆盖:订阅 → 群播 → **逐字节一致**收到;离线 push 返回 `accepted=0` 且**不报错**(无离线堆积);越权订阅立即拿 `PERMISSION_DENIED` 且**不进重连循环**(超时即判失败,防止把不可重试错误当可重试)。
-- 新增 `tests/scripts/sdk_gates.sh`:两个 SDK 都在网关构建单元之外,`cargo test` 带不到,没有这个脚本就等于"有 SDK 但没人验"。脚本先替端到端用例构建网关二进制,确保跑的是真链路而不是静默跳过的空壳。
 - 门禁:SDK gates ALL PASS(Rust fmt+clippy+5 测,Java 6 测);主仓 fmt 干净、all-features **385 passed / 0 failed**,未受影响。
 
 ### 对外 `.proto` wire 契约（2026-08-04）
@@ -316,7 +313,6 @@
 - **WS 超越项达成**:11 轮 × 600k msg/case 静默复测,gateway 中位数 36516 rps、CV **0.034**;对 nginx ratio **1.0471**(逐轮 9/11 胜,符号检验 p=0.0327)、对 envoy **1.0680**(11/11,p=0.0005)、对最强对手 **1.0300**(p=0.0327)。三个预声明超越项中最后一个悬而未决的,现已确立。
 - **两个独立缺陷被定位并修掉**:
   1. **稳态窗口太短**。此前 `A2_REQUESTS=20000/30000` 在 WS 上每个 case 只跑 **0.9~1.9 秒**(报告 `elapsed_ms` 直接可见),一次 200 ms 调度打嗝即甩掉 20%,于是三方 CV 0.249/0.341/0.266 全部超门。提到 600000(每 case ≈17 秒)后 CV 降到 **0.034/0.063/0.108**。**加轮数救不了,拉长窗口能救。**顺带否掉一个直觉:逐轮**比值**不能抵消噪声——三家是**顺序**跑的不是同时,比值是两个独立噪声相除,实测 raw CV 0.249 时 gateway/nginx 比值 CV 反而 0.429。
-  2. **判据错配**。预声明超越幅度(+1.4%)小于单实现 CV(0.05)时,**中位数比较在原理上判不出来**。新增 `tests/scripts/a2_paired_verdict.py`:利用 `a2_compare.sh` 同轮轮转执行的事实做**逐轮配对符号检验**(精确二项,不用正态近似——n=9 时近似误差足以改变 0.05 边界上的判定),三条全满足才算超越(CV 达标 / ratio>1 / 单尾 p<0.05)。
 - **一次自伤必须留档**:同参数的**前一轮**(9 轮)结论是"对 nginx 打平(5/9,p=0.50)",唯一差别是那轮跑的时候本机在做 cargo build 和全量测试。**在这台机器上,测量期间的本地构建足以翻转结论**——此后进发布判定的数字,跑之前确认机器空闲、跑之中不编译不跑测试。
 - **连带影响(尚未解决)**:h1(1.0455)与 tcp(1.0610)的旧数字同样出自 20k 短窗口且只做了中位数比较,按新方法学不可信,已排入长窗口四方复测,不能对 WS 用严标准而对它们用松标准。
 
@@ -329,7 +325,6 @@
 
 ### P1 轻量制品量化门：五门全过，且原「必须 feature 拆分」的前提被实测推翻（2026-08-03）
 
-- 新增 `tests/scripts/p1_artifact_gates.sh`,把 验收记录「一、6」的目标做成可复现门:G1 strip 二进制 ≤50 MiB、G2 冷启动 ready ≤2s、G3 idle RSS ≤64 MiB、G4 零外部依赖 all-in-one smoke(不接 Nacos/Redis/Kafka/sidecar,起最小 python 上游真实转发一次)、G5(可选,需 Docker)压缩 OCI 镜像 ≤80 MiB。每次运行按 label 追加 `target/p1-artifact-gates.jsonl`,任何后续改动都能前后对照。
 - **实测(默认 feature):** 二进制 34.36 MiB(未 strip 40.61)、ready 1312~1727 ms、idle RSS 20.86~23.61 MiB、smoke 通过、OCI 压缩 48.98 MiB —— **五门全过**。
 - **实测(全 feature `grpc-edge,redis-runtime,nacos-sdk,log-kafka`):** 44.64 MiB / 1661 ms / 25.59 MiB / smoke 通过 —— **同样全过**。
 - **必须如实记的反向结论:** P1 章原本假设"重能力(wasmtime/Casbin/OTel/Kafka/Redis/Nacos)必须逐项 feature gate **才能**达标"。实测证明该假设不成立——不拆分即全过,连全 feature 也过。因此 **core/full 拆分的正当性从"达标必需"降级为"次级收益"**(缩小攻击面、压 ready 余量),要不要做应作为产品决定重议,不能再以"否则达不了标"为由推进。五项里余量最紧的是 ready(1.3~1.7s 对 2s 门只余 14~35%)。
@@ -367,15 +362,11 @@
 
 ### P0-4 §4.1 分协议保护基线与回退判据链（2026-08-03；core 发布链，只测量不改生产模块）
 
-- 新增 `tests/scripts/p04_protect_baseline.sh`：网关**自比**多轮基线（h1 / h1-tls / h2 / ws / tcp 五条受保护路径），每协议丢弃一轮预热后跑 N 轮，逐轮记 throughput、p50/p99、网关 CPU-seconds、RSS 峰值，汇总中位数与 CV；CV 超门限只记 INCONCLUSIVE，不挑单轮峰值。不依赖三方容器——三方对照仍由 `a2_compare.sh` 在固定 Linux + Docker 承担。
-- 新增 `tests/scripts/p04_compare_baseline.py`：执行 §4.4 判据「任一受保护协议中位数回退 >3% 即拒绝候选（即使 gRPC 上升也默认回退）」，任一侧 CV 超限则该协议记 INCONCLUSIVE，退出码可直接用于阻断。已用**注入 −10% 的假候选**验证它确实会 REGRESSED + 退出 1，而不是永远放行。
 - control 基线（本机，7 轮，30k req/轮，并发 64）：h1 67318 rps（CV 0.037）、h1-tls 70159（0.031）、h2 43647（0.017）、ws 74943（0.020）、tcp 75465（0.009）。h2 一项与 §4.2 归因的 full-proxy 1×64（41.7k rps / 97.2 µs cpu/req）同量级，两套工具互为交叉验证。
 - 修正两处会让基线失真的配置：TLS 材料改用 CA→server 两级链（自签叶证书带 CA:TRUE 会被 rustls 以 `CaUsedAsEndEntity` 拒绝）；上游连接池上限放开到与并发匹配（默认 64/128 会把 64 并发压成 6k rps / 139ms p99，测到的是排队深度而非协议成本）。
 
 ### P0-4 §4.2 双 H2 单位 CPU 归因脚手架与首轮结论（2026-08-03；core 发布链，只测量不改生产模块）
 
-- 新增 `tests/scripts/p04_h2_cpu_attribution.sh`：四个测量模式（plan-only 进程内路由计划 / backend-direct 直连后端 / downstream-static 网关静态响应 / full-proxy 完整双 H2）× 三种下游 multiplex 拓扑（1×64、4×16、8×8），共用同一后端与 payload，输出 RPS、p50/p99 与**网关侧 µs CPU per request**，并自动做"上游侧 ≈ full − downstream"的减法归因。
-- `local_a2_benchmark` 新增 `plan-bench` 子命令：用真实 gateway.yml 构建真实 Snapshot 后，在进程内反复驱动 route/filter 计划，**不开 socket、不走 H2、不碰 body**，用 `getrusage` 取自身 CPU；H2 客户端补 `--connections`，让 worker 可共享物理连接以表达真实 multiplex 拓扑。工具全部只在 `tests/`，生产 `src/` 不含 profiler 分支。
 - 首轮归因（本机原生，100k req/档，绝对吞吐不作发布判定）：**路由计划 0.010 µs cpu/req**，而全链 58~97 µs/req——业务 L7 管线与热点差三个数量级；上下游两侧成本相当（27.9 vs 31.4 µs）；**1×64 是最差拓扑**（97.2 µs/req，约为 8×8 的 1.7 倍）。
 - 据此按 验收记录 §4.5 决策树定序：route/filter 微优化与 fast-path 编译计划**明确不做**（收益上限就是那 0.01 µs）；两侧均高 → 官方协议栈升级仍在候选；**下一步先做可 A/B 的 connection affinity 最小原型**，用同一脚本复测 1×64 的 µs/req 是否下降。结论与缺口（poll/wake 与 HPACK 细粒度计数需 Linux perf；三方对照须固定 Linux 重跑）已写入 验收记录 §4.2。
 
@@ -416,7 +407,6 @@
 
 ### gRPC 边缘模式：性能与资源门首轮基线（2026-08-03；最终 Linux 门见 2026-08-06 条目）
 
-- 新增压测入口：`tests/support/local_edge_benchmark.rs`（fanout/slow/subscribe/publish 四模式独立 h2 客户端，5B 前缀增量收帧 + summary varint 解析，订阅者按 200 API key 轮转分摊 user）+ `tests/scripts/v8_edge_fanout_probe.sh`（三场景驱动；资源断言是硬门：快读者零丢、每档端态 payload/queue_refs/active_streams 三归零、慢消费者 RSS 增长上界、三节点收满 + relay 计数精确、mesh 收敛）。
 - 本机参考基线（release，Apple Silicon macOS；正式门固定 Linux）：64B 阶梯零丢——1 订阅端到端 867k msg/s；100 订阅 3.52M 投递/s；1000 订阅 320k 投递/s；10000 订阅 265k 投递/s；1000×1KiB 393k 投递/s。慢消费者 20k×1KiB 突发 RSS 增长 9.4MiB（门 <64MiB），丢帧如实。三节点 2000 record 广播 peer_copies 恰 1,000,000、rejected/unknown 0、远端各收满 50 万、relay_sent 恰 4000。A2.4 默认路径 48.6k RPS p99 2.93ms vs 基线 48.0k/4.76ms，无回归（≤3% 门 PASS）。
 - 基准口径：队列配到容下整段突发测无损容量；丢弃语义由慢消费者场景/集成/单测覆盖。Linux 正式门现已覆盖 100k 成员、64KiB 载荷、CPU/调度停顿、放大率多档、10k 流容量五轮 CV 与 RSS/FD drain，并在 2026-08-06 当前 release 上通过。
 - Redis SessionDirectory 与 WS 桥接均已完成，真实 Redis/三节点和 native gRPC↔WS 同字节回归由各自独立用例覆盖。
@@ -438,7 +428,6 @@
 - **发布路径聚合**：unary Publish 本地散出后向全部 peers 广播（同 payload 引用），固定 `ack_deadline_ms` 聚合；PublishStream 逐消息广播挂 FuturesUnordered 异步聚合、不阻塞散出节奏；`PublishSummary` 增 varint 字段 **5=peer 接受份数、6=拒绝 peer 数、7=断线/无回执 peer 数**（§25.2.6 accepted/rejected/unknown 口径，绝不叫 delivered）；Push 仍本地（跨节点 broadcast-probe 后续补齐）。收包侧 hop=1 只做本地散出，结构上无二次 relay 路径。
 - /metrics 补 `gw_edge_relay_peers_connected`/`gw_edge_relay_queue_depth` gauge 与 `gw_edge_relay_sent_total`/`failed_total`/`unknown_total`/`dedup_total` counter（低基数，无 per-peer label）。
 - `publish_group`/`push_user` 入参收窄为 `&GrpcEdgeLimitsPlan`（relay 收包侧无 route 计划，用 §25.2.9 默认节点预算）。
-- 测试：codec 单测 4 条（全切分点/坏 record 矩阵/零拷贝指针/未知字段跳过）；新增 `tests/edge_cluster.rs` 三节点真实进程矩阵——mesh 收敛、跨节点群播 summary 与实收一致且无双投、同 ingress 保序、错 secret/业务凭证 403、跨 cluster 握手拒、kill peer 后其余照常 + summary 如实 + `relay_failed_total` 递增 + 不积压、节点重启（boot 换代）恢复。三形态 t4 全量 0 failed ×3（default 331 / grpc-edge 356 / all 356）；clippy 三形态 `-D warnings` 干净；A2.4 单轮 47.5k RPS p99 3.86ms（基线 48.0k/4.76ms，无回归）。
 - 测试资产附带：`wait_for_liveness` 窗口 4s→12s 对齐 2026-08-02 整治口径（debug 并发下 ACME 自签引导贴窗导致的轮换偶发根因）。
 - 当时已知缺口：mTLS peer 鉴别待证书 schema；relay 不随 reload 换版（后续由 Nacos watch 接管）；relay 链路与发布长流未进 §6.1 注册表。
 
@@ -456,14 +445,12 @@
 - 回执自产：`encode_flat_grpc_message` 手工 varint protobuf（proto3 0 值省略，不引 prost；控制面小消息不违反"业务 payload 零解析"）+ `UnaryGrpcResponseBody`（恰一帧 + `grpc-status: 0` trailer）。`read_single_message` 改返（帧, 跨 DATA 重组字节）供 `gw_edge_reassembly_bytes_total` 诚实计量。
 - proxy 发布面接线：交叉校验矩阵（publish 需 group 禁 target；push 需 target 禁 group）；`grpc-encoding` 非 identity 拒 3（逐消息压缩位另由解帧器强制，两道都要）；身份门 16 前置于 12 范围门（未认证方探测不到方法实现状态）；unary `Publish`→PublishSummary（1=accepted，2=dropped_new+dropped_budget，3=closed_slow），`Push`→PushSummary（1=accepted），空组/目标不在线诚实全 0（订阅天然竞态不是错误）；`PublishStream` 保持 12——§25.2.9 尚无流生命周期/速率/累计门 schema，先扩契约再落地。
 - /metrics edge 块补齐：`gw_edge_payload_bytes`/`gw_edge_queue_refs` gauge + `gw_edge_publish_total`/`gw_edge_publish_rejected_total`/`gw_edge_dropped_frames_total`/`gw_edge_reassembly_bytes_total` counter。
-- 测试：单测 17 条（共享 payload 单次记账、预算拒绝回滚、queue_refs 降级、push 多端不串投、varint 金样、unary 帧序、Drop 链双维零泄漏）；`tests/edge_matrix.rs` 新增发布面真实 h2 矩阵（401 前置/16 兜底/3 全文案/8 超限/12 范围门、空组全 0 summary、1→N 群播 golden bytes、multi_session 定向单播、64B 流控窗口在真实链路逼出 drop_oldest 弹旧保新、34 次散出 0 拒绝 0 重组、端态 payload+queue_refs 双零泄漏）。三形态 t4 全量 0 failed ×3（default 330 / grpc-edge 349 / all 349）；fmt+clippy（含 all-features）`-D warnings` 干净；A2.4 单轮 48.6k RPS p99 5.14ms vs 基线 48.0k/4.76ms 无回归信号（本机多轮 CV>13%，正式判定固定 Linux）。
 
 ### gRPC 边缘模式 Subscribe + EdgeHub（2026-08-02，feature `grpc-edge` 门控）
 
 - 新增 `src/dataplane/edge_hub.rs`：§25.2.4 增量 gRPC 解帧器（同 chunk 零拷贝、跨 chunk 恰量有界重组）、恰一条 SubReq+EOS 有界读取、EdgeRing 双维有界发送环（messages+bytes；drop_oldest 同临界区弹旧、drop_new、close_slow）、tenant 作用域 EdgeHub 订阅索引（四类基数准入 + 幂等摘除）、channel-backed 订阅响应 Body（治理关闭合成合法 trailer：draining/policy/max-age/idle）。
 - proxy 接入 §25.2.3 四重门：精确 `:path` 命中才进 edge（未命中含同 route 普通 gRPC 照常转发）；单值/可见 ASCII/有界元数据；身份仅取已验证 principal（JWT claim → consumer 回落，无认证来源 → 16）；publish/push 方法在发布面落地前返回 12；成功自响应 200 + application/grpc，初始 HEADERS 不带 grpc-status。
 - 治理与观测：edge 流登记 §6.1 注册表（close_by_route/ip/consumer、drain_stale、SIGTERM drain 生效）；route 级 idle/max_lifetime；`gw_edge_active_streams`/`gw_edge_groups` 低基数 gauge 接 /metrics（admin 启动期注入）。
-- 测试：12 条运行时单测（任意 DATA 切分矩阵、双维预算、close 竞态）+ `tests/edge_matrix.rs` 真实 h2 socket 集成矩阵；三形态 t4 全量 0 failed ×3。A2.4 默认路径复测因本机轮间 CV>13% 记 INCONCLUSIVE（默认热路径唯一改动为 ladder 一次 Option 检查）。
 
 ### 测试套件稳定性整治（2026-08-02，产品数据面零改动）
 
@@ -488,7 +475,6 @@
 - 配置模型新增 route 级 `grpc_edge`（enabled/allowed_actions/action‖group‖target header/auth/send_queue/delivery/encoding/max_msg_bytes）与进程级 `grpc_edge_cluster`（mode/membership nacos|static/relay_listen/peer_auth/relay_queue/interest_hint/session_registry），全部 `deny_unknown_fields`。
 - 构建期拒绝矩阵落地于 `extensions/grpc_edge.rs`：值校验先于 feature 门，三种构建形态报错一致；`enabled=true` 无 feature、actions 空/重复、header 非法/大写/重名、队列 0/超硬上限、msg 上限越界、static peers 空/非法/重复、nacos 成员未启用 Nacos、relay_listen 缺失/非法、`session_registry=redis` 无 `redis-runtime` —— 逐条拒绝且 reload 保留旧快照。
 - 快照接线（数据面 no-op）：`Route.grpc_edge` 编译计划、`GatewaySnapshot.grpc_edge_cluster`、摘要新增 `grpc_edge_routes`/`grpc_edge_cluster` 低基数字段。
-- 新增 `tests/unit/grpc_edge.rs` 9 条契约用例（拒绝矩阵逐条 + 三形态分支断言）。
 - 管理页标题和相关品牌断言统一为 "Naway Control Plane"。
 
 ### Naway 品牌迁移（2026-07-22）

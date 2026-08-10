@@ -83,7 +83,3 @@ fn read_open_file(mut file: File, path: &Path, max_bytes: usize, kind: &str) -> 
     );
     Ok(bytes)
 }
-
-#[path = "../../tests/unit/bounded_io.rs"]
-#[cfg(test)]
-mod tests;

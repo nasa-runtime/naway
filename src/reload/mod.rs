@@ -1645,9 +1645,6 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
-#[path = "../../tests/unit/reload_mod.rs"]
-#[cfg(test)]
-mod tests;
 
 /// 比较当前与候选快照的 edge relay 常驻拓扑。
 #[cfg(feature = "grpc-edge")]

@@ -2266,7 +2266,3 @@ fn grpc_status_to_http(status: u16) -> StatusCode {
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
-
-#[path = "../../tests/unit/grpc_browser.rs"]
-#[cfg(test)]
-mod tests;

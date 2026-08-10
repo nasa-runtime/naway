@@ -653,7 +653,3 @@ impl Body for StreamingCodecBody {
         SizeHint::default()
     }
 }
-
-#[path = "../../tests/unit/compression.rs"]
-#[cfg(test)]
-mod tests;

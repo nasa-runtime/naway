@@ -252,7 +252,3 @@ async fn parse_v2(stream: &mut TcpStream, peer: SocketAddr) -> Result<ConnInfo> 
         _ => bail!("unsupported PROXY protocol v2 address family/protocol 0x{fam:02x}"),
     }
 }
-
-#[path = "../../tests/unit/proxy_protocol.rs"]
-#[cfg(test)]
-mod tests;

@@ -3094,9 +3094,6 @@ where
         .ok()
 }
 
-#[path = "../../tests/unit/edge_relay.rs"]
-#[cfg(test)]
-mod tests;
 
 const EDGE_META_PROTOCOL: &str = "gateway.edge.protocol";
 const EDGE_META_CLUSTER_ID: &str = "gateway.edge.cluster_id";

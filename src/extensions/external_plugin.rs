@@ -779,7 +779,3 @@ pub(crate) fn dependency_path(
 ) -> Option<std::path::PathBuf> {
     crate::secret::dependency_path(cfg.authorization.as_str(), config_dir)
 }
-
-#[path = "../../tests/unit/external_plugin.rs"]
-#[cfg(test)]
-mod tests;

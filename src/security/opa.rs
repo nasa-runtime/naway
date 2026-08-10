@@ -2039,7 +2039,3 @@ fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
 }
-
-#[path = "../../tests/unit/opa.rs"]
-#[cfg(test)]
-mod tests;

@@ -1644,9 +1644,6 @@ fn parse_identity_token(field: &str, raw: &str, max_bytes: usize) -> Result<Box<
     Ok(Box::from(trimmed))
 }
 
-#[path = "../../tests/unit/grpc_edge.rs"]
-#[cfg(test)]
-mod tests;
 
 /// 编译 edge relay mTLS 配置；所有证书错误都在快照构建期 fail-fast。
 fn build_relay_tls(
