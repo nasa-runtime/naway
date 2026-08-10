@@ -80,7 +80,8 @@ globset = "0.4"                       # 接口守卫 path glob
 getrandom = "0.2"                     # WS client→upstream Close 帧按 RFC 6455 生成不可预测 mask
 http = "1"
 http-body-util = { version = "0.1", features = ["channel"] }
-httpdate = "1"                           # V5 cache 条件请求解析 RFC HTTP-date，不自造不完整日期语法
+httpdate = "1"                           # cache 条件请求解析 RFC HTTP-date，不自造不完整日期语法
+hmac = "0.12"                           # RFC2136 DNS-01 的 HMAC-SHA256 TSIG 签名与响应认证
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio", "webpki-roots"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "tokio", "http1", "http2"] }
@@ -99,7 +100,7 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] } # V5 OTLP/HTTP protobuf exporter
 parking_lot = "0.12"                  # 上游 client cache 共享读快路径；短临界区不占 Tokio 异步锁
 percent-encoding = "2"                # OpenAPI path parameter percent-decode；不同于 query，不把 `+` 错当空格
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2"] } # 后台 HTTP、受控 callout 与有界响应读取
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2", "form", "json", "query"] } # 后台 HTTP、受控 callout 与有界表单/响应读取
 quinn = { version = "0.11.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] } # V9 QUIC/TLS 1.3 transport；与现有 aws-lc rustls provider 对齐
 prost = { version = "0.14.4", optional = true } # V10 只编码显式声明的 xDS v3 message surface
 prost-types = { version = "0.14.4", optional = true } # V10 DiscoveryResponse Any 与基础 wrapper
@@ -110,6 +111,7 @@ rustls-webpki = "0.103"               # BackendTLSPolicy 显式 SAN 时独立执
 saml-rs = { version = "0.3.0", optional = true } # 纯 Rust SAML SP、严格 XML Signature/反 wrapping 校验
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"                      # 配置 tree(nasa::yml 产出 serde_json::Value)
+serde_yml = "0.0.12"                  # Console 语义编辑与三文档 dry-run 工作区
 sha2 = "0.10"                         # V5 cache key 增量摘要；避免把 Vary/header 原值写进 L1/Redis key
 tar = "0.4"                           # 标准 OPA bundle archive；拒绝链接与路径穿越 entry
 socket2 = { version = "0.6", features = ["all"] } # V7 SO_REUSEPORT 两阶段 listener 热切换

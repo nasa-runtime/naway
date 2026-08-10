@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
+use arc_swap::ArcSwap;
 use bytes::BytesMut;
 use http::header::{HeaderName, HeaderValue};
 use http::HeaderMap;
@@ -115,6 +116,11 @@ pub struct TelemetryRuntime {
     b3_compat: bool,
     /// 是否真正记录/导出 span；关闭态仍创建合法上下文以维持 W3C/B3 传播，但不构造属性。
     recording: bool,
+}
+
+/// 对数据面保持稳定地址的 telemetry 代际句柄。
+pub struct SwappableTelemetryRuntime {
+    active: ArcSwap<TelemetryRuntime>,
 }
 
 impl TelemetryRuntime {
@@ -264,6 +270,73 @@ impl TelemetryRuntime {
         self.provider
             .shutdown()
             .map_err(|error| anyhow::anyhow!("shutdown OpenTelemetry provider: {error}"))
+    }
+}
+
+impl SwappableTelemetryRuntime {
+    /// 业务作用：用启动期已构建的 provider 创建可原子换代的稳定句柄。
+    ///
+    /// 参数说明：`initial` 是已完成 exporter、队列与 sampler 复验的初始代。
+    ///
+    /// 返回：返回 Proxy 全生命周期共用的可换代句柄。
+    pub fn new(initial: Arc<TelemetryRuntime>) -> Arc<Self> {
+        Arc::new(Self {
+            active: ArcSwap::from(initial),
+        })
+    }
+
+    /// 业务作用：用当前 telemetry 代开启 server span 并固化本请求的传播上下文。
+    ///
+    /// 参数说明：`headers` 是可规范化的请求头；`trusted_inbound` 是远端上下文信任门；
+    /// `method/path/scheme/peer_ip` 描述当前入站请求。
+    ///
+    /// 返回：返回持有本次所选 provider/tracer 的请求 trace，后续 reload 不会把它跨代。
+    pub fn begin_server(
+        &self,
+        headers: &mut HeaderMap,
+        trusted_inbound: bool,
+        method: &http::Method,
+        path: &str,
+        scheme: &'static str,
+        peer_ip: std::net::IpAddr,
+    ) -> ServerTrace {
+        self.active.load_full().begin_server(
+            headers,
+            trusted_inbound,
+            method,
+            path,
+            scheme,
+            peer_ip,
+        )
+    }
+
+    /// 业务作用：发布新 exporter 代，保留旧 provider 一个有界排空窗口后 flush。
+    ///
+    /// 参数说明：`candidate` 是发布前已完成构建的候选代；`drain` 是旧 span 的最长自然收尾窗口。
+    ///
+    /// 返回：无返回值；新请求立即只选候选代，旧代在窗口后有界关闭。
+    pub fn replace(&self, candidate: Arc<TelemetryRuntime>, drain: Duration) {
+        let old = self.active.swap(candidate);
+        tokio::spawn(async move {
+            tokio::time::sleep(drain).await;
+            let result = tokio::task::spawn_blocking(move || old.shutdown()).await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "old telemetry generation flush failed"),
+                Err(error) => {
+                    tracing::warn!(%error, "old telemetry generation shutdown task failed")
+                }
+            }
+        });
+    }
+
+    /// 业务作用：进程停机时 flush 当前 exporter 代。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：当前 provider 完成 shutdown 时成功，SDK 拒绝或 flush 失败时返回错误。
+    pub fn shutdown(&self) -> Result<()> {
+        self.active.load_full().shutdown()
     }
 }
 

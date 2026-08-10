@@ -4275,12 +4275,13 @@ async fn main() -> Result<()> {
         .context("open admin audit log")?;
     // 日志仍由 nasa::log 统一格式化/滚动/热调级；OTel layer 同挂一个 tracing subscriber，
     // 避免两个全局 subscriber 争用。必须先读 bootstrap telemetry 配置再一次性初始化。
-    let telemetry = gateway::telemetry::TelemetryRuntime::build(&snapshot.telemetry)
+    let telemetry_generation = gateway::telemetry::TelemetryRuntime::build(&snapshot.telemetry)
         .context("build OpenTelemetry runtime")?;
     nasa::log::init_with_default_and_layer(
         "gateway=info,info",
-        tracing_opentelemetry::layer().with_tracer(telemetry.tracer()),
+        tracing_opentelemetry::layer().with_tracer(telemetry_generation.tracer()),
     );
+    let telemetry = gateway::telemetry::SwappableTelemetryRuntime::new(telemetry_generation);
     // reload channel 容量和去抖窗口属 bootstrap 执行参数；worker 建立后不在热更时自重建。
     let reload_cfg = snapshot.reload.clone();
     discovery.reconcile(&snapshot);
@@ -4369,13 +4370,15 @@ async fn main() -> Result<()> {
     );
     // V5 cache L2 是显式 bootstrap 依赖：local 默认零网络；redis 模式启动期 fail-fast 建连，
     // 运行中 GET/SET 错误仍 fail-open 成普通 miss，不阻断业务数据面。
-    let http_cache = gateway::http_cache::HttpCacheRuntime::build(&runtime_state_cfg.http_cache)
-        .await
-        .context("build HTTP cache runtime")?;
+    let http_cache_generation =
+        gateway::http_cache::HttpCacheRuntime::build(&runtime_state_cfg.http_cache)
+            .await
+            .context("build HTTP cache runtime")?;
+    let http_cache = gateway::http_cache::SwappableHttpCacheRuntime::new(http_cache_generation);
     let snap = Arc::new(ArcSwap::from_pointee(snapshot));
     let apply_coordinator = Arc::new(reload::SnapshotApplyCoordinator::default());
-    // xDS bootstrap/owner 已在打开 socket 前锁定。状态先接入 admin/readiness，但网络 task
-    // 必须等 listener supervisor 建好后才启动；否则 LDS response 会缺少 two-phase bind 权威。
+    // xDS 状态句柄先接入 admin/readiness，网络 task 等 listener supervisor 建好后才启动；
+    // 后续 reload 继续复用该句柄并由 generation manager 撤销旧 owner。
     #[cfg(feature = "xds-client")]
     let xds_bootstrap = if run_mode.runs_data() && snap.load().control_plane.xds.enabled {
         let initial = snap.load();
@@ -4387,7 +4390,7 @@ async fn main() -> Result<()> {
         None
     };
     #[cfg(feature = "xds-client")]
-    let xds_status = xds_bootstrap.as_ref().map(|_| gateway::xds::new_status());
+    let xds_status = run_mode.runs_data().then(gateway::xds::new_status);
     http_cache.spawn_invalidation_worker(snap.clone());
     let history_root = cfg_path
         .parent()
@@ -4438,7 +4441,7 @@ async fn main() -> Result<()> {
             blacklist: blacklist.clone(),
             interface_disable: interface_disable.clone(),
             http_cache: http_cache.clone(),
-            audit: admin_audit,
+            audit: admin_audit.clone(),
             #[cfg(feature = "xds-client")]
             xds_status: xds_status.clone(),
         },
@@ -4471,6 +4474,10 @@ async fn main() -> Result<()> {
     admin_state_for_edge.attach_edge_hub(proxy.grpc_edge_hub());
     #[cfg(feature = "grpc-edge")]
     admin_state_for_edge.attach_edge_relay_slot(proxy.edge_relay_slot());
+    #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
+    admin_state_for_edge.attach_edge_redis_bus_slot(proxy.edge_redis_bus_slot());
+    #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
+    admin_state_for_edge.attach_edge_redis_stream_slot(proxy.edge_redis_stream_slot());
     // 集群传输随初始快照启动。relay 与 Redis Pub/Sub 已在配置构建期严格互斥，
     // 这里按 mode 只启动其中一条链路，避免重复散出。
     #[cfg(feature = "grpc-edge")]
@@ -4541,8 +4548,7 @@ async fn main() -> Result<()> {
                         )
                         .await
                         .context("start grpc edge Redis Pub/Sub bus")?;
-                        proxy.attach_edge_redis_bus(bus.clone());
-                        admin_state_for_edge.attach_edge_redis_bus(bus);
+                        proxy.attach_edge_redis_bus(bus);
                     }
                     #[cfg(not(feature = "redis-runtime"))]
                     unreachable!("redis_pubsub plan requires redis-runtime at build time");
@@ -4556,8 +4562,7 @@ async fn main() -> Result<()> {
                         )
                         .await
                         .context("start grpc edge Redis Stream bus")?;
-                        proxy.attach_edge_redis_stream(bus.clone());
-                        admin_state_for_edge.attach_edge_redis_stream(bus);
+                        proxy.attach_edge_redis_stream(bus);
                     }
                     #[cfg(not(feature = "redis-runtime"))]
                     unreachable!("redis_stream plan requires redis-runtime at build time");
@@ -4650,10 +4655,8 @@ async fn main() -> Result<()> {
     drop(initial_snapshot);
 
     #[cfg(feature = "xds-client")]
-    if let Some((xds_cfg, specs)) = xds_bootstrap {
-        gateway::xds::start_with_snapshot_status(
-            xds_cfg,
-            specs,
+    let xds_manager = if run_mode.runs_data() {
+        let manager = gateway::xds::XdsGenerationManager::new(
             dynamic_upstreams.clone(),
             gateway::xds::XdsSnapshotRuntime {
                 snap: snap.clone(),
@@ -4664,10 +4667,16 @@ async fn main() -> Result<()> {
             },
             xds_status
                 .as_ref()
-                .expect("enabled xDS has a pre-created status")
+                .expect("data plane has a pre-created xDS status")
                 .clone(),
         );
-    }
+        if let Some((xds_cfg, specs)) = xds_bootstrap {
+            manager.start_initial(xds_cfg, specs);
+        }
+        Some(manager)
+    } else {
+        None
+    };
 
     // listener 已进入 supervisor 后再启动唯一 reload worker；从此数据面拓扑也遵守
     // bind/build → ArcSwap publish → accept generation handoff 的同一事务边界。
@@ -4690,6 +4699,12 @@ async fn main() -> Result<()> {
             proxy: Some(proxy.clone()),
             sidecar_mode: run_mode.is_sidecar(),
             listener_topology: Some(listener_supervisor.clone()),
+            access_log: Some(access_log_shutdown.clone()),
+            admin_audit: Some(admin_audit.clone()),
+            http_cache: Some(http_cache.clone()),
+            telemetry: Some(telemetry.clone()),
+            #[cfg(feature = "xds-client")]
+            xds: xds_manager.clone(),
         },
         config_history.clone(),
         reload_cfg,
@@ -4706,7 +4721,8 @@ async fn main() -> Result<()> {
     let registration_control_ready: Arc<dyn Fn() -> bool + Send + Sync> = match &xds_status {
         Some(status) => {
             let status = status.clone();
-            Arc::new(move || status.ready())
+            let snapshot = snap.clone();
+            Arc::new(move || !snapshot.load().control_plane.xds.enabled || status.ready())
         }
         None => Arc::new(|| true),
     };

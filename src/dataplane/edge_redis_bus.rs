@@ -16,7 +16,7 @@ use nasa::redis::{
     CompatibilityProfile, RedisClient, RedisConfig, StreamAckPolicy, StreamMode, StreamStart,
     StreamSubscribeCfg, StreamSubscription,
 };
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, watch, Notify};
 
 use crate::config::model::{GrpcEdgeOrderingCfg, GrpcEdgeSessionModeCfg};
 use crate::edge_hub::{EdgeHub, EdgeSessionControl, LocalFanoutOutcome};
@@ -154,8 +154,10 @@ struct RedisStrongControl {
     hub: Arc<EdgeHub>,
     subscription_connected: AtomicBool,
     ready: AtomicBool,
+    active: AtomicBool,
     next_correlation: AtomicU64,
     pending_fences: DashMap<u64, Arc<FenceAckWaiter>>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl RedisStrongControl {
@@ -166,7 +168,7 @@ impl RedisStrongControl {
     /// `hub` 承接本地 fencing 副作用。
     ///
     /// 返回：订阅与首次 membership 心跳均成功后返回控制面；任一步失败则拒绝启动。
-    async fn start(
+    async fn prepare(
         cluster: Arc<GrpcEdgeClusterPlan>,
         redis: Arc<RedisClient>,
         data_key: &str,
@@ -186,6 +188,7 @@ impl RedisStrongControl {
             .max(u128::from(cluster.ack_deadline_ms.saturating_mul(3)))
             .max(u128::from(MIN_MEMBERSHIP_LEASE_MS))
             .min(u128::from(u64::MAX)) as u64;
+        let (shutdown, _) = watch::channel(false);
         let control = Arc::new(Self {
             cluster,
             redis,
@@ -198,22 +201,30 @@ impl RedisStrongControl {
             hub,
             subscription_connected: AtomicBool::new(true),
             ready: AtomicBool::new(false),
+            active: AtomicBool::new(false),
             next_correlation: AtomicU64::new(1),
             pending_fences: DashMap::new(),
+            shutdown,
         });
-        // 只有控制订阅已经存在且 membership 首次写入成功，节点才有资格参与 claim。
-        control.refresh_membership().await?;
-        control.ready.store(true, Ordering::Release);
-        let session_control: Arc<dyn EdgeSessionControl> = control.clone();
-        control
-            .hub
-            .attach_session_control(Arc::downgrade(&session_control));
+        // 在 Redis 内原子写回原 score，只复验候选具有 membership 所需权限，不让未发布代成为成员。
+        control.probe_membership_permissions().await?;
 
         let consumer = control.clone();
+        let mut consumer_shutdown = consumer.shutdown.subscribe();
         tokio::spawn(async move {
             loop {
-                match subscription.next_message().await {
+                let message = tokio::select! {
+                    changed = consumer_shutdown.changed() => {
+                        if changed.is_err() || *consumer_shutdown.borrow() { return; }
+                        continue;
+                    }
+                    message = subscription.next_message() => message,
+                };
+                match message {
                     Some(message) => {
+                        if !consumer.active.load(Ordering::Acquire) {
+                            continue;
+                        }
                         if message.channel == consumer.channel.as_ref() {
                             if let Err(error) =
                                 consumer.consume_control(Bytes::from(message.payload)).await
@@ -251,14 +262,23 @@ impl RedisStrongControl {
         });
 
         let heartbeat = control.clone();
+        let mut heartbeat_shutdown = heartbeat.shutdown.subscribe();
         tokio::spawn(async move {
             let period = Duration::from_millis((heartbeat.membership_lease_ms / 3).max(100));
             let mut ticker = tokio::time::interval(period);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await;
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    changed = heartbeat_shutdown.changed() => {
+                        if changed.is_err() || *heartbeat_shutdown.borrow() { return; }
+                    }
+                    _ = ticker.tick() => {}
+                }
                 if !heartbeat.subscription_connected.load(Ordering::Acquire) {
+                    continue;
+                }
+                if !heartbeat.active.load(Ordering::Acquire) {
                     continue;
                 }
                 match heartbeat.refresh_membership().await {
@@ -275,6 +295,58 @@ impl RedisStrongControl {
             }
         });
         Ok(control)
+    }
+
+    /// 业务作用：在数据总线提交后登记 membership 并接管本地 session fencing 权威。
+    ///
+    /// 参数说明：无；控制订阅与 Redis 写权限已在 prepare 阶段验证。
+    ///
+    /// 返回：首次 membership 心跳成功时获得权威；网络在提交窗口失效则进入保护态并失败。
+    async fn activate(self: &Arc<Self>) -> Result<()> {
+        anyhow::ensure!(
+            !self.active.swap(true, Ordering::AcqRel),
+            "edge Redis strong-control generation is already active"
+        );
+        let session_control: Arc<dyn EdgeSessionControl> = self.clone();
+        self.hub
+            .attach_session_control(Arc::downgrade(&session_control));
+        if let Err(error) = self.refresh_membership().await {
+            self.active.store(false, Ordering::Release);
+            self.enter_protection();
+            return Err(error).context("activate edge Redis membership");
+        }
+        self.ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// 业务作用：撤销本 Redis strong-control 代的 claim 权威并从 membership 中幂等移除。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；清理网络失败只保留有租约的旧成员，本地已立即进入保护态。
+    async fn shutdown(&self) {
+        let was_active = self.active.swap(false, Ordering::AcqRel);
+        self.subscription_connected.store(false, Ordering::Release);
+        let _ = self.shutdown.send(true);
+        if !was_active {
+            self.ready.store(false, Ordering::Release);
+            return;
+        }
+        // 旧代先保护所有本地 token，再从 membership 移除；新代只能在此步骤完成后激活。
+        self.enter_protection();
+        const REMOVE_MEMBER: &str = "return redis.call('ZREM', KEYS[1], ARGV[1])";
+        let result = tokio::time::timeout(
+            self.command_timeout,
+            self.redis.eval::<i64>(
+                REMOVE_MEMBER,
+                &[self.membership_key.as_ref()],
+                &[self.cluster.node_id.as_ref()],
+            ),
+        )
+        .await;
+        if !matches!(result, Ok(Ok(_))) {
+            tracing::warn!("edge Redis strong-control membership cleanup failed");
+        }
     }
 
     /// 业务作用：用 Redis TIME 刷新本节点 membership score，避免应用节点时钟偏差改变租约生死。
@@ -299,6 +371,36 @@ return ms
         )
         .await
         .context("refresh edge Redis membership timeout")??;
+        Ok(())
+    }
+
+    /// 业务作用：原子复验 Redis ACL 覆盖 membership 所需命令，但把 key 恢复到调用前的精确事实。
+    ///
+    /// 参数说明：无；使用当前 cluster/node 固定键。
+    ///
+    /// 返回：EVAL/ZADD/ZREM/ZSCORE 全部获准时成功；无权限或依赖失败拒绝候选。
+    async fn probe_membership_permissions(&self) -> Result<()> {
+        const PROBE: &str = r#"
+local old = redis.call('ZSCORE', KEYS[1], ARGV[1])
+redis.call('ZADD', KEYS[1], 0, ARGV[1])
+if old then
+  redis.call('ZADD', KEYS[1], old, ARGV[1])
+else
+  redis.call('ZREM', KEYS[1], ARGV[1])
+end
+return 1
+"#;
+        let result = tokio::time::timeout(
+            self.command_timeout,
+            self.redis.eval::<i64>(
+                PROBE,
+                &[self.membership_key.as_ref()],
+                &[self.cluster.node_id.as_ref()],
+            ),
+        )
+        .await
+        .context("probe edge Redis membership permissions timeout")??;
+        anyhow::ensure!(result == 1, "edge Redis membership permission probe failed");
         Ok(())
     }
 
@@ -598,6 +700,8 @@ pub struct EdgeRedisBus {
     next_correlation: AtomicU64,
     pending_fanout: PendingFanout,
     strong_control: Option<Arc<RedisStrongControl>>,
+    shutdown: watch::Sender<bool>,
+    active: AtomicBool,
 }
 
 impl EdgeRedisBus {
@@ -607,6 +711,20 @@ impl EdgeRedisBus {
     ///
     /// 返回：数据与所需控制订阅均 ready 后返回总线；连接或订阅失败则拒绝启动。
     pub async fn start(cluster: Arc<GrpcEdgeClusterPlan>, hub: Arc<EdgeHub>) -> Result<Arc<Self>> {
+        let bus = Self::prepare(cluster, hub).await?;
+        bus.activate().await?;
+        Ok(bus)
+    }
+
+    /// 业务作用：连接并订阅 Redis Pub/Sub 候选，但发布前不消费消息、不登记成员或接管 session。
+    ///
+    /// 参数说明：`cluster` 是候选集群计划，`hub` 是共享订阅索引。
+    ///
+    /// 返回：连接、SUBSCRIBE 与 ACL 探针均成功时返回休眠候选；失败不改变在线 owner。
+    pub async fn prepare(
+        cluster: Arc<GrpcEdgeClusterPlan>,
+        hub: Arc<EdgeHub>,
+    ) -> Result<Arc<Self>> {
         let redis_plan = cluster
             .redis_pubsub
             .clone()
@@ -637,7 +755,7 @@ impl EdgeRedisBus {
             .context("subscribe edge Redis Pub/Sub channel")?;
         let strong_control = if cluster.session_mode == GrpcEdgeSessionModeCfg::SingleSession {
             Some(
-                RedisStrongControl::start(
+                RedisStrongControl::prepare(
                     cluster.clone(),
                     redis.clone(),
                     redis_plan.channel.as_ref(),
@@ -650,6 +768,7 @@ impl EdgeRedisBus {
         } else {
             None
         };
+        let (shutdown, _) = watch::channel(false);
         let bus = Arc::new(Self {
             cluster,
             redis,
@@ -659,13 +778,25 @@ impl EdgeRedisBus {
             next_correlation: AtomicU64::new(1),
             pending_fanout: DashMap::new(),
             strong_control,
+            shutdown,
+            active: AtomicBool::new(false),
         });
-        bus.metrics.connected.store(true, Ordering::Relaxed);
         let consumer = bus.clone();
+        let mut consumer_shutdown = consumer.shutdown.subscribe();
         tokio::spawn(async move {
             loop {
-                match subscription.next_message().await {
+                let message = tokio::select! {
+                    changed = consumer_shutdown.changed() => {
+                        if changed.is_err() || *consumer_shutdown.borrow() { return; }
+                        continue;
+                    }
+                    message = subscription.next_message() => message,
+                };
+                match message {
                     Some(message) => {
+                        if !consumer.active.load(Ordering::Acquire) {
+                            continue;
+                        }
                         consumer.metrics.connected.store(true, Ordering::Relaxed);
                         consumer
                             .metrics
@@ -702,6 +833,38 @@ impl EdgeRedisBus {
             }
         });
         Ok(bus)
+    }
+
+    /// 业务作用：提交 Pub/Sub 候选后授予 strong-control 与消息消费权，随后才允许请求使用该代。
+    ///
+    /// 参数说明：无；对象必须来自 `prepare` 且旧代已撤权。
+    ///
+    /// 返回：membership 激活成功后返回；重复激活或 Redis 失联失败闭合。
+    pub async fn activate(self: &Arc<Self>) -> Result<()> {
+        anyhow::ensure!(
+            !self.active.load(Ordering::Acquire),
+            "edge Redis Pub/Sub generation is already active"
+        );
+        if let Some(control) = &self.strong_control {
+            control.activate().await?;
+        }
+        self.active.store(true, Ordering::Release);
+        self.metrics.connected.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// 业务作用：撤销 Pub/Sub 代的新发布与控制权，并停止数据/强控制订阅。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；已在途 Redis 命令按原 deadline 结算，不再开始新订阅循环。
+    pub async fn shutdown(&self) {
+        self.active.store(false, Ordering::Release);
+        self.metrics.connected.store(false, Ordering::Release);
+        let _ = self.shutdown.send(true);
+        if let Some(control) = &self.strong_control {
+            control.shutdown().await;
+        }
     }
 
     /// 业务作用：暴露 Pub/Sub 数据面低基数指标快照句柄。
@@ -741,6 +904,9 @@ impl EdgeRedisBus {
         tenant: Arc<str>,
         user: Arc<str>,
     ) -> Result<u64, &'static str> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err("edge-redis-generation-inactive");
+        }
         let Some(control) = &self.strong_control else {
             return Err("edge-redis-session-control-disabled");
         };
@@ -771,7 +937,7 @@ impl EdgeRedisBus {
         frame: Bytes,
         reassembled: u64,
     ) -> Result<(LocalFanoutOutcome, PeerBroadcastSummary), &'static str> {
-        if !self.metrics.connected.load(Ordering::Acquire) {
+        if !self.active.load(Ordering::Acquire) || !self.metrics.connected.load(Ordering::Acquire) {
             return Err("edge-redis-group-order-unavailable");
         }
         let correlation_id = next_correlation(&self.next_correlation);
@@ -839,6 +1005,10 @@ impl EdgeRedisBus {
         frame: Bytes,
     ) -> PeerBroadcastSummary {
         let mut summary = PeerBroadcastSummary::default();
+        if !self.active.load(Ordering::Acquire) {
+            summary.peers_rejected = 1;
+            return summary;
+        }
         let payload = match encode_from_grpc_frame(
             action,
             self.cluster.cluster_id.as_ref(),
@@ -952,11 +1122,12 @@ pub struct EdgeRedisStreamBus {
     redis: Arc<RedisClient>,
     redis_plan: GrpcEdgeRedisStreamPlan,
     hub: Arc<EdgeHub>,
-    subscription: std::sync::OnceLock<StreamSubscription>,
+    subscription: parking_lot::Mutex<Option<StreamSubscription>>,
     metrics: Arc<EdgeRedisStreamMetrics>,
     next_correlation: AtomicU64,
     pending_fanout: PendingFanout,
     strong_control: std::sync::OnceLock<Arc<RedisStrongControl>>,
+    active: AtomicBool,
 }
 
 impl EdgeRedisStreamBus {
@@ -966,6 +1137,20 @@ impl EdgeRedisStreamBus {
     ///
     /// 返回：Stream 消费器与所需控制面均 ready 后返回；任一步失败则拒绝启动。
     pub async fn start(cluster: Arc<GrpcEdgeClusterPlan>, hub: Arc<EdgeHub>) -> Result<Arc<Self>> {
+        let bus = Self::prepare(cluster, hub).await?;
+        bus.activate().await?;
+        Ok(bus)
+    }
+
+    /// 业务作用：连接 Redis、建立独立 XREAD 和 strong-control 候选，但发布前丢弃候选消费结果。
+    ///
+    /// 参数说明：`cluster` 是候选计划，`hub` 是共享订阅索引。
+    ///
+    /// 返回：cursor/trim 探测、订阅和 ACL 探针成功时返回休眠候选；失败不接管数据面。
+    pub async fn prepare(
+        cluster: Arc<GrpcEdgeClusterPlan>,
+        hub: Arc<EdgeHub>,
+    ) -> Result<Arc<Self>> {
         let redis_plan = cluster
             .redis_stream
             .clone()
@@ -1014,11 +1199,12 @@ impl EdgeRedisStreamBus {
             redis: redis.clone(),
             redis_plan: redis_plan.clone(),
             hub,
-            subscription: std::sync::OnceLock::new(),
+            subscription: parking_lot::Mutex::new(None),
             metrics: Arc::new(EdgeRedisStreamMetrics::default()),
             next_correlation: AtomicU64::new(1),
             pending_fanout: DashMap::new(),
             strong_control: std::sync::OnceLock::new(),
+            active: AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&bus);
         let cfg = StreamSubscribeCfg {
@@ -1038,6 +1224,9 @@ impl EdgeRedisStreamBus {
                     let Some(bus) = weak.upgrade() else {
                         return Err("edge Redis Stream bus stopped".to_string());
                     };
+                    if !bus.active.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
                     bus.consume_stream_entry(event.id, Bytes::from(event.raw))
                         .await
                         .map_err(|error| format!("{error:#}"))
@@ -1046,9 +1235,9 @@ impl EdgeRedisStreamBus {
             .start()
             .await
             .context("start edge Redis Stream XREAD subscription")?;
-        let _ = bus.subscription.set(subscription);
+        *bus.subscription.lock() = Some(subscription);
         if bus.cluster.session_mode == GrpcEdgeSessionModeCfg::SingleSession {
-            let control = RedisStrongControl::start(
+            let control = RedisStrongControl::prepare(
                 bus.cluster.clone(),
                 bus.redis.clone(),
                 bus.redis_plan.stream.as_ref(),
@@ -1070,6 +1259,39 @@ impl EdgeRedisStreamBus {
             );
         }
         Ok(bus)
+    }
+
+    /// 业务作用：旧代撤权后激活 Stream strong-control 与 XREAD 消费副作用。
+    ///
+    /// 参数说明：无；候选连接和权限已在 prepare 阶段复验。
+    ///
+    /// 返回：membership 激活成功时授予业务权威；重复激活或提交时依赖故障失败。
+    pub async fn activate(self: &Arc<Self>) -> Result<()> {
+        anyhow::ensure!(
+            !self.active.load(Ordering::Acquire),
+            "edge Redis Stream generation is already active"
+        );
+        if let Some(control) = self.strong_control.get() {
+            control.activate().await?;
+        }
+        self.active.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// 业务作用：撤销 Stream 代的新发布与控制权，并协作取消 XREAD/强控制订阅。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；方法返回时 XREAD worker 已确认停止，成员租约已尝试幂等清理。
+    pub async fn shutdown(&self) {
+        self.active.store(false, Ordering::Release);
+        if let Some(control) = self.strong_control.get() {
+            control.shutdown().await;
+        }
+        let subscription = { self.subscription.lock().take() };
+        if let Some(subscription) = subscription {
+            subscription.shutdown().await;
+        }
     }
 
     /// 业务作用：暴露 Redis Stream 数据面低基数指标快照句柄。
@@ -1109,6 +1331,9 @@ impl EdgeRedisStreamBus {
         tenant: Arc<str>,
         user: Arc<str>,
     ) -> Result<u64, &'static str> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err("edge-redis-generation-inactive");
+        }
         let Some(control) = self.strong_control.get() else {
             return Err("edge-redis-session-control-disabled");
         };
@@ -1139,6 +1364,9 @@ impl EdgeRedisStreamBus {
         frame: Bytes,
         reassembled: u64,
     ) -> Result<(LocalFanoutOutcome, PeerBroadcastSummary), &'static str> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err("edge-redis-group-order-unavailable");
+        }
         let correlation_id = next_correlation(&self.next_correlation);
         let payload = encode_from_grpc_frame_with_control(
             RedisFanoutAction::Publish,
@@ -1205,6 +1433,10 @@ impl EdgeRedisStreamBus {
         frame: Bytes,
     ) -> PeerBroadcastSummary {
         let mut summary = PeerBroadcastSummary::default();
+        if !self.active.load(Ordering::Acquire) {
+            summary.peers_rejected = 1;
+            return summary;
+        }
         let payload = match encode_from_grpc_frame(
             action,
             self.cluster.cluster_id.as_ref(),

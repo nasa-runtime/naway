@@ -763,6 +763,20 @@ fn hash_file_contents(path: &Path, hasher: &mut DefaultHasher) -> Result<()> {
 /// 损坏或目标不完整会拒绝 reload，绝不回退并拼出混合 pair。manifest 尚不存在时才使用旧
 /// `cert_file`/`key_file`，支持 seed 迁移和无 seed ACME 首签。
 pub(crate) fn active_keypair_paths(tls: &TlsRuntimeCfg) -> Result<(PathBuf, PathBuf)> {
+    if tls.keypair_manifest_file.is_none() {
+        // 旧双文件模式可能在断电时停在两个 rename 之间；任何 loader 读 pair 前先在安装锁内
+        // 完成恢复，避免一次启动把跨代材料发布成新的 ServerConfig。
+        crate::acme::recover_legacy_keypair_transaction(tls)?;
+    }
+    active_keypair_paths_unrecovered(tls)
+}
+
+/// 业务作用：在证书安装锁持有期间解析 pair 路径，避免恢复入口递归获取同一互斥锁。
+///
+/// 参数说明：`tls` 是当前 listener 的固定材料计划；调用方必须已处理旧式事务恢复。
+///
+/// 返回：manifest 当前指向的同代路径，或兼容 cert/key 路径；指针损坏时失败闭合。
+pub(crate) fn active_keypair_paths_unrecovered(tls: &TlsRuntimeCfg) -> Result<(PathBuf, PathBuf)> {
     let Some(manifest_file) = &tls.keypair_manifest_file else {
         return Ok((tls.cert_file.clone(), tls.key_file.clone()));
     };

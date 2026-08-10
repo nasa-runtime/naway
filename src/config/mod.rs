@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use base64::Engine as _;
 use serde::Serialize;
 
 use crate::access_log::AccessLogRuntime;
@@ -24,10 +25,11 @@ use crate::tls::{build_upstream_tls_profile, UpstreamTlsProfile};
 use crate::upstream::{DynamicUpstreamStore, UpstreamDirectory};
 use crate::variable::VariablePlan;
 use model::{
-    AcmeCfg, AdminAction, AdminCfg, AdminResource, AdminRole, ConfigSourceCfg, ControlPlaneCfg,
-    ControlPlaneModeCfg, DiscoveryCfg, GatewayConfig, GuardFile, Http3Cfg, ProxyCfg,
-    ProxyProtocolCfg, RuntimeStateCfg, SentinelFile, ServerCfg, ServerLimitsCfg, StreamCfg,
-    TimeoutCfg, XdsResourceOwnerCfg, XdsStartupPolicyCfg,
+    AcmeCfg, AdminAction, AdminApprovalCfg, AdminCfg, AdminResource, AdminRole, AdminRolloutCfg,
+    ConfigSourceCfg, ControlPlaneCfg, ControlPlaneModeCfg, DiscoveryCfg, GatewayConfig, GuardFile,
+    Http3Cfg, ProxyCfg, ProxyProtocolCfg, ReusableSnippetCfg, RuntimeStateCfg, SentinelFile,
+    ServerCfg, ServerLimitsCfg, SnippetsCfg, StreamCfg, TimeoutCfg, XdsResourceOwnerCfg,
+    XdsStartupPolicyCfg,
 };
 
 /// 一次请求要读的全部配置的不可变快照(路由 + 接口守卫)。换版 = 造新的、`ArcSwap` 原子替换指针。
@@ -53,6 +55,10 @@ pub struct GatewaySnapshot {
     pub admin_auth: AdminAuthRuntimeCfg,
     /// 管理操作审计 bootstrap 计划；writer/client 在进程启动时创建。
     pub admin_audit: AdminAuditRuntimeCfg,
+    /// 集群配置渐进发布策略；只由管理面状态机读取。
+    pub admin_rollout: AdminRolloutCfg,
+    /// 高危管理变更 maker-checker 策略；只由管理面待审批状态机读取。
+    pub admin_approval: AdminApprovalCfg,
     /// 控制面候选 gateway.yml 请求体上限。
     pub admin_max_config_body_bytes: usize,
     /// Nacos 等发现后端配置。热路径不直接连接远端,只供 discovery manager reconcile。
@@ -91,6 +97,8 @@ pub struct GatewaySnapshot {
     pub stream_listeners: Arc<Vec<StreamRuntime>>,
     /// V7 开发者门户/API 目录；OpenAPI 文档和 operation 摘要均随快照原子换版。
     pub developer_portal: Arc<crate::developer_portal::DeveloperPortalRuntime>,
+    /// 与 route 模板同版的变量执行计划；数据面和管理面路由推演共用同一语义。
+    pub variables: Arc<VariablePlan>,
     /// gRPC 边缘模式集群中继计划；None = 未配置或显式单机，不绑定 relay 端口、不建 peer 连接。
     pub grpc_edge_cluster: Option<Arc<crate::grpc_edge::GrpcEdgeClusterPlan>>,
 }
@@ -233,6 +241,8 @@ pub struct AcmeRuntimeCfg {
     pub lock_key: String,
     /// `local-file` 或 `shared-file`。
     pub storage_mode: String,
+    /// manifest 模式保留的完整 keypair 代数。
+    pub keypair_retention_generations: usize,
 }
 
 /// ACME challenge 类型；构建后 worker 不再解析字符串。
@@ -244,17 +254,54 @@ pub enum AcmeChallenge {
     Dns01,
 }
 
-/// 构建期校验后的 DNS-01 command provider。
+/// 构建期校验后的 DNS-01 provider。
 #[derive(Clone, PartialEq, Eq)]
 pub struct AcmeDns01RuntimeCfg {
-    /// 直接 exec 的 provider 路径，不经 shell。
-    pub command: PathBuf,
-    /// 固定参数；record/value 仅通过环境变量传入。
-    pub args: Arc<[String]>,
+    /// 已冻结 provider 类型和凭据；运行期不再读取 SecretSource。
+    pub provider: AcmeDns01ProviderRuntime,
     /// present 成功后的 DNS 传播等待(ms)。
     pub propagation_delay_ms: u64,
-    /// present/cleanup 命令超时(ms)。
+    /// present/cleanup 单操作总 deadline(ms)。
     pub timeout_ms: u64,
+    /// 包含首次调用的最大尝试次数。
+    pub retry_attempts: usize,
+    /// 重试退避(ms)。
+    pub retry_backoff_ms: u64,
+    /// HTTP 响应体硬上限。
+    pub max_response_bytes: usize,
+    /// TXT TTL。
+    pub ttl_seconds: u32,
+}
+
+/// DNS-01 provider 的已解析运行计划；secret 字段不实现 Debug/Serialize。
+#[derive(Clone, PartialEq, Eq)]
+pub enum AcmeDns01ProviderRuntime {
+    /// 直接 exec，不经 shell。
+    Command {
+        command: PathBuf,
+        args: Arc<[String]>,
+    },
+    /// Cloudflare DNS Records API。
+    Cloudflare {
+        api_base: String,
+        zone_id: String,
+        api_token: String,
+    },
+    /// RFC2136 TCP UPDATE + HMAC-SHA256 TSIG。
+    Rfc2136 {
+        server: std::net::SocketAddr,
+        zone: String,
+        tsig_key_name: String,
+        tsig_secret: Arc<[u8]>,
+    },
+    /// 固定 HTTPS Vault action endpoint。
+    Vault {
+        endpoint: String,
+        token: String,
+        namespace: Option<String>,
+        present_path: String,
+        cleanup_path: String,
+    },
 }
 
 /// mTLS 运行期配置(§19)。
@@ -358,7 +405,7 @@ pub struct AdminAuthRuntimeCfg {
     pub realm: String,
     /// 是否允许 `/healthz` 匿名访问。
     pub allow_healthz_unauthenticated: bool,
-    /// C5:是否允许本节点用自己的 admin 凭据抓取同集群其它节点的 `/metrics`。
+    /// 是否允许本节点用自己的 admin 凭据抓取同集群其它节点的 `/metrics`。
     /// 默认 false——它让 admin 从"只被访问"变成"会主动外连",是攻击面的实质变化。
     pub allow_cluster_metrics_scrape: bool,
     /// 已规范化的浏览器管理面来源 allowlist（scheme + authority）。
@@ -701,6 +748,14 @@ const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 /// reload 指纹单文件硬上限。它覆盖主配置、OpenAPI/schema、WASM 与 SecretSource 依赖；
 /// 各构建器仍执行更严格的业务上限，这里先防 watcher 因敌意大文件产生无界分配。
 const MAX_FINGERPRINT_FILE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SNIPPET_IMPORTS: usize = 32;
+/// 单个 snippet import 的硬上限，避免小引用图带入过大控制面文档。
+const MAX_SNIPPET_FILE_BYTES: usize = 1024 * 1024;
+const MAX_SNIPPET_DEFINITIONS: usize = 256;
+const MAX_SNIPPET_FILTERS_PER_DEFINITION: usize = 128;
+const MAX_EXPANDED_FILTERS_PER_ROUTE: usize = 512;
+const MAX_EXPANDED_FILTER_BYTES_PER_ROUTE: usize = 1024 * 1024;
+const MAX_SNIPPET_DEPTH: usize = 16;
 /// 所有会进入 `Instant + Duration`、timer wheel 或后台 sleep 的通用运行期时长上限。
 /// 一年已经覆盖连接/流/换版治理需求，同时拒绝 `u64::MAX` 一类会在不同平台触发时间溢出的配置。
 const MAX_RUNTIME_DURATION_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
@@ -745,11 +800,12 @@ pub fn load_candidate_snapshot(
         .and_then(|value| value.to_str())
         .unwrap_or("gateway");
     let profile_pattern = dir.join(format!("{stem}-{{profile}}"));
-    let cfg: GatewayConfig = nasa::yml::YmlLoader::standard()
+    let mut cfg: GatewayConfig = nasa::yml::YmlLoader::standard()
         .base_file(candidate_path)
         .profile_file_pattern(profile_pattern.to_string_lossy().to_string())
         .load()
         .with_context(|| format!("load candidate config {}", candidate_path.display()))?;
+    expand_config_snippets(&mut cfg, cfg_path, candidate_path)?;
     build_snapshot_from_config(cfg_path, version, DynamicUpstreamStore::new(), cfg)
 }
 
@@ -780,6 +836,16 @@ fn build_snapshot_from_config(
     let secret_files = collect_secret_dependencies(&cfg, config_dir);
     let admin_auth = build_admin_auth(&cfg.admin, config_dir).context("build admin auth/RBAC")?;
     let admin_audit = build_admin_audit(&cfg.admin, config_dir).context("build admin audit")?;
+    validate_admin_rollout(
+        &cfg.admin.rollout,
+        &cfg.config_source,
+        &cfg.discovery,
+        &admin_auth,
+        &admin_audit,
+    )
+    .context("validate admin rollout")?;
+    validate_admin_approval(&cfg.admin.approval, &admin_auth, &admin_audit)
+        .context("validate admin approval")?;
     anyhow::ensure!(
         (1024..=16 * 1024 * 1024).contains(&cfg.admin.max_config_body_bytes),
         "admin.max_config_body_bytes must be within 1024..=16777216"
@@ -819,7 +885,7 @@ fn build_snapshot_from_config(
             TimeoutCfg::default(),
         )
     } else {
-        let proxies = build_proxies(cfg_path, &cfg, &sentinel, variables, usage_plans)
+        let proxies = build_proxies(cfg_path, &cfg, &sentinel, variables.clone(), usage_plans)
             .context("build proxies")?;
         let default_proxy = proxies
             .first()
@@ -891,6 +957,8 @@ fn build_snapshot_from_config(
         expose_metrics: cfg.admin.expose_metrics,
         admin_auth,
         admin_audit,
+        admin_rollout: cfg.admin.rollout,
+        admin_approval: cfg.admin.approval,
         admin_max_config_body_bytes: cfg.admin.max_config_body_bytes,
         discovery,
         kubernetes_routes: cfg.kubernetes_routes,
@@ -910,6 +978,7 @@ fn build_snapshot_from_config(
         proxies: Arc::new(proxies),
         stream_listeners: Arc::new(stream_listeners),
         developer_portal,
+        variables,
         grpc_edge_cluster,
     })
 }
@@ -1280,11 +1349,11 @@ fn parse_xds_duration_ms(raw: &str, field: &str) -> Result<u64> {
         .with_context(|| format!("{field} overflows milliseconds"))
 }
 
-/// 构建管理面运行期认证策略。
+/// 业务作用：构建管理面运行期认证策略，并在发布前拒绝匿名跨节点抓取或缺少 Cluster/Read 主体的配置。
 ///
-/// # 参数
-/// - `cfg`: `gateway.yml admin.auth` 配置。
-/// - `config_dir`: file/mounted SecretSource 相对路径基准。
+/// 参数说明：`cfg` 是完整 admin 认证/RBAC 配置；`config_dir` 是 SecretSource 相对路径基准。
+///
+/// 返回：认证、来源门与主体权限全部合法时返回不可变运行态；矛盾配置或密钥解析失败时拒绝候选快照。
 fn build_admin_auth(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuthRuntimeCfg> {
     let auth = &cfg.auth;
     let mut allowed_origins = Vec::with_capacity(auth.allowed_origins.len());
@@ -1307,6 +1376,9 @@ fn build_admin_auth(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuthRuntim
     }
     if cfg.rbac.enabled && !auth.enabled {
         bail!("admin.rbac.enabled requires admin.auth.enabled=true");
+    }
+    if auth.allow_cluster_metrics_scrape && !auth.enabled {
+        bail!("admin.auth.allow_cluster_metrics_scrape requires admin.auth.enabled=true");
     }
     if !auth.enabled {
         return Ok(AdminAuthRuntimeCfg {
@@ -1352,6 +1424,16 @@ fn build_admin_auth(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuthRuntim
     }
     if !cfg.rbac.enabled && bearer_token.is_none() && basic_expected.is_none() {
         bail!("admin.auth enabled requires bearer_token or basic_user/basic_password");
+    }
+    if auth.allow_cluster_metrics_scrape
+        && cfg.rbac.enabled
+        && !principals
+            .iter()
+            .any(|principal| principal.allows(AdminResource::Cluster, AdminAction::Read))
+    {
+        bail!(
+            "admin.auth.allow_cluster_metrics_scrape with RBAC requires a principal with cluster read permission"
+        );
     }
     Ok(AdminAuthRuntimeCfg {
         enabled: true,
@@ -1463,6 +1545,151 @@ fn build_admin_audit(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuditRunt
         max_record_bytes: audit.max_record_bytes,
         history_limit: audit.history_limit,
     })
+}
+
+/// 业务作用：校验集群渐进发布的批次、观察窗和健康阈值，避免控制面进入永不完成或无门槛放量状态。
+///
+/// 参数说明：`cfg` 是 rollout 声明；`source`/`discovery` 提供原子配置与成员事实；`auth`/`audit` 提供抓取授权与持久审计门禁。
+///
+/// 返回：全部资源与阈值可安全执行时成功；非法选择器、窗口或浮点值返回构建错误。
+fn validate_admin_rollout(
+    cfg: &AdminRolloutCfg,
+    source: &ConfigSourceCfg,
+    discovery: &DiscoveryCfg,
+    auth: &AdminAuthRuntimeCfg,
+    audit: &AdminAuditRuntimeCfg,
+) -> Result<()> {
+    anyhow::ensure!(
+        (1..=32).contains(&cfg.canary_count),
+        "admin.rollout.canary_count must be within 1..=32"
+    );
+    anyhow::ensure!(
+        (5..=3_600).contains(&cfg.observation_seconds),
+        "admin.rollout.observation_seconds must be within 5..=3600"
+    );
+    anyhow::ensure!(
+        cfg.max_5xx_ratio.is_finite() && (0.0..=1.0).contains(&cfg.max_5xx_ratio),
+        "admin.rollout.max_5xx_ratio must be finite and within 0..=1"
+    );
+    anyhow::ensure!(
+        cfg.max_p99_regression_ratio.is_finite()
+            && (1.0..=100.0).contains(&cfg.max_p99_regression_ratio),
+        "admin.rollout.max_p99_regression_ratio must be finite and within 1..=100"
+    );
+    anyhow::ensure!(
+        (1..=600_000).contains(&cfg.max_p99_ms),
+        "admin.rollout.max_p99_ms must be within 1..=600000"
+    );
+    if cfg.selector_key.trim().is_empty() {
+        anyhow::ensure!(
+            cfg.selector_value.trim().is_empty(),
+            "admin.rollout.selector_value requires selector_key"
+        );
+    } else {
+        anyhow::ensure!(
+            cfg.selector_key.len() <= 128
+                && cfg.selector_value.len() <= 256
+                && !cfg.selector_key.chars().any(char::is_control)
+                && !cfg.selector_value.chars().any(char::is_control),
+            "admin.rollout selector key/value exceeds limits or contains control characters"
+        );
+    }
+    if cfg.enabled {
+        anyhow::ensure!(
+            source.nacos.enabled && !source.nacos.bundle_data_id.trim().is_empty(),
+            "admin.rollout.enabled requires config_source.nacos.enabled and an atomic bundle_data_id"
+        );
+        anyhow::ensure!(
+            discovery.nacos.enabled && discovery.nacos.self_register.enabled,
+            "admin.rollout.enabled requires discovery.nacos self-registration"
+        );
+        anyhow::ensure!(
+            auth.enabled && auth.allow_cluster_metrics_scrape,
+            "admin.rollout.enabled requires authenticated admin peer metrics scraping"
+        );
+        anyhow::ensure!(
+            audit.enabled,
+            "admin.rollout.enabled requires admin.audit.enabled=true"
+        );
+        if cfg.require_approval {
+            anyhow::ensure!(
+                auth.rbac_enabled,
+                "admin.rollout.require_approval requires admin.rbac.enabled=true"
+            );
+            let approvers = auth
+                .principals
+                .iter()
+                .filter(|principal| principal.allows(AdminResource::Config, AdminAction::Write))
+                .count();
+            anyhow::ensure!(
+                approvers >= 2,
+                "admin.rollout.require_approval requires at least two Config/Write principals"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 业务作用：校验 maker-checker 的资源边界、容量、时效与双主体授权，避免启用后无人可审批或候选
+/// 无限滞留。
+///
+/// 参数说明：`cfg` 是审批策略；`auth` 是已编译主体权限；`audit` 是持久审计事实。
+///
+/// 返回：策略可安全执行时成功；资源越界、重复、预算非法或任一资源不足两名写主体时拒绝候选。
+fn validate_admin_approval(
+    cfg: &AdminApprovalCfg,
+    auth: &AdminAuthRuntimeCfg,
+    audit: &AdminAuditRuntimeCfg,
+) -> Result<()> {
+    anyhow::ensure!(
+        (30..=86_400).contains(&cfg.ttl_seconds),
+        "admin.approval.ttl_seconds must be within 30..=86400"
+    );
+    anyhow::ensure!(
+        (1..=1024).contains(&cfg.max_pending),
+        "admin.approval.max_pending must be within 1..=1024"
+    );
+    let mut seen = Vec::new();
+    for resource in &cfg.resources {
+        anyhow::ensure!(
+            matches!(
+                resource,
+                AdminResource::Sentinel | AdminResource::Consumers | AdminResource::Certs
+            ),
+            "admin.approval.resources only supports sentinel, consumers and certs"
+        );
+        anyhow::ensure!(
+            !seen.contains(resource),
+            "admin.approval.resources contains a duplicate"
+        );
+        seen.push(*resource);
+    }
+    if cfg.enabled {
+        anyhow::ensure!(
+            !cfg.resources.is_empty(),
+            "admin.approval.enabled requires at least one resource"
+        );
+        anyhow::ensure!(
+            auth.enabled && auth.rbac_enabled,
+            "admin.approval.enabled requires admin auth and RBAC"
+        );
+        anyhow::ensure!(
+            audit.enabled,
+            "admin.approval.enabled requires admin.audit.enabled=true"
+        );
+        for resource in &cfg.resources {
+            let writers = auth
+                .principals
+                .iter()
+                .filter(|principal| principal.allows(*resource, AdminAction::Write))
+                .count();
+            anyhow::ensure!(
+                writers >= 2,
+                "admin.approval resource requires at least two principals with Write permission"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// 解析 RBAC principal SecretSource，并把角色/授权编译成固定权限位图。
@@ -2476,20 +2703,9 @@ fn build_acme_runtime(cfg_path: &Path, proxy_id: &str, cfg: &AcmeCfg) -> Result<
                     "proxy `{proxy_id}` challenge=dns-01 requires tls.acme.dns01 provider"
                 )
             })?;
-            if !dns.provider.trim().eq_ignore_ascii_case("command") {
-                anyhow::bail!(
-                    "proxy `{proxy_id}` ACME dns01.provider currently supports command; got `{}`",
-                    dns.provider
-                );
-            }
-            if dns.command.trim().is_empty() || dns.timeout_ms == 0 {
-                anyhow::bail!(
-                    "proxy `{proxy_id}` ACME dns01.command must not be empty and timeout_ms must be positive"
-                );
-            }
             anyhow::ensure!(
-                dns.args.len() <= 64,
-                "proxy `{proxy_id}` ACME dns01.args supports at most 64 entries"
+                dns.timeout_ms > 0,
+                "proxy `{proxy_id}` ACME dns01.timeout_ms must be positive"
             );
             validate_optional_duration(
                 &format!("proxy `{proxy_id}` tls.acme.dns01.propagation_delay_ms"),
@@ -2500,11 +2716,136 @@ fn build_acme_runtime(cfg_path: &Path, proxy_id: &str, cfg: &AcmeCfg) -> Result<
                 dns.timeout_ms <= 60 * 60 * 1_000,
                 "proxy `{proxy_id}` ACME dns01.timeout_ms must be within 1..=3600000"
             );
+            anyhow::ensure!(
+                (1..=5).contains(&dns.retry_attempts),
+                "proxy `{proxy_id}` ACME dns01.retry_attempts must be within 1..=5"
+            );
+            anyhow::ensure!(
+                dns.retry_backoff_ms <= 30_000,
+                "proxy `{proxy_id}` ACME dns01.retry_backoff_ms must be within 0..=30000"
+            );
+            anyhow::ensure!(
+                (1_024..=4 * 1024 * 1024).contains(&dns.max_response_bytes),
+                "proxy `{proxy_id}` ACME dns01.max_response_bytes must be within 1024..=4194304"
+            );
+            anyhow::ensure!(
+                (1..=86_400).contains(&dns.ttl_seconds),
+                "proxy `{proxy_id}` ACME dns01.ttl_seconds must be within 1..=86400"
+            );
+            let config_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
+            let provider = match dns.provider.trim().to_ascii_lowercase().as_str() {
+                "command" => {
+                    anyhow::ensure!(
+                        !dns.command.trim().is_empty(),
+                        "proxy `{proxy_id}` ACME dns01.command must not be empty"
+                    );
+                    anyhow::ensure!(
+                        dns.args.len() <= 64,
+                        "proxy `{proxy_id}` ACME dns01.args supports at most 64 entries"
+                    );
+                    AcmeDns01ProviderRuntime::Command {
+                        command: resolve_relative(cfg_path, dns.command.trim()),
+                        args: dns.args.clone().into(),
+                    }
+                }
+                "cloudflare" => {
+                    validate_acme_https_endpoint(
+                        proxy_id,
+                        "cloudflare_api_base",
+                        &dns.cloudflare_api_base,
+                    )?;
+                    validate_acme_provider_component(
+                        proxy_id,
+                        "cloudflare_zone_id",
+                        &dns.cloudflare_zone_id,
+                    )?;
+                    let api_token = crate::secret::resolve_text(
+                        &dns.cloudflare_api_token,
+                        config_dir,
+                        "ACME Cloudflare API token",
+                    )?;
+                    anyhow::ensure!(
+                        !api_token.is_empty(),
+                        "proxy `{proxy_id}` ACME Cloudflare API token must not be empty"
+                    );
+                    AcmeDns01ProviderRuntime::Cloudflare {
+                        api_base: dns.cloudflare_api_base.trim_end_matches('/').to_owned(),
+                        zone_id: dns.cloudflare_zone_id.trim().to_owned(),
+                        api_token,
+                    }
+                }
+                "rfc2136" => {
+                    let server = dns.rfc2136_server.parse::<std::net::SocketAddr>().with_context(
+                        || format!("proxy `{proxy_id}` invalid ACME RFC2136 server"),
+                    )?;
+                    let zone = normalize_acme_dns_name(proxy_id, "rfc2136_zone", &dns.rfc2136_zone)?;
+                    let tsig_key_name = normalize_acme_dns_name(
+                        proxy_id,
+                        "rfc2136_tsig_key_name",
+                        &dns.rfc2136_tsig_key_name,
+                    )?;
+                    let encoded = crate::secret::resolve_text(
+                        &dns.rfc2136_tsig_secret,
+                        config_dir,
+                        "ACME RFC2136 TSIG secret",
+                    )?;
+                    let tsig_secret = base64::engine::general_purpose::STANDARD
+                        .decode(encoded.trim())
+                        .context("decode ACME RFC2136 TSIG secret as Base64")?;
+                    anyhow::ensure!(
+                        (16..=512).contains(&tsig_secret.len()),
+                        "proxy `{proxy_id}` ACME RFC2136 TSIG secret must decode to 16..=512 bytes"
+                    );
+                    AcmeDns01ProviderRuntime::Rfc2136 {
+                        server,
+                        zone,
+                        tsig_key_name,
+                        tsig_secret: tsig_secret.into(),
+                    }
+                }
+                "vault" => {
+                    validate_acme_https_endpoint(
+                        proxy_id,
+                        "vault_endpoint",
+                        &dns.vault_endpoint,
+                    )?;
+                    validate_acme_vault_path(proxy_id, "vault_present_path", &dns.vault_present_path)?;
+                    validate_acme_vault_path(proxy_id, "vault_cleanup_path", &dns.vault_cleanup_path)?;
+                    let token = crate::secret::resolve_text(
+                        &dns.vault_token,
+                        config_dir,
+                        "ACME Vault token",
+                    )?;
+                    anyhow::ensure!(
+                        !token.is_empty(),
+                        "proxy `{proxy_id}` ACME Vault token must not be empty"
+                    );
+                    anyhow::ensure!(
+                        dns.vault_namespace.len() <= 256
+                            && !dns.vault_namespace.bytes().any(|byte| byte.is_ascii_control()),
+                        "proxy `{proxy_id}` ACME Vault namespace is invalid"
+                    );
+                    AcmeDns01ProviderRuntime::Vault {
+                        endpoint: dns.vault_endpoint.trim_end_matches('/').to_owned(),
+                        token,
+                        namespace: (!dns.vault_namespace.trim().is_empty())
+                            .then(|| dns.vault_namespace.trim().to_owned()),
+                        present_path: dns.vault_present_path.trim_start_matches('/').to_owned(),
+                        cleanup_path: dns.vault_cleanup_path.trim_start_matches('/').to_owned(),
+                    }
+                }
+                other => anyhow::bail!(
+                    "proxy `{proxy_id}` ACME dns01.provider must be command|cloudflare|rfc2136|vault; got `{other}`"
+                ),
+            };
             Some(AcmeDns01RuntimeCfg {
-                command: resolve_relative(cfg_path, dns.command.trim()),
-                args: dns.args.clone().into(),
+                provider,
                 propagation_delay_ms: dns.propagation_delay_ms,
                 timeout_ms: dns.timeout_ms,
+                retry_attempts: dns.retry_attempts,
+                retry_backoff_ms: dns.retry_backoff_ms,
+                max_response_bytes: dns.max_response_bytes,
+                ttl_seconds: dns.ttl_seconds,
             })
         }
     };
@@ -2524,6 +2865,10 @@ fn build_acme_runtime(cfg_path: &Path, proxy_id: &str, cfg: &AcmeCfg) -> Result<
     if cfg.lock_key.trim().is_empty() {
         anyhow::bail!("proxy `{proxy_id}` ACME lock_key must not be empty");
     }
+    anyhow::ensure!(
+        (2..=64).contains(&cfg.keypair_retention_generations),
+        "proxy `{proxy_id}` ACME keypair_retention_generations must be within 2..=64"
+    );
     Ok(AcmeRuntimeCfg {
         bootstrap_without_seed: cfg.bootstrap_without_seed || cfg.bootstrap_http01_only,
         directory_url: cfg.directory_url.trim().to_owned(),
@@ -2547,7 +2892,88 @@ fn build_acme_runtime(cfg_path: &Path, proxy_id: &str, cfg: &AcmeCfg) -> Result<
         lock_backend,
         lock_key: cfg.lock_key.trim().to_owned(),
         storage_mode,
+        keypair_retention_generations: cfg.keypair_retention_generations,
     })
+}
+
+/// 业务作用：校验内建 ACME HTTP provider 的固定 authority，阻止凭据被明文传输或经 URL 注入外带。
+///
+/// 参数说明：`proxy_id`/`field` 定位配置；`raw` 是待固定的 endpoint。
+///
+/// 返回：仅无 userinfo/query/fragment 的 HTTPS 绝对 URL 成功，其它输入拒绝候选快照。
+fn validate_acme_https_endpoint(proxy_id: &str, field: &str, raw: &str) -> Result<()> {
+    let url = reqwest::Url::parse(raw.trim())
+        .with_context(|| format!("proxy `{proxy_id}` invalid ACME {field}"))?;
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "proxy `{proxy_id}` ACME {field} must be an HTTPS URL without credentials, query or fragment"
+    );
+    Ok(())
+}
+
+/// 业务作用：限制会进入 Cloudflare URL path 的租户标识，避免路径重解释与无界日志字段。
+///
+/// 参数说明：`proxy_id`/`field` 定位配置；`raw` 是单个 path component。
+///
+/// 返回：1..=128 个安全 ASCII 字符时成功，否则拒绝配置。
+fn validate_acme_provider_component(proxy_id: &str, field: &str, raw: &str) -> Result<()> {
+    let value = raw.trim();
+    anyhow::ensure!(
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "proxy `{proxy_id}` ACME {field} is invalid"
+    );
+    Ok(())
+}
+
+/// 业务作用：规范化 RFC2136 zone/key name，使 UPDATE 和 TSIG MAC 使用唯一 wire 表示。
+///
+/// 参数说明：`proxy_id`/`field` 定位配置；`raw` 是 DNS name。
+///
+/// 返回：合法有界 DNS name 的小写无尾点形式；空 label、过长 label 或非法字符失败。
+fn normalize_acme_dns_name(proxy_id: &str, field: &str, raw: &str) -> Result<String> {
+    let value = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    anyhow::ensure!(
+        !value.is_empty()
+            && value.len() <= 253
+            && value.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            }),
+        "proxy `{proxy_id}` ACME {field} is not a valid DNS name"
+    );
+    Ok(value)
+}
+
+/// 业务作用：限制 Vault action path 只能停留在已配置 HTTPS authority 内。
+///
+/// 参数说明：`proxy_id`/`field` 定位配置；`raw` 是相对 API path。
+///
+/// 返回：非空、无 traversal/query/fragment 的有界相对路径成功，否则拒绝。
+fn validate_acme_vault_path(proxy_id: &str, field: &str, raw: &str) -> Result<()> {
+    let value = raw.trim().trim_start_matches('/');
+    anyhow::ensure!(
+        !value.is_empty()
+            && value.len() <= 1024
+            && !value.contains('?')
+            && !value.contains('#')
+            && value
+                .split('/')
+                .all(|segment| !segment.is_empty() && segment != "." && segment != ".."),
+        "proxy `{proxy_id}` ACME {field} must be a bounded relative path without traversal"
+    );
+    Ok(())
 }
 
 /// 业务作用：编译 Gateway API HTTPS 逻辑 listener 选择表，保证 SNI 与 Host 比较使用
@@ -3108,10 +3534,295 @@ pub(crate) fn load_gateway_config(cfg_path: &Path) -> Result<GatewayConfig> {
     // (`${remote_addr}` / `${request_id}`)。因此使用 naml 的宽松解析:能解析的配置占位符照常解析,
     // 未命中的运行期变量保留给 gateway 的变量系统解释。
     preflight_config_file(cfg_path, "gateway config")?;
-    loader(cfg_path)
+    let mut cfg = loader(cfg_path)
         .preserve_unresolved_placeholders(true)
         .load()
-        .with_context(|| format!("load gateway config {}", cfg_path.display()))
+        .with_context(|| format!("load gateway config {}", cfg_path.display()))?;
+    expand_config_snippets(&mut cfg, cfg_path, cfg_path)?;
+    Ok(cfg)
+}
+
+struct SnippetDefinition {
+    config: ReusableSnippetCfg,
+    source: PathBuf,
+}
+
+/// 业务作用：加载并展开主配置的可复用 filter snippet，使后续 Router 只接收普通确定性 DSL。
+///
+/// 参数说明：`cfg` 是已完成 profile/env 合并的候选；`base_path` 固定相对路径根；`source_path` 用于根定义溯源。
+///
+/// 返回：全部 import、依赖与 route 引用合法时原地替换 filters；循环、重复展开、越界路径或资源超限返回错误。
+fn expand_config_snippets(
+    cfg: &mut GatewayConfig,
+    base_path: &Path,
+    source_path: &Path,
+) -> Result<()> {
+    let root = base_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()
+        .with_context(|| format!("resolve snippet root for {}", base_path.display()))?;
+    let root_scope = std::mem::take(&mut cfg.snippets);
+    let mut definitions = HashMap::new();
+    let mut imported = HashSet::new();
+    collect_snippet_scope(
+        root_scope,
+        &root,
+        &root,
+        source_path,
+        0,
+        &mut imported,
+        &mut definitions,
+    )?;
+    let mut snippet_files = imported.into_iter().collect::<Vec<_>>();
+    snippet_files.sort();
+    cfg.snippet_files = snippet_files;
+    for route in &mut cfg.routes {
+        route.filters = expand_route_filters(&route.id, &route.filters, &definitions)?;
+    }
+    for proxy in &mut cfg.proxies {
+        for route in &mut proxy.routes {
+            route.filters = expand_route_filters(&route.id, &route.filters, &definitions)?;
+        }
+    }
+    Ok(())
+}
+
+/// 业务作用：递归读取一个 snippet scope，并把定义连同源文件登记到单一候选 registry。
+///
+/// 参数说明：`scope` 含当前定义/import；`current_dir` 是本文件目录；`root` 是不可越过的主配置目录。
+///
+/// 返回：定义成功登记；重复文件/名称、循环、非法路径或容量超限返回错误。
+#[allow(clippy::too_many_arguments)]
+fn collect_snippet_scope(
+    scope: SnippetsCfg,
+    current_dir: &Path,
+    root: &Path,
+    source: &Path,
+    depth: usize,
+    imported: &mut HashSet<PathBuf>,
+    definitions: &mut HashMap<String, SnippetDefinition>,
+) -> Result<()> {
+    if depth > MAX_SNIPPET_DEPTH {
+        bail!(
+            "snippet import depth exceeds {MAX_SNIPPET_DEPTH} at {}",
+            source.display()
+        );
+    }
+    for (name, config) in scope.definitions {
+        validate_snippet_name(&name)?;
+        if config.filters.len() > MAX_SNIPPET_FILTERS_PER_DEFINITION
+            || config.uses.len() > MAX_SNIPPET_FILTERS_PER_DEFINITION
+        {
+            bail!(
+                "snippet `{name}` in {} exceeds item limit",
+                source.display()
+            );
+        }
+        if config.filters.iter().any(|filter| filter.len() > 64 * 1024) {
+            bail!(
+                "snippet `{name}` in {} contains an oversized filter",
+                source.display()
+            );
+        }
+        if definitions.len() >= MAX_SNIPPET_DEFINITIONS {
+            bail!("snippet definitions exceed {MAX_SNIPPET_DEFINITIONS}");
+        }
+        if let Some(previous) = definitions.insert(
+            name.clone(),
+            SnippetDefinition {
+                config,
+                source: source.to_path_buf(),
+            },
+        ) {
+            bail!(
+                "duplicate snippet `{name}` in {} and {}",
+                previous.source.display(),
+                source.display()
+            );
+        }
+    }
+    for import in scope.imports {
+        let relative = Path::new(&import);
+        if import.is_empty()
+            || relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            bail!("snippet import `{import}` must be a relative path without parent traversal");
+        }
+        let path = current_dir.join(relative).canonicalize().with_context(|| {
+            format!(
+                "resolve snippet import `{import}` from {}",
+                source.display()
+            )
+        })?;
+        if !path.starts_with(root) {
+            bail!(
+                "snippet import {} escapes configuration root",
+                path.display()
+            );
+        }
+        if !imported.insert(path.clone()) {
+            bail!("snippet import {} is duplicated or cyclic", path.display());
+        }
+        if imported.len() > MAX_SNIPPET_IMPORTS {
+            bail!("snippet imports exceed {MAX_SNIPPET_IMPORTS}");
+        }
+        let bytes = crate::bounded_io::read_file(&path, MAX_SNIPPET_FILE_BYTES, "snippet import")?;
+        let imported_scope: SnippetsCfg = serde_yml::from_slice(&bytes)
+            .with_context(|| format!("parse snippet import {}", path.display()))?;
+        let directory = path.parent().unwrap_or(root);
+        collect_snippet_scope(
+            imported_scope,
+            directory,
+            root,
+            &path,
+            depth + 1,
+            imported,
+            definitions,
+        )?;
+    }
+    Ok(())
+}
+
+/// 业务作用：校验 snippet 名可安全进入 route DSL 引用和低敏错误上下文。
+///
+/// 参数说明：`name` 是定义或引用名。
+///
+/// 返回：1..=128 字节的 ASCII 标识成功，其它返回错误。
+fn validate_snippet_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        bail!("invalid snippet name `{name}`");
+    }
+    Ok(())
+}
+
+/// 业务作用：把一条 route 的 snippet 引用按声明顺序展开为普通 filters，并阻止同一片段重复生效。
+///
+/// 参数说明：`route_id` 用于错误定位；`filters` 是 route 原声明；`definitions` 是带来源 registry。
+///
+/// 返回：有界、无引用的 filter 列表；未知、循环、菱形重复或展开超限返回错误。
+fn expand_route_filters(
+    route_id: &str,
+    filters: &[String],
+    definitions: &HashMap<String, SnippetDefinition>,
+) -> Result<Vec<String>> {
+    let mut output = Vec::new();
+    let mut active = Vec::new();
+    let mut expanded = HashSet::new();
+    for filter in filters {
+        if let Some(name) = parse_snippet_reference(filter)? {
+            expand_named_snippet(
+                route_id,
+                name,
+                definitions,
+                &mut active,
+                &mut expanded,
+                &mut output,
+            )?;
+        } else {
+            output.push(filter.clone());
+        }
+        enforce_expanded_snippet_budget(route_id, &output)?;
+    }
+    Ok(output)
+}
+
+/// 业务作用：递归展开单个命名片段，使用 active/expanded 两套集合区分循环与重复应用。
+///
+/// 参数说明：route/name 确定引用；registry 提供来源；其余集合与 output 属于当前 route 展开事务。
+///
+/// 返回：成功把依赖和 filters 追加到 output；失败不发布候选快照。
+fn expand_named_snippet(
+    route_id: &str,
+    name: &str,
+    definitions: &HashMap<String, SnippetDefinition>,
+    active: &mut Vec<String>,
+    expanded: &mut HashSet<String>,
+    output: &mut Vec<String>,
+) -> Result<()> {
+    validate_snippet_name(name)?;
+    if active.iter().any(|current| current == name) {
+        bail!(
+            "route `{route_id}` snippet cycle: {} -> {name}",
+            active.join(" -> ")
+        );
+    }
+    if !expanded.insert(name.to_owned()) {
+        bail!("route `{route_id}` expands snippet `{name}` more than once");
+    }
+    let definition = definitions
+        .get(name)
+        .with_context(|| format!("route `{route_id}` references unknown snippet `{name}`"))?;
+    active.push(name.to_owned());
+    for dependency in &definition.config.uses {
+        expand_named_snippet(route_id, dependency, definitions, active, expanded, output)
+            .with_context(|| {
+                format!(
+                    "snippet `{name}` from {} depends on `{dependency}`",
+                    definition.source.display()
+                )
+            })?;
+    }
+    for filter in &definition.config.filters {
+        if let Some(dependency) = parse_snippet_reference(filter)? {
+            expand_named_snippet(route_id, dependency, definitions, active, expanded, output)?;
+        } else {
+            output.push(filter.clone());
+        }
+        enforce_expanded_snippet_budget(route_id, output)?;
+    }
+    active.pop();
+    Ok(())
+}
+
+/// 业务作用：识别 route filter 位置唯一合法的 snippet 引用语法，不把相似普通指令误展开。
+///
+/// 参数说明：`filter` 是一条原始 filter DSL。
+///
+/// 返回：`snippet <name>`/`use_snippet <name>` 返回名称；普通 filter 返回 None；畸形引用返回错误。
+fn parse_snippet_reference(filter: &str) -> Result<Option<&str>> {
+    let mut tokens = filter.split_whitespace();
+    let Some(command) = tokens.next() else {
+        return Ok(None);
+    };
+    if !matches!(command, "snippet" | "use_snippet") {
+        return Ok(None);
+    }
+    let name = tokens.next().context("snippet reference requires a name")?;
+    if tokens.next().is_some() {
+        bail!("snippet reference accepts exactly one name");
+    }
+    Ok(Some(name))
+}
+
+/// 业务作用：限制单 route 展开后的 filter 数量与文本总量，防止小引用图放大候选内存与构建成本。
+///
+/// 参数说明：`route_id` 用于错误定位；`filters` 是当前已展开前缀。
+///
+/// 返回：预算内成功；数量或累计字节超限返回错误。
+fn enforce_expanded_snippet_budget(route_id: &str, filters: &[String]) -> Result<()> {
+    if filters.len() > MAX_EXPANDED_FILTERS_PER_ROUTE
+        || filters
+            .iter()
+            .try_fold(0usize, |total, filter| total.checked_add(filter.len()))
+            .is_none_or(|bytes| bytes > MAX_EXPANDED_FILTER_BYTES_PER_ROUTE)
+    {
+        bail!("route `{route_id}` expanded snippets exceed filter budget");
+    }
+    Ok(())
 }
 
 fn load_interface_guard(main_cfg: &Path, guard_file: &str) -> Result<InterfaceGuard> {
@@ -3312,6 +4023,9 @@ pub(crate) fn config_fingerprint(main_cfg: &Path) -> Result<u64> {
     for secret_file in collect_secret_dependencies(&cfg, config_dir) {
         hash_config_file(&mut hasher, &secret_file)?;
     }
+    for snippet_file in &cfg.snippet_files {
+        hash_config_file(&mut hasher, snippet_file)?;
+    }
 
     Ok(hasher.finish())
 }
@@ -3332,6 +4046,7 @@ pub(crate) fn reload_dependencies(main_cfg: &Path) -> Result<Vec<PathBuf>> {
         paths.push(path);
     }
     paths.extend(collect_secret_dependencies(&cfg, config_dir));
+    paths.extend(cfg.snippet_files.iter().cloned());
     paths.sort();
     paths.dedup();
     Ok(paths)
@@ -3401,6 +4116,25 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
         config_dir,
     ) {
         paths.push(path);
+    }
+    for proxy in &cfg.proxies {
+        let Some(dns) = proxy
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.acme.as_ref())
+            .and_then(|acme| acme.dns01.as_ref())
+        else {
+            continue;
+        };
+        for raw in [
+            dns.cloudflare_api_token.as_str(),
+            dns.rfc2136_tsig_secret.as_str(),
+            dns.vault_token.as_str(),
+        ] {
+            if let Some(path) = crate::secret::dependency_path(raw, config_dir) {
+                paths.push(path);
+            }
+        }
     }
     for catalog in &cfg.developer_portal.catalogs {
         let path = Path::new(&catalog.openapi_file);

@@ -28,6 +28,12 @@ pub struct GatewayConfig {
     /// 旧版全局路由。仅当 `proxies[]` 为空时使用,兼容成 default proxy 的 routes。
     #[serde(default)]
     pub routes: Vec<RouteCfg>,
+    /// 可复用 route filter 片段；所有 import 与引用在候选构建期展开，运行态不保留解释器。
+    #[serde(default)]
+    pub snippets: SnippetsCfg,
+    /// 展开期规范化的 snippet import 依赖，仅供指纹与 reload watcher 使用。
+    #[serde(skip)]
+    pub(crate) snippet_files: Vec<std::path::PathBuf>,
     /// 静态上游定义；`lb://service` 路由从这里选实例，Nacos 等动态注册中心通过同一发现抽象补充实例。
     #[serde(default)]
     pub upstreams: UpstreamsCfg,
@@ -1284,17 +1290,22 @@ pub struct AcmeCfg {
     /// `local-file` 或 `shared-file`；Redis 锁要求 shared-file。
     #[serde(default = "default_acme_storage_mode")]
     pub storage_mode: String,
+    /// manifest 模式最多保留的完整 keypair 代数；当前指针与未完成原子发布可能引用的版本始终受保护。
+    #[serde(default = "default_acme_keypair_retention_generations")]
+    pub keypair_retention_generations: usize,
 }
 
-/// ACME DNS-01 外部 provider 配置。
+/// ACME DNS-01 provider 配置。
 ///
-/// command provider 使用环境变量传递 action/name/value，避免 shell 拼接与 secret 出现在进程 argv。
+/// `command` 使用环境变量传递 action/name/value；内建 provider 的凭据只接受 SecretSource，
+/// 构建期解析后不会进入日志、argv 或管理面输出。
 #[derive(Debug, Deserialize, Clone)]
 pub struct AcmeDns01Cfg {
-    /// 当前支持 `command`；provider 协议稳定后可扩 Cloudflare/RFC2136 等原生实现。
+    /// `command`、`cloudflare`、`rfc2136` 或 `vault`。
     #[serde(default = "default_acme_dns01_provider")]
     pub provider: String,
     /// provider 可执行文件路径；直接 exec，不经过 shell。
+    #[serde(default)]
     pub command: String,
     /// 固定参数列表；challenge 值不会拼入参数。
     #[serde(default)]
@@ -1305,6 +1316,54 @@ pub struct AcmeDns01Cfg {
     /// present/cleanup 单次命令超时(ms)。
     #[serde(default = "default_acme_dns01_timeout_ms")]
     pub timeout_ms: u64,
+    /// 网络 provider 的最大尝试次数，包含首次请求。
+    #[serde(default = "default_acme_dns01_retry_attempts")]
+    pub retry_attempts: usize,
+    /// 可重试失败之间的固定退避；每次等待仍受单操作总 deadline 约束。
+    #[serde(default = "default_acme_dns01_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    /// HTTP provider 单次响应体硬上限。
+    #[serde(default = "default_acme_dns01_max_response_bytes")]
+    pub max_response_bytes: usize,
+    /// TXT TTL；RFC2136 与支持 TTL 的 HTTP provider 共用。
+    #[serde(default = "default_acme_dns01_ttl_seconds")]
+    pub ttl_seconds: u32,
+    /// Cloudflare zone id；仅 `cloudflare` 使用。
+    #[serde(default)]
+    pub cloudflare_zone_id: String,
+    /// Cloudflare API token SecretSource；仅 `cloudflare` 使用。
+    #[serde(default)]
+    pub cloudflare_api_token: String,
+    /// Cloudflare API 根地址；默认官方 HTTPS API，主要用于私有兼容网关。
+    #[serde(default = "default_acme_cloudflare_api_base")]
+    pub cloudflare_api_base: String,
+    /// RFC2136 权威 DNS TCP 地址，例如 `10.0.0.53:53`。
+    #[serde(default)]
+    pub rfc2136_server: String,
+    /// RFC2136 UPDATE zone，例如 `example.com`。
+    #[serde(default)]
+    pub rfc2136_zone: String,
+    /// RFC2136 TSIG key name。
+    #[serde(default)]
+    pub rfc2136_tsig_key_name: String,
+    /// Base64 编码的 RFC2136 TSIG HMAC-SHA256 secret SecretSource。
+    #[serde(default)]
+    pub rfc2136_tsig_secret: String,
+    /// Vault API 根地址；必须为 HTTPS。
+    #[serde(default)]
+    pub vault_endpoint: String,
+    /// Vault token SecretSource。
+    #[serde(default)]
+    pub vault_token: String,
+    /// Vault present 操作的相对 API path。
+    #[serde(default)]
+    pub vault_present_path: String,
+    /// Vault cleanup 操作的相对 API path；cleanup 必须按 name/value 幂等删除。
+    #[serde(default)]
+    pub vault_cleanup_path: String,
+    /// 可选 Vault namespace。
+    #[serde(default)]
+    pub vault_namespace: String,
 }
 
 /// mTLS 客户端证书校验配置。
@@ -1484,6 +1543,12 @@ pub struct AdminCfg {
     /// V5 管理操作持久、防篡改审计。
     #[serde(default)]
     pub audit: AdminAuditCfg,
+    /// 集群配置渐进发布策略；关闭时保持一次 CAS 全量发布的兼容行为。
+    #[serde(default)]
+    pub rollout: AdminRolloutCfg,
+    /// 高危管理变更的 maker-checker 策略；关闭时保持直接执行兼容行为。
+    #[serde(default)]
+    pub approval: AdminApprovalCfg,
     /// UI/API 候选配置 dry-run 的请求体上限；只影响控制面，不改变数据面 body 策略。
     #[serde(default = "default_admin_max_config_body_bytes")]
     pub max_config_body_bytes: usize,
@@ -1497,7 +1562,87 @@ impl Default for AdminCfg {
             auth: AdminAuthCfg::default(),
             rbac: AdminRbacCfg::default(),
             audit: AdminAuditCfg::default(),
+            rollout: AdminRolloutCfg::default(),
+            approval: AdminApprovalCfg::default(),
             max_config_body_bytes: default_admin_max_config_body_bytes(),
+        }
+    }
+}
+
+/// 高危管理变更的双人复核策略。
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AdminApprovalCfg {
+    /// 是否把指定资源的写操作先登记为待审批候选。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 需要复核的资源域；仅允许 Sentinel、Consumers 与 Certs。
+    #[serde(default = "default_admin_approval_resources")]
+    pub resources: Vec<AdminResource>,
+    /// 待审批候选有效期，过期候选永不执行。
+    #[serde(default = "default_admin_approval_ttl_seconds")]
+    pub ttl_seconds: u64,
+    /// 单进程待审批候选上限；达到上限时拒绝新提交。
+    #[serde(default = "default_admin_approval_max_pending")]
+    pub max_pending: usize,
+}
+
+impl Default for AdminApprovalCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            resources: default_admin_approval_resources(),
+            ttl_seconds: default_admin_approval_ttl_seconds(),
+            max_pending: default_admin_approval_max_pending(),
+        }
+    }
+}
+
+/// 集群配置金丝雀发布与健康门控策略。
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AdminRolloutCfg {
+    /// 是否把 Nacos 配置发布改为先 canary、再全量的状态机。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 从符合 selector 的启用成员中选取的节点数。
+    #[serde(default = "default_admin_rollout_canary_count")]
+    pub canary_count: usize,
+    /// 可选成员 metadata 键；空值表示按稳定 node_id 选择所有启用成员中的前 N 个。
+    #[serde(default)]
+    pub selector_key: String,
+    /// selector_key 非空时要求 metadata 精确等于该值。
+    #[serde(default)]
+    pub selector_value: String,
+    /// canary 换版并取得首个健康样本后的观察窗口。
+    #[serde(default = "default_admin_rollout_observation_seconds")]
+    pub observation_seconds: u64,
+    /// 观察窗内 canary 请求 5xx 比例绝对上限。
+    #[serde(default = "default_admin_rollout_max_5xx_ratio")]
+    pub max_5xx_ratio: f64,
+    /// canary p99 相对基线的最大倍率；没有基线流量时只使用绝对上限。
+    #[serde(default = "default_admin_rollout_max_p99_regression_ratio")]
+    pub max_p99_regression_ratio: f64,
+    /// canary 请求端到端 p99 绝对上限。
+    #[serde(default = "default_admin_rollout_max_p99_ms")]
+    pub max_p99_ms: u64,
+    /// 是否要求另一名具备 Config/Write 权限的主体确认后才从 canary 放量。
+    #[serde(default)]
+    pub require_approval: bool,
+}
+
+impl Default for AdminRolloutCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            canary_count: default_admin_rollout_canary_count(),
+            selector_key: String::new(),
+            selector_value: String::new(),
+            observation_seconds: default_admin_rollout_observation_seconds(),
+            max_5xx_ratio: default_admin_rollout_max_5xx_ratio(),
+            max_p99_regression_ratio: default_admin_rollout_max_p99_regression_ratio(),
+            max_p99_ms: default_admin_rollout_max_p99_ms(),
+            require_approval: false,
         }
     }
 }
@@ -1527,7 +1672,7 @@ pub struct AdminAuthCfg {
     /// CLI/服务间请求通常不带这两个浏览器来源头，不受影响。
     #[serde(default)]
     pub allowed_origins: Vec<String>,
-    /// 是否允许本节点用**自己这份 admin 凭据**去抓取同集群其它节点的 `/metrics`(C5)。
+    /// 是否允许本节点用**自己这份 admin 凭据**去抓取同集群其它节点的 `/metrics`。
     ///
     /// 默认 **false**,必须显式开启。为什么不默认开:
     /// - 它让 admin 从"只被访问"变成"会主动外连",是**攻击面的实质变化**——被打穿的
@@ -1537,6 +1682,7 @@ pub struct AdminAuthCfg {
     ///
     /// 凭据只从进程内已解析的配置取,**不接受请求携带的任何凭证**——否则控制面就成了
     /// 一个可被借用的跳板(调用方带什么凭据,网关就拿什么去连内网别的机器)。
+    /// 开启时必须同时启用 `admin.auth`；RBAC 模式还必须至少有一个 Cluster/Read principal。
     #[serde(default)]
     pub allow_cluster_metrics_scrape: bool,
 }
@@ -1902,6 +2048,30 @@ pub struct VariablesCfg {
     /// 允许被 `${query.k}` 读取的 query 参数;可显式写 `"*"` 放开。
     #[serde(default)]
     pub allow_queries: Vec<String>,
+}
+
+/// 可复用 filter snippet 的根配置；import 只能位于主配置目录内。
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SnippetsCfg {
+    /// 相对当前文件的 snippet 文档列表。
+    #[serde(default)]
+    pub imports: Vec<String>,
+    /// 当前文件定义的命名片段。
+    #[serde(default)]
+    pub definitions: HashMap<String, ReusableSnippetCfg>,
+}
+
+/// 一个命名 snippet；先展开显式依赖，再按顺序追加 filter。
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ReusableSnippetCfg {
+    /// 依赖的其它 snippet 名称。
+    #[serde(default, rename = "use", alias = "uses")]
+    pub uses: Vec<String>,
+    /// 最终插入 route 的 filter DSL。
+    #[serde(default)]
+    pub filters: Vec<String>,
 }
 
 /// 一张由请求变量驱动的确定性字符串映射表。
@@ -2336,12 +2506,12 @@ pub struct GrpcEdgeClusterCfg {
     /// (§25.2.6 背压与回执)。对应 §25.2.9 示例 `ack_deadline: 100ms`,本仓统一 `_ms` 整数。
     #[serde(default = "default_grpc_edge_ack_deadline_ms")]
     pub ack_deadline_ms: u64,
-    /// 全网状中继的节点数硬门(§25.2.2 建议 <=32)。静态 peers 超门直接拒绝;
-    /// 更大集群必须先实现 interest/group-owner 路由，不允许 O(N²) 盲广播。
+    /// 全网状中继的节点数硬门。静态 peers 或 Nacos 成员超门直接拒绝；
+    /// `auto` 只降低无关 group 的 payload 流量，不改变全网状连接数量。
     #[serde(default = "default_grpc_edge_full_mesh_max_nodes")]
     pub full_mesh_max_nodes: usize,
-    /// 兴趣路由策略（§25.2.6）：`auto` 当前只允许小集群广播，
-    /// hint 缺失/过期一律 fail-open 广播;`broadcast_all` = 显式永远广播(仅小集群)。
+    /// 兴趣路由策略：`auto` 使用 revision 快照过滤明确无兴趣的 peer，hint 缺失、断档或过期
+    /// 一律 fail-open 广播；`broadcast_all` 显式永远广播且仅允许建议规模内的小集群。
     #[serde(default)]
     pub interest_route: GrpcEdgeInterestRouteCfg,
     /// 顺序承诺(§25.2.6):默认仅"同 publisher stream → 同 ingress → 同目标队列"FIFO;
@@ -5664,6 +5834,57 @@ fn default_admin_max_config_body_bytes() -> usize {
     2 * 1024 * 1024
 }
 
+const fn default_admin_rollout_canary_count() -> usize {
+    1
+}
+
+const fn default_admin_rollout_observation_seconds() -> u64 {
+    60
+}
+
+fn default_admin_rollout_max_5xx_ratio() -> f64 {
+    0.01
+}
+
+fn default_admin_rollout_max_p99_regression_ratio() -> f64 {
+    1.5
+}
+
+const fn default_admin_rollout_max_p99_ms() -> u64 {
+    2_000
+}
+
+/// 业务作用：提供 maker-checker 默认覆盖的高危资源集合。
+///
+/// 参数说明：无。
+///
+/// 返回：返回流量防护、消费者凭据和证书三个资源域。
+fn default_admin_approval_resources() -> Vec<AdminResource> {
+    vec![
+        AdminResource::Sentinel,
+        AdminResource::Consumers,
+        AdminResource::Certs,
+    ]
+}
+
+/// 业务作用：提供待审批候选的默认有效期。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 900 秒。
+const fn default_admin_approval_ttl_seconds() -> u64 {
+    900
+}
+
+/// 业务作用：提供待审批队列的默认硬上限。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 64 条。
+const fn default_admin_approval_max_pending() -> usize {
+    64
+}
+
 fn default_nacos_gateway_data_id() -> String {
     "gateway.yml".to_string()
 }
@@ -6019,6 +6240,26 @@ fn default_acme_dns01_timeout_ms() -> u64 {
     30_000
 }
 
+fn default_acme_dns01_retry_attempts() -> usize {
+    3
+}
+
+fn default_acme_dns01_retry_backoff_ms() -> u64 {
+    250
+}
+
+fn default_acme_dns01_max_response_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_acme_dns01_ttl_seconds() -> u32 {
+    60
+}
+
+fn default_acme_cloudflare_api_base() -> String {
+    "https://api.cloudflare.com/client/v4".to_string()
+}
+
 /// 默认单节点本地锁；多节点必须显式选择 redis。
 fn default_acme_lock_backend() -> String {
     "local".to_string()
@@ -6032,6 +6273,10 @@ fn default_acme_lock_key() -> String {
 /// 默认本地 SecretSource 文件；多节点需显式声明 shared-file。
 fn default_acme_storage_mode() -> String {
     "local-file".to_string()
+}
+
+fn default_acme_keypair_retention_generations() -> usize {
+    3
 }
 
 fn default_rate_limiter_backend() -> String {

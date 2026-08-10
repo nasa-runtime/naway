@@ -680,6 +680,8 @@ pub struct EdgeUserKey {
 /// 通过不可变成员切片避免在散出期间长期持锁。
 pub struct GroupMembers {
     members: parking_lot::RwLock<HashMap<u64, Arc<EdgeRing>>>,
+    /// 首个完整准入完成后置位；不能把尚可能回滚的临时 member 提前发布为远端事实。
+    interest_announced: AtomicBool,
 }
 
 /// 一个 user 的在线 session 记录;ring 供定向 push 本地投递。
@@ -725,7 +727,7 @@ pub struct EdgeHub {
     /// 大规模订阅波次排空后触发一次 glibc trim。小流量不碰 allocator 全局锁；达到
     /// 10k 活跃流才置位，最后一条流退出时异步执行一次。
     drain_trim_armed: AtomicBool,
-    /// E1 interest 传播目标；Weak 避免 hub↔relay 强引用环，relay 换代时可替换。
+    /// interest 传播目标；Weak 避免 hub↔relay 强引用环，relay 换代时可替换。
     interest_relay: parking_lot::RwLock<Weak<crate::edge_relay::EdgeRelay>>,
     /// Redis strong control 的会话收尾端；只在非 relay single-session 模式注入。
     session_control: parking_lot::RwLock<Option<Weak<dyn EdgeSessionControl>>>,
@@ -1088,33 +1090,34 @@ impl EdgeHub {
             map_overflow(plan.overflow),
         );
 
-        let first_interest;
-        {
-            let bucket = match self.groups.entry(group_key.clone()) {
-                Entry::Occupied(entry) => entry.get().clone(),
-                Entry::Vacant(entry) => {
-                    if !try_reserve(&self.active_groups, 1, limits.max_groups_per_node) {
-                        self.active_streams.fetch_sub(1, Ordering::Relaxed);
-                        return Err(EdgeAdmitError::Groups);
-                    }
-                    entry
-                        .insert(Arc::new(GroupMembers {
-                            members: parking_lot::RwLock::new(HashMap::new()),
-                        }))
-                        .clone()
+        let group_bucket = match self.groups.entry(group_key.clone()) {
+            Entry::Occupied(entry) => {
+                let bucket = entry.get().clone();
+                let mut members = bucket.members.write();
+                if members.len() >= limits.max_members_per_group {
+                    self.active_streams.fetch_sub(1, Ordering::Relaxed);
+                    return Err(EdgeAdmitError::Members);
                 }
-            };
-            let mut members = bucket.members.write();
-            first_interest = members.is_empty();
-            if members.len() >= limits.max_members_per_group {
-                // 回滚空组:本次插入建出的空 bucket 不留残影。
+                members.insert(stream_id, ring.clone());
                 drop(members);
-                self.remove_group_if_empty(&group_key);
-                self.active_streams.fetch_sub(1, Ordering::Relaxed);
-                return Err(EdgeAdmitError::Members);
+                // entry guard 保持到 member 插入完成，使并发 remove_if 不能删掉仍将被使用的 bucket。
+                bucket
             }
-            members.insert(stream_id, ring.clone());
-        }
+            Entry::Vacant(entry) => {
+                if !try_reserve(&self.active_groups, 1, limits.max_groups_per_node) {
+                    self.active_streams.fetch_sub(1, Ordering::Relaxed);
+                    return Err(EdgeAdmitError::Groups);
+                }
+                let mut members = HashMap::new();
+                members.insert(stream_id, ring.clone());
+                entry
+                    .insert(Arc::new(GroupMembers {
+                        members: parking_lot::RwLock::new(members),
+                        interest_announced: AtomicBool::new(false),
+                    }))
+                    .clone()
+            }
+        };
         let sessions_entry = self
             .users
             .entry(user_key.clone())
@@ -1126,7 +1129,9 @@ impl EdgeHub {
                 drop(sessions_entry);
                 if let Some(bucket) = self.groups.get(&group_key).map(|entry| entry.clone()) {
                     bucket.members.write().remove(&stream_id);
-                    self.remove_group_if_empty(&group_key);
+                    if self.remove_group_if_empty(&group_key) {
+                        self.notify_interest(&group_key);
+                    }
                 }
                 self.users
                     .remove_if(&user_key, |_, sessions| sessions.lock().is_empty());
@@ -1139,7 +1144,9 @@ impl EdgeHub {
             drop(sessions_entry);
             if let Some(bucket) = self.groups.get(&group_key).map(|entry| entry.clone()) {
                 bucket.members.write().remove(&stream_id);
-                self.remove_group_if_empty(&group_key);
+                if self.remove_group_if_empty(&group_key) {
+                    self.notify_interest(&group_key);
+                }
             }
             self.users
                 .remove_if(&user_key, |_, sessions| sessions.lock().is_empty());
@@ -1153,7 +1160,9 @@ impl EdgeHub {
         });
         drop(sessions);
         drop(sessions_entry);
-        if first_interest {
+        // 只有 group 与 user 两侧都完成准入后才发布 up；并发首个请求回滚时，
+        // 后续成功请求会接管这次唯一通知，不会留下永远未传播的本地兴趣。
+        if !group_bucket.interest_announced.swap(true, Ordering::AcqRel) {
             self.notify_interest(&group_key);
         }
 

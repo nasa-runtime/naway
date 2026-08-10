@@ -152,6 +152,17 @@ pub struct ReloadRuntime {
     pub sidecar_mode: bool,
     /// data/stream listener 两阶段热切换；纯库测试或 admin-only 模式可为 None。
     pub listener_topology: Option<Arc<dyn ListenerTopologyReconciler>>,
+    /// access-log dispatcher/sink 的可换代稳定句柄。
+    pub access_log: Option<crate::access_log::AccessLogger>,
+    /// 管理写操作审计 owner，换代期间失败闭合。
+    pub admin_audit: Option<crate::admin_audit::AdminAuditLog>,
+    /// HTTP cache Redis L2 与失效订阅的可换代句柄。
+    pub http_cache: Option<Arc<crate::http_cache::SwappableHttpCacheRuntime>>,
+    /// OpenTelemetry exporter/provider 的可换代句柄。
+    pub telemetry: Option<Arc<crate::telemetry::SwappableTelemetryRuntime>>,
+    /// xDS ADS 任务与 authority/ownership 的唯一换代 owner。
+    #[cfg(feature = "xds-client")]
+    pub xds: Option<Arc<crate::xds::XdsGenerationManager>>,
 }
 
 /// 起热重载后台任务(notify + SIGHUP 汇入同一 reload)。
@@ -239,6 +250,7 @@ pub async fn apply_reload(
             let old = snap.load();
             let old_topology = old.listen_topology();
             let old_admin_listen = old.admin_listen.clone();
+            #[cfg(feature = "grpc-edge")]
             let old_edge_cluster = old.grpc_edge_cluster.clone();
             #[cfg(feature = "grpc-edge")]
             let old_edge_nacos = old.discovery.nacos.clone();
@@ -252,10 +264,6 @@ pub async fn apply_reload(
             let old_access_log = old.access_log.clone();
             let old_admin_audit = old.admin_audit.clone();
             let old_control_plane = old.control_plane.clone();
-            #[cfg(feature = "xds-client")]
-            let xds_policy_owned = old.control_plane.xds.enabled
-                && old.control_plane.xds.ownership.routes
-                    == crate::config::model::XdsResourceOwnerCfg::Xds;
             let mut old_xds_specs = old.upstreams.xds_watch_specs();
             old_xds_specs.sort_by(|left, right| {
                 left.logical_service
@@ -266,23 +274,6 @@ pub async fn apply_reload(
                 .then(|| nacos_bootstrap_change(old.as_ref(), &new_snap))
                 .flatten();
             drop(old);
-            #[cfg(feature = "xds-client")]
-            if xds_policy_owned {
-                // 当前 CDS/RDS generation 与 file bootstrap 合成后才成为 active。overlay merge 尚未
-                // 纳入同一协调事务前，禁止 file/Nacos reload 单独覆盖 ArcSwap 并擦除已 ACK 路由。
-                tracing::error!(
-                    trigger,
-                    "reload rejected while xDS owns routes/clusters; restart required"
-                );
-                history.record_rejected(
-                    trigger,
-                    cfg_path,
-                    old_version,
-                    next,
-                    "reload while xDS owns routes/clusters requires restart",
-                );
-                return false;
-            }
             if let Some(field) = nacos_bootstrap_violation {
                 tracing::error!(
                     trigger,
@@ -304,46 +295,61 @@ pub async fn apply_reload(
                     .cmp(&right.logical_service)
                     .then_with(|| left.cluster_name.cmp(&right.cluster_name))
             });
-            if new_snap.control_plane != old_control_plane || new_xds_specs != old_xds_specs {
-                // ADS server/identity/trust/budgets 与 EDS owner 映射共同定义一个常驻 authority；
-                // 未实现 task 两阶段换代前绝不能先发布新快照，让旧 stream 写入新 owner 域。
-                tracing::error!(
-                    trigger,
-                    "xDS bootstrap or EDS ownership change rejected; restart required"
-                );
+            let xds_changed =
+                new_snap.control_plane != old_control_plane || new_xds_specs != old_xds_specs;
+            #[cfg(feature = "xds-client")]
+            let prepared_xds = if xds_changed {
+                let Some(manager) = &runtime.xds else {
+                    tracing::error!(trigger, "xDS topology change has no runtime owner");
+                    history.record_rejected(
+                        trigger,
+                        cfg_path,
+                        old_version,
+                        next,
+                        "control_plane.xds change requires a running generation owner",
+                    );
+                    return false;
+                };
+                let cfg = new_snap
+                    .control_plane
+                    .xds
+                    .enabled
+                    .then(|| new_snap.control_plane.xds.clone());
+                match manager.prepare(cfg, new_xds_specs.clone()).await {
+                    Ok(candidate) => Some(candidate),
+                    Err(error) => {
+                        tracing::error!(trigger, error = %error, "xDS candidate prepare failed");
+                        history.record_rejected(
+                            trigger,
+                            cfg_path,
+                            old_version,
+                            next,
+                            format!("xDS candidate prepare failed: {error:#}"),
+                        );
+                        return false;
+                    }
+                }
+            } else {
+                None
+            };
+            #[cfg(not(feature = "xds-client"))]
+            if xds_changed {
+                tracing::error!(trigger, "xDS topology change requires xds-client support");
                 history.record_rejected(
                     trigger,
                     cfg_path,
                     old_version,
                     next,
-                    "control_plane.xds bootstrap/EDS ownership change requires restart",
+                    "control_plane.xds change requires xds-client support",
                 );
                 return false;
             }
             let new_topology = new_snap.listen_topology();
+            #[cfg(feature = "grpc-edge")]
             let edge_relay_changed = !same_edge_relay_topology(
                 old_edge_cluster.as_deref(),
                 new_snap.grpc_edge_cluster.as_deref(),
             );
-            if edge_relay_changed
-                && !edge_relay_hot_reload_compatible(
-                    old_edge_cluster.as_deref(),
-                    new_snap.grpc_edge_cluster.as_deref(),
-                )
-            {
-                tracing::error!(
-                    trigger,
-                    "gRPC edge cluster transport mode or identity change rejected; restart required"
-                );
-                history.record_rejected(
-                    trigger,
-                    cfg_path,
-                    old_version,
-                    next,
-                    "grpc_edge_cluster mode/cluster_id/node_id/membership change requires restart",
-                );
-                return false;
-            }
             let acme_lock_runtime_changed = rate_limiter_config_signature(&new_snap.runtime_state)
                 != old_runtime_state
                 && old_topology
@@ -392,62 +398,124 @@ pub async fn apply_reload(
             let new_http_cache =
                 crate::http_cache::runtime_config_signature(&new_snap.runtime_state.http_cache);
             let new_telemetry = crate::telemetry::config_signature(&new_snap.telemetry);
-            if !old_access_log.same_sink_topology(&new_snap.access_log) {
-                tracing::error!(
-                    trigger,
-                    "access log queue/sink topology change rejected; restart required"
-                );
-                history.record_rejected(
-                    trigger,
-                    cfg_path,
-                    old_version,
-                    next,
-                    "access_log queue/sink topology change requires restart",
-                );
-                return false;
-            }
-            if !old_admin_audit.same_bootstrap(&new_snap.admin_audit) {
-                tracing::error!(
-                    trigger,
-                    "admin audit spool/credential/endpoint change rejected; restart required"
-                );
-                history.record_rejected(
-                    trigger,
-                    cfg_path,
-                    old_version,
-                    next,
-                    "admin.audit bootstrap change requires restart",
-                );
-                return false;
-            }
-            if new_http_cache != old_http_cache {
-                tracing::error!(
-                    trigger,
-                    "HTTP cache Redis connection/prefix/invalidation topology change rejected; restart required"
-                );
-                history.record_rejected(
-                    trigger,
-                    cfg_path,
-                    old_version,
-                    next,
-                    "runtime_state.http_cache bootstrap change requires restart",
-                );
-                return false;
-            }
-            if new_telemetry != old_telemetry {
-                tracing::error!(
-                    trigger,
-                    "telemetry exporter/sampling topology change rejected; restart required"
-                );
-                history.record_rejected(
-                    trigger,
-                    cfg_path,
-                    old_version,
-                    next,
-                    "telemetry bootstrap change requires restart",
-                );
-                return false;
-            }
+            let next_access_log = if !old_access_log.same_sink_topology(&new_snap.access_log) {
+                let Some(active) = &runtime.access_log else {
+                    tracing::error!(trigger, "access log topology change has no runtime owner");
+                    history.record_rejected(
+                        trigger,
+                        cfg_path,
+                        old_version,
+                        next,
+                        "access_log topology change requires a running generation owner",
+                    );
+                    return false;
+                };
+                match active.prepare_replacement(&new_snap.access_log) {
+                    Ok(candidate) => Some(candidate),
+                    Err(error) => {
+                        tracing::error!(trigger, error = %error, "access log candidate prepare failed");
+                        history.record_rejected(
+                            trigger,
+                            cfg_path,
+                            old_version,
+                            next,
+                            format!("access_log candidate prepare failed: {error:#}"),
+                        );
+                        return false;
+                    }
+                }
+            } else {
+                None
+            };
+            let next_admin_audit = if !old_admin_audit.same_bootstrap(&new_snap.admin_audit) {
+                let Some(active) = &runtime.admin_audit else {
+                    tracing::error!(trigger, "admin audit topology change has no runtime owner");
+                    history.record_rejected(
+                        trigger,
+                        cfg_path,
+                        old_version,
+                        next,
+                        "admin.audit change requires a running generation owner",
+                    );
+                    return false;
+                };
+                match active.prepare_replacement(&new_snap.admin_audit) {
+                    Ok(candidate) => Some(candidate),
+                    Err(error) => {
+                        tracing::error!(trigger, error = %error, "admin audit candidate prepare failed");
+                        history.record_rejected(
+                            trigger,
+                            cfg_path,
+                            old_version,
+                            next,
+                            format!("admin.audit candidate prepare failed: {error:#}"),
+                        );
+                        return false;
+                    }
+                }
+            } else {
+                None
+            };
+            let next_http_cache = if new_http_cache != old_http_cache {
+                if runtime.http_cache.is_none() {
+                    tracing::error!(trigger, "HTTP cache topology change has no runtime owner");
+                    history.record_rejected(
+                        trigger,
+                        cfg_path,
+                        old_version,
+                        next,
+                        "runtime_state.http_cache change requires a running generation owner",
+                    );
+                    return false;
+                }
+                match crate::http_cache::HttpCacheRuntime::build(&new_snap.runtime_state.http_cache)
+                    .await
+                {
+                    Ok(candidate) => Some(candidate),
+                    Err(error) => {
+                        tracing::error!(trigger, error = %error, "HTTP cache candidate prepare failed");
+                        history.record_rejected(
+                            trigger,
+                            cfg_path,
+                            old_version,
+                            next,
+                            format!("HTTP cache candidate prepare failed: {error:#}"),
+                        );
+                        return false;
+                    }
+                }
+            } else {
+                None
+            };
+            let next_telemetry = if new_telemetry != old_telemetry {
+                if runtime.telemetry.is_none() {
+                    tracing::error!(trigger, "telemetry topology change has no runtime owner");
+                    history.record_rejected(
+                        trigger,
+                        cfg_path,
+                        old_version,
+                        next,
+                        "telemetry change requires a running generation owner",
+                    );
+                    return false;
+                }
+                match crate::telemetry::TelemetryRuntime::build(&new_snap.telemetry) {
+                    Ok(candidate) => Some(candidate),
+                    Err(error) => {
+                        tracing::error!(trigger, error = %error, "telemetry candidate prepare failed");
+                        history.record_rejected(
+                            trigger,
+                            cfg_path,
+                            old_version,
+                            next,
+                            format!("telemetry candidate prepare failed: {error:#}"),
+                        );
+                        return false;
+                    }
+                }
+            } else {
+                None
+            };
             let next_rate_limiter = if new_runtime_state != old_runtime_state {
                 match build_rate_limiter(&new_snap.runtime_state).await {
                     Ok(next) => Some(next),
@@ -656,16 +724,10 @@ pub async fn apply_reload(
             let guards = new_snap.interface_guard.rule_count();
             #[cfg(feature = "grpc-edge")]
             let prepared_edge_relay = if edge_relay_changed {
-                match prepare_edge_relay_reload(
+                match prepare_edge_cluster_reload(
                     runtime,
-                    old_edge_cluster
-                        .as_ref()
-                        .expect("compatible change has current relay"),
-                    new_snap
-                        .grpc_edge_cluster
-                        .as_ref()
-                        .expect("compatible change has candidate relay")
-                        .clone(),
+                    old_edge_cluster.clone(),
+                    new_snap.grpc_edge_cluster.clone(),
                     old_edge_nacos,
                     new_snap.discovery.nacos.clone(),
                 )
@@ -679,7 +741,7 @@ pub async fn apply_reload(
                             cfg_path,
                             old_version,
                             next,
-                            format!("grpc_edge_cluster hot reload prepare failed: {error:#}"),
+                            format!("grpc_edge_cluster candidate prepare failed: {error:#}"),
                         );
                         return false;
                     }
@@ -687,11 +749,47 @@ pub async fn apply_reload(
             } else {
                 None
             };
+            if next_admin_audit.is_some() {
+                // 审计 sequence 是控制面安全边界；发布窗口先关闭新写入，再切 owner，
+                // 防止旧请求在候选代验证 spool 后迟到追加导致跨代 hash-chain。
+                runtime
+                    .admin_audit
+                    .as_ref()
+                    .expect("prepared audit replacement has active owner")
+                    .begin_transition();
+            }
             let new_snap = Arc::new(new_snap);
             snap.store(new_snap.clone()); // ★唯一的原子换版点(无锁、纳秒级)★
+            #[cfg(feature = "xds-client")]
+            if let Some(prepared) = prepared_xds {
+                // 快照已关闭旧 authority 的业务语义；立即撤销旧 task，
+                // 再让候选身份从空 ACK 状态重新取证，迟到 stream 不能写新 owner 域。
+                prepared.commit();
+            }
+            if let (Some(active), Some(candidate)) = (&runtime.access_log, &next_access_log) {
+                active.replace(candidate);
+            }
+            if let (Some(active), Some(candidate)) = (&runtime.admin_audit, &next_admin_audit) {
+                active.replace(candidate).await;
+            }
+            if let (Some(active), Some(candidate)) = (&runtime.http_cache, next_http_cache) {
+                active.replace(candidate);
+            }
+            if let (Some(active), Some(candidate)) = (&runtime.telemetry, next_telemetry) {
+                let drain = Duration::from_millis(
+                    new_snap
+                        .proxies
+                        .iter()
+                        .map(|proxy| proxy.timeouts.drain_timeout_ms)
+                        .max()
+                        .unwrap_or(30_000)
+                        .max(1),
+                );
+                active.replace(candidate, drain);
+            }
             #[cfg(feature = "grpc-edge")]
             if let Some(prepared) = prepared_edge_relay {
-                prepared.commit();
+                prepared.commit().await;
             }
             if let Some(prepared) = prepared_listener_topology {
                 // prepare 已完成所有可能失败的 bind/TLS 构建；commit 只启动新 accept task，
@@ -878,8 +976,7 @@ fn same_tls_secret_references(current: &GatewaySnapshot, candidate: &GatewaySnap
                                 current.directory_ca_file == candidate.directory_ca_file
                                     && current.account_credentials_file
                                         == candidate.account_credentials_file
-                                    && current.dns01.as_ref().map(|dns| &dns.command)
-                                        == candidate.dns01.as_ref().map(|dns| &dns.command)
+                                    && current.dns01 == candidate.dns01
                             }
                             _ => false,
                         }
@@ -1257,12 +1354,38 @@ pub(crate) fn nacos_config_props(cfg: &NacosConfigSourceCfg) -> nasa::config::na
 /// # 参数
 /// - `cfg`: `config_source.nacos` 配置。
 fn nacos_config_refs(cfg: &NacosConfigSourceCfg) -> Vec<nasa::config::nacos::ConfigRef> {
+    let node_id = std::env::var("GW_NODE_ID").ok();
+    nacos_config_refs_for_node(cfg, node_id.as_deref())
+}
+
+/// 业务作用：根据可选稳定节点身份构造 Nacos 必需全局 bundle 与可选 canary override 订阅集。
+///
+/// 参数说明：`cfg` 是配置源；`node_id` 为空时只订阅全局事实。
+///
+/// 返回：原子 bundle 模式返回一个必需文档和至多一个可选 override；兼容模式返回三个必需 YAML 文档。
+fn nacos_config_refs_for_node(
+    cfg: &NacosConfigSourceCfg,
+    node_id: Option<&str>,
+) -> Vec<nasa::config::nacos::ConfigRef> {
     if !cfg.bundle_data_id.trim().is_empty() {
-        return vec![
+        let mut refs = vec![
             nasa::config::nacos::ConfigRef::required(cfg.bundle_data_id.clone())
                 .with_group(cfg.group.clone())
                 .with_file_extension("json"),
         ];
+        if let Some(node_id) = node_id {
+            if let Ok(data_id) = nacos_canary_data_id(cfg, node_id) {
+                // 节点专属 override 不存在是正常稳态；其它依赖错误由 nanacos 保持失败闭合。
+                refs.push(
+                    nasa::config::nacos::ConfigRef::optional(data_id)
+                        .with_group(cfg.group.clone())
+                        .with_file_extension("json"),
+                );
+            } else {
+                tracing::error!("GW_NODE_ID cannot be used for Nacos canary config; only base bundle will be watched");
+            }
+        }
+        return refs;
     }
     vec![
         nasa::config::nacos::ConfigRef::required(cfg.gateway_data_id.clone())
@@ -1275,6 +1398,33 @@ fn nacos_config_refs(cfg: &NacosConfigSourceCfg) -> Vec<nasa::config::nacos::Con
             .with_group(cfg.group.clone())
             .with_file_extension("yaml"),
     ]
+}
+
+/// 业务作用：为指定网关节点派生唯一的 Nacos canary override dataId，使候选配置只影响被选节点。
+///
+/// 参数说明：`cfg` 提供全局原子 bundle 身份；`node_id` 是成员注册和本节点环境共享的稳定身份。
+///
+/// 返回：输入合法时返回长度有界且不会与全局 bundle 冲突的 dataId；缺少原子 bundle 或非法身份时失败。
+pub(crate) fn nacos_canary_data_id(cfg: &NacosConfigSourceCfg, node_id: &str) -> Result<String> {
+    let node_id = node_id.trim();
+    anyhow::ensure!(
+        !cfg.bundle_data_id.trim().is_empty(),
+        "Nacos canary rollout requires bundle_data_id"
+    );
+    anyhow::ensure!(
+        !node_id.is_empty()
+            && node_id.len() <= 128
+            && node_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "Nacos canary node_id must contain 1..=128 ASCII letters, digits, '.', '_' or '-'"
+    );
+    let data_id = format!("{}.canary.{node_id}", cfg.bundle_data_id.trim());
+    anyhow::ensure!(
+        data_id.len() <= 256,
+        "Nacos canary dataId exceeds 256 bytes"
+    );
+    Ok(data_id)
 }
 
 /// Nacos 单 dataId 原子配置 bundle。三份原文作为 JSON string 一次 CAS，watcher 不会
@@ -1350,7 +1500,9 @@ fn materialize_nacos_config_bundle(
             bundle_required_doc(bundle, &cfg.sentinel_rules_data_id)?.to_string(),
         )
     } else {
-        let atomic = parse_atomic_nacos_bundle(bundle_required_doc(bundle, &cfg.bundle_data_id)?)?;
+        let node_id = std::env::var("GW_NODE_ID").ok();
+        let selected = select_atomic_nacos_bundle(bundle, cfg, node_id.as_deref())?;
+        let atomic = parse_atomic_nacos_bundle(selected)?;
         (
             atomic.gateway,
             atomic.interface_guard,
@@ -1361,6 +1513,39 @@ fn materialize_nacos_config_bundle(
     write_atomic(&dir.join("interface-guard.yml"), documents.1.as_bytes())?;
     write_atomic(&dir.join("sentinel-rules.yml"), documents.2.as_bytes())?;
     Ok(dir.join("gateway.yml"))
+}
+
+/// 业务作用：为当前节点选择原子 Nacos 配置文档，使 canary 存在时覆盖全局基线。
+///
+/// 参数说明：`bundle` 是同一轮拉取事实；`cfg` 提供全局 dataId；`node_id` 为节点稳定身份。
+///
+/// 返回：节点 override 存在时返回 override；不存在或节点身份不可用时返回必需全局 bundle；全局文档缺失时失败。
+fn select_atomic_nacos_bundle<'a>(
+    bundle: &'a nasa::config::nacos::ConfigBundle,
+    cfg: &NacosConfigSourceCfg,
+    node_id: Option<&str>,
+) -> Result<&'a str> {
+    let base = bundle_required_doc(bundle, &cfg.bundle_data_id)?;
+    Ok(node_id
+        .and_then(|node_id| nacos_canary_data_id(cfg, node_id).ok())
+        .and_then(|data_id| bundle_optional_doc(bundle, &data_id))
+        .unwrap_or(base))
+}
+
+/// 业务作用：从 Nacos bundle 中读取可选文档，供节点专属 canary override 覆盖全局原子 bundle。
+///
+/// 参数说明：`bundle` 是同一轮完整拉取；`data_id` 是节点专属可选文档身份。
+///
+/// 返回：文档存在时返回正文，不存在时返回 `None`，由调用方安全回退全局 bundle。
+fn bundle_optional_doc<'a>(
+    bundle: &'a nasa::config::nacos::ConfigBundle,
+    data_id: &str,
+) -> Option<&'a str> {
+    bundle
+        .documents
+        .iter()
+        .find(|doc| doc.source.data_id == data_id)
+        .map(|doc| doc.content.as_str())
 }
 
 /// 从 Nacos bundle 中取必需文档。
@@ -1465,6 +1650,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests;
 
 /// 比较当前与候选快照的 edge relay 常驻拓扑。
+#[cfg(feature = "grpc-edge")]
 fn same_edge_relay_topology(
     current: Option<&crate::grpc_edge::GrpcEdgeClusterPlan>,
     candidate: Option<&crate::grpc_edge::GrpcEdgeClusterPlan>,
@@ -1476,117 +1662,183 @@ fn same_edge_relay_topology(
     }
 }
 
-/// 业务作用：判定 relay 候选能否在进程内热换代，防止身份/成员事实源变化绕过显式迁移。
-///
-/// 参数说明：`current`/`candidate` 是当前与候选集群计划。
-///
-/// 返回：两侧均为 relay 且 cluster/node/membership 权威不变时返回 `true`。
-///
-/// relay hot swap 只允许同一逻辑成员换运行参数；改变 mode/集群身份/成员事实源会
-/// 同时改变连接所有权和外部依赖，仍要求显式重启迁移。
-fn edge_relay_hot_reload_compatible(
-    current: Option<&crate::grpc_edge::GrpcEdgeClusterPlan>,
-    candidate: Option<&crate::grpc_edge::GrpcEdgeClusterPlan>,
-) -> bool {
-    use crate::config::model::GrpcEdgeClusterModeCfg;
-    matches!((current, candidate), (Some(current), Some(candidate))
-        if current.mode == GrpcEdgeClusterModeCfg::Relay
-            && candidate.mode == GrpcEdgeClusterModeCfg::Relay
-            && current.cluster_id == candidate.cluster_id
-            && current.node_id == candidate.node_id
-            && current.membership == candidate.membership)
+#[cfg(feature = "grpc-edge")]
+enum PreparedEdgeTransport {
+    None,
+    Relay(Arc<crate::edge_relay::EdgeRelay>),
+    #[cfg(feature = "redis-runtime")]
+    RedisPubsub(Arc<crate::edge_redis_bus::EdgeRedisBus>),
+    #[cfg(feature = "redis-runtime")]
+    RedisStream(Arc<crate::edge_redis_bus::EdgeRedisStreamBus>),
 }
 
 #[cfg(feature = "grpc-edge")]
-struct PreparedEdgeRelayReload {
-    old: Arc<crate::edge_relay::EdgeRelay>,
-    candidate: Arc<crate::edge_relay::EdgeRelay>,
+struct PreparedEdgeClusterReload {
+    candidate: PreparedEdgeTransport,
     proxy: Arc<crate::proxy::GatewayProxy>,
 }
 
 #[cfg(feature = "grpc-edge")]
-impl PreparedEdgeRelayReload {
-    /// 业务作用：原子发布已准备的 relay 候选，再异步排干旧代，保持“先可用后切换”的提交顺序。
+impl PreparedEdgeClusterReload {
+    /// 业务作用：发布已准备的 edge 候选代，再异步排空 relay/Redis 旧代。
     ///
-    /// 参数说明：无；`self` 已持有完成 bind/成员任务准备的候选和当前旧代。
+    /// 参数说明：无；`self` 已持有完成 bind/连接/订阅准备的候选代。
     ///
-    /// 返回：无返回值；提交后新请求只见候选，旧代最多保留一个 ACK deadline 结算在途。
-    fn commit(self) {
-        // 候选已完成所有可失败准备，必须先原子发布再排干旧代；反序会制造无 relay 窗口。
-        self.proxy.attach_edge_relay(self.candidate);
-        tokio::spawn(self.old.drain_and_shutdown());
+    /// 返回：无返回值；新请求在 slot 切换后只能选候选代，旧 owner 立即失去新工作权。
+    async fn commit(self) {
+        let old_relay = self.proxy.clear_edge_relay();
+        #[cfg(feature = "redis-runtime")]
+        let old_pubsub = self.proxy.clear_edge_redis_bus();
+        #[cfg(feature = "redis-runtime")]
+        let old_stream = self.proxy.clear_edge_redis_stream();
+        if let Some(relay) = &old_relay {
+            // 新快照已经失去旧 owner；先停 accept/dial，排干既有链路可在候选激活后继续。
+            relay.pause_transport().await;
+        }
+        #[cfg(feature = "redis-runtime")]
+        if let Some(bus) = &old_pubsub {
+            bus.shutdown().await;
+        }
+        #[cfg(feature = "redis-runtime")]
+        if let Some(bus) = &old_stream {
+            bus.shutdown().await;
+        }
+        match self.candidate {
+            PreparedEdgeTransport::None => {}
+            PreparedEdgeTransport::Relay(relay) => {
+                // slot 与快照已经失去旧 owner；候选此刻才开始 accept/dial/interest，不会在 prepare 期双写 Hub。
+                relay
+                    .activate()
+                    .expect("prepared edge relay activation cannot fail");
+                self.proxy.attach_edge_relay(relay);
+            }
+            #[cfg(feature = "redis-runtime")]
+            PreparedEdgeTransport::RedisPubsub(bus) => match bus.activate().await {
+                Ok(()) => self.proxy.attach_edge_redis_bus(bus),
+                Err(error) => {
+                    tracing::error!(error = %format!("{error:#}"), "prepared edge Redis Pub/Sub activation failed; generation remains protected")
+                }
+            },
+            #[cfg(feature = "redis-runtime")]
+            PreparedEdgeTransport::RedisStream(bus) => match bus.activate().await {
+                Ok(()) => self.proxy.attach_edge_redis_stream(bus),
+                Err(error) => {
+                    tracing::error!(error = %format!("{error:#}"), "prepared edge Redis Stream activation failed; generation remains protected")
+                }
+            },
+        }
+        if let Some(relay) = old_relay {
+            tokio::spawn(relay.drain_and_shutdown());
+        }
     }
 }
 
 #[cfg(feature = "grpc-edge")]
-/// 业务作用：在不发布半完成状态的前提下准备 relay 热换代，并在任一失败点恢复旧代权威。
+/// 业务作用：准备 relay、Redis Pub/Sub、Redis Stream 或关闭态候选，失败时恢复旧 relay listener。
 ///
-/// 参数说明：`runtime` 提供当前 Proxy；`old_plan`/`candidate_plan` 是换代两侧计划；
+/// 参数说明：`runtime` 提供当前 Proxy；`old_plan`/`candidate_plan` 是换代两侧可选计划；
 /// `old_nacos`/`candidate_nacos` 用于分别恢复或启动成员事实源。
 ///
-/// 返回：候选 listener 与成员任务全部就绪时返回可提交对象；失败时恢复旧 transport 后返回错误。
-async fn prepare_edge_relay_reload(
+/// 返回：候选传输的绑定、建连与所需订阅全部就绪时返回可提交对象。
+async fn prepare_edge_cluster_reload(
     runtime: &ReloadRuntime,
-    old_plan: &Arc<crate::grpc_edge::GrpcEdgeClusterPlan>,
-    candidate_plan: Arc<crate::grpc_edge::GrpcEdgeClusterPlan>,
+    old_plan: Option<Arc<crate::grpc_edge::GrpcEdgeClusterPlan>>,
+    candidate_plan: Option<Arc<crate::grpc_edge::GrpcEdgeClusterPlan>>,
     old_nacos: crate::config::model::NacosDiscoveryCfg,
     candidate_nacos: crate::config::model::NacosDiscoveryCfg,
-) -> anyhow::Result<PreparedEdgeRelayReload> {
-    use crate::config::model::GrpcEdgeMembershipCfg;
+) -> anyhow::Result<PreparedEdgeClusterReload> {
+    use crate::config::model::{GrpcEdgeClusterModeCfg, GrpcEdgeMembershipCfg};
 
     let proxy = runtime
         .proxy
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("relay hot reload requires a running data plane"))?
+        .ok_or_else(|| anyhow::anyhow!("edge cluster reload requires a running data plane"))?
         .clone();
-    let old = proxy
-        .current_edge_relay()
-        .ok_or_else(|| anyhow::anyhow!("active relay generation is missing"))?;
-    let same_listener = old_plan.relay_listen == candidate_plan.relay_listen;
+    let old_relay = proxy.current_edge_relay();
+    let same_listener =
+        old_plan
+            .as_ref()
+            .zip(candidate_plan.as_ref())
+            .is_some_and(|(old, candidate)| {
+                old.mode == GrpcEdgeClusterModeCfg::Relay
+                    && candidate.mode == GrpcEdgeClusterModeCfg::Relay
+                    && old.relay_listen == candidate.relay_listen
+            });
     if same_listener {
-        // 同地址候选只有在旧 accept/dial 暂停并释放 listener 后才能 bind；既有链路继续持有，
-        // 候选失败时可先恢复旧权威再返回，避免把集群留在半完成保护态。
-        old.pause_transport().await;
+        old_relay
+            .as_ref()
+            .context("active relay generation is missing")?
+            .pause_transport()
+            .await;
     }
 
-    let candidate =
-        match crate::edge_relay::EdgeRelay::start(candidate_plan.clone(), proxy.grpc_edge_hub())
-            .await
-        {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                // 候选尚未发布；先把 Hub 的控制权和旧 transport 恢复，再把失败交给 reload 回滚。
-                old.activate_interest();
-                if same_listener {
-                    old.resume_transport()
+    let prepared = async {
+        let Some(plan) = candidate_plan else {
+            return Ok(PreparedEdgeTransport::None);
+        };
+        match plan.mode {
+            GrpcEdgeClusterModeCfg::None => Ok(PreparedEdgeTransport::None),
+            GrpcEdgeClusterModeCfg::Relay => {
+                let relay =
+                    crate::edge_relay::EdgeRelay::prepare(plan.clone(), proxy.grpc_edge_hub())
                         .await
-                        .context("restore old relay transport")?;
-                    if old_plan.membership == GrpcEdgeMembershipCfg::Nacos {
-                        old.start_nacos_membership(old_nacos)
-                            .context("restore old relay Nacos membership")?;
+                        .context("prepare candidate relay generation")?;
+                if plan.membership == GrpcEdgeMembershipCfg::Nacos {
+                    if let Err(error) = relay.prepare_nacos_membership(candidate_nacos) {
+                        relay.shutdown_now().await;
+                        return Err(error).context("prepare candidate relay Nacos membership");
                     }
                 }
-                return Err(error).context("start candidate relay generation");
+                Ok(PreparedEdgeTransport::Relay(relay))
             }
-        };
-    if candidate_plan.membership == GrpcEdgeMembershipCfg::Nacos {
-        if let Err(error) = candidate.start_nacos_membership(candidate_nacos) {
-            // 成员事实源未就绪的候选不能发布；先清候选资源，再完整恢复旧代控制权与 watcher。
-            candidate.shutdown_now().await;
-            old.activate_interest();
+            GrpcEdgeClusterModeCfg::RedisPubsub => {
+                #[cfg(feature = "redis-runtime")]
+                {
+                    let bus =
+                        crate::edge_redis_bus::EdgeRedisBus::prepare(plan, proxy.grpc_edge_hub())
+                            .await
+                            .context("prepare candidate edge Redis Pub/Sub generation")?;
+                    Ok(PreparedEdgeTransport::RedisPubsub(bus))
+                }
+                #[cfg(not(feature = "redis-runtime"))]
+                anyhow::bail!("edge Redis Pub/Sub requires redis-runtime")
+            }
+            GrpcEdgeClusterModeCfg::RedisStream => {
+                #[cfg(feature = "redis-runtime")]
+                {
+                    let bus = crate::edge_redis_bus::EdgeRedisStreamBus::prepare(
+                        plan,
+                        proxy.grpc_edge_hub(),
+                    )
+                    .await
+                    .context("prepare candidate edge Redis Stream generation")?;
+                    Ok(PreparedEdgeTransport::RedisStream(bus))
+                }
+                #[cfg(not(feature = "redis-runtime"))]
+                anyhow::bail!("edge Redis Stream requires redis-runtime")
+            }
+        }
+    }
+    .await;
+
+    match prepared {
+        Ok(candidate) => Ok(PreparedEdgeClusterReload { candidate, proxy }),
+        Err(error) => {
             if same_listener {
+                let old = old_relay.expect("same listener has active relay");
                 old.resume_transport()
                     .await
                     .context("restore old relay transport")?;
-                old.start_nacos_membership(old_nacos)
-                    .context("restore old relay Nacos membership")?;
+                if old_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.membership == GrpcEdgeMembershipCfg::Nacos)
+                {
+                    old.start_nacos_membership(old_nacos)
+                        .context("restore old relay Nacos membership")?;
+                }
+                old.activate_interest();
             }
-            return Err(error).context("start candidate relay Nacos membership");
+            Err(error)
         }
     }
-    Ok(PreparedEdgeRelayReload {
-        old,
-        candidate,
-        proxy,
-    })
 }

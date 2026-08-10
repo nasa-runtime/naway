@@ -678,6 +678,17 @@ impl UpstreamDirectory {
         self.services.len()
     }
 
+    /// 业务作用：返回当前快照声明的逻辑上游名集，供管理面语义 diff 识别服务增删。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：按字典序排列的服务名；不包含动态实例、metadata 或连接凭据。
+    pub(crate) fn service_names(&self) -> Vec<String> {
+        let mut names = self.services.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     /// 返回后台发现/预热线程的扫描间隔。该值来自 yml，可随快照热更。
     pub(crate) fn prewarm_scan_interval_ms(&self) -> u64 {
         self.prewarm_scan_interval_ms

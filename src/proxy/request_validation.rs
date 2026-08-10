@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE, COOKIE};
 use http::request::Parts;
 use http::HeaderMap;
 use http_body_util::BodyExt;
@@ -73,6 +73,7 @@ enum ParameterLocation {
     Query,
     Header,
     Path,
+    Cookie,
 }
 
 enum ParameterDecode {
@@ -450,9 +451,11 @@ fn compile_openapi_operation(
     let mut query_properties = Map::new();
     let mut header_properties = Map::new();
     let mut path_properties = Map::new();
+    let mut cookie_properties = Map::new();
     let mut query_required = Vec::new();
     let mut header_required = Vec::new();
     let mut path_required = Vec::new();
+    let mut cookie_required = Vec::new();
     for parameter in &parameters {
         let (schema, required) =
             openapi_parameter_schema(document, operation, path_item, parameter)?;
@@ -473,6 +476,12 @@ fn compile_openapi_operation(
                 path_properties.insert(parameter.name.clone(), schema);
                 path_required.push(Value::String(parameter.name.clone()));
             }
+            ParameterLocation::Cookie => {
+                cookie_properties.insert(parameter.name.clone(), schema);
+                if required {
+                    cookie_required.push(Value::String(parameter.name.clone()));
+                }
+            }
         }
     }
 
@@ -484,8 +493,9 @@ fn compile_openapi_operation(
             "query": object_schema(query_properties, query_required, false),
             "headers": object_schema(header_properties, header_required, true),
             "path_params": object_schema(path_properties, path_required, false)
+            ,"cookies": object_schema(cookie_properties, cookie_required, false)
         },
-        "required": ["method", "path", "query", "headers", "path_params"],
+        "required": ["method", "path", "query", "headers", "path_params", "cookies"],
         "additionalProperties": false,
         "components": components
     });
@@ -530,9 +540,7 @@ fn append_openapi_parameters(
             Some("query") => ParameterLocation::Query,
             Some("header") => ParameterLocation::Header,
             Some("path") => ParameterLocation::Path,
-            Some("cookie") => {
-                bail!("OpenAPI cookie parameters are not supported by request_validation")
-            }
+            Some("cookie") => ParameterLocation::Cookie,
             Some(other) => bail!("unsupported OpenAPI parameter location `{other}`"),
             None => bail!("OpenAPI parameter requires `in`"),
         };
@@ -543,6 +551,14 @@ fn append_openapi_parameters(
             .to_string();
         if matches!(location, ParameterLocation::Header) {
             name.make_ascii_lowercase();
+        }
+        if matches!(location, ParameterLocation::Cookie)
+            && parameter
+                .get("style")
+                .and_then(Value::as_str)
+                .is_some_and(|style| style != "form")
+        {
+            bail!("OpenAPI cookie parameters only support form style");
         }
         let schema = parameter
             .get("schema")
@@ -586,6 +602,7 @@ fn openapi_parameter_schema(
                 (ParameterLocation::Query, "query")
                     | (ParameterLocation::Header, "header")
                     | (ParameterLocation::Path, "path")
+                    | (ParameterLocation::Cookie, "cookie")
             );
             if same_location && name.eq_ignore_ascii_case(&plan.name) {
                 let schema = parameter
@@ -758,9 +775,11 @@ fn build_openapi_head_instance(
 ) -> std::result::Result<Value, &'static str> {
     let query_values = parsed_query_pairs(parts)?;
     let path_values = extract_path_parameters(plan.path_template.as_str(), parts.uri.path())?;
+    let cookie_values = parsed_cookie_pairs(parts)?;
     let mut query = Map::new();
     let mut headers = Map::new();
     let mut path_params = Map::new();
+    let mut cookies = Map::new();
     for parameter in &plan.parameters {
         let values = match parameter.location {
             ParameterLocation::Query => query_values
@@ -786,6 +805,10 @@ fn build_openapi_head_instance(
                 .get(parameter.name.as_str())
                 .map(std::slice::from_ref)
                 .unwrap_or_default(),
+            ParameterLocation::Cookie => cookie_values
+                .get(parameter.name.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
         };
         if let Some(value) = decode_parameter(values, &parameter.decode)? {
             match parameter.location {
@@ -794,6 +817,9 @@ fn build_openapi_head_instance(
                 }
                 ParameterLocation::Path => {
                     path_params.insert(parameter.name.clone(), value);
+                }
+                ParameterLocation::Cookie => {
+                    cookies.insert(parameter.name.clone(), value);
                 }
                 ParameterLocation::Header => unreachable!("handled above"),
             }
@@ -804,8 +830,77 @@ fn build_openapi_head_instance(
         "path": parts.uri.path(),
         "query": query,
         "headers": headers,
-        "path_params": path_params
+        "path_params": path_params,
+        "cookies": cookies
     }))
+}
+
+/// 业务作用：按 OpenAPI cookie `form` 序列化规则读取全部 Cookie header，保留同名值顺序并严格解码。
+///
+/// 参数说明：`parts` 是下游请求 head。
+///
+/// 返回：合法 cookie 组成 name→values；缺少等号、非法 percent 编码、UTF-8 或控制字符返回 400 类错误。
+fn parsed_cookie_pairs(
+    parts: &Parts,
+) -> std::result::Result<HashMap<String, Vec<String>>, &'static str> {
+    let mut values: HashMap<String, Vec<String>> = HashMap::new();
+    for header in parts.headers.get_all(COOKIE) {
+        let header = header
+            .to_str()
+            .map_err(|_| "request cookie header is not valid UTF-8")?;
+        for item in header.split(';') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let (name, value) = item
+                .split_once('=')
+                .ok_or("request cookie item requires name=value")?;
+            if name.is_empty() || !valid_percent_encoding(name) || !valid_percent_encoding(value) {
+                return Err("request cookie has invalid percent encoding");
+            }
+            let name = percent_encoding::percent_decode_str(name)
+                .decode_utf8()
+                .map_err(|_| "request cookie name is not valid UTF-8")?
+                .into_owned();
+            let value = percent_encoding::percent_decode_str(value)
+                .decode_utf8()
+                .map_err(|_| "request cookie value is not valid UTF-8")?
+                .into_owned();
+            if name.is_empty()
+                || name.bytes().any(|byte| byte.is_ascii_control())
+                || value.bytes().any(|byte| byte.is_ascii_control())
+            {
+                return Err("request cookie contains a control character");
+            }
+            values.entry(name).or_default().push(value);
+        }
+    }
+    Ok(values)
+}
+
+/// 业务作用：拒绝不完整 `%XX`，避免宽松解码让校验值与上游解释不同。
+///
+/// 参数说明：`value` 是尚未解码的 cookie name 或 value。
+///
+/// 返回：每个 `%` 后都恰有两个十六进制字符时返回 true。
+fn valid_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
 }
 
 fn raw_query_values(parts: &Parts) -> std::result::Result<Map<String, Value>, &'static str> {

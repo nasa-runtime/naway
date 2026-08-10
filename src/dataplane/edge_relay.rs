@@ -39,13 +39,13 @@ pub enum RelayAction {
     Publish,
     /// 定向单播：scope = 目标 user（broadcast-probe 使用）。
     Push,
-    /// E1 控制面：清空并开始指定 revision 的兴趣快照。
+    /// 清空并开始指定 revision 的兴趣快照。
     InterestReset,
-    /// E1 控制面：指定 tenant/group 当前有本地订阅。
+    /// 指定 tenant/group 当前有本地订阅。
     InterestUp,
-    /// E1 控制面：指定 tenant/group 当前无本地订阅。
+    /// 指定 tenant/group 当前无本地订阅。
     InterestDown,
-    /// E1 控制面：快照完成或心跳，允许接收方使用该 hint。
+    /// 快照完成或心跳，允许接收方使用该 hint。
     InterestReady,
     /// group_owner 入口把 payload 定向交给 owner；owner 串行化后再发最终 Publish。
     PublishToOwner,
@@ -98,7 +98,7 @@ pub struct RelayData {
     pub tenant: Box<str>,
     /// group id(publish)或目标 user(push)。
     pub scope: Box<str>,
-    /// E1 interest 控制 revision；业务 Publish/Push 恒为 0。
+    /// interest 控制 revision；业务 Publish/Push 恒为 0。
     pub revision: u64,
     /// 原样业务 gRPC 帧 `[5B prefix + body]`;同 chunk 到达时是零拷贝 slice。
     pub payload: Bytes,
@@ -913,6 +913,8 @@ impl RelayQueue {
 struct RemoteInterestState {
     revision: u64,
     ready: bool,
+    /// 只有收到同 revision 的 reset 后才允许 ready 发布快照；断档不能被心跳误恢复。
+    snapshot_open: bool,
     last_refresh: Option<TokioInstant>,
     /// tenant/group 的 64 位稳定摘要；碰撞只会多发 payload，不会漏发。
     groups: HashSet<u64>,
@@ -982,6 +984,10 @@ pub struct EdgeRelay {
     dial_tasks: Mutex<HashMap<SocketAddr, tokio::task::JoinHandle<()>>>,
     accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     membership_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pending_listener: Mutex<Option<TcpListener>>,
+    pending_interest_rx: Mutex<Option<mpsc::Receiver<InterestCommand>>>,
+    pending_nacos: Mutex<Option<crate::config::model::NacosDiscoveryCfg>>,
+    active: AtomicBool,
     peer_count: AtomicUsize,
     links: Mutex<HashMap<Box<str>, Arc<PeerLink>>>,
     watermarks: Mutex<HashMap<Box<str>, Watermark>>,
@@ -1011,6 +1017,20 @@ impl EdgeRelay {
         plan: Arc<GrpcEdgeClusterPlan>,
         hub: Arc<EdgeHub>,
     ) -> anyhow::Result<Arc<Self>> {
+        let relay = Self::prepare(plan, hub).await?;
+        relay.activate()?;
+        Ok(relay)
+    }
+
+    /// 业务作用：只完成 relay listener bind 与内存容量准备，候选发布前不 accept、拨号或接管 Hub。
+    ///
+    /// 参数说明：`plan` 是已校验集群计划，`hub` 是进程唯一订阅索引。
+    ///
+    /// 返回：bind 与静态成员门禁成功时返回休眠候选；任何失败无后台副作用。
+    pub async fn prepare(
+        plan: Arc<GrpcEdgeClusterPlan>,
+        hub: Arc<EdgeHub>,
+    ) -> anyhow::Result<Arc<Self>> {
         let listener = TcpListener::bind(plan.relay_listen)
             .await
             .map_err(|error| {
@@ -1018,6 +1038,19 @@ impl EdgeRelay {
             })?;
         let fingerprint = config_fingerprint(&plan);
         let (interest_tx, interest_rx) = mpsc::channel(INTEREST_EVENT_CAPACITY);
+        let mut unique_peers = HashSet::new();
+        for peer in &plan.static_peers {
+            anyhow::ensure!(
+                *peer != plan.relay_listen,
+                "edge relay static peers must not contain self address {}",
+                plan.relay_listen
+            );
+            unique_peers.insert(*peer);
+        }
+        anyhow::ensure!(
+            unique_peers.len().saturating_add(1) <= plan.full_mesh_max_nodes,
+            "edge relay peer count exceeds full_mesh_max_nodes"
+        );
         let relay = Arc::new(Self {
             boot_id: random_boot_id(),
             fingerprint,
@@ -1028,6 +1061,10 @@ impl EdgeRelay {
             dial_tasks: Mutex::new(HashMap::new()),
             accept_task: Mutex::new(None),
             membership_task: Mutex::new(None),
+            pending_listener: Mutex::new(Some(listener)),
+            pending_interest_rx: Mutex::new(Some(interest_rx)),
+            pending_nacos: Mutex::new(None),
+            active: AtomicBool::new(false),
             peer_count: AtomicUsize::new(0),
             links: Mutex::new(HashMap::new()),
             watermarks: Mutex::new(HashMap::new()),
@@ -1045,11 +1082,38 @@ impl EdgeRelay {
             plan,
             hub,
         });
-        relay.hub.attach_interest_relay(Arc::downgrade(&relay));
-        tokio::spawn(interest_worker(relay.clone(), interest_rx));
-        *relay.accept_task.lock() = Some(tokio::spawn(accept_loop(relay.clone(), listener)));
-        relay.reconcile_peers(relay.plan.static_peers.clone())?;
         Ok(relay)
+    }
+
+    /// 业务作用：在快照提交点授予 relay 业务权威，随后才启动 accept、interest 和 peer dial。
+    ///
+    /// 参数说明：无；对象必须来自尚未激活的 `prepare`。
+    ///
+    /// 返回：候选完整转为 active 时成功；重复激活或准备资源缺失时拒绝。
+    pub fn activate(self: &Arc<Self>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.active.load(Ordering::Acquire),
+            "edge relay generation is already active"
+        );
+        let listener = self
+            .pending_listener
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("prepared edge relay listener is missing"))?;
+        let interest_rx = self
+            .pending_interest_rx
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("prepared edge relay interest worker is missing"))?;
+        self.active.store(true, Ordering::Release);
+        self.hub.attach_interest_relay(Arc::downgrade(self));
+        tokio::spawn(interest_worker(self.clone(), interest_rx));
+        *self.accept_task.lock() = Some(tokio::spawn(accept_loop(self.clone(), listener)));
+        self.reconcile_peers(self.plan.static_peers.clone())?;
+        if let Some(cfg) = self.pending_nacos.lock().take() {
+            self.start_nacos_membership(cfg)?;
+        }
+        Ok(())
     }
 
     /// 业务作用：先停止 listener、拨号与成员发现，阻止旧代获得新流量，同时保留既有链路排干。
@@ -1058,6 +1122,9 @@ impl EdgeRelay {
     ///
     /// 返回：无返回值；所有 transport task 已取消并完成结算后才返回。
     pub async fn pause_transport(self: &Arc<Self>) {
+        self.active.store(false, Ordering::Release);
+        self.pending_listener.lock().take();
+        self.pending_interest_rx.lock().take();
         let accept_task = { self.accept_task.lock().take() };
         if let Some(task) = accept_task {
             task.abort();
@@ -1094,6 +1161,7 @@ impl EdgeRelay {
                 anyhow::anyhow!("rebind relay listener {}: {error}", self.plan.relay_listen)
             })?;
         *self.accept_task.lock() = Some(tokio::spawn(accept_loop(self.clone(), listener)));
+        self.active.store(true, Ordering::Release);
         self.reconcile_peers(self.plan.static_peers.clone())?;
         self.hub.attach_interest_relay(Arc::downgrade(self));
         Ok(())
@@ -1315,6 +1383,28 @@ impl EdgeRelay {
         if let Some(previous) = self.membership_task.lock().replace(task) {
             previous.abort();
         }
+        Ok(())
+    }
+
+    /// 业务作用：在候选阶段复验 Nacos membership 身份并延迟启动 watch，避免未发布代提前拨号。
+    ///
+    /// 参数说明：`cfg` 是候选快照的固定发现权威。
+    ///
+    /// 返回：服务身份完整时保存激活计划；缺少自注册事实时拒绝候选。
+    pub fn prepare_nacos_membership(
+        &self,
+        cfg: crate::config::model::NacosDiscoveryCfg,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.plan.membership == crate::config::model::GrpcEdgeMembershipCfg::Nacos,
+            "edge relay Nacos membership can only prepare when membership=nacos"
+        );
+        crate::discovery::self_register_service_name(&cfg).ok_or_else(|| {
+            anyhow::anyhow!(
+                "grpc_edge_cluster.membership=nacos requires discovery.nacos.self_register.enabled=true and a service_name/app_name"
+            )
+        })?;
+        *self.pending_nacos.lock() = Some(cfg);
         Ok(())
     }
 
@@ -1621,16 +1711,16 @@ impl EdgeRelay {
                     None => links
                         .values()
                         .filter(|link| {
-                            if action != RelayAction::Publish
-                                || relay.plan.interest_route
-                                    != crate::config::model::GrpcEdgeInterestRouteCfg::Auto
-                            {
+                            if action != RelayAction::Publish {
                                 return true;
                             }
                             let state = link.remote_interest.lock();
-                            if !interest_hint_ready(&state, TokioInstant::now())
-                                || state.groups.contains(&interest_key)
-                            {
+                            if should_route_publish_to_peer(
+                                relay.plan.interest_route,
+                                &state,
+                                interest_key,
+                                TokioInstant::now(),
+                            ) {
                                 true
                             } else {
                                 filtered += 1;
@@ -2241,6 +2331,23 @@ fn interest_hint_ready(state: &RemoteInterestState, now: TokioInstant) -> bool {
             .is_some_and(|seen| now.saturating_duration_since(seen) <= INTEREST_HINT_TTL)
 }
 
+/// 业务作用：按配置与远端兴趣证据裁决一条 group publish 是否仍需发送给指定 peer。
+///
+/// 参数说明：`route` 是集群兴趣策略；`state` 是远端快照；`key` 是 tenant/group 摘要；
+/// `now` 是同一 Tokio 单调时钟采样。
+///
+/// 返回：仅在 `auto` 且远端快照完整、新鲜并确认不含该 group 时返回 `false`；任何证据不足均广播。
+fn should_route_publish_to_peer(
+    route: crate::config::model::GrpcEdgeInterestRouteCfg,
+    state: &RemoteInterestState,
+    key: u64,
+    now: TokioInstant,
+) -> bool {
+    route != crate::config::model::GrpcEdgeInterestRouteCfg::Auto
+        || !interest_hint_ready(state, now)
+        || state.groups.contains(&key)
+}
+
 /// 业务作用：按 revision 应用 peer 的 reset/up/down/ready 控制流，并在断档时立即撤销 hint 权威。
 ///
 /// 参数说明：`link` 持有远端快照，`data` 是已通过 wire 与字段边界校验的控制 record。
@@ -2256,6 +2363,7 @@ fn apply_interest_control(link: &PeerLink, data: &RelayData) -> bool {
             }
             state.revision = data.revision;
             state.ready = false;
+            state.snapshot_open = true;
             state.groups.clear();
             state.last_refresh = Some(now);
             true
@@ -2264,14 +2372,21 @@ fn apply_interest_control(link: &PeerLink, data: &RelayData) -> bool {
             if data.revision < state.revision {
                 return true;
             }
-            let snapshot_item = !state.ready && data.revision == state.revision;
+            let snapshot_item =
+                state.snapshot_open && !state.ready && data.revision == state.revision;
             let live_item = state.ready && data.revision == state.revision.saturating_add(1);
             if !snapshot_item && !live_item {
-                // revision 断档：立即停止使用 hint，直到下次完整快照。
+                // revision 断档后必须等待显式 reset；若允许同 revision 心跳直接 ready，
+                // 空集合会被误当成完整快照并过滤所有业务发布。
                 state.revision = data.revision;
                 state.ready = false;
+                state.snapshot_open = false;
                 state.groups.clear();
                 state.last_refresh = Some(now);
+                drop(state);
+                // 有序 TCP 上出现 revision 断档说明控制流已不可信；拆链让双方丢弃 hint，
+                // 重连必须从 reset 全量快照恢复，不能让 10 万 group 周期扫描拖垮正常链路。
+                link.close();
                 return true;
             }
             if live_item {
@@ -2290,14 +2405,22 @@ fn apply_interest_control(link: &PeerLink, data: &RelayData) -> bool {
             if data.revision < state.revision {
                 return true;
             }
-            if data.revision == state.revision {
+            if data.revision == state.revision && (state.ready || state.snapshot_open) {
                 state.ready = true;
+                state.snapshot_open = false;
+                state.last_refresh = Some(now);
+            } else if state.revision == 0 && !state.ready && !state.snapshot_open {
+                // 新链路登记与 Sync 命令串行队列之间存在极短窗口；先到的 heartbeat
+                // 只能保持 fail-open，不能把尚未接收 reset 的健康链路误判为断档。
                 state.last_refresh = Some(now);
             } else {
                 state.revision = data.revision;
                 state.ready = false;
+                state.snapshot_open = false;
                 state.groups.clear();
                 state.last_refresh = Some(now);
+                drop(state);
+                link.close();
             }
             true
         }

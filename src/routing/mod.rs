@@ -15,7 +15,7 @@ use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use http::request::Parts;
 use http::Method;
-use hyper::StatusCode;
+use hyper::{Response, StatusCode};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
@@ -37,7 +37,7 @@ use crate::net::Cidr;
 use crate::opa::OpaPolicy;
 use crate::proxy::request_validation::RequestValidationPlan;
 use crate::static_serve::StaticServe;
-use crate::variable::{ValueTemplate, VariablePlan};
+use crate::variable::{ValueTemplate, VariablePhase, VariablePlan};
 use crate::wasm::WasmPluginChain;
 use predicate::{parse_predicate, parse_strip_prefix, Predicate};
 
@@ -69,6 +69,12 @@ const MAX_JWT_TOKEN_BYTES: usize = 64 * 1024;
 const DEFAULT_JWKS_TIMEOUT_MS: u64 = 1_000;
 /// JWKS/OIDC metadata 最大总超时，避免身份依赖长期占住请求任务。
 const MAX_JWKS_TIMEOUT_MS: u64 = 60_000;
+/// OIDC token/userinfo/introspection 单响应最大实体。
+const MAX_OIDC_RESPONSE_BYTES: usize = 1024 * 1024;
+/// OIDC 登录前 state/PKCE 暂存上限。
+const DEFAULT_OIDC_MAX_PENDING: usize = 1024;
+/// OIDC 活跃浏览器 session 默认上限。
+const DEFAULT_OIDC_MAX_SESSIONS: usize = 10_000;
 /// ext_authz 默认外呼超时,单位毫秒。它是 yml filter 的可覆盖默认值,不是不可调硬编码。
 const DEFAULT_EXT_AUTHZ_TIMEOUT_MS: u64 = 500;
 /// ext_authz 允许配置的最大外呼超时,避免鉴权服务拖住主数据面。
@@ -196,6 +202,8 @@ pub struct Route {
     pub hmac_auth: Vec<HmacAuthPolicy>,
     /// V4 JWT HS256 鉴权策略集合。多条策略之间视为同一种认证方式的 OR。
     pub jwt_auth: Vec<JwtAuthPolicy>,
+    /// OAuth2/OIDC Authorization Code RP；存在时浏览器会话是本地认证的唯一身份来源。
+    oidc_rp: Option<Arc<OidcRpPolicy>>,
     /// 可选 SAML/LDAP 企业身份策略；同协议策略之间按 OR，作为独立认证方式参与 satisfy。
     pub(crate) enterprise_auth: Vec<EnterpriseAuthPolicy>,
     /// V4 ext_authz / auth_request 外部鉴权策略集合。多条策略之间视为同一种认证方式的 OR。
@@ -519,6 +527,7 @@ impl Router {
             let mut api_keys = Vec::new();
             let mut hmac_auth = Vec::new();
             let mut jwt_auth = Vec::new();
+            let mut oidc_rp = None;
             let mut enterprise_auth = Vec::new();
             let mut ext_authz = Vec::new();
             let mut satisfy = SatisfyMode::All;
@@ -592,6 +601,12 @@ impl Router {
                     ParsedFilter::ApiKey(policy) => api_keys.push(policy),
                     ParsedFilter::HmacAuth(policy) => hmac_auth.push(policy),
                     ParsedFilter::JwtAuth(policy) => jwt_auth.push(policy),
+                    ParsedFilter::OidcRp(policy) => {
+                        if oidc_rp.is_some() {
+                            bail!("route `{}` declares oidc_rp more than once", c.id);
+                        }
+                        oidc_rp = Some(Arc::new(*policy));
+                    }
                     ParsedFilter::EnterpriseAuth(policy) => enterprise_auth.push(policy),
                     ParsedFilter::ExtAuthz(policy) => ext_authz.push(policy),
                     ParsedFilter::Satisfy(mode) => satisfy = mode,
@@ -626,6 +641,12 @@ impl Router {
                         .iter()
                         .flat_map(EnterpriseAuthPolicy::owned_headers),
                 )
+                .chain(
+                    oidc_rp
+                        .iter()
+                        .flat_map(|policy| policy.identity_headers.iter())
+                        .map(|mapping| &mapping.header),
+                )
             {
                 if !owned_identity_headers.insert(header.clone()) {
                     bail!(
@@ -633,6 +654,18 @@ impl Router {
                         c.id
                     );
                 }
+            }
+            if oidc_rp.is_some()
+                && (basic_auth.is_some()
+                    || !api_keys.is_empty()
+                    || !hmac_auth.is_empty()
+                    || !jwt_auth.is_empty()
+                    || !enterprise_auth.is_empty())
+            {
+                bail!(
+                    "route `{}` oidc_rp cannot be combined with header-based local authentication",
+                    c.id
+                );
             }
             let hedge = c
                 .hedge
@@ -1065,6 +1098,7 @@ impl Router {
                     api_keys,
                     hmac_auth,
                     jwt_auth,
+                    oidc_rp,
                     enterprise_auth,
                     ext_authz,
                     satisfy,
@@ -1196,7 +1230,6 @@ impl Router {
     }
 
     /// 当前不可变 route slice。只供低频管理/失效对账遍历，不暴露可变入口。
-    #[cfg(feature = "redis-runtime")]
     pub(crate) fn routes(&self) -> &[Arc<Route>] {
         &self.routes
     }
@@ -1277,6 +1310,68 @@ impl Router {
 }
 
 impl Route {
+    /// 业务作用：为管理面语义 diff 产生稳定、低敏的 route 结构摘要。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：包含断言签名、upstream、rewrite 和已启用 filter 名称；不包含 API key、token、证书或其它 SecretSource 解析值。
+    pub(crate) fn admin_semantic_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "upstream": self.upstream,
+            "internal": self.internal,
+            "predicates": self.predicates.iter().map(Predicate::signature).collect::<Vec<_>>(),
+            "strip_prefix": self.strip_prefix,
+            "rewrite_prefix": self.rewrite_prefix.as_ref().map(|rewrite| serde_json::json!({
+                "from": rewrite.from,
+                "to": rewrite.to,
+            })),
+            "rewrite_full_path": self.gateway_rewrite_full_path,
+            "preserve_host": self.preserve_host,
+            "filters": self.admin_filter_chain(),
+        })
+    }
+
+    /// 业务作用：按数据面执行类别输出不含密钥的 filter 链，供路由推演和审查展示。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回已实际编译进 route 的功能名称；同类多条策略只显示一次，并按固定顺序产生结果。
+    pub(crate) fn admin_filter_chain(&self) -> Vec<&'static str> {
+        let mut filters = Vec::new();
+        let mut push = |enabled: bool, name| {
+            if enabled {
+                filters.push(name);
+            }
+        };
+        push(!self.access_rules.is_empty(), "access");
+        push(self.referer.is_some(), "referer");
+        push(self.limit_except.is_some(), "limit_except");
+        push(self.basic_auth.is_some(), "basic_auth");
+        push(!self.api_keys.is_empty(), "api_key");
+        push(!self.hmac_auth.is_empty(), "hmac_auth");
+        push(!self.jwt_auth.is_empty(), "jwt_auth");
+        push(self.oidc_rp.is_some(), "oidc_rp");
+        push(!self.enterprise_auth.is_empty(), "enterprise_auth");
+        push(!self.ext_authz.is_empty(), "ext_authz");
+        push(self.opa_authorization.is_some(), "opa");
+        push(self.casbin_authorization.is_some(), "casbin");
+        push(!self.limit_req.is_empty(), "limit_req");
+        push(!self.limit_conn.is_empty(), "limit_conn");
+        push(!self.circuit_breakers.is_empty(), "circuit_breaker");
+        push(self.request_validation.is_some(), "request_validation");
+        push(self.graphql_guard.is_some(), "graphql_guard");
+        push(self.usage_plan.is_some(), "usage_plan");
+        push(self.wasm_plugins.is_some(), "wasm");
+        push(self.external_plugins.is_some(), "external_plugin");
+        push(self.http_cache.is_some(), "http_cache");
+        push(self.compression.is_some(), "compression");
+        push(!self.mirrors.is_empty(), "mirror");
+        push(self.grpc_edge.is_some(), "grpc_edge");
+        push(self.grpc_transcoding.is_some(), "grpc_transcoding");
+        filters
+    }
+
     /// 按本 route 的 allow/deny 规则判断客户端 IP 是否允许访问。
     ///
     /// # 参数
@@ -1379,6 +1474,7 @@ impl Route {
         &self,
         parts: &Parts,
         saml_response: Option<&str>,
+        body: Option<&[u8]>,
     ) -> ResolvedAuthState {
         let has_basic = self.basic_auth.is_some();
         let has_api_key = !self.api_keys.is_empty();
@@ -1399,7 +1495,10 @@ impl Route {
             .as_ref()
             .is_some_and(|policy| policy.matches(parts));
         let api_key_ok = self.api_keys.iter().any(|policy| policy.matches(parts));
-        let hmac_ok = self.hmac_auth.iter().any(|policy| policy.matches(parts));
+        let hmac_ok = self
+            .hmac_auth
+            .iter()
+            .any(|policy| policy.matches_body(parts, body));
         let mut verified_jwt = None;
         for policy in &self.jwt_auth {
             let Some(token) = policy.token(parts) else {
@@ -1515,6 +1614,32 @@ impl Route {
             .max()
     }
 
+    /// 业务作用：汇总 HMAC 与 ext_authz 显式 body 慢路径的共同硬上限，确保原请求最多聚合一次。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：至少一项需要实体时返回所有声明上限中的最小值；未启用 body 鉴权返回 None。
+    pub(crate) fn auth_body_limit(&self) -> Option<u64> {
+        self.hmac_auth
+            .iter()
+            .filter_map(|policy| policy.body_max_bytes)
+            .chain(
+                self.ext_authz
+                    .iter()
+                    .filter_map(|policy| policy.body_max_bytes),
+            )
+            .min()
+    }
+
+    /// 业务作用：在代理本地认证阶段执行本 route 的浏览器 OIDC RP，并保持未配置 route 的零成本旁路。
+    ///
+    /// 参数说明：`parts` 是客户端原始请求 head，尚未经过 ext_authz 修改。
+    ///
+    /// 返回：未配置时返回 None；已配置时返回可信 session 身份，或必须立即短路的登录/回调/失败响应。
+    pub(crate) async fn oidc_rp_authenticate(&self, parts: &Parts) -> Option<OidcRpDecision> {
+        Some(self.oidc_rp.as_ref()?.authenticate(parts).await)
+    }
+
     /// 业务作用：先删除所有由网关拥有的身份头，再提交认证阶段冻结的可信身份值。
     ///
     /// 参数说明：`parts` 是可能已被 ext_authz 修改的请求 head，`identity_headers` 只来自外呼前冻结的本地认证结果。
@@ -1526,6 +1651,11 @@ impl Route {
         identity_headers: &[(HeaderName, HeaderValue)],
     ) {
         for policy in &self.jwt_auth {
+            for mapping in policy.identity_headers.iter() {
+                parts.headers.remove(&mapping.header);
+            }
+        }
+        if let Some(policy) = &self.oidc_rp {
             for mapping in policy.identity_headers.iter() {
                 parts.headers.remove(&mapping.header);
             }
@@ -1580,7 +1710,10 @@ impl Route {
     /// 拼入进程 HashMap/Redis key，也不进入日志或 metrics label。
     pub fn authenticated_api_key_fingerprint(&self, parts: &Parts) -> Option<String> {
         let policy = self.api_keys.iter().find(|policy| policy.matches(parts))?;
-        let digest = Sha256::digest(policy.expected.as_slice());
+        let digest: [u8; 32] = match &policy.expected {
+            ApiKeyExpected::Plain(value) => Sha256::digest(value).into(),
+            ApiKeyExpected::Sha256(digest) => *digest,
+        };
         let mut encoded = String::with_capacity(32);
         use std::fmt::Write as _;
         for byte in &digest[..16] {
@@ -1610,10 +1743,11 @@ impl Route {
     pub async fn hmac_replay_detected(
         &self,
         parts: &Parts,
+        body: Option<&[u8]>,
         guard: &dyn crate::runtime_state::ReplayGuard,
     ) -> bool {
         for policy in &self.hmac_auth {
-            if policy.replay_enabled() && policy.matches(parts) {
+            if policy.replay_enabled() && policy.matches_body(parts, body) {
                 if let Some(nonce) = policy.nonce_value(parts) {
                     // 按 route id + nonce 生成去重 key,避免不同 route 的 nonce 相互撞车。
                     let key = format!("{}:{}", self.id, nonce);
@@ -1656,6 +1790,7 @@ impl Route {
             downstream_proto,
             request_id,
             route_id: self.id.as_str(),
+            response_status: None,
         };
         self.conditional_returns
             .iter()
@@ -2589,15 +2724,22 @@ pub struct BasicAuthPolicy {
 pub struct ApiKeyPolicy {
     /// API-Key 来源。
     source: ApiKeySource,
-    /// 构建期保存的期望 key 字节串。
-    expected: Vec<u8>,
+    /// 构建期保存的明文 SecretSource 结果或管理面生成的不可逆摘要。
+    expected: ApiKeyExpected,
     /// 可选稳定 consumer 名；绝不使用原始 API key 作为管理面标识。
     consumer: Option<Arc<str>>,
 }
 
-/// V4 HMAC-SHA256 已编译策略。
-///
-/// 基础版只签 method/path/query/timestamp/nonce/header,不读取请求体,避免破坏流式转发的低拷贝边界。
+/// API-Key 的构建期校验材料；摘要模式使 Console 创建 key 后无需把原值写回配置事实源。
+#[derive(Clone)]
+enum ApiKeyExpected {
+    /// 兼容既有声明式 SecretSource，运行态以常量时间直接比较。
+    Plain(Vec<u8>),
+    /// 管理面生成 key 的 SHA-256，原值只在创建响应中出现一次。
+    Sha256([u8; 32]),
+}
+
+/// HMAC-SHA256 已编译策略。
 #[derive(Clone)]
 pub struct HmacAuthPolicy {
     /// 共享密钥;V4 基础版仍来自 route 配置,SecretStore 热更后续补齐。
@@ -2612,9 +2754,11 @@ pub struct HmacAuthPolicy {
     signed_headers: Vec<HeaderName>,
     /// 允许的客户端时间偏差,单位毫秒。
     max_skew_ms: u64,
-    /// 是否开启防重放(§20):开启后签名有效的请求还须 nonce 唯一(经 ReplayGuard `SET NX PX` 去重)。
+    /// 是否开启防重放：开启后签名有效的请求还须 nonce 唯一（经 ReplayGuard `SET NX PX` 去重）。
     /// 需配 `nonce_header`;去重窗口 = `max_skew_ms`(超窗时间戳本就被拒,nonce 可遗忘)。
     replay_protection: bool,
+    /// 显式启用 body SHA-256 时的实体硬上限；None 保持原有纯 head canonical contract。
+    body_max_bytes: Option<u64>,
 }
 
 /// 已编译 JWT/JWKS/OIDC 策略。
@@ -2666,6 +2810,68 @@ struct JwtIdentityHeader {
     header: HeaderName,
 }
 
+/// OAuth2/OIDC Authorization Code RP 的已编译策略与有界会话状态。
+struct OidcRpPolicy {
+    authorization_endpoint: Arc<str>,
+    token_endpoint: Arc<str>,
+    userinfo_endpoint: Option<Arc<str>>,
+    introspection_endpoint: Option<Arc<str>>,
+    issuer: Arc<str>,
+    client_id: Arc<str>,
+    client_secret: Arc<str>,
+    client_auth: OidcClientAuth,
+    scope: Arc<str>,
+    redirect_uri: Arc<str>,
+    callback_path: Arc<str>,
+    logout_path: Arc<str>,
+    post_logout_uri: Arc<str>,
+    cookie_name: Arc<str>,
+    session_ttl: Duration,
+    pending_ttl: Duration,
+    max_pending: usize,
+    max_sessions: usize,
+    timeout: Duration,
+    client: reqwest::Client,
+    id_token_verifier: JwtAuthPolicy,
+    identity_headers: Arc<Vec<JwtIdentityHeader>>,
+    pending: parking_lot::Mutex<HashMap<String, OidcPendingLogin>>,
+    sessions: parking_lot::Mutex<HashMap<String, OidcSession>>,
+}
+
+#[derive(Clone, Copy)]
+enum OidcClientAuth {
+    SecretBasic,
+    SecretPost,
+}
+
+struct OidcPendingLogin {
+    nonce: String,
+    verifier: String,
+    browser_binding: String,
+    return_uri: String,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct OidcSession {
+    consumer: Arc<str>,
+    claims: serde_json::Value,
+    identity_headers: Vec<(HeaderName, HeaderValue)>,
+    expires_at: Instant,
+}
+
+/// OIDC RP 在认证相位返回的两类结果。
+pub(crate) enum OidcRpDecision {
+    /// 会话已验证，可冻结为本地可信身份。
+    Authenticated {
+        consumer: Arc<str>,
+        claims: serde_json::Value,
+        identity_headers: Vec<(HeaderName, HeaderValue)>,
+    },
+    /// 登录跳转、回调、退出或失败响应已经完成，主代理链必须立即短路。
+    Response(Response<crate::BoxBody>),
+}
+
 struct RemoteJwks {
     endpoint: RemoteJwksEndpoint,
     issuer: Arc<str>,
@@ -2715,6 +2921,16 @@ pub struct ExtAuthzPolicy {
     pub timeout_ms: u64,
     /// 鉴权服务不可达/超时时是否放行。默认 fail-closed。
     pub fail_open: bool,
+    /// 显式转发给鉴权服务的原始请求实体硬上限；None 时保持无 body 子请求。
+    pub body_max_bytes: Option<u64>,
+    /// 明确 allow/deny 决策的本地缓存 TTL；None 时不缓存。
+    pub cache_ttl: Option<Duration>,
+    /// 单策略最多保留的决策数；缓存关闭时为零。
+    pub cache_max_entries: usize,
+    /// 连续依赖故障达到该值后打开独立熔断；零表示关闭。
+    pub circuit_failure_threshold: u32,
+    /// 熔断保持时间；到期只允许一个 half-open 探测。
+    pub circuit_open: Duration,
     /// 允许从原始请求复制给鉴权服务的 header 名列表。
     pub request_headers: Vec<HeaderName>,
     /// 鉴权通过后允许从鉴权响应复制回主上游请求的 header 名列表。
@@ -2787,10 +3003,12 @@ impl BasicAuthPolicy {
 }
 
 impl ApiKeyPolicy {
-    /// 判断请求是否携带正确 API-Key。
+    /// 业务作用：验证请求携带的 API-Key，并统一兼容 SecretSource 明文和 Console 不可逆摘要两种事实。
     ///
-    /// # 参数
-    /// - `parts`: 下游请求 head。
+    /// 参数说明：`parts` 是下游请求 head。
+    ///
+    /// 返回：指定 header/query 的单值与期望材料常量时间一致时返回 true；缺失、编码非法或摘要不一致
+    /// 均返回 false。
     fn matches(&self, parts: &Parts) -> bool {
         let value = match &self.source {
             ApiKeySource::Header(name) => parts
@@ -2801,18 +3019,34 @@ impl ApiKeyPolicy {
                 query_param_raw(parts.uri.query().unwrap_or_default(), name)
             }
         };
-        value
-            .map(|value| constant_time_eq(value.as_bytes(), self.expected.as_slice()))
-            .unwrap_or(false)
+        value.is_some_and(|value| match &self.expected {
+            ApiKeyExpected::Plain(expected) => {
+                constant_time_eq(value.as_bytes(), expected.as_slice())
+            }
+            ApiKeyExpected::Sha256(expected) => {
+                let actual: [u8; 32] = Sha256::digest(value.as_bytes()).into();
+                constant_time_eq(actual.as_slice(), expected.as_slice())
+            }
+        })
     }
 }
 
 impl HmacAuthPolicy {
-    /// 判断请求是否携带正确 HMAC-SHA256 签名。
+    /// 业务作用：验证不读取实体的兼容 HMAC-SHA256 请求；body 策略必须走有界认证慢路径。
     ///
-    /// # 参数
-    /// - `parts`: 下游请求 head。
+    /// 参数说明：`parts` 是下游请求 head。
+    ///
+    /// 返回：未启用 body 签名且 canonical contract 匹配时返回 true；其它情况返回 false。
     fn matches(&self, parts: &Parts) -> bool {
+        self.matches_body(parts, None)
+    }
+
+    /// 业务作用：按策略声明决定是否把已聚合原始实体的 SHA-256 纳入 HMAC canonical contract。
+    ///
+    /// 参数说明：`parts` 是请求 head；`body` 仅由有界认证慢路径提供，未启用 body 签名时忽略。
+    ///
+    /// 返回：时间、nonce、header、可选 body 摘要和签名全部匹配时返回 true。
+    fn matches_body(&self, parts: &Parts, body: Option<&[u8]>) -> bool {
         let Some(signature) = header_str(parts, &self.signature_header) else {
             return false;
         };
@@ -2829,23 +3063,23 @@ impl HmacAuthPolicy {
             },
             None => None,
         };
-        let Some(canonical) = self.canonical_request(parts, timestamp, nonce) else {
+        let Some(canonical) = self.canonical_request(parts, timestamp, nonce, body) else {
             return false;
         };
         nasa::crypto::hmac_sha256_verify(&canonical, &self.secret, signature.trim())
     }
 
-    /// 构造低拷贝 HMAC canonical string。
+    /// 业务作用：构造稳定 HMAC canonical string，并在显式启用时追加原始实体 SHA-256。
     ///
-    /// # 参数
-    /// - `parts`: 下游请求 head。
-    /// - `timestamp`: 时间戳 header 原始文本。
-    /// - `nonce`: 可选 nonce header 原始文本。
+    /// 参数说明：`parts` 是请求 head；`timestamp`/`nonce` 是签名字段；`body` 是有界收集的原始实体。
+    ///
+    /// 返回：所需 header/body 完整时返回 canonical 文本；缺少声明字段时返回 None。
     fn canonical_request(
         &self,
         parts: &Parts,
         timestamp: &str,
         nonce: Option<&str>,
+        body: Option<&[u8]>,
     ) -> Option<String> {
         let path_and_query = parts
             .uri
@@ -2866,6 +3100,15 @@ impl HmacAuthPolicy {
             canonical.push_str(name.as_str());
             canonical.push(':');
             canonical.push_str(value);
+            canonical.push('\n');
+        }
+        if self.body_max_bytes.is_some() {
+            let digest = Sha256::digest(body?);
+            canonical.push_str("body-sha256:");
+            use std::fmt::Write as _;
+            for byte in digest {
+                write!(&mut canonical, "{byte:02x}").ok()?;
+            }
             canonical.push('\n');
         }
         Some(canonical)
@@ -3118,6 +3361,563 @@ impl JwtAuthPolicy {
         }
         true
     }
+}
+
+impl OidcRpPolicy {
+    /// 业务作用：执行 OIDC 浏览器入口的 session、回调、退出或登录跳转，只有已验证 IdP 结果能形成身份。
+    ///
+    /// 参数说明：`parts` 是尚未注入身份头的原始请求 head。
+    ///
+    /// 返回：有效 session 返回可信身份；回调/退出/登录和任何失败返回应立即短路的响应。
+    async fn authenticate(&self, parts: &Parts) -> OidcRpDecision {
+        self.prune_expired();
+        if parts.uri.path() == self.logout_path.as_ref() {
+            return self.logout(parts);
+        }
+        if parts.uri.path() == self.callback_path.as_ref() {
+            return self.callback(parts).await;
+        }
+        if let Some(session_id) = oidc_cookie(parts, self.cookie_name.as_ref()) {
+            if let Some(session) = self.sessions.lock().get(session_id).cloned() {
+                if Instant::now() < session.expires_at {
+                    return OidcRpDecision::Authenticated {
+                        consumer: session.consumer,
+                        claims: session.claims,
+                        identity_headers: session.identity_headers,
+                    };
+                }
+            }
+            self.sessions.lock().remove(session_id);
+        }
+        self.begin_login(parts)
+    }
+
+    /// 业务作用：建立一次绑定浏览器、state、nonce 与 PKCE verifier 的短期授权事务。
+    ///
+    /// 参数说明：`parts` 提供原始 origin-form URI，成功登录后只允许返回该本地 URI。
+    ///
+    /// 返回：容量与随机源可用时返回 302 到固定授权 endpoint；失败返回 503，绝不匿名放行。
+    fn begin_login(&self, parts: &Parts) -> OidcRpDecision {
+        let mut pending = self.pending.lock();
+        if pending.len() >= self.max_pending {
+            return OidcRpDecision::Response(crate::text_status(
+                503,
+                "OIDC login capacity reached",
+            ));
+        }
+        let state = match oidc_random_token() {
+            Ok(value) => value,
+            Err(_) => {
+                return OidcRpDecision::Response(crate::text_status(
+                    503,
+                    "OIDC random source unavailable",
+                ))
+            }
+        };
+        let nonce = match oidc_random_token() {
+            Ok(value) => value,
+            Err(_) => {
+                return OidcRpDecision::Response(crate::text_status(
+                    503,
+                    "OIDC random source unavailable",
+                ))
+            }
+        };
+        let verifier = match oidc_random_token() {
+            Ok(value) => value,
+            Err(_) => {
+                return OidcRpDecision::Response(crate::text_status(
+                    503,
+                    "OIDC random source unavailable",
+                ))
+            }
+        };
+        let browser_binding = match oidc_random_token() {
+            Ok(value) => value,
+            Err(_) => {
+                return OidcRpDecision::Response(crate::text_status(
+                    503,
+                    "OIDC random source unavailable",
+                ))
+            }
+        };
+        let return_uri = parts
+            .uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .filter(|value| valid_oidc_local_path(value))
+            .unwrap_or("/")
+            .to_string();
+        use sha2::Digest as _;
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(verifier.as_bytes()));
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("response_type", "code")
+            .append_pair("client_id", self.client_id.as_ref())
+            .append_pair("redirect_uri", self.redirect_uri.as_ref())
+            .append_pair("scope", self.scope.as_ref())
+            .append_pair("state", &state)
+            .append_pair("nonce", &nonce)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .finish();
+        let location = format!("{}?{query}", self.authorization_endpoint);
+        pending.insert(
+            state,
+            OidcPendingLogin {
+                nonce,
+                verifier,
+                browser_binding: browser_binding.clone(),
+                return_uri,
+                expires_at: Instant::now() + self.pending_ttl,
+            },
+        );
+        let state_cookie = format!(
+            "{}_state={}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
+            self.cookie_name,
+            browser_binding,
+            self.pending_ttl.as_secs()
+        );
+        OidcRpDecision::Response(oidc_redirect(&location, Some(&state_cookie)))
+    }
+
+    /// 业务作用：消费一次性授权码回调，复验浏览器绑定/state/nonce/PKCE、token、可选 introspection
+    /// 与 userinfo 后建立受保护 session。
+    ///
+    /// 参数说明：`parts` 必须是固定 callback path 的 GET 请求。
+    ///
+    /// 返回：全部证据通过返回 303 到原本地 URI并设置 session cookie；任何缺失或依赖失败返回 401/502。
+    async fn callback(&self, parts: &Parts) -> OidcRpDecision {
+        if parts.method != Method::GET {
+            return OidcRpDecision::Response(crate::text_status(405, "OIDC callback requires GET"));
+        }
+        let query = parts.uri.query().unwrap_or_default();
+        let Some(state) = oidc_unique_query_param(query, "state") else {
+            return OidcRpDecision::Response(crate::text_status(400, "invalid OIDC state"));
+        };
+        let Some(code) = oidc_unique_query_param(query, "code") else {
+            return OidcRpDecision::Response(crate::text_status(400, "invalid OIDC code"));
+        };
+        if state.len() > 256 || code.is_empty() || code.len() > 8_192 {
+            return OidcRpDecision::Response(crate::text_status(400, "invalid OIDC callback"));
+        }
+        // state 一旦出现就从表中取走；后续 token/nonce 失败也不能重放同一授权事务。
+        let Some(pending) = self.pending.lock().remove(&state) else {
+            return OidcRpDecision::Response(crate::text_status(401, "expired OIDC state"));
+        };
+        if Instant::now() >= pending.expires_at {
+            return OidcRpDecision::Response(crate::text_status(401, "expired OIDC state"));
+        }
+        let state_cookie_name = format!("{}_state", self.cookie_name);
+        let browser_binding = oidc_cookie(parts, &state_cookie_name);
+        if browser_binding.is_none_or(|value| {
+            !constant_time_eq(value.as_bytes(), pending.browser_binding.as_bytes())
+        }) {
+            return OidcRpDecision::Response(crate::text_status(
+                401,
+                "OIDC browser binding mismatch",
+            ));
+        }
+        let session = match self.exchange_code(&code, &pending).await {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(%error, "OIDC authorization code exchange rejected");
+                return OidcRpDecision::Response(crate::text_status(
+                    502,
+                    "OIDC identity provider unavailable or rejected response",
+                ));
+            }
+        };
+        let session_id = match oidc_random_token() {
+            Ok(value) => value,
+            Err(_) => {
+                return OidcRpDecision::Response(crate::text_status(
+                    503,
+                    "OIDC random source unavailable",
+                ))
+            }
+        };
+        let max_age = session
+            .expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        let mut sessions = self.sessions.lock();
+        if sessions.len() >= self.max_sessions {
+            return OidcRpDecision::Response(crate::text_status(
+                503,
+                "OIDC session capacity reached",
+            ));
+        }
+        sessions.insert(session_id.clone(), session);
+        drop(sessions);
+        let session_cookie = format!(
+            "{}={}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
+            self.cookie_name, session_id, max_age
+        );
+        let clear_state = format!(
+            "{}_state=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax",
+            self.cookie_name
+        );
+        let mut response = oidc_redirect(&pending.return_uri, Some(&session_cookie));
+        if let Ok(value) = HeaderValue::from_str(&clear_state) {
+            response
+                .headers_mut()
+                .append(http::header::SET_COOKIE, value);
+        }
+        *response.status_mut() = StatusCode::SEE_OTHER;
+        OidcRpDecision::Response(response)
+    }
+
+    /// 业务作用：以固定 token endpoint 和客户端认证交换授权码，并把 token/introspection/userinfo
+    /// 证据合并成受限 session 身份。
+    ///
+    /// 参数说明：`code` 是一次性回调码；`pending` 冻结 nonce、verifier 和原始本地 URI。
+    ///
+    /// 返回：全部远端与 claims 证据通过时返回 session；任何协议、签名、issuer/audience/sub 失败返回错误。
+    async fn exchange_code(&self, code: &str, pending: &OidcPendingLogin) -> Result<OidcSession> {
+        let mut form = vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("code", code.to_string()),
+            ("redirect_uri", self.redirect_uri.to_string()),
+            ("client_id", self.client_id.to_string()),
+            ("code_verifier", pending.verifier.clone()),
+        ];
+        let mut request = self.client.post(self.token_endpoint.as_ref());
+        match self.client_auth {
+            OidcClientAuth::SecretBasic => {
+                request =
+                    request.basic_auth(self.client_id.as_ref(), Some(self.client_secret.as_ref()));
+            }
+            OidcClientAuth::SecretPost => {
+                form.push(("client_secret", self.client_secret.to_string()));
+            }
+        }
+        let token: OidcTokenResponse =
+            fetch_oidc_json(request.form(&form), self.timeout, "token").await?;
+        anyhow::ensure!(
+            !token.access_token.is_empty() && token.access_token.len() <= MAX_JWT_TOKEN_BYTES,
+            "OIDC access token is empty or exceeds limit"
+        );
+        anyhow::ensure!(
+            !token.id_token.is_empty() && token.id_token.len() <= MAX_JWT_TOKEN_BYTES,
+            "OIDC ID token is empty or exceeds limit"
+        );
+        anyhow::ensure!(
+            token.token_type.eq_ignore_ascii_case("bearer"),
+            "OIDC token_type is not Bearer"
+        );
+        let mut claims = self
+            .id_token_verifier
+            .verified_payload_resolved(&token.id_token)
+            .await
+            .context("OIDC ID token verification failed")?;
+        anyhow::ensure!(
+            claims.get("nonce").and_then(|value| value.as_str()) == Some(pending.nonce.as_str()),
+            "OIDC ID token nonce mismatch"
+        );
+        let subject = bounded_jwt_claim(&claims, "sub").context("OIDC ID token sub is invalid")?;
+        if let Some(endpoint) = &self.introspection_endpoint {
+            self.verify_introspection(endpoint, &token.access_token, subject.as_ref())
+                .await?;
+        }
+        if let Some(endpoint) = &self.userinfo_endpoint {
+            let userinfo: serde_json::Value = fetch_oidc_json(
+                self.client
+                    .get(endpoint.as_ref())
+                    .bearer_auth(&token.access_token),
+                self.timeout,
+                "userinfo",
+            )
+            .await?;
+            anyhow::ensure!(
+                userinfo.get("sub").and_then(|value| value.as_str()) == Some(subject.as_ref()),
+                "OIDC userinfo sub mismatch"
+            );
+            merge_oidc_userinfo(&mut claims, userinfo)?;
+        }
+        let identity_headers = oidc_identity_headers(&claims, &self.identity_headers);
+        let now_unix = unix_now_secs().context("system clock is before Unix epoch")?;
+        let token_remaining = claims
+            .get("exp")
+            .and_then(json_i64)
+            .and_then(|exp| exp.checked_sub(now_unix))
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| Duration::from_secs(seconds as u64))
+            .context("OIDC ID token is expired")?;
+        let advertised = token
+            .expires_in
+            .map(Duration::from_secs)
+            .unwrap_or(self.session_ttl);
+        let ttl = self.session_ttl.min(token_remaining).min(advertised);
+        anyhow::ensure!(!ttl.is_zero(), "OIDC session TTL is zero");
+        Ok(OidcSession {
+            consumer: subject,
+            claims,
+            identity_headers,
+            expires_at: Instant::now() + ttl,
+        })
+    }
+
+    /// 业务作用：调用固定 introspection endpoint 复验 access token 仍 active 且 issuer/audience/sub
+    /// 与已验证 ID token 一致。
+    ///
+    /// 参数说明：`endpoint` 是构建期固定 HTTPS URL；`token` 是 token endpoint 返回值；`subject`
+    /// 来自已验签 ID token。
+    ///
+    /// 返回：所有字段严格匹配时成功；不活跃、身份不一致或依赖失败均返回错误。
+    async fn verify_introspection(&self, endpoint: &str, token: &str, subject: &str) -> Result<()> {
+        let mut form = vec![("token", token.to_string())];
+        let mut request = self.client.post(endpoint);
+        match self.client_auth {
+            OidcClientAuth::SecretBasic => {
+                request =
+                    request.basic_auth(self.client_id.as_ref(), Some(self.client_secret.as_ref()));
+            }
+            OidcClientAuth::SecretPost => {
+                form.push(("client_id", self.client_id.to_string()));
+                form.push(("client_secret", self.client_secret.to_string()));
+            }
+        }
+        let value: serde_json::Value =
+            fetch_oidc_json(request.form(&form), self.timeout, "introspection").await?;
+        anyhow::ensure!(
+            value.get("active").and_then(|value| value.as_bool()) == Some(true),
+            "OIDC introspection token is inactive"
+        );
+        anyhow::ensure!(
+            value.get("iss").and_then(|value| value.as_str()) == Some(self.issuer.as_ref()),
+            "OIDC introspection issuer mismatch"
+        );
+        anyhow::ensure!(
+            jwt_audience_matches(value.get("aud"), self.client_id.as_ref()),
+            "OIDC introspection audience mismatch"
+        );
+        anyhow::ensure!(
+            value.get("sub").and_then(|value| value.as_str()) == Some(subject),
+            "OIDC introspection subject mismatch"
+        );
+        Ok(())
+    }
+
+    /// 业务作用：撤销当前浏览器 session，并只重定向到构建期固定的本地退出后 URI。
+    ///
+    /// 参数说明：`parts` 提供可选 session cookie。
+    ///
+    /// 返回：返回 303 并清除 session/state cookie；不存在 session 也保持幂等。
+    fn logout(&self, parts: &Parts) -> OidcRpDecision {
+        if let Some(session_id) = oidc_cookie(parts, self.cookie_name.as_ref()) {
+            self.sessions.lock().remove(session_id);
+        }
+        let clear_session = format!(
+            "{}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax",
+            self.cookie_name
+        );
+        let clear_state = format!(
+            "{}_state=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax",
+            self.cookie_name
+        );
+        let mut response = oidc_redirect(self.post_logout_uri.as_ref(), Some(&clear_session));
+        if let Ok(value) = HeaderValue::from_str(&clear_state) {
+            response
+                .headers_mut()
+                .append(http::header::SET_COOKIE, value);
+        }
+        *response.status_mut() = StatusCode::SEE_OTHER;
+        OidcRpDecision::Response(response)
+    }
+
+    /// 业务作用：回收过期登录事务和 session，确保长期运行下内存仍受配置容量约束。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；只删除当前单调时钟已到期记录。
+    fn prune_expired(&self) {
+        let now = Instant::now();
+        self.pending
+            .lock()
+            .retain(|_, pending| now < pending.expires_at);
+        self.sessions
+            .lock()
+            .retain(|_, session| now < session.expires_at);
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct OidcTokenResponse {
+    access_token: String,
+    id_token: String,
+    token_type: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+/// 业务作用：有界读取固定 IdP endpoint 的 JSON 响应，统一执行总 deadline、status、media 和实体上限。
+///
+/// 参数说明：`request` 已由固定 HTTPS client 构建；`timeout` 覆盖 head/body；`kind` 仅用于低敏错误。
+///
+/// 返回：合法 JSON 解码为 T；网络、非 2xx、媒体类型、长度、超时或 schema 错误返回失败。
+async fn fetch_oidc_json<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+    kind: &str,
+) -> Result<T> {
+    use futures::StreamExt as _;
+
+    tokio::time::timeout(timeout, async {
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            bail!("OIDC {kind} endpoint returned HTTP {}", response.status());
+        }
+        let media = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .unwrap_or_default()
+            .trim();
+        if !media.eq_ignore_ascii_case("application/json") && !media.ends_with("+json") {
+            bail!("OIDC {kind} endpoint did not return JSON");
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_OIDC_RESPONSE_BYTES as u64)
+        {
+            bail!("OIDC {kind} response exceeds body limit");
+        }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| format!("read OIDC {kind} response"))?;
+            if body.len().saturating_add(chunk.len()) > MAX_OIDC_RESPONSE_BYTES {
+                bail!("OIDC {kind} response exceeds body limit");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&body).with_context(|| format!("decode OIDC {kind} JSON"))
+    })
+    .await
+    .with_context(|| format!("OIDC {kind} total timeout"))?
+}
+
+/// 业务作用：将受信 userinfo 的补充 claim 合入已验签 ID token，同时禁止覆盖核心权威字段。
+///
+/// 参数说明：`claims` 是已验签 token object；`userinfo` 已从固定 HTTPS endpoint 有界取得且 sub 已匹配。
+///
+/// 返回：两个值均为 object 时合并非核心字段；类型错误返回失败。
+fn merge_oidc_userinfo(claims: &mut serde_json::Value, userinfo: serde_json::Value) -> Result<()> {
+    let claims = claims
+        .as_object_mut()
+        .context("OIDC ID token claims are not an object")?;
+    let userinfo = userinfo
+        .as_object()
+        .context("OIDC userinfo is not an object")?;
+    for (key, value) in userinfo {
+        if matches!(
+            key.as_str(),
+            "iss" | "aud" | "azp" | "sub" | "nonce" | "exp" | "iat"
+        ) {
+            continue;
+        }
+        claims.insert(key.clone(), value.clone());
+    }
+    Ok(())
+}
+
+/// 业务作用：只从已验证 OIDC claims 生成配置声明的身份头，非法或非字符串 claim 不注入。
+///
+/// 参数说明：`claims` 是 token/userinfo 合并后的受信 object；`mappings` 已在构建期校验 header 名。
+///
+/// 返回：返回长度和 header 编码均合法的身份头集合。
+fn oidc_identity_headers(
+    claims: &serde_json::Value,
+    mappings: &[JwtIdentityHeader],
+) -> Vec<(HeaderName, HeaderValue)> {
+    mappings
+        .iter()
+        .filter_map(|mapping| {
+            let value = claims.get(mapping.claim.as_ref())?.as_str()?;
+            if value.is_empty()
+                || value.len() > MAX_JWT_IDENTITY_BYTES
+                || value.bytes().any(|byte| byte.is_ascii_control())
+            {
+                return None;
+            }
+            HeaderValue::from_str(value)
+                .ok()
+                .map(|value| (mapping.header.clone(), value))
+        })
+        .collect()
+}
+
+/// 业务作用：生成 OAuth state/nonce/verifier/session 的 256 位不可预测 URL-safe token。
+///
+/// 参数说明：无。
+///
+/// 返回：系统随机源可用时返回无 padding Base64URL；失败返回错误并阻止登录。
+fn oidc_random_token() -> Result<String> {
+    let mut random = [0_u8; 32];
+    getrandom::getrandom(&mut random).context("OIDC random source failed")?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random))
+}
+
+/// 业务作用：从所有 Cookie header 中提取唯一指定 cookie，拒绝重复同名值造成解析歧义。
+///
+/// 参数说明：`parts` 是原始请求 head；`name` 是构建期安全 cookie 名。
+///
+/// 返回：恰好一个非空且有界值时返回借用；缺失、重复或非法返回 None。
+fn oidc_cookie<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
+    let mut found = None;
+    for header in parts.headers.get_all(http::header::COOKIE) {
+        let raw = header.to_str().ok()?;
+        for item in raw.split(';') {
+            let Some((key, value)) = item.trim().split_once('=') else {
+                continue;
+            };
+            if key == name {
+                if found.is_some() || value.is_empty() || value.len() > 256 {
+                    return None;
+                }
+                found = Some(value);
+            }
+        }
+    }
+    found
+}
+
+/// 业务作用：读取回调 query 中恰好一个参数并按标准 form 规则解码，重复值一律拒绝。
+///
+/// 参数说明：`query` 是原始 query；`name` 固定为 state 或 code。
+///
+/// 返回：唯一值返回 owned String；缺失、重复或解码结果含控制字符时返回 None。
+fn oidc_unique_query_param(query: &str, name: &str) -> Option<String> {
+    let mut found = None;
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        if key == name {
+            if found.is_some() || value.bytes().any(|byte| byte.is_ascii_control()) {
+                return None;
+            }
+            found = Some(value.into_owned());
+        }
+    }
+    found
+}
+
+/// 业务作用：构造只指向构建期固定 IdP URL 或已保存本地 origin URI 的重定向响应。
+///
+/// 参数说明：`location` 已由安全来源生成；`cookie` 是可选受保护 Set-Cookie 值。
+///
+/// 返回：header 可编码时返回 302；防御性编码失败返回 500。
+fn oidc_redirect(location: &str, cookie: Option<&str>) -> Response<crate::BoxBody> {
+    let mut builder = Response::builder()
+        .status(StatusCode::FOUND)
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .header(http::header::LOCATION, location);
+    if let Some(cookie) = cookie {
+        builder = builder.header(http::header::SET_COOKIE, cookie);
+    }
+    builder
+        .body(crate::full_body(Bytes::new()))
+        .unwrap_or_else(|_| crate::text_status(500, "cannot build OIDC redirect"))
 }
 
 /// 业务作用：从已验签 payload 提取可作为授权主体或身份头来源的有界字符串 claim。
@@ -3450,15 +4250,11 @@ fn jwk_type_matches_algorithm(jwk: &jsonwebtoken::jwk::Jwk, algorithm: Algorithm
 
 /// nginx `if` 安全子集的固定返回规则。
 ///
-/// 只支持变量模板之间的 `=` / `!=` 判断和 `return` 动作;不支持 rewrite 循环、正则脚本或子请求。
+/// 表达式是有界的字符串比较计划，不支持 rewrite 循环、正则脚本、括号或子请求。
 #[derive(Clone)]
 pub struct ConditionalReturn {
-    /// 左侧已编译取值模板。
-    left: ValueTemplate,
-    /// 条件比较操作。
-    op: ConditionOp,
-    /// 右侧已编译取值模板。
-    right: ValueTemplate,
+    /// 构建期已编译的条件表达式。
+    condition: ConditionExpr,
     /// 条件命中后的固定响应。
     response: DirectResponse,
 }
@@ -3470,21 +4266,48 @@ enum ConditionOp {
     Eq,
     /// 字符串不相等。
     NotEq,
+    /// 左侧以右侧字符串开头。
+    StartsWith,
+    /// 左侧以右侧字符串结尾。
+    EndsWith,
+    /// 左侧包含右侧字符串。
+    Contains,
+}
+
+/// 一个已编译的原子比较。
+#[derive(Clone)]
+struct ConditionComparison {
+    left: ValueTemplate,
+    op: ConditionOp,
+    right: ValueTemplate,
+}
+
+/// 析取后的析取范式：外层是 OR，每个分组内是 AND。
+#[derive(Clone)]
+struct ConditionExpr {
+    any: Vec<Vec<ConditionComparison>>,
 }
 
 impl ConditionalReturn {
-    /// 判断当前请求是否命中条件。
+    /// 业务作用：按 AND 高于 OR 的固定优先级判断请求是否应短路返回。
     ///
-    /// # 参数
-    /// - `ctx`: 当前请求变量上下文。
-    /// - `variables`: route 使用的变量计划。
+    /// 参数说明：`ctx` 是当前请求变量上下文；`variables` 是 route 的变量计划。
+    ///
+    /// 返回：任一 OR 分组内的全部比较命中时返回 true。
     fn matches(&self, ctx: &crate::variable::EvalContext<'_>, variables: &VariablePlan) -> bool {
-        let left = self.left.render(ctx, variables);
-        let right = self.right.render(ctx, variables);
-        match self.op {
-            ConditionOp::Eq => left == right,
-            ConditionOp::NotEq => left != right,
-        }
+        self.condition.any.iter().any(|all| {
+            all.iter().all(|comparison| {
+                let left = comparison.left.render(ctx, variables);
+                let right = comparison.right.render(ctx, variables);
+                match comparison.op {
+                    ConditionOp::Eq => left == right,
+                    ConditionOp::NotEq => left != right,
+                    ConditionOp::StartsWith => left.starts_with(&right),
+                    ConditionOp::EndsWith => left.ends_with(&right),
+                    ConditionOp::Contains => left.contains(&right),
+                }
+            })
+        })
     }
 }
 
@@ -3699,6 +4522,7 @@ enum ParsedFilter {
     ApiKey(ApiKeyPolicy),
     HmacAuth(HmacAuthPolicy),
     JwtAuth(JwtAuthPolicy),
+    OidcRp(Box<OidcRpPolicy>),
     EnterpriseAuth(EnterpriseAuthPolicy),
     ExtAuthz(ExtAuthzPolicy),
     Satisfy(SatisfyMode),
@@ -3866,6 +4690,10 @@ fn parse_filter(spec: &str, variables: &VariablePlan, config_dir: &Path) -> Resu
     }
     if starts_filter(trimmed, "jwt_hs256") {
         return parse_jwt_auth(trimmed, "jwt_hs256", config_dir).map(ParsedFilter::JwtAuth);
+    }
+    if starts_filter(trimmed, "oidc_rp") {
+        return parse_oidc_rp(trimmed, config_dir)
+            .map(|policy| ParsedFilter::OidcRp(Box::new(policy)));
     }
     if starts_filter(trimmed, "saml_auth") {
         return crate::enterprise_identity::parse_saml_auth(trimmed, config_dir)
@@ -4285,7 +5113,7 @@ fn parse_response_header_set(
         .trim()
         .parse::<HeaderName>()
         .with_context(|| format!("invalid header name `{name}`"))?;
-    let value = variables.compile_template(value.trim())?;
+    let value = variables.compile_template_for_phase(value.trim(), VariablePhase::Response)?;
     if let Some(literal) = value.static_literal() {
         http::HeaderValue::from_str(literal)
             .with_context(|| format!("{cmd} invalid header value `{literal}`"))?;
@@ -5182,17 +6010,19 @@ fn parse_auth_basic(spec: &str, config_dir: &Path) -> Result<Option<BasicAuthPol
     }))
 }
 
-/// 解析 V4 `api_key` 基础规则。
+/// 业务作用：把 route 的 `api_key` 声明编译为固定来源和校验材料，拒绝混合明文/摘要或不完整规则。
 ///
-/// # 参数
-/// - `spec`: route filter 原始字符串,如 `api_key header=X-Api-Key value=secret`。
+/// 参数说明：`spec` 是 route filter 原始字符串；`config_dir` 限定 SecretSource 相对路径。
+///
+/// 返回：合法声明返回可共享策略；来源、consumer、SecretSource 或 SHA-256 非法时拒绝整个候选。
 fn parse_api_key(spec: &str, config_dir: &Path) -> Result<ApiKeyPolicy> {
     let rest = filter_args(spec, "api_key").trim();
     if rest.is_empty() {
-        bail!("api_key requires `header=<name>|query=<name> value=<secret>`");
+        bail!("api_key requires `header=<name>|query=<name> value=<secret>|sha256=<digest>`");
     }
     let mut source = None;
     let mut value = None;
+    let mut sha256 = None;
     let mut consumer = None;
     for token in rest.split_whitespace() {
         let (key, raw_value) = token
@@ -5211,22 +6041,52 @@ fn parse_api_key(spec: &str, config_dir: &Path) -> Result<ApiKeyPolicy> {
                 source = Some(ApiKeySource::Query(raw_value.to_string()));
             }
             "value" | "key" | "secret" => value = Some(raw_value.to_string()),
+            "sha256" => sha256 = Some(raw_value.to_string()),
             "consumer" => consumer = Some(raw_value.to_string()),
             other => bail!("api_key unsupported option `{other}`"),
         }
     }
     let source = source.context("api_key requires header or query source")?;
-    let value = value.context("api_key requires value")?;
-    let value = crate::secret::resolve_text(&value, config_dir, "api_key value")?;
-    validate_basic_auth_secret("api_key value", &value)?;
+    anyhow::ensure!(
+        value.is_some() ^ sha256.is_some(),
+        "api_key requires exactly one of value or sha256"
+    );
+    let expected = if let Some(value) = value {
+        let value = crate::secret::resolve_text(&value, config_dir, "api_key value")?;
+        validate_basic_auth_secret("api_key value", &value)?;
+        ApiKeyExpected::Plain(value.into_bytes())
+    } else {
+        ApiKeyExpected::Sha256(parse_api_key_sha256(
+            sha256.as_deref().expect("exclusive option checked"),
+        )?)
+    };
     if let Some(consumer) = &consumer {
         validate_basic_auth_user(consumer)?;
     }
     Ok(ApiKeyPolicy {
         source,
-        expected: value.into_bytes(),
+        expected,
         consumer: consumer.map(Arc::from),
     })
+}
+
+/// 业务作用：解析管理面生成 API-Key 的固定长度 SHA-256，避免宽松 hex 语义产生不同配置解释。
+///
+/// 参数说明：`value` 必须是 64 个 ASCII 十六进制字符。
+///
+/// 返回：严格解码为 32 字节；长度或任一字符非法时拒绝候选。
+fn parse_api_key_sha256(value: &str) -> Result<[u8; 32]> {
+    anyhow::ensure!(
+        value.len() == 64,
+        "api_key sha256 must contain 64 hex characters"
+    );
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(pair).expect("hex pair is an ASCII slice");
+        digest[index] = u8::from_str_radix(pair, 16)
+            .with_context(|| format!("api_key sha256 contains invalid hex at byte {index}"))?;
+    }
+    Ok(digest)
 }
 
 /// 解析 V4 HMAC-SHA256 签名规则。
@@ -5248,6 +6108,8 @@ fn parse_hmac_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<HmacAuthP
     let mut signed_headers = Vec::new();
     let mut max_skew_ms = DEFAULT_HMAC_SKEW_MS;
     let mut replay_protection = false;
+    let mut include_body = false;
+    let mut body_max_bytes = None;
     for token in rest.split_whitespace() {
         let (key, raw_value) = token
             .split_once('=')
@@ -5288,11 +6150,15 @@ fn parse_hmac_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<HmacAuthP
                 }
             }
             "body" | "include_body" => {
-                if parse_bool(raw_value)? {
-                    bail!(
-                        "{cmd} body signing is not supported in V4 basic mode; use header/path/query signing to keep the data plane streaming"
-                    );
+                include_body = parse_bool(raw_value)?;
+            }
+            "max_body_bytes" | "body_max_bytes" => {
+                let value = parse_byte_size(raw_value)
+                    .with_context(|| format!("{cmd} invalid max_body_bytes `{raw_value}`"))?;
+                if value == 0 || value > 16 * 1024 * 1024 {
+                    bail!("{cmd} max_body_bytes must be within 1..=16777216");
                 }
+                body_max_bytes = Some(value);
             }
             "replay" | "replay_protection" | "anti_replay" => {
                 replay_protection = parse_bool(raw_value)?;
@@ -5307,6 +6173,9 @@ fn parse_hmac_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<HmacAuthP
     if replay_protection && nonce_header.is_none() {
         bail!("{cmd} replay=on requires nonce_header to dedup one-time nonces");
     }
+    if include_body != body_max_bytes.is_some() {
+        bail!("{cmd} body=on requires max_body_bytes and body=off forbids it");
+    }
     Ok(HmacAuthPolicy {
         secret,
         signature_header,
@@ -5315,6 +6184,7 @@ fn parse_hmac_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<HmacAuthP
         signed_headers,
         max_skew_ms,
         replay_protection,
+        body_max_bytes,
     })
 }
 
@@ -5342,6 +6212,263 @@ fn parse_hmac_signed_headers(raw: &str) -> Result<Vec<HeaderName>> {
         headers.push(parse_hmac_header_name(name, "signed_headers")?);
     }
     Ok(headers)
+}
+
+/// 业务作用：把浏览器 OAuth2/OIDC Authorization Code 配置编译为固定 endpoint、PKCE 和有界会话策略。
+///
+/// 参数说明：`spec` 是 route filter 原文，`config_dir` 是 client secret 与 CA 的 SecretSource 相对目录。
+///
+/// 返回：所有信任锚点、重定向和资源上限合法时返回 RP 策略；弱 URL、跨 IdP authority、开放重定向
+/// 或无界容量在快照构建阶段返回错误。
+fn parse_oidc_rp(spec: &str, config_dir: &Path) -> Result<OidcRpPolicy> {
+    let cmd = "oidc_rp";
+    let rest = filter_args(spec, cmd).trim();
+    if rest.is_empty() {
+        bail!("oidc_rp requires issuer, discovery_url, authorization_endpoint, token_endpoint, client_id, client_secret, and redirect_uri");
+    }
+    let mut issuer = None;
+    let mut discovery_url = None;
+    let mut authorization_endpoint = None;
+    let mut token_endpoint = None;
+    let mut userinfo_endpoint = None;
+    let mut introspection_endpoint = None;
+    let mut client_id = None;
+    let mut client_secret = None;
+    let mut client_auth = OidcClientAuth::SecretBasic;
+    let mut redirect_uri = None;
+    let mut callback_path = None;
+    let mut logout_path = "/_oidc/logout".to_string();
+    let mut post_logout_uri = "/".to_string();
+    let mut cookie_name = "naway_oidc".to_string();
+    let mut scope = "openid profile email".to_string();
+    let mut ca_certificate = None;
+    let mut algorithm = Algorithm::RS256;
+    let mut identity_headers = Vec::new();
+    let mut timeout_ms = DEFAULT_JWKS_TIMEOUT_MS;
+    let mut session_ttl_secs = 3_600_u64;
+    let mut pending_ttl_secs = 300_u64;
+    let mut max_pending = DEFAULT_OIDC_MAX_PENDING;
+    let mut max_sessions = DEFAULT_OIDC_MAX_SESSIONS;
+    for token in rest.split_whitespace() {
+        let (key, raw_value) = token
+            .split_once('=')
+            .with_context(|| format!("oidc_rp option `{token}` must be key=value"))?;
+        let raw_value = unquote_token(raw_value.trim());
+        match key {
+            "issuer" => issuer = Some(raw_value.to_string()),
+            "discovery_url" | "oidc_discovery" => discovery_url = Some(raw_value.to_string()),
+            "authorization_endpoint" | "authorize_url" => {
+                authorization_endpoint = Some(raw_value.to_string())
+            }
+            "token_endpoint" | "token_url" => token_endpoint = Some(raw_value.to_string()),
+            "userinfo_endpoint" | "userinfo_url" => userinfo_endpoint = Some(raw_value.to_string()),
+            "introspection_endpoint" | "introspection_url" => {
+                introspection_endpoint = Some(raw_value.to_string())
+            }
+            "client_id" => client_id = Some(raw_value.to_string()),
+            "client_secret" => client_secret = Some(raw_value.to_string()),
+            "client_auth" => {
+                client_auth = match raw_value.to_ascii_lowercase().as_str() {
+                    "secret_basic" | "client_secret_basic" | "basic" => OidcClientAuth::SecretBasic,
+                    "secret_post" | "client_secret_post" | "post" => OidcClientAuth::SecretPost,
+                    _ => bail!(
+                        "oidc_rp client_auth must be client_secret_basic or client_secret_post"
+                    ),
+                }
+            }
+            "redirect_uri" => redirect_uri = Some(raw_value.to_string()),
+            "callback_path" => callback_path = Some(raw_value.to_string()),
+            "logout_path" => logout_path = raw_value.to_string(),
+            "post_logout_uri" => post_logout_uri = raw_value.to_string(),
+            "cookie_name" => cookie_name = raw_value.to_string(),
+            "scope" | "scopes" => scope = raw_value.replace(',', " "),
+            "ca_certificate" | "ca_pem" | "ca_file" => ca_certificate = Some(raw_value.to_string()),
+            "algorithm" | "alg" => {
+                algorithm = parse_jwt_algorithm(raw_value, cmd)?;
+                if !matches!(algorithm, Algorithm::RS256 | Algorithm::ES256) {
+                    bail!("oidc_rp algorithm must be RS256 or ES256");
+                }
+            }
+            "identity_headers" | "claim_headers" => {
+                identity_headers = parse_jwt_identity_headers(raw_value, cmd)?
+            }
+            "timeout_ms" => {
+                timeout_ms = raw_value
+                    .parse::<u64>()
+                    .with_context(|| format!("oidc_rp invalid timeout_ms `{raw_value}`"))?;
+            }
+            "session_ttl_secs" => {
+                session_ttl_secs = raw_value
+                    .parse::<u64>()
+                    .with_context(|| format!("oidc_rp invalid session_ttl_secs `{raw_value}`"))?;
+            }
+            "pending_ttl_secs" => {
+                pending_ttl_secs = raw_value
+                    .parse::<u64>()
+                    .with_context(|| format!("oidc_rp invalid pending_ttl_secs `{raw_value}`"))?;
+            }
+            "max_pending" => {
+                max_pending = raw_value
+                    .parse::<usize>()
+                    .with_context(|| format!("oidc_rp invalid max_pending `{raw_value}`"))?;
+            }
+            "max_sessions" => {
+                max_sessions = raw_value
+                    .parse::<usize>()
+                    .with_context(|| format!("oidc_rp invalid max_sessions `{raw_value}`"))?;
+            }
+            other => bail!("oidc_rp unsupported option `{other}`"),
+        }
+    }
+    let issuer = issuer.context("oidc_rp requires issuer")?;
+    let discovery_url = discovery_url.context("oidc_rp requires discovery_url")?;
+    let authorization_endpoint =
+        authorization_endpoint.context("oidc_rp requires authorization_endpoint")?;
+    let token_endpoint = token_endpoint.context("oidc_rp requires token_endpoint")?;
+    let client_id = client_id.context("oidc_rp requires client_id")?;
+    let client_secret_source = client_secret.context("oidc_rp requires client_secret")?;
+    let redirect_uri = redirect_uri.context("oidc_rp requires redirect_uri")?;
+    if client_id.is_empty()
+        || client_id.len() > 512
+        || client_id.bytes().any(|byte| byte.is_ascii_control())
+    {
+        bail!("oidc_rp client_id must be non-empty, bounded, and free of control characters");
+    }
+    validate_oidc_idp_endpoint(&issuer, &issuer, "issuer")?;
+    for (field, endpoint) in [
+        ("discovery_url", Some(&discovery_url)),
+        ("authorization_endpoint", Some(&authorization_endpoint)),
+        ("token_endpoint", Some(&token_endpoint)),
+        ("userinfo_endpoint", userinfo_endpoint.as_ref()),
+        ("introspection_endpoint", introspection_endpoint.as_ref()),
+    ] {
+        if let Some(endpoint) = endpoint {
+            validate_oidc_idp_endpoint(endpoint, &issuer, field)?;
+        }
+    }
+    validate_https_url(&redirect_uri, "oidc_rp redirect_uri")?;
+    let redirect = redirect_uri.parse::<http::Uri>()?;
+    if redirect.query().is_some() {
+        bail!("oidc_rp redirect_uri must not contain a query");
+    }
+    let callback_path = callback_path.unwrap_or_else(|| redirect.path().to_string());
+    if !valid_oidc_local_path(&callback_path) || callback_path != redirect.path() {
+        bail!("oidc_rp callback_path must equal the local path in redirect_uri");
+    }
+    if !valid_oidc_local_path(&logout_path) || !valid_oidc_local_path(&post_logout_uri) {
+        bail!("oidc_rp logout_path and post_logout_uri must be bounded local origin-form URIs");
+    }
+    if callback_path == logout_path {
+        bail!("oidc_rp callback_path and logout_path must be different");
+    }
+    if cookie_name.is_empty()
+        || cookie_name.len() > 128
+        || !cookie_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+    {
+        bail!("oidc_rp cookie_name is invalid");
+    }
+    let scopes = scope.split_whitespace().collect::<HashSet<_>>();
+    if !scopes.contains("openid") || scopes.len() > 32 || scope.len() > 1_024 {
+        bail!("oidc_rp scope must be bounded and include openid");
+    }
+    if !(1..=MAX_JWKS_TIMEOUT_MS).contains(&timeout_ms) {
+        bail!("oidc_rp timeout_ms must be in 1..={MAX_JWKS_TIMEOUT_MS}");
+    }
+    if !(60..=86_400).contains(&session_ttl_secs) {
+        bail!("oidc_rp session_ttl_secs must be in 60..=86400");
+    }
+    if !(30..=900).contains(&pending_ttl_secs) {
+        bail!("oidc_rp pending_ttl_secs must be in 30..=900");
+    }
+    if !(1..=10_000).contains(&max_pending) || !(1..=1_000_000).contains(&max_sessions) {
+        bail!("oidc_rp max_pending or max_sessions is outside its bounded range");
+    }
+    let client_secret =
+        crate::secret::resolve_text(&client_secret_source, config_dir, "OIDC client secret")?;
+    validate_basic_auth_secret("OIDC client secret", &client_secret)?;
+    let mut verifier_spec = format!(
+        "jwt_auth alg={} oidc_discovery={} issuer={} audience={} timeout_ms={}",
+        match algorithm {
+            Algorithm::RS256 => "RS256",
+            Algorithm::ES256 => "ES256",
+            _ => unreachable!("OIDC algorithm was constrained above"),
+        },
+        discovery_url,
+        issuer,
+        client_id,
+        timeout_ms
+    );
+    if let Some(source) = &ca_certificate {
+        verifier_spec.push_str(" ca_certificate=");
+        verifier_spec.push_str(source);
+    }
+    let id_token_verifier = parse_jwt_auth(&verifier_spec, "jwt_auth", config_dir)?;
+    let mut client_builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true);
+    if let Some(source) = ca_certificate {
+        let pem = crate::secret::resolve_text(&source, config_dir, "OIDC IdP CA")?;
+        let certificate =
+            reqwest::Certificate::from_pem(pem.as_bytes()).context("parse OIDC IdP CA PEM")?;
+        client_builder = client_builder.add_root_certificate(certificate);
+    }
+    Ok(OidcRpPolicy {
+        authorization_endpoint: Arc::from(authorization_endpoint),
+        token_endpoint: Arc::from(token_endpoint),
+        userinfo_endpoint: userinfo_endpoint.map(Arc::from),
+        introspection_endpoint: introspection_endpoint.map(Arc::from),
+        issuer: Arc::from(issuer),
+        client_id: Arc::from(client_id),
+        client_secret: Arc::from(client_secret),
+        client_auth,
+        scope: Arc::from(scope),
+        redirect_uri: Arc::from(redirect_uri),
+        callback_path: Arc::from(callback_path),
+        logout_path: Arc::from(logout_path),
+        post_logout_uri: Arc::from(post_logout_uri),
+        cookie_name: Arc::from(cookie_name),
+        session_ttl: Duration::from_secs(session_ttl_secs),
+        pending_ttl: Duration::from_secs(pending_ttl_secs),
+        max_pending,
+        max_sessions,
+        timeout: Duration::from_millis(timeout_ms),
+        client: client_builder.build().context("build OIDC RP client")?,
+        id_token_verifier,
+        identity_headers: Arc::new(identity_headers),
+        pending: parking_lot::Mutex::new(HashMap::new()),
+        sessions: parking_lot::Mutex::new(HashMap::new()),
+    })
+}
+
+/// 业务作用：把所有 IdP 网络端点固定到配置 issuer 的 HTTPS authority，阻止重定向或 endpoint SSRF。
+///
+/// 参数说明：`endpoint` 是待验证地址，`issuer` 是信任锚点，`field` 用于错误定位。
+///
+/// 返回：HTTPS 且 authority 与 issuer 相同返回成功；其它地址返回错误。
+fn validate_oidc_idp_endpoint(endpoint: &str, issuer: &str, field: &str) -> Result<()> {
+    validate_https_url(endpoint, &format!("oidc_rp {field}"))?;
+    if endpoint.parse::<http::Uri>()?.query().is_some() {
+        bail!("oidc_rp {field} must not contain a query");
+    }
+    if uri_authority(endpoint)? != uri_authority(issuer)? {
+        bail!("oidc_rp {field} must use the issuer authority");
+    }
+    Ok(())
+}
+
+/// 业务作用：限制 OIDC 回调、退出和登录后返回值为本地 origin-form URI，杜绝开放重定向。
+///
+/// 参数说明：`value` 是配置或已保存的本地 URI。
+///
+/// 返回：以单斜杠开头、无控制字符且长度不超过 8192 字节时返回 true。
+fn valid_oidc_local_path(value: &str) -> bool {
+    value.starts_with('/')
+        && !value.starts_with("//")
+        && value.len() <= 8_192
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+        && value.parse::<http::Uri>().is_ok()
 }
 
 /// 业务作用：把 JWT/JWKS/OIDC route DSL 编译为算法与 endpoint 均固定的认证策略。
@@ -5751,6 +6878,12 @@ fn parse_ext_authz(spec: &str, cmd: &str) -> Result<ExtAuthzPolicy> {
     let mut method = Method::GET;
     let mut timeout_ms = DEFAULT_EXT_AUTHZ_TIMEOUT_MS;
     let mut fail_open = false;
+    let mut include_body = false;
+    let mut body_max_bytes = None;
+    let mut cache_ttl_ms = 0_u64;
+    let mut cache_max_entries = 0_usize;
+    let mut circuit_failure_threshold = 0_u32;
+    let mut circuit_open_ms = 0_u64;
     // WHY:默认只给 auth 服务最常用的 Bearer 凭据,避免把 Cookie/PII/header 全量裸转发给外部服务。
     let mut request_headers = vec![http::header::AUTHORIZATION];
     let mut upstream_headers = Vec::new();
@@ -5770,18 +6903,40 @@ fn parse_ext_authz(spec: &str, cmd: &str) -> Result<ExtAuthzPolicy> {
                     }
                 }
                 "fail_open" | "failure_mode_allow" => fail_open = parse_bool(raw_value)?,
+                "body" | "include_body" | "send_body" => include_body = parse_bool(raw_value)?,
+                "max_body_bytes" | "body_max_bytes" => {
+                    let value = parse_byte_size(raw_value)
+                        .with_context(|| format!("{cmd} invalid max_body_bytes `{raw_value}`"))?;
+                    if value == 0 || value > 16 * 1024 * 1024 {
+                        bail!("{cmd} max_body_bytes must be within 1..=16777216");
+                    }
+                    body_max_bytes = Some(value);
+                }
+                "cache_ttl_ms" => {
+                    cache_ttl_ms = raw_value
+                        .parse::<u64>()
+                        .with_context(|| format!("{cmd} invalid cache_ttl_ms `{raw_value}`"))?;
+                }
+                "cache_max_entries" => {
+                    cache_max_entries = raw_value.parse::<usize>().with_context(|| {
+                        format!("{cmd} invalid cache_max_entries `{raw_value}`")
+                    })?;
+                }
+                "circuit_failure_threshold" | "circuit_failures" => {
+                    circuit_failure_threshold = raw_value.parse::<u32>().with_context(|| {
+                        format!("{cmd} invalid circuit_failure_threshold `{raw_value}`")
+                    })?;
+                }
+                "circuit_open_ms" => {
+                    circuit_open_ms = raw_value
+                        .parse::<u64>()
+                        .with_context(|| format!("{cmd} invalid circuit_open_ms `{raw_value}`"))?;
+                }
                 "headers" | "request_headers" | "allow_headers" => {
                     request_headers = parse_ext_authz_header_list(raw_value, "request_headers")?;
                 }
                 "upstream_headers" | "response_headers" | "copy_headers" => {
                     upstream_headers = parse_ext_authz_header_list(raw_value, "upstream_headers")?;
-                }
-                "body" | "send_body" => {
-                    if parse_bool(raw_value)? {
-                        bail!(
-                            "{cmd} body forwarding is not supported in V4 basic mode; use body=off"
-                        );
-                    }
                 }
                 other => bail!("{cmd} unsupported option `{other}`"),
             }
@@ -5793,12 +6948,35 @@ fn parse_ext_authz(spec: &str, cmd: &str) -> Result<ExtAuthzPolicy> {
     }
     let target = target.with_context(|| format!("{cmd} requires uri/target"))?;
     validate_ext_authz_target(&target, path.as_deref(), cmd)?;
+    if include_body != body_max_bytes.is_some() {
+        bail!("{cmd} body=on requires max_body_bytes and body=off forbids it");
+    }
+    if include_body && method != Method::POST {
+        bail!("{cmd} body=on requires method=POST");
+    }
+    if (cache_ttl_ms == 0) != (cache_max_entries == 0)
+        || cache_ttl_ms > 60_000
+        || cache_max_entries > 100_000
+    {
+        bail!("{cmd} cache requires cache_ttl_ms=1..60000 and cache_max_entries=1..100000");
+    }
+    if (circuit_failure_threshold == 0) != (circuit_open_ms == 0)
+        || circuit_failure_threshold > 100
+        || (circuit_open_ms != 0 && !(10..=300_000).contains(&circuit_open_ms))
+    {
+        bail!("{cmd} circuit requires threshold=1..100 and circuit_open_ms=10..300000");
+    }
     Ok(ExtAuthzPolicy {
         target,
         path,
         method,
         timeout_ms,
         fail_open,
+        body_max_bytes,
+        cache_ttl: (cache_ttl_ms != 0).then(|| Duration::from_millis(cache_ttl_ms)),
+        cache_max_entries,
+        circuit_failure_threshold,
+        circuit_open: Duration::from_millis(circuit_open_ms),
         request_headers,
         upstream_headers,
     })
@@ -5894,20 +7072,26 @@ fn parse_ext_authz_header_list(raw: &str, field: &str) -> Result<Vec<HeaderName>
 /// # 参数
 /// - `name`: 已解析 header 名。
 fn ext_authz_header_is_safe(name: &HeaderName) -> bool {
-    !matches!(
-        name.as_str(),
-        "host"
-            | "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "expect"
-            | "te"
-            | "upgrade"
-            | "keep-alive"
-            | "proxy-connection"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-    )
+    let name = name.as_str();
+    !name.starts_with("x-forwarded-")
+        && !name.starts_with("x-original-")
+        && !matches!(
+            name,
+            "host"
+                | "connection"
+                | "content-length"
+                | "transfer-encoding"
+                | "expect"
+                | "te"
+                | "upgrade"
+                | "keep-alive"
+                | "proxy-connection"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "x-real-ip"
+                | "x-request-id"
+                | "x-gateway-route-id"
+        )
 }
 
 /// 取请求头的 UTF-8 文本值。
@@ -6104,30 +7288,68 @@ fn validate_query_key_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// 解析 nginx `if` 的安全子集。
+/// 业务作用：把 nginx `if` 安全子集编译成有界、无脚本能力的短路返回计划。
 ///
-/// # 参数
-/// - `spec`: route filter 原始字符串,如 `if ${header.X-Mode} = block return 451 blocked`。
-/// - `variables`: 当前快照变量计划,用于构建期编译左右模板。
+/// 参数说明：`spec` 是 route filter 原始字符串；`variables` 用于构建期编译比较两侧模板。
+///
+/// 返回：语法、操作符、复杂度和响应均合法时返回固定执行计划，否则拒绝候选快照。
 fn parse_if_return(spec: &str, variables: &VariablePlan) -> Result<ConditionalReturn> {
     let rest = filter_args(spec, "if");
     let tokens = rest.split_whitespace().collect::<Vec<_>>();
     if tokens.len() < 5 {
-        bail!("if requires `<left> (=|!=) <right> return <status> [body]`");
+        bail!("if requires `<expression> return <status> [body]`");
     }
-    let left = variables.compile_template(unquote_token(tokens[0]))?;
-    let op = match tokens[1] {
-        "=" | "==" => ConditionOp::Eq,
-        "!=" => ConditionOp::NotEq,
-        other => bail!("if unsupported operator `{other}` (=|!= only)"),
-    };
-    let right = variables.compile_template(unquote_token(tokens[2]))?;
-    if tokens[3] != "return" {
-        bail!("if only supports `return` action in V3 basic mode");
+    anyhow::ensure!(tokens.len() <= 68, "if expression exceeds token limit");
+    let return_index = tokens
+        .iter()
+        .position(|token| *token == "return")
+        .context("if only supports a final `return` action")?;
+    anyhow::ensure!(return_index > 0, "if expression is empty");
+    anyhow::ensure!(return_index + 1 < tokens.len(), "if return requires status");
+
+    let expression_tokens = &tokens[..return_index];
+    let mut any = vec![Vec::new()];
+    let mut cursor = 0;
+    let mut comparisons = 0usize;
+    while cursor < expression_tokens.len() {
+        anyhow::ensure!(
+            cursor + 2 < expression_tokens.len(),
+            "if comparison requires `<left> <operator> <right>`"
+        );
+        let left = variables.compile_template(unquote_token(expression_tokens[cursor]))?;
+        let op = match expression_tokens[cursor + 1] {
+            "=" | "==" => ConditionOp::Eq,
+            "!=" => ConditionOp::NotEq,
+            "^=" => ConditionOp::StartsWith,
+            "$=" => ConditionOp::EndsWith,
+            "*=" => ConditionOp::Contains,
+            other => bail!("if unsupported operator `{other}`"),
+        };
+        let right = variables.compile_template(unquote_token(expression_tokens[cursor + 2]))?;
+        any.last_mut()
+            .expect("condition expression always has one group")
+            .push(ConditionComparison { left, op, right });
+        comparisons += 1;
+        anyhow::ensure!(comparisons <= 16, "if expression exceeds comparison limit");
+        cursor += 3;
+        if cursor == expression_tokens.len() {
+            break;
+        }
+        match expression_tokens[cursor] {
+            "&&" => {}
+            "||" => any.push(Vec::new()),
+            other => bail!("if expected `&&` or `||`, got `{other}`"),
+        }
+        cursor += 1;
+        anyhow::ensure!(
+            cursor < expression_tokens.len(),
+            "if expression ends with connector"
+        );
     }
-    let status = parse_status_code(tokens[4], "if return status")?;
-    let value = if tokens.len() > 5 {
-        Some(unquote_token(&tokens[5..].join(" ")).to_string())
+
+    let status = parse_status_code(tokens[return_index + 1], "if return status")?;
+    let value = if tokens.len() > return_index + 2 {
+        Some(unquote_token(&tokens[return_index + 2..].join(" ")).to_string())
     } else {
         None
     };
@@ -6138,9 +7360,7 @@ fn parse_if_return(spec: &str, variables: &VariablePlan) -> Result<ConditionalRe
         }
     }
     Ok(ConditionalReturn {
-        left,
-        op,
-        right,
+        condition: ConditionExpr { any },
         response: DirectResponse { status, value },
     })
 }

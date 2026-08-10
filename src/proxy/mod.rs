@@ -47,7 +47,9 @@ use crate::config::{GatewayListenerRuntime, GatewaySnapshot};
 use crate::conn_registry::{CloseNotified, ConnGuard, ConnectionRegistry, LongProto};
 use crate::graphql::{GraphqlGuardResult, GraphqlOutcome};
 use crate::guard::DynamicInterfaceGuardCache;
-use crate::http_cache::{CacheLookup, CacheMiss, HttpCacheFill, HttpCacheHit, HttpCacheRuntime};
+use crate::http_cache::{
+    CacheLookup, CacheMiss, HttpCacheFill, HttpCacheHit, SwappableHttpCacheRuntime,
+};
 use crate::metrics::{
     CasbinDecisionMetric, DegraphqlMetric, DubboMetric, ExternalPluginMetric, LlmModerationMetric,
     Metrics, OpaCacheMetric, OpaDecisionMetric, OpaRequestMetric, UsagePlanMetric,
@@ -449,10 +451,10 @@ pub struct GatewayProxy {
     edge_relay: Arc<arc_swap::ArcSwapOption<crate::edge_relay::EdgeRelay>>,
     /// Redis Pub/Sub 集群总线；与 edge_relay 在配置构建期严格互斥。
     #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
-    edge_redis_bus: std::sync::OnceLock<Arc<crate::edge_redis_bus::EdgeRedisBus>>,
+    edge_redis_bus: Arc<arc_swap::ArcSwapOption<crate::edge_redis_bus::EdgeRedisBus>>,
     /// Redis Stream XREAD 集群总线；与 relay/PubSub 在配置构建期严格互斥。
     #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
-    edge_redis_stream: std::sync::OnceLock<Arc<crate::edge_redis_bus::EdgeRedisStreamBus>>,
+    edge_redis_stream: Arc<arc_swap::ArcSwapOption<crate::edge_redis_bus::EdgeRedisStreamBus>>,
     /// 可选 SessionDirectory 指路条：仅 `session_registry=redis` 且编译 `redis-runtime` 时注入；
     /// 恒空即走 broadcast-probe，push 热路径只多一次 OnceLock 原子读。
     #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
@@ -480,6 +482,8 @@ pub struct GatewayProxy {
     circuit_stats: Arc<dyn CircuitStats>,
     /// §20 HMAC 防重放守卫后端。local 每节点各自去重;redis 跨节点 `SET NX PX`。可热替换。
     replay_guard: Arc<dyn ReplayGuard>,
+    /// ext_authz 每后端独立的有界决策缓存与连续故障熔断状态；策略指纹变化会原地清空旧 owner 域。
+    ext_authz_runtime: Mutex<HashMap<String, ExtAuthzBackendState>>,
     /// V3 Sentinel `limit_req` 后端。local 用于单机/降级,Redis 用于集群共享计数。
     rate_limiter: Arc<dyn RateLimiter>,
     /// V3 动态事实源。auto-ban/admin 等低频运行态写入走这里,不进入正常请求热路径。
@@ -489,9 +493,9 @@ pub struct GatewayProxy {
     /// V4 动态接口禁用缓存。请求热路径只查本地已编译 matcher。
     interface_disable: Arc<DynamicInterfaceGuardCache>,
     /// V5 HTTP cache 的可选 Redis L2。local backend 的方法均为零网络空操作。
-    http_cache_runtime: Arc<HttpCacheRuntime>,
+    http_cache_runtime: Arc<SwappableHttpCacheRuntime>,
     /// V5 进程级 OpenTelemetry provider；server/client span 只处理 head，不接触 body。
-    telemetry: Arc<crate::telemetry::TelemetryRuntime>,
+    telemetry: Arc<crate::telemetry::SwappableTelemetryRuntime>,
     /// V6 model 成功 TTFB EWMA。route/model 都来自有界配置；热更历史仍设 4096 项硬上限。
     llm_model_latency: Mutex<HashMap<String, HashMap<Arc<str>, u64>>>,
     /// auto-ban 本地计数:IP -> 当前窗口内被 limit_req 拒绝次数。
@@ -521,9 +525,9 @@ pub struct ProxyRuntimeState {
     /// 集群接口禁用本地只读缓存。
     pub interface_disable: Arc<DynamicInterfaceGuardCache>,
     /// HTTP response cache L2 与失效总线。
-    pub http_cache: Arc<HttpCacheRuntime>,
+    pub http_cache: Arc<SwappableHttpCacheRuntime>,
     /// W3C/B3 传播与 OTLP exporter。
-    pub telemetry: Arc<crate::telemetry::TelemetryRuntime>,
+    pub telemetry: Arc<crate::telemetry::SwappableTelemetryRuntime>,
 }
 
 struct UpstreamFailureState {
@@ -534,6 +538,23 @@ struct UpstreamFailureState {
 struct CircuitState {
     open_until: Option<Instant>,
     half_open_probe: bool,
+}
+
+struct ExtAuthzBackendState {
+    policy_fingerprint: [u8; 32],
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+    half_open_probe: bool,
+    cache: HashMap<[u8; 32], ExtAuthzCachedDecision>,
+}
+
+#[derive(Clone)]
+struct ExtAuthzCachedDecision {
+    allowed: bool,
+    status: StatusCode,
+    challenge: Option<HeaderValue>,
+    upstream_headers: Vec<(HeaderName, HeaderValue)>,
+    expires_at: Instant,
 }
 
 struct CircuitPermit {
@@ -734,9 +755,9 @@ impl GatewayProxy {
             #[cfg(feature = "grpc-edge")]
             edge_relay: Arc::new(arc_swap::ArcSwapOption::empty()),
             #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
-            edge_redis_bus: std::sync::OnceLock::new(),
+            edge_redis_bus: Arc::new(arc_swap::ArcSwapOption::empty()),
             #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
-            edge_redis_stream: std::sync::OnceLock::new(),
+            edge_redis_stream: Arc::new(arc_swap::ArcSwapOption::empty()),
             #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
             edge_directory: std::sync::OnceLock::new(),
             ws_activity_clock: forward::start_ws_activity_clock(),
@@ -749,6 +770,7 @@ impl GatewayProxy {
             circuit_states: Arc::new(Mutex::new(HashMap::new())),
             circuit_stats: runtime_state.circuit_stats,
             replay_guard: runtime_state.replay_guard,
+            ext_authz_runtime: Mutex::new(HashMap::new()),
             rate_limiter: runtime_state.rate_limiter,
             dynamic_store: runtime_state.dynamic_store,
             blacklist: runtime_state.blacklist,
@@ -1435,6 +1457,7 @@ impl GatewayProxy {
                     downstream_proto,
                     request_id: &request_id,
                     route_id: route.id.as_str(),
+                    response_status: None,
                 };
                 static_serve
                     .serve(&parts, route.variables.as_ref(), &eval_ctx)
@@ -3065,6 +3088,7 @@ impl GatewayProxy {
                 downstream_proto: req.downstream_proto,
                 request_id: req.request_id,
                 route_id: route.id.as_str(),
+                response_status: None,
             };
             static_serve
                 .serve(&parts, route.variables.as_ref(), &eval_ctx)
@@ -3102,32 +3126,51 @@ impl GatewayProxy {
         identity: &mut AuthorizationIdentity,
         long_connection_consumer: Option<&mut Option<Arc<str>>>,
     ) -> Option<Response<BoxBody>> {
+        let auth_body = match collect_auth_body(route, parts, forward_body).await {
+            Ok(body) => body,
+            Err(response) => return Some(response),
+        };
         // 防重放必须先于 satisfy：有效签名的 nonce 一旦复用就不能借另一种认证方式绕过。
         // 仅在签名本身有效后消费 nonce，避免攻击者用垃圾输入污染去重状态。
         if route.has_hmac_replay()
             && route
-                .hmac_replay_detected(parts, self.replay_guard.as_ref())
+                .hmac_replay_detected(parts, auth_body.as_deref(), self.replay_guard.as_ref())
                 .await
         {
             return Some(text_status(401, "hmac replay detected"));
         }
+        let oidc = match route.oidc_rp_authenticate(parts).await {
+            Some(crate::routing::OidcRpDecision::Response(response)) => return Some(response),
+            Some(crate::routing::OidcRpDecision::Authenticated {
+                consumer,
+                claims,
+                identity_headers,
+            }) => Some((consumer, claims, identity_headers)),
+            None => None,
+        };
         let saml_response = match extract_saml_post_response(route, parts, forward_body).await {
             Ok(response) => response,
             Err(response) => return Some(response),
         };
         let resolved = route
-            .resolved_auth_state(parts, saml_response.as_deref())
+            .resolved_auth_state(parts, saml_response.as_deref(), auth_body.as_deref())
             .await;
-        let authenticated = resolved.configured && resolved.ok;
+        let local_configured = resolved.configured || oidc.is_some();
+        let local_ok = oidc.is_some() || resolved.ok;
+        let authenticated = local_configured && local_ok;
+        let (oidc_consumer, oidc_claims, oidc_identity_headers) = oidc
+            .map(|(consumer, claims, headers)| (Some(consumer), Some(claims), headers))
+            .unwrap_or_default();
         // 身份只从外部鉴权尚未触碰的原始请求冻结；后续绝不重新解释被注入的凭据头。
         let frozen = AuthorizationIdentity {
             authenticated,
-            consumer: resolved.consumer,
-            jwt_claims: resolved.jwt_claims,
+            consumer: oidc_consumer.or(resolved.consumer),
+            jwt_claims: oidc_claims.or(resolved.jwt_claims),
         };
-        let generated_identity_headers = resolved.identity_headers;
+        let mut generated_identity_headers = resolved.identity_headers;
+        generated_identity_headers.extend(oidc_identity_headers);
         if !route.has_ext_authz() {
-            if !resolved.ok {
+            if !local_ok {
                 return Some(auth_failed_response(route.auth_challenge(parts).as_deref()));
             }
             route.apply_identity_headers(parts, &generated_identity_headers);
@@ -3138,11 +3181,11 @@ impl GatewayProxy {
             return None;
         }
         match route.satisfy {
-            SatisfyMode::All if resolved.configured && !resolved.ok => {
+            SatisfyMode::All if local_configured && !local_ok => {
                 // `all` 语义不能通过发起外呼掩盖本地凭据失败，先拒绝也避免无意义依赖流量。
                 return Some(auth_failed_response(route.auth_challenge(parts).as_deref()));
             }
-            SatisfyMode::Any if resolved.configured && resolved.ok => {
+            SatisfyMode::Any if local_configured && local_ok => {
                 route.apply_identity_headers(parts, &generated_identity_headers);
                 if let Some(output) = long_connection_consumer {
                     *output = frozen.consumer.clone();
@@ -3163,6 +3206,7 @@ impl GatewayProxy {
                 downstream_proto,
                 request_id,
                 trace,
+                auth_body.as_ref(),
             )
             .await;
         match decision {
@@ -3355,15 +3399,80 @@ impl GatewayProxy {
         self.edge_relay.load_full()
     }
 
-    /// 注入 Redis Pub/Sub 集群总线；配置构建保证它与 relay 不会同时存在。
+    /// 业务作用：原子发布 Redis Pub/Sub 集群总线代。
+    ///
+    /// 参数说明：`bus` 是已建连并完成订阅的候选代。
+    ///
+    /// 返回：无返回值；后续请求只能选新代。
     #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
     pub fn attach_edge_redis_bus(&self, bus: Arc<crate::edge_redis_bus::EdgeRedisBus>) {
-        let _ = self.edge_redis_bus.set(bus);
+        self.edge_redis_bus.store(Some(bus));
     }
 
+    /// 业务作用：向管理观测面共享 Pub/Sub 原子 slot，使 metrics 跟随热换代而非固定初始句柄。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回 Proxy 持有的唯一当前代 slot。
+    #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
+    pub fn edge_redis_bus_slot(
+        &self,
+    ) -> Arc<arc_swap::ArcSwapOption<crate::edge_redis_bus::EdgeRedisBus>> {
+        self.edge_redis_bus.clone()
+    }
+
+    /// 业务作用：原子发布 Redis Stream 集群总线代。
+    ///
+    /// 参数说明：`bus` 是已建连并完成 XREAD 订阅的候选代。
+    ///
+    /// 返回：无返回值；后续请求只能选新代。
     #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
     pub fn attach_edge_redis_stream(&self, bus: Arc<crate::edge_redis_bus::EdgeRedisStreamBus>) {
-        let _ = self.edge_redis_stream.set(bus);
+        self.edge_redis_stream.store(Some(bus));
+    }
+
+    /// 业务作用：向管理观测面共享 Redis Stream 原子 slot，使 metrics 只读取当前发布代。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回 Proxy 持有的唯一当前代 slot。
+    #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
+    pub fn edge_redis_stream_slot(
+        &self,
+    ) -> Arc<arc_swap::ArcSwapOption<crate::edge_redis_bus::EdgeRedisStreamBus>> {
+        self.edge_redis_stream.clone()
+    }
+
+    /// 业务作用：清除已失去配置 owner 的 relay slot。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回切换前的 relay 代，供提交方排空。
+    #[cfg(feature = "grpc-edge")]
+    pub fn clear_edge_relay(&self) -> Option<Arc<crate::edge_relay::EdgeRelay>> {
+        self.edge_relay.swap(None)
+    }
+
+    /// 业务作用：清除已失去配置 owner 的 Pub/Sub slot。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回切换前的总线代，供提交方取消。
+    #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
+    pub fn clear_edge_redis_bus(&self) -> Option<Arc<crate::edge_redis_bus::EdgeRedisBus>> {
+        self.edge_redis_bus.swap(None)
+    }
+
+    /// 业务作用：清除已失去配置 owner 的 Stream slot。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回切换前的总线代，供提交方取消。
+    #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
+    pub fn clear_edge_redis_stream(
+        &self,
+    ) -> Option<Arc<crate::edge_redis_bus::EdgeRedisStreamBus>> {
+        self.edge_redis_stream.swap(None)
     }
 
     /// 业务作用：统一选择 relay 或 Redis 的 single-session 权威并完成 fencing claim。
@@ -3386,7 +3495,7 @@ impl GatewayProxy {
         #[cfg(feature = "redis-runtime")]
         if let Some(bus) = self
             .edge_redis_bus
-            .get()
+            .load_full()
             .filter(|bus| bus.single_session_enabled())
         {
             return bus.claim_single_session(tenant, user).await.map(Some);
@@ -3394,7 +3503,7 @@ impl GatewayProxy {
         #[cfg(feature = "redis-runtime")]
         if let Some(bus) = self
             .edge_redis_stream
-            .get()
+            .load_full()
             .filter(|bus| bus.single_session_enabled())
         {
             return bus.claim_single_session(tenant, user).await.map(Some);
@@ -3440,7 +3549,7 @@ impl GatewayProxy {
         #[cfg(feature = "redis-runtime")]
         if let Some(bus) = self
             .edge_redis_bus
-            .get()
+            .load_full()
             .filter(|bus| bus.group_owner_enabled())
         {
             return Some(
@@ -3451,7 +3560,7 @@ impl GatewayProxy {
         #[cfg(feature = "redis-runtime")]
         if let Some(bus) = self
             .edge_redis_stream
-            .get()
+            .load_full()
             .filter(|bus| bus.group_owner_enabled())
         {
             return Some(
@@ -4042,11 +4151,11 @@ impl GatewayProxy {
         frame: bytes::Bytes,
     ) -> crate::edge_relay::PeerBroadcastSummary {
         #[cfg(feature = "redis-runtime")]
-        if let Some(bus) = self.edge_redis_stream.get() {
+        if let Some(bus) = self.edge_redis_stream.load_full() {
             return bus.broadcast_push(&tenant, &user, frame).await;
         }
         #[cfg(feature = "redis-runtime")]
-        if let Some(bus) = self.edge_redis_bus.get() {
+        if let Some(bus) = self.edge_redis_bus.load_full() {
             return bus.broadcast_push(&tenant, &user, frame).await;
         }
         let Some(relay) = self.edge_relay.load_full() else {
@@ -4086,15 +4195,13 @@ impl GatewayProxy {
         frame: bytes::Bytes,
     ) -> Option<futures::future::BoxFuture<'static, crate::edge_relay::PeerBroadcastSummary>> {
         #[cfg(feature = "redis-runtime")]
-        if let Some(bus) = self.edge_redis_stream.get() {
-            let bus = bus.clone();
+        if let Some(bus) = self.edge_redis_stream.load_full() {
             return Some(Box::pin(async move {
                 bus.broadcast_publish(&tenant, &group, frame).await
             }));
         }
         #[cfg(feature = "redis-runtime")]
-        if let Some(bus) = self.edge_redis_bus.get() {
-            let bus = bus.clone();
+        if let Some(bus) = self.edge_redis_bus.load_full() {
             return Some(Box::pin(async move {
                 bus.broadcast_publish(&tenant, &group, frame).await
             }));
@@ -4261,7 +4368,8 @@ impl GatewayProxy {
                     // Redis Pub/Sub 没有 relay 的有序 per-peer enqueue queue。若把同一
                     // PublishStream 的多个 PUBLISH future 并发轮询，Redis 到达顺序没有契约；
                     // 因此该模式逐条等待命令完成，同时把有限背压传回 gRPC 发布流。
-                    if self.edge_redis_bus.get().is_some() || self.edge_redis_stream.get().is_some()
+                    if self.edge_redis_bus.load().is_some()
+                        || self.edge_redis_stream.load().is_some()
                     {
                         if let Some(pending) = pending_broadcast.take() {
                             let summary = pending.await;
@@ -5275,7 +5383,7 @@ async fn lookup_route_cache(
     downstream_proto: &str,
     miss_key: &mut Option<CacheMiss>,
     stale_refresh: &mut Option<CacheMiss>,
-    runtime: &HttpCacheRuntime,
+    runtime: &SwappableHttpCacheRuntime,
     metrics: &Metrics,
 ) -> Option<Response<BoxBody>> {
     let policy = route.http_cache.as_ref()?;
@@ -6273,6 +6381,7 @@ fn apply_response_filters(
     downstream_proto: &'static str,
     request_id: &str,
 ) {
+    let response_status = resp.status();
     for op in &route.response_headers {
         match op {
             ResponseHeaderOp::Add(set) => {
@@ -6283,6 +6392,7 @@ fn apply_response_filters(
                     client_ip,
                     downstream_proto,
                     request_id,
+                    response_status,
                 );
                 if let Ok(value) = http::header::HeaderValue::from_str(&value) {
                     resp.headers_mut().append(set.name.clone(), value);
@@ -6298,6 +6408,7 @@ fn apply_response_filters(
                     client_ip,
                     downstream_proto,
                     request_id,
+                    response_status,
                 );
                 if let Ok(value) = http::header::HeaderValue::from_str(&value) {
                     resp.headers_mut().insert(set.name.clone(), value);
@@ -6324,15 +6435,13 @@ fn apply_response_filters(
     }
 }
 
-/// 渲染动态 `add_header` 的 header value。
+/// 业务作用：在响应相位渲染头部模板，使响应状态等事实不会泄漏到请求相位。
 ///
-/// # 参数
-/// - `set`: 响应头设置规则。
-/// - `route`: 当前 route,提供变量计划和 route id。
-/// - `request_parts`: 原始请求 parts;仅动态模板需要。
-/// - `client_ip`: 真实客户端 IP。
-/// - `downstream_proto`: 下游协议 scheme。
-/// - `request_id`: 网关生成的 request id。
+/// 参数说明：`set` 是头部规则；`route` 提供变量计划；`request_parts` 是原始请求；
+/// `client_ip` 是真实客户端地址；`downstream_proto` 是下游 scheme；`request_id` 是权威请求标识；
+/// `response_status` 是当前已确定的响应状态。
+///
+/// 返回：静态值直接复用；动态值按响应相位上下文渲染。
 fn render_response_header_value(
     set: &crate::routing::ResponseHeaderSet,
     route: &Route,
@@ -6340,6 +6449,7 @@ fn render_response_header_value(
     client_ip: IpAddr,
     downstream_proto: &'static str,
     request_id: &str,
+    response_status: StatusCode,
 ) -> String {
     if let Some(literal) = set.value.static_literal() {
         return literal.to_string();
@@ -6353,6 +6463,7 @@ fn render_response_header_value(
         downstream_proto,
         request_id,
         route_id: route.id.as_str(),
+        response_status: Some(response_status),
     };
     set.value.render(&eval_ctx, route.variables.as_ref())
 }
@@ -8407,6 +8518,45 @@ async fn enforce_wasm_request_headers(
 /// 参数说明：`route` 提供构建期协议上限，`parts` 用于核对 POST/media type/声明长度，`body` 是
 /// 请求体唯一所有权槽。
 ///
+/// 业务作用：为 HMAC body hash 与 ext_authz body 转发只执行一次有界聚合，并把原字节和 trailers 放回主链。
+///
+/// 参数说明：`route` 决定是否启用及共同上限；`parts` 用于提前拒绝已知超长实体；`body` 是请求体所有权槽。
+///
+/// 返回：未启用返回 None；成功返回共享原始字节并恢复可重放 body；超限或读取失败返回本地拒绝响应。
+async fn collect_auth_body(
+    route: &Route,
+    parts: &Parts,
+    body: &mut Option<forward::ForwardBody>,
+) -> Result<Option<Bytes>, Response<BoxBody>> {
+    let Some(limit) = route.auth_body_limit() else {
+        return Ok(None);
+    };
+    if too_large(parts, limit) {
+        return Err(text_status(
+            413,
+            "authentication body exceeds configured limit",
+        ));
+    }
+    let current = body
+        .take()
+        .expect("body authentication owns the request body before later body phases");
+    let collected = match crate::proxy::request_validation::collect_bounded(current, limit).await {
+        Ok(collected) => collected,
+        Err(crate::proxy::request_validation::CollectError::TooLarge) => {
+            return Err(text_status(
+                413,
+                "authentication body exceeds configured limit",
+            ));
+        }
+        Err(crate::proxy::request_validation::CollectError::Read) => {
+            return Err(text_status(400, "authentication body read failed"));
+        }
+    };
+    let bytes = collected.bytes.clone();
+    *body = Some(crate::proxy::request_validation::buffered_body(collected));
+    Ok(Some(bytes))
+}
+
 /// 返回：没有适用 form 时返回 None；唯一 `SAMLResponse` 返回解码文本且 body 原样放回；超限、
 /// 读取失败或重复凭据返回本地拒绝响应。
 async fn extract_saml_post_response(

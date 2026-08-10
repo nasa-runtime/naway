@@ -588,7 +588,7 @@ pub struct GrpcEdgeClusterPlan {
     pub ack_deadline_ms: u64,
     /// 全网状节点数硬门。
     pub full_mesh_max_nodes: usize,
-    /// 兴趣路由策略；当前大集群模式仍由构建期硬门拒绝。
+    /// 兴趣路由策略；`auto` 使用已确认的远端兴趣快照过滤无关 group payload。
     pub interest_route: GrpcEdgeInterestRouteCfg,
     /// 顺序承诺；`group_owner` 通过确定性 owner 生效。
     pub ordering: GrpcEdgeOrderingCfg,

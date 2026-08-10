@@ -91,7 +91,7 @@ async function refresh() {
   }
 }
 
-// ── P0-2 配置发布闭环:载入(带 ETag)→ 编辑 → If-Match CAS 发布 → 确认生效 ──
+// 配置发布闭环：载入 ETag → 编辑 → If-Match CAS 发布 → 确认生效。
 //
 // ETag 是发布的**唯一并发凭据**:它由服务端按整份配置集(含依赖文件)算出。这里只保存
 // 载入时拿到的那一个,发布成功后立刻用响应里的新 ETag 覆盖——绝不自己拼造或复用旧值,
@@ -116,10 +116,12 @@ async function loadCurrentConfig() {
     $("candidate").value = payload.content || "";
     configEtag = payload.etag || response.headers.get("etag");
     $("config-publish").disabled = !configEtag;
+    $("config-diff").disabled = !configEtag;
     setConfigMeta(`v${payload.version} · ${payload.source} · ${configEtag}`);
   } catch (error) {
     configEtag = null;
     $("config-publish").disabled = true;
+    $("config-diff").disabled = true;
     setConfigMeta("载入失败", "bad");
     showNotice(error instanceof Error ? error.message : String(error));
   }
@@ -153,10 +155,13 @@ async function publishCurrentConfig() {
       configEtag = payload.etag || response.headers.get("etag");
       setConfigMeta(`v${payload.version} · applied · ${configEtag}`);
       showNotice(`已生效:版本 v${payload.version}(网关已确认换版,非仅调度 reload)`);
-    } else if (payload.status === "published") {
+    } else if (payload.status === "published" || payload.status === "canary_published") {
       // 集群(Nacos)路径:CAS 已写回事实源,各节点靠 watch 收敛,这里只能说"已发布"。
       setConfigMeta(`rollout ${payload.rollout_id}`, "");
       showNotice(`已 CAS 发布到集群(rollout ${payload.rollout_id});下方 rollout 面板显示各节点收敛进度`);
+    } else if (payload.status === "awaiting_approval") {
+      setConfigMeta(`change ${payload.change_id}`, "");
+      showNotice(`变更 ${payload.change_id} 已登记，需另一名有权主体复核后执行`);
     } else {
       setConfigMeta(payload.status || "pending", "bad");
       showNotice(`发布已提交但尚未确认生效(${payload.status});可查看最近变更或稍后刷新`);
@@ -170,7 +175,7 @@ async function publishCurrentConfig() {
   }
 }
 
-// ── P0-3 集群页:节点收敛 + rollout 进度 ──
+// 集群页：节点收敛与 rollout 进度。
 //
 // 收敛判据与后端一致:**版本一致还不够,指纹也必须一致**——同版本不同内容意味着某节点
 // 从别处物化了不同配置,只看版本号会把分叉误显示成"已收敛"。
@@ -221,7 +226,7 @@ async function refreshCluster() {
   }
 }
 
-// ── P0-3 C2b 上游拓扑:服务 / 来源 / LB 策略 / 实例 / 健康 ──
+// 上游拓扑：服务、来源、负载策略、实例和健康事实。
 //
 // 口径必须说清楚,否则这个面板会骗人:`/admin/upstreams` 的 `healthy` 是**发现态**
 // (静态 yml 的标记,或注册中心 last-known-good),**不含主动探测结果**——后端注释明确
@@ -267,14 +272,14 @@ async function refreshTopology() {
   }
 }
 
-// ── P0-3 C5 节点流量:各节点 QPS / 5xx / 活跃连接 ──
+// ── 节点流量：各节点 QPS / 5xx / 活跃连接 ──
 //
 // 数据来自本节点用**自己的 admin 凭据**抓取同集群其它节点的 /metrics(需显式开启
 // `admin.auth.allow_cluster_metrics_scrape`)。抓不到的节点显示失败原因而**不显示 0**——
 // 把抓不到画成"没流量"会让运维得出完全相反的结论。
 async function refreshNodeTraffic() {
   try {
-    const payload = await getJson("/admin/cluster/metrics");
+    const payload = await getJson("/api/cluster/metrics");
     const nodes = payload.nodes || [];
     $("node-traffic-state").textContent = `${payload.reachable}/${payload.total} 可达`;
     $("node-traffic-state").className =
@@ -290,13 +295,16 @@ async function refreshNodeTraffic() {
             tone: "bad",
           };
         }
-        const errors = node.responses_5xx_total ?? 0;
+        const qps = Number.isFinite(node.qps) ? node.qps.toFixed(2) : "?";
+        const errorRate = Number.isFinite(node.responses_5xx_per_second)
+          ? node.responses_5xx_per_second.toFixed(2)
+          : "?";
         return {
           title: node.node_id,
-          detail: `${node.admin_listen} · 累计请求 ${node.requests_total ?? "?"}`
-            + ` · 5xx ${errors}`,
+          detail: `${node.admin_listen} · QPS ${qps} · 5xx/s ${errorRate}`,
           state: `${node.active_connections ?? "?"} 活跃`,
-          tone: errors > 0 ? "warn" : "",
+          tone: Number.isFinite(node.responses_5xx_per_second)
+            && node.responses_5xx_per_second > 0 ? "warn" : "",
         };
       }),
       "集群成员为空",
@@ -312,8 +320,201 @@ async function refreshNodeTraffic() {
   }
 }
 
+async function requestJson(path, options = {}) {
+  const response = await fetch(path, {
+    credentials: "same-origin",
+    cache: "no-store",
+    ...options,
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || `${path}: HTTP ${response.status}`);
+  return { response, payload };
+}
+
+function renderJson(target, value) {
+  target.hidden = false;
+  target.textContent = JSON.stringify(value, null, 2);
+}
+
+async function runConfigDiff() {
+  showNotice("");
+  try {
+    const { payload } = await requestJson("/api/config/all/diff", {
+      method: "POST",
+      headers: { "content-type": "application/yaml" },
+      body: $("candidate").value,
+    });
+    renderJson($("config-diff-result"), payload.diff);
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function runExplain() {
+  showNotice("");
+  const headers = {};
+  if ($("explain-host").value.trim()) headers.host = $("explain-host").value.trim();
+  try {
+    const { payload } = await requestJson("/api/explain", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        method: $("explain-method").value,
+        path: $("explain-path").value || "/",
+        headers,
+      }),
+    });
+    renderJson($("explain-result"), payload);
+  } catch (error) {
+    $("explain-result").textContent = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function loadSentinel() {
+  showNotice("");
+  try {
+    const { response, payload } = await requestJson("/api/sentinel");
+    $("sentinel-candidate").value = payload.content || "";
+    configEtag = payload.etag || response.headers.get("etag");
+    $("sentinel-publish").disabled = !configEtag;
+  } catch (error) {
+    $("sentinel-publish").disabled = true;
+    showNotice(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function publishSentinel() {
+  if (!configEtag) {
+    showNotice("请先载入 Sentinel 文档以取得整体配置 ETag");
+    return;
+  }
+  const button = $("sentinel-publish");
+  button.disabled = true;
+  try {
+    const { payload } = await requestJson("/api/sentinel", {
+      method: "PUT",
+      headers: { "content-type": "application/yaml", "if-match": configEtag },
+      body: $("sentinel-candidate").value,
+    });
+    showNotice(payload.status === "awaiting_approval"
+      ? `Sentinel 变更 ${payload.change_id} 等待另一主体复核`
+      : `Sentinel 变更状态：${payload.status || "applied"}`);
+    await refreshAdvanced();
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error));
+  } finally {
+    button.disabled = !configEtag;
+  }
+}
+
+function setApprovalRows(changes) {
+  const target = $("approvals");
+  target.replaceChildren();
+  if (!changes.length) {
+    target.className = "list empty";
+    target.textContent = "没有可复核变更";
+    return;
+  }
+  target.className = "list";
+  for (const change of changes.slice().reverse()) {
+    const item = document.createElement("div");
+    item.className = "row";
+    const copy = document.createElement("div");
+    const title = document.createElement("strong");
+    const detail = document.createElement("small");
+    title.textContent = `${change.id} · ${change.resource}`;
+    detail.textContent = `${change.initiator} · base v${change.base_version} · ${change.status}`;
+    copy.append(title, detail);
+    if (change.status === "pending") {
+      const actions = document.createElement("div");
+      actions.className = "row-actions";
+      for (const action of ["approve", "reject"]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = action === "approve" ? "批准" : "拒绝";
+        if (action === "approve") button.className = "primary";
+        button.addEventListener("click", () => reviewChange(change, action));
+        actions.append(button);
+      }
+      item.append(copy, actions);
+    } else {
+      const status = document.createElement("span");
+      status.className = `state ${["failed", "stale", "expired", "rejected"].includes(change.status) ? "bad" : ""}`;
+      status.textContent = change.status;
+      item.append(copy, status);
+    }
+    target.append(item);
+  }
+}
+
+async function reviewChange(change, action) {
+  showNotice("");
+  try {
+    const { payload } = await requestJson(`/api/changes/${encodeURIComponent(change.id)}/${action}`, {
+      method: "POST",
+      headers: { "if-match": change.candidate_etag },
+    });
+    showNotice(`变更 ${change.id}：${payload.status || action}`);
+    await refreshAdvanced();
+    await refresh();
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function refreshAdvanced() {
+  try {
+    const consumers = await getJson("/api/consumers");
+    const rows = consumers.consumers || [];
+    $("consumer-state").textContent = `${rows.length} 个`;
+    setRows(
+      $("consumers"),
+      rows.map((consumer) => ({
+        title: consumer.id,
+        detail: `plan ${consumer.plan || "未绑定"}`,
+        state: `${consumer.key_count || 0} keys`,
+      })),
+      "尚未配置消费者",
+    );
+  } catch (error) {
+    $("consumer-state").textContent = "不可用";
+    setRows($("consumers"), [], "无查看权限或配置不可用");
+  }
+  try {
+    const certs = await getJson("/api/certs");
+    const rows = certs.certificates || [];
+    $("cert-state").textContent = `${rows.length} 张`;
+    setRows(
+      $("certificates"),
+      rows.map((cert) => ({
+        title: `${cert.proxy} · ${cert.entry}`,
+        detail: `${(cert.domains || []).join(", ") || "default"} · ${cert.source}`,
+        state: cert.ok ? `${cert.status?.days_remaining ?? "?"} 天` : "INVALID",
+        tone: !cert.ok || (cert.status?.days_remaining ?? 999) < 14 ? "bad" : "",
+      })),
+      "未配置 TLS 证书",
+    );
+  } catch (error) {
+    $("cert-state").textContent = "不可用";
+    setRows($("certificates"), [], "无查看权限或证书不可用");
+  }
+  try {
+    const payload = await getJson("/api/changes");
+    const changes = payload.changes || [];
+    $("approval-state").textContent = `${changes.filter((change) => change.status === "pending").length} 待复核`;
+    setApprovalRows(changes);
+  } catch (error) {
+    $("approval-state").textContent = "未启用或无权限";
+    setApprovalRows([]);
+  }
+}
+
 $("config-load").addEventListener("click", loadCurrentConfig);
 $("config-publish").addEventListener("click", publishCurrentConfig);
+$("config-diff").addEventListener("click", runConfigDiff);
+$("explain-run").addEventListener("click", runExplain);
+$("sentinel-load").addEventListener("click", loadSentinel);
+$("sentinel-publish").addEventListener("click", publishSentinel);
 $("refresh").addEventListener("click", refresh);
 $("dry-run").addEventListener("click", async () => {
   showNotice("");
@@ -342,6 +543,7 @@ function refreshAll() {
   refreshCluster();
   refreshTopology();
   refreshNodeTraffic();
+  refreshAdvanced();
 }
 
 refreshAll();

@@ -8,13 +8,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 #[cfg(any(feature = "redis-runtime", test))]
 use anyhow::Context as _;
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use http::header::{
     AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_LOCATION,
@@ -31,7 +32,7 @@ use parking_lot::Mutex;
 #[cfg(feature = "redis-runtime")]
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 use crate::config::model::HttpCacheBackendCfg;
 use crate::config::GatewaySnapshot;
@@ -76,6 +77,13 @@ pub struct HttpCacheRuntime {
     backend: HttpCacheBackend,
     #[cfg(feature = "redis-runtime")]
     reconcile_interval: Duration,
+    shutdown: watch::Sender<bool>,
+}
+
+/// 进程级 HTTP cache L2 代际句柄；请求每次只借用当前代，reload 可先建连再切换。
+pub struct SwappableHttpCacheRuntime {
+    active: ArcSwap<HttpCacheRuntime>,
+    snapshot: OnceLock<Arc<arc_swap::ArcSwap<GatewaySnapshot>>>,
 }
 
 enum HttpCacheBackend {
@@ -112,10 +120,12 @@ impl HttpCacheRuntime {
             "redis" => build_redis_backend(cfg).await?,
             other => anyhow::bail!("unsupported runtime_state.http_cache.backend `{other}`"),
         };
+        let (shutdown, _) = watch::channel(false);
         Ok(Arc::new(Self {
             backend,
             #[cfg(feature = "redis-runtime")]
             reconcile_interval: Duration::from_millis(cfg.reconcile_interval_ms),
+            shutdown,
         }))
     }
 
@@ -251,8 +261,9 @@ impl HttpCacheRuntime {
         #[cfg(feature = "redis-runtime")]
         if matches!(self.backend, HttpCacheBackend::Redis { .. }) {
             let runtime = self.clone();
+            let shutdown = runtime.shutdown.subscribe();
             tokio::spawn(async move {
-                runtime.run_invalidation_worker(snap).await;
+                runtime.run_invalidation_worker(snap, shutdown).await;
             });
         }
         #[cfg(not(feature = "redis-runtime"))]
@@ -455,6 +466,7 @@ impl HttpCacheRuntime {
     async fn run_invalidation_worker(
         self: Arc<Self>,
         snap: Arc<arc_swap::ArcSwap<GatewaySnapshot>>,
+        mut shutdown: watch::Receiver<bool>,
     ) {
         let HttpCacheBackend::Redis {
             client,
@@ -465,6 +477,9 @@ impl HttpCacheRuntime {
             return;
         };
         loop {
+            if *shutdown.borrow() {
+                return;
+            }
             // 每次重订前先对账；即使上次断线期间漏了广播，也不会永久保留旧 L1。
             self.reconcile_all_generations(&snap).await;
             match client.sub(&[invalidation_channel]).await {
@@ -473,6 +488,9 @@ impl HttpCacheRuntime {
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tokio::select! {
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() { return; }
+                            }
                             message = subscription.next_message() => {
                                 let Some(message) = message else { break; };
                                 self.apply_invalidation_message(&snap, &message.payload);
@@ -486,7 +504,12 @@ impl HttpCacheRuntime {
                     tracing::warn!(%error, "HTTP cache invalidation subscribe failed");
                 }
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { return; }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
         }
     }
 
@@ -530,6 +553,146 @@ impl HttpCacheRuntime {
                 }
             }
         }
+    }
+}
+
+impl SwappableHttpCacheRuntime {
+    /// 业务作用：以已建立的 cache 代创建稳定句柄，使 Proxy/Admin 无需换指针。
+    ///
+    /// 参数说明：`initial` 是启动期已完成 Redis 连接复验的初始代。
+    ///
+    /// 返回：返回尚未启动失效订阅的可换代句柄。
+    pub fn new(initial: Arc<HttpCacheRuntime>) -> Arc<Self> {
+        Arc::new(Self {
+            active: ArcSwap::from(initial),
+            snapshot: OnceLock::new(),
+        })
+    }
+
+    /// 业务作用：启动当前 cache 代的失效订阅，并保存后续换代共用的快照句柄。
+    ///
+    /// 参数说明：`snap` 用于将 Redis generation 对账到当前 route L1。
+    ///
+    /// 返回：无返回值；重复调用不会改变已绑定的快照 owner。
+    pub fn spawn_invalidation_worker(
+        self: &Arc<Self>,
+        snap: Arc<arc_swap::ArcSwap<GatewaySnapshot>>,
+    ) {
+        if self.snapshot.set(snap.clone()).is_ok() {
+            self.active.load_full().spawn_invalidation_worker(snap);
+        }
+    }
+
+    /// 业务作用：原子切换已建连的 cache 代，先让新代可见再撤销旧失效订阅。
+    ///
+    /// 参数说明：`candidate` 是通过 [`HttpCacheRuntime::build`] 准备好的候选代。
+    ///
+    /// 返回：无返回值；新请求立即使用候选拓扑，旧代在通知后退出。
+    pub fn replace(&self, candidate: Arc<HttpCacheRuntime>) {
+        let old = self.active.swap(candidate.clone());
+        if let Some(snapshot) = self.snapshot.get() {
+            candidate.spawn_invalidation_worker(snapshot.clone());
+        }
+        let _ = old.shutdown.send(true);
+    }
+
+    /// 业务作用：读取当前 L2 共享状态，供候选 route 构建与运行门禁使用。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：当前代使用 Redis L2 时返回 true。
+    pub fn is_shared(&self) -> bool {
+        self.active.load().is_shared()
+    }
+
+    async fn generation(&self, scope: &str) -> Result<u64> {
+        self.active.load_full().generation(scope).await
+    }
+
+    async fn lookup_l2(
+        &self,
+        storage_key: &str,
+        max_body_bytes: usize,
+    ) -> Result<Option<CachedResponse>> {
+        self.active
+            .load_full()
+            .lookup_l2(storage_key, max_body_bytes)
+            .await
+    }
+
+    async fn store_l2(&self, storage_key: &str, entry: &CachedResponse) -> Result<()> {
+        self.active.load_full().store_l2(storage_key, entry).await
+    }
+
+    #[cfg(feature = "redis-runtime")]
+    async fn acquire_fill_lock(
+        &self,
+        storage_key: &str,
+        timeout: Duration,
+    ) -> Result<Option<nasa::redis::LockGuard>> {
+        self.active
+            .load_full()
+            .acquire_fill_lock(storage_key, timeout)
+            .await
+    }
+
+    pub(crate) async fn llm_cache_get_exact(
+        &self,
+        scope: &str,
+        digest: &str,
+        max_encoded_bytes: usize,
+    ) -> Result<Option<Bytes>> {
+        self.active
+            .load_full()
+            .llm_cache_get_exact(scope, digest, max_encoded_bytes)
+            .await
+    }
+
+    pub(crate) async fn llm_cache_candidates(
+        &self,
+        scope: &str,
+        max_candidates: usize,
+        max_dimensions: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.active
+            .load_full()
+            .llm_cache_candidates(scope, max_candidates, max_dimensions)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn llm_cache_store(
+        &self,
+        scope: &str,
+        digest: &str,
+        encoded_response: &[u8],
+        encoded_candidate: Option<&str>,
+        ttl: Duration,
+        max_entries: usize,
+    ) -> Result<()> {
+        self.active
+            .load_full()
+            .llm_cache_store(
+                scope,
+                digest,
+                encoded_response,
+                encoded_candidate,
+                ttl,
+                max_entries,
+            )
+            .await
+    }
+
+    pub(crate) async fn purge_route(
+        &self,
+        proxy_id: &str,
+        route_id: &str,
+        policy: &HttpCachePolicy,
+    ) -> Result<u64> {
+        self.active
+            .load_full()
+            .purge_route(proxy_id, route_id, policy)
+            .await
     }
 }
 
@@ -914,7 +1077,7 @@ impl HttpCachePolicy {
         request: &Parts,
         proxy_id: &str,
         route_id: &str,
-        runtime: &HttpCacheRuntime,
+        runtime: &SwappableHttpCacheRuntime,
         metrics: &Metrics,
     ) -> CacheLookup {
         let scope = cache_scope(proxy_id, route_id);
@@ -1067,7 +1230,7 @@ impl HttpCachePolicy {
         key: &String,
         proxy_id: &str,
         route_id: &str,
-        runtime: &HttpCacheRuntime,
+        runtime: &SwappableHttpCacheRuntime,
         metrics: &Metrics,
         accept_stale: bool,
     ) -> Option<CacheReady> {
@@ -1159,7 +1322,7 @@ impl HttpCachePolicy {
         leader: CacheFlightLeader,
         proxy_id: &str,
         route_id: &str,
-        runtime: &HttpCacheRuntime,
+        runtime: &SwappableHttpCacheRuntime,
         metrics: &Metrics,
     ) -> PreparedFlight {
         #[cfg(feature = "redis-runtime")]
@@ -1225,7 +1388,7 @@ impl HttpCachePolicy {
         miss: CacheMiss,
         proxy_id: &str,
         route_id: &str,
-        runtime: &HttpCacheRuntime,
+        runtime: &SwappableHttpCacheRuntime,
         metrics: &Metrics,
     ) -> Option<CacheMiss> {
         let CacheMiss { key, flight } = miss;
@@ -1255,7 +1418,7 @@ impl HttpCachePolicy {
         self: &Arc<Self>,
         mut resp: Response<BoxBody>,
         miss: CacheMiss,
-        runtime: Arc<HttpCacheRuntime>,
+        runtime: Arc<SwappableHttpCacheRuntime>,
         metrics: Arc<Metrics>,
     ) -> Response<BoxBody> {
         let Some(mut lifetime) = self.response_ttl(&resp) else {
@@ -1396,7 +1559,7 @@ struct CacheFillBody {
     /// route cache 与配置。
     policy: Arc<HttpCachePolicy>,
     /// 进程级 L2；只有 policy.l2_enabled 时提交任务会访问。
-    runtime: Arc<HttpCacheRuntime>,
+    runtime: Arc<SwappableHttpCacheRuntime>,
     /// L2 回填成功/失败计数器；Arc clone 不复制指标状态。
     metrics: Arc<Metrics>,
     /// EOF 提交时消费的 key。

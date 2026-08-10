@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::header::HeaderName;
 use http::request::Parts;
+use http::StatusCode;
 
 use crate::config::model::{VariableMapCfg, VariablesCfg};
 use crate::net::Cidr;
@@ -63,6 +64,14 @@ enum Var {
     Query(String),
     Set(String),
     Map(usize),
+    ResponseStatus,
+}
+
+/// 模板可读取变量的执行相位；构建期用它阻止请求相位提前读取响应事实。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VariablePhase {
+    Request,
+    Response,
 }
 
 /// 单个 nginx `map` 的编译结果。
@@ -101,6 +110,8 @@ pub struct EvalContext<'a> {
     pub request_id: &'a str,
     /// 当前命中的 route id。
     pub route_id: &'a str,
+    /// 仅响应 header/filter 相位存在；请求路由、鉴权与上游选择一律为 None。
+    pub response_status: Option<StatusCode>,
 }
 
 /// 变量模板编译期上下文。
@@ -114,6 +125,7 @@ struct CompileCtx {
     allow_any_query: bool,
     allowed_queries: HashSet<String>,
     allow_maps: bool,
+    phase: VariablePhase,
 }
 
 impl VariablePlan {
@@ -165,6 +177,7 @@ impl VariablePlan {
             allow_any_query,
             allowed_queries,
             allow_maps: true,
+            phase: VariablePhase::Request,
         };
         let sets = cfg
             .set
@@ -210,6 +223,19 @@ impl VariablePlan {
     /// # 参数
     /// - `raw`: 原始模板字符串,例如 `"${remote_addr}-${map.tenant}"`。
     pub fn compile_template(&self, raw: &str) -> Result<ValueTemplate> {
+        self.compile_template_for_phase(raw, VariablePhase::Request)
+    }
+
+    /// 业务作用：在指定执行相位编译模板，使响应事实不能被请求路由、鉴权或上游选择提前读取。
+    ///
+    /// 参数说明：`raw` 是模板文本；`phase` 是调用点实际执行相位。
+    ///
+    /// 返回：变量均在该相位可用时返回模板；越相位引用、未知变量或资源超限返回错误。
+    pub(crate) fn compile_template_for_phase(
+        &self,
+        raw: &str,
+        phase: VariablePhase,
+    ) -> Result<ValueTemplate> {
         let ctx = CompileCtx {
             set_names: self.sets.keys().cloned().collect(),
             map_index: self.map_index.clone(),
@@ -218,6 +244,7 @@ impl VariablePlan {
             allow_any_query: self.allow_any_query,
             allowed_queries: self.allowed_queries.clone(),
             allow_maps: true,
+            phase,
         };
         compile_template(raw, &ctx)
     }
@@ -309,6 +336,7 @@ impl Clone for CompileCtx {
             allow_any_query: self.allow_any_query,
             allowed_queries: self.allowed_queries.clone(),
             allow_maps: self.allow_maps,
+            phase: self.phase,
         }
     }
 }
@@ -319,6 +347,9 @@ impl Clone for CompileCtx {
 /// - `raw`: 配置中的原始模板。
 /// - `ctx`: 编译期变量上下文,负责校验可引用变量集合。
 fn compile_template(raw: &str, ctx: &CompileCtx) -> Result<ValueTemplate> {
+    if raw.len() > 64 * 1024 {
+        bail!("variable template exceeds 65536 bytes");
+    }
     if !raw.contains("${") {
         return Ok(ValueTemplate {
             parts: Arc::from([TemplatePart::Literal(Arc::from(raw))]),
@@ -345,6 +376,9 @@ fn compile_template(raw: &str, ctx: &CompileCtx) -> Result<ValueTemplate> {
     if !rest.is_empty() {
         parts.push(TemplatePart::Literal(Arc::from(rest)));
     }
+    if parts.len() > 128 {
+        bail!("variable template exceeds 128 parts");
+    }
     Ok(ValueTemplate {
         parts: Arc::from(parts),
         static_literal: None,
@@ -367,6 +401,12 @@ fn parse_var(name: &str, ctx: &CompileCtx) -> Result<Var> {
         "scheme" => return Ok(Var::Scheme),
         "request_id" => return Ok(Var::RequestId),
         "route_id" => return Ok(Var::RouteId),
+        "status" | "response.status" | "response_status" => {
+            if ctx.phase != VariablePhase::Response {
+                bail!("response status variable is unavailable in request phase");
+            }
+            return Ok(Var::ResponseStatus);
+        }
         _ => {}
     }
     if let Some(header) = name.strip_prefix("header.") {
@@ -456,6 +496,11 @@ fn render_var(
             if let Some(map) = plan.maps.get(*idx) {
                 let key = map.source.render_with_depth(ctx, plan, depth);
                 out.push_str(map.lookup(&key));
+            }
+        }
+        Var::ResponseStatus => {
+            if let Some(status) = ctx.response_status {
+                out.push_str(status.as_str());
             }
         }
     }

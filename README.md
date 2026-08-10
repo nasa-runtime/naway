@@ -58,10 +58,11 @@ protobuf 内容，业务消息按不透明字节传递，只依据 gRPC metadata
 RequestMirror、百分比 RequestMirror、CORS 和 named rule。GRPCRoute named rule 已按 provisional
 contract 支持。
 
-TLS listener 只接受 `mode: Passthrough`，按 exact SNI 优先、再按最长 wildcard suffix 选择
-TLSRoute；`mode: Terminate`、同 listener 混合 terminate/passthrough、动态 HTTP 8080 listener、
-`parentRef.port`、multiple mirrors 与 BackendTLSPolicy 不在声明范围。无效 L4 backend 仍保留拒绝型
-listener，避免旧配置或其它进程接管本应失败闭合的端口。
+TLS listener 支持 `Passthrough` 与 `Terminate`：透传按 exact SNI 优先、再按最长 wildcard suffix
+选择 TLSRoute；终止模式从受授权 Secret 构建同代证书配置。`parentRef.sectionName`/`port`、多个有界
+RequestMirror，以及带 System/ConfigMap CA 和显式 DNS/URI SAN 的 BackendTLSPolicy 均在候选发布前
+裁决。未知 kind、ExtensionRef、TLS mode、跨 namespace 引用或冲突 policy 会通过 status 报告并失败
+闭合；无效 L4 backend 仍保留拒绝型 listener，避免其它进程接管本应保护的端口。
 
 HTTP/HTTPS listener 使用 `gateway_bind_address`。TLS/TCP/UDP listener 默认使用
 `gateway_stream_bind_address`；配置非空 `gateway_stream_bind_addresses` 后，控制器按稳定 Gateway
@@ -91,8 +92,13 @@ token quota 在 cache miss 后预留，依据 provider 最终 usage 幂等多退
 `runtime_state.store.backend` 支持 `file|redis|nacos`。Nacos 后端需要 `nacos-sdk` feature，每个
 collection 使用独立 dataId 和带 schema/revision 的有界 JSON 文档，二进制 value 以 Base64 保存；
 写入、删除和容量 admission 使用 md5 CAS，watch 把完整快照差异转换成本地增量事件。坏文档或超限
-推送不会覆盖 last-known-good。`admin.listen`、普通/TLS/QUIC listener 与 ACME worker 使用同一
-prepare→publish→drain 热换事务：候选 bind/provider/锁初始化失败时，旧快照与旧 listener 保持在线。
+推送不会覆盖 last-known-good。`admin.listen`、普通/TLS/QUIC listener、xDS/edge 集群传输、日志与
+审计 sink、HTTP cache、telemetry exporter 和 ACME worker 使用 prepare→publish→drain 换代：候选
+bind、连接、权限、provider 或锁初始化失败时，旧快照与旧 generation 保持在线。
+
+ACME DNS-01 可直接使用 Cloudflare、RFC2136 HMAC-SHA256 TSIG、Vault action endpoint，或兼容的
+无 shell command provider；所有内建凭据只从 SecretSource 解析。manifest 证书模式保护当前与恢复
+指针后按保留代数回收，旧双文件模式通过持久 journal 在任何读取前恢复完整 pair。
 
 OPA route 默认通过外部 Data API 执行 head-only 授权，也可用 `opa-embedded` feature 从 detached
 Ed25519 签名的标准 tar.gz bundle 构建本地 Rego 引擎。bundle 的压缩/解压字节、文件数、路径、

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read as _;
 use std::pin::Pin;
 #[cfg(feature = "grpc-descriptor")]
 use std::sync::Arc;
@@ -41,6 +42,14 @@ const GRPC_MESSAGE: HeaderName = HeaderName::from_static("grpc-message");
 const GRPC_STATUS_DETAILS: HeaderName = HeaderName::from_static("grpc-status-details-bin");
 const X_GRPC_WEB: HeaderName = HeaderName::from_static("x-grpc-web");
 const DEFAULT_UNARY_BUFFER_LIMIT: u64 = 64 * 1024 * 1024;
+const MAX_BROWSER_REQUEST_TRAILERS: usize = 32;
+const MAX_BROWSER_REQUEST_TRAILER_BYTES: usize = 8 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowserRequestEncoding {
+    Identity,
+    Gzip,
+}
 
 /// 浏览器请求使用的 wire protocol；值会跨一次上游 await，用于恢复下游响应外壳。
 #[derive(Clone, Debug)]
@@ -303,7 +312,7 @@ impl BrowserGrpc {
         body: ForwardBody,
         max_body_bytes: u64,
     ) -> Result<ForwardBody, BrowserGrpcError> {
-        validate_request_encoding(self, &parts.headers)?;
+        let request_encoding = validate_request_encoding(self, &parts.headers)?;
         map_connect_timeout(&mut parts.headers)?;
         map_connect_compression(self, &mut parts.headers);
         parts.headers.remove(CONTENT_LENGTH);
@@ -320,12 +329,22 @@ impl BrowserGrpc {
             Self::GrpcWebBinary | Self::ConnectStreaming => body,
             Self::GrpcWebText => Base64DecodeBody::new(body).boxed(),
             Self::ConnectUnary => {
-                let payload = collect_unary_payload(body, unary_limit(max_body_bytes)).await?;
-                GrpcUnaryRequestBody::new(payload).boxed()
+                let collected = collect_unary_payload(body, unary_limit(max_body_bytes)).await?;
+                let payload = decode_unary_request(
+                    collected.bytes,
+                    request_encoding,
+                    unary_limit(max_body_bytes),
+                )?;
+                GrpcUnaryRequestBody::new(payload, collected.trailers).boxed()
             }
             #[cfg(feature = "grpc-descriptor")]
             Self::ConnectUnaryJson(method) => {
-                let json = collect_unary_payload(body, unary_limit(max_body_bytes)).await?;
+                let collected = collect_unary_payload(body, unary_limit(max_body_bytes)).await?;
+                let json = decode_unary_request(
+                    collected.bytes,
+                    request_encoding,
+                    unary_limit(max_body_bytes),
+                )?;
                 let payload = method
                     .encode_json_request(&json)
                     .map_err(|error| BrowserGrpcError::request(error.status(), error.message()))?;
@@ -334,7 +353,7 @@ impl BrowserGrpc {
                     .path_and_query(method.rpc_path())
                     .build()
                     .expect("validated protobuf RPC path");
-                GrpcUnaryRequestBody::new(payload).boxed()
+                GrpcUnaryRequestBody::new(payload, collected.trailers).boxed()
             }
             #[cfg(feature = "grpc-descriptor")]
             Self::ConnectStreamingJson(method) => {
@@ -348,7 +367,12 @@ impl BrowserGrpc {
             }
             #[cfg(feature = "grpc-descriptor")]
             Self::GoogleUnaryJson(request) => {
-                let json = collect_unary_payload(body, unary_limit(max_body_bytes)).await?;
+                let collected = collect_unary_payload(body, unary_limit(max_body_bytes)).await?;
+                let json = decode_unary_request(
+                    collected.bytes,
+                    request_encoding,
+                    unary_limit(max_body_bytes),
+                )?;
                 let payload = request
                     .encode_json_request(&json)
                     .map_err(|error| BrowserGrpcError::request(error.status(), error.message()))?;
@@ -357,10 +381,15 @@ impl BrowserGrpc {
                     .path_and_query(request.rpc_path())
                     .build()
                     .expect("validated protobuf RPC path");
-                GrpcUnaryRequestBody::new(payload).boxed()
+                GrpcUnaryRequestBody::new(payload, collected.trailers).boxed()
             }
         };
-        Ok(EnvelopeValidateBody::new(body, parts.headers.contains_key(GRPC_ENCODING)).boxed())
+        Ok(EnvelopeValidateBody::new(
+            body,
+            parts.headers.contains_key(GRPC_ENCODING),
+            unary_limit(max_body_bytes),
+        )
+        .boxed())
     }
 
     /// 业务作用：把 native gRPC response 恢复成浏览器可消费的 gRPC-Web/Connect wire 语义。
@@ -446,7 +475,7 @@ fn unary_limit(configured: u64) -> u64 {
 fn validate_request_encoding(
     protocol: &BrowserGrpc,
     headers: &HeaderMap,
-) -> Result<(), BrowserGrpcError> {
+) -> Result<BrowserRequestEncoding, BrowserGrpcError> {
     #[cfg(feature = "grpc-descriptor")]
     let descriptor_json = matches!(
         protocol,
@@ -456,25 +485,41 @@ fn validate_request_encoding(
     );
     #[cfg(not(feature = "grpc-descriptor"))]
     let descriptor_json = false;
-    if !protocol.is_connect_unary() && !descriptor_json {
-        return Ok(());
+    let header = if protocol.is_connect_unary() || descriptor_json {
+        headers
+            .get(CONTENT_ENCODING)
+            .or_else(|| headers.get(CONNECT_CONTENT_ENCODING))
+    } else if matches!(protocol, BrowserGrpc::ConnectStreaming) {
+        headers.get(CONNECT_CONTENT_ENCODING)
+    } else {
+        headers.get(GRPC_ENCODING)
+    };
+    let Some(value) = header else {
+        return Ok(BrowserRequestEncoding::Identity);
+    };
+    let value = value.to_str().map_err(|_| {
+        BrowserGrpcError::request(
+            StatusCode::BAD_REQUEST,
+            "browser gRPC request encoding is not valid ASCII",
+        )
+    })?;
+    if value.eq_ignore_ascii_case("identity") {
+        return Ok(BrowserRequestEncoding::Identity);
     }
-    let encoded = headers
-        .get(CONTENT_ENCODING)
-        .or_else(|| headers.get(CONNECT_CONTENT_ENCODING))
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| !value.eq_ignore_ascii_case("identity"));
-    if encoded {
+    if !value.eq_ignore_ascii_case("gzip") {
         return Err(BrowserGrpcError::request(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            if descriptor_json {
-                "compressed descriptor JSON requests are not supported"
-            } else {
-                "compressed unary browser RPC requests are not supported"
-            },
+            "browser gRPC request compression algorithm is not supported",
         ));
     }
-    Ok(())
+    #[cfg(feature = "grpc-descriptor")]
+    if matches!(protocol, BrowserGrpc::ConnectStreamingJson(_)) {
+        return Err(BrowserGrpcError::request(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "compressed streaming JSON requests are not supported",
+        ));
+    }
+    Ok(BrowserRequestEncoding::Gzip)
 }
 
 /// 业务作用：把 Connect timeout 毫秒值转换为 gRPC timeout，并在非法/溢出时 fail closed。
@@ -539,6 +584,7 @@ fn map_connect_compression(protocol: &BrowserGrpc, headers: &mut HeaderMap) {
         }
         headers.remove(CONNECT_PROTOCOL_VERSION);
         headers.remove(CONTENT_ENCODING);
+        headers.remove(CONNECT_CONTENT_ENCODING);
         return;
     }
     match protocol {
@@ -575,8 +621,17 @@ fn map_connect_compression(protocol: &BrowserGrpc, headers: &mut HeaderMap) {
 /// 参数说明：`body` 是裸 protobuf body；`limit` 是已确定的非零预算。
 ///
 /// 返回：成功时复用聚合 Bytes；读取、trailer 或大小错误映射 400/413。
-async fn collect_unary_payload(mut body: BoxBody, limit: u64) -> Result<Bytes, BrowserGrpcError> {
+struct CollectedUnaryPayload {
+    bytes: Bytes,
+    trailers: Option<HeaderMap>,
+}
+
+async fn collect_unary_payload(
+    mut body: BoxBody,
+    limit: u64,
+) -> Result<CollectedUnaryPayload, BrowserGrpcError> {
     let mut bytes = BytesMut::new();
+    let mut trailers = None;
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| {
             BrowserGrpcError::request(StatusCode::BAD_REQUEST, "Connect request body read failed")
@@ -592,11 +647,15 @@ async fn collect_unary_payload(mut body: BoxBody, limit: u64) -> Result<Bytes, B
                 bytes.extend_from_slice(&data);
             }
             Err(frame) => {
-                if frame.into_trailers().is_ok() {
-                    return Err(BrowserGrpcError::request(
-                        StatusCode::BAD_REQUEST,
-                        "Connect unary request trailers are not supported",
-                    ));
+                if let Ok(next) = frame.into_trailers() {
+                    if trailers.is_some() {
+                        return Err(BrowserGrpcError::request(
+                            StatusCode::BAD_REQUEST,
+                            "browser gRPC request contains duplicate trailer blocks",
+                        ));
+                    }
+                    validate_browser_request_trailers(&next)?;
+                    trailers = Some(next);
                 }
             }
         }
@@ -607,13 +666,111 @@ async fn collect_unary_payload(mut body: BoxBody, limit: u64) -> Result<Bytes, B
             "Connect unary request exceeds gRPC frame limit",
         ));
     }
-    Ok(bytes.freeze())
+    Ok(CollectedUnaryPayload {
+        bytes: bytes.freeze(),
+        trailers,
+    })
+}
+
+/// 业务作用：对 Connect unary gzip 实体执行同步有界解压，防止压缩炸弹进入 protobuf/JSON 编码器。
+///
+/// 参数说明：`bytes` 是已受压缩体上限保护的原始实体；`encoding` 只允许 identity/gzip；`limit` 是解压后硬门。
+///
+/// 返回：identity 原样复用；gzip 成功返回解压字节；算法、格式或解压后超限返回 4xx。
+fn decode_unary_request(
+    bytes: Bytes,
+    encoding: BrowserRequestEncoding,
+    limit: u64,
+) -> Result<Bytes, BrowserGrpcError> {
+    if encoding == BrowserRequestEncoding::Identity {
+        return Ok(bytes);
+    }
+    let take_limit = limit.saturating_add(1);
+    let mut decoder = flate2::read::GzDecoder::new(bytes.as_ref()).take(take_limit);
+    let capacity = usize::try_from(limit.min(64 * 1024)).unwrap_or(64 * 1024);
+    let mut decoded = Vec::with_capacity(capacity);
+    decoder.read_to_end(&mut decoded).map_err(|_| {
+        BrowserGrpcError::request(StatusCode::BAD_REQUEST, "invalid gzip browser RPC request")
+    })?;
+    if decoded.len() as u64 > limit {
+        return Err(BrowserGrpcError::request(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "decompressed browser RPC request exceeds body limit",
+        ));
+    }
+    Ok(Bytes::from(decoded))
+}
+
+/// 业务作用：限制浏览器请求 trailers 为低风险应用 metadata，防止在认证后追加凭据、路由或 framing 权威。
+///
+/// 参数说明：`trailers` 是下游提交且准备转发给 native gRPC 的最终 trailer block。
+///
+/// 返回：名称、数量和值总预算均合法时成功；敏感字段、控制字符或超限返回 400 类协议错误。
+fn validate_browser_request_trailers(trailers: &HeaderMap) -> Result<(), BrowserGrpcError> {
+    if trailers.len() > MAX_BROWSER_REQUEST_TRAILERS {
+        return Err(BrowserGrpcError::request(
+            StatusCode::BAD_REQUEST,
+            "browser gRPC request has too many trailers",
+        ));
+    }
+    let mut total = 0usize;
+    for (name, value) in trailers {
+        total = total
+            .checked_add(name.as_str().len())
+            .and_then(|size| size.checked_add(value.as_bytes().len()))
+            .ok_or_else(|| {
+                BrowserGrpcError::request(
+                    StatusCode::BAD_REQUEST,
+                    "browser gRPC request trailers exceed size limit",
+                )
+            })?;
+        let lower = name.as_str();
+        if lower.starts_with("grpc-")
+            || lower.starts_with("content-")
+            || lower.starts_with("x-forwarded-")
+            || lower.starts_with("x-original-")
+            || matches!(
+                lower,
+                "authorization"
+                    | "proxy-authorization"
+                    | "cookie"
+                    | "host"
+                    | "connection"
+                    | "keep-alive"
+                    | "proxy-connection"
+                    | "transfer-encoding"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+                    | "x-request-id"
+            )
+        {
+            return Err(BrowserGrpcError::request(
+                StatusCode::BAD_REQUEST,
+                "browser gRPC request trailer name is forbidden",
+            ));
+        }
+        if value.to_str().is_err() || value.as_bytes().iter().any(|byte| byte.is_ascii_control()) {
+            return Err(BrowserGrpcError::request(
+                StatusCode::BAD_REQUEST,
+                "browser gRPC request trailer value is invalid",
+            ));
+        }
+    }
+    if total > MAX_BROWSER_REQUEST_TRAILER_BYTES {
+        return Err(BrowserGrpcError::request(
+            StatusCode::BAD_REQUEST,
+            "browser gRPC request trailers exceed size limit",
+        ));
+    }
+    Ok(())
 }
 
 /// Connect unary 请求体：先发送 5-byte native gRPC envelope，再零拷贝发送已聚合 payload。
 struct GrpcUnaryRequestBody {
     header: Option<Bytes>,
     payload: Option<Bytes>,
+    trailers: Option<HeaderMap>,
 }
 
 impl GrpcUnaryRequestBody {
@@ -622,12 +779,13 @@ impl GrpcUnaryRequestBody {
     /// 参数说明：`payload` 已通过 u32 frame 长度与 proxy body 预算校验。
     ///
     /// 返回：两帧以内的请求 body；HTTP frame 边界不改变 gRPC 字节流语义。
-    fn new(payload: Bytes) -> Self {
+    fn new(payload: Bytes, trailers: Option<HeaderMap>) -> Self {
         let mut header = [0_u8; 5];
         header[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
         Self {
             header: Some(Bytes::copy_from_slice(&header)),
             payload: Some(payload),
+            trailers,
         }
     }
 }
@@ -648,7 +806,14 @@ impl Body for GrpcUnaryRequestBody {
         if let Some(header) = self.header.take() {
             return Poll::Ready(Some(Ok(Frame::data(header))));
         }
-        Poll::Ready(self.payload.take().map(|payload| Ok(Frame::data(payload))))
+        if let Some(payload) = self.payload.take() {
+            return Poll::Ready(Some(Ok(Frame::data(payload))));
+        }
+        Poll::Ready(
+            self.trailers
+                .take()
+                .map(|trailers| Ok(Frame::trailers(trailers))),
+        )
     }
 
     /// 业务作用：让 Hyper 只在 header 与 payload 都已交付后关闭请求流。
@@ -657,7 +822,7 @@ impl Body for GrpcUnaryRequestBody {
     ///
     /// 返回：两段数据均被取走时为 true。
     fn is_end_stream(&self) -> bool {
-        self.header.is_none() && self.payload.is_none()
+        self.header.is_none() && self.payload.is_none() && self.trailers.is_none()
     }
 
     /// 业务作用：提供精确 native gRPC body 长度，避免上游使用 chunked 语义猜测 unary 边界。
@@ -679,6 +844,8 @@ struct EnvelopeValidateBody {
     header_len: usize,
     remaining: u32,
     compression_allowed: bool,
+    max_frame_bytes: u64,
+    saw_trailers: bool,
     finished: bool,
 }
 
@@ -689,13 +856,15 @@ impl EnvelopeValidateBody {
     /// `compression_allowed` 表示请求头已声明 grpc-encoding。
     ///
     /// 返回：逐帧零拷贝转发、同时跨 HTTP chunk 校验 5-byte envelope 的 body。
-    fn new(inner: BoxBody, compression_allowed: bool) -> Self {
+    fn new(inner: BoxBody, compression_allowed: bool, max_frame_bytes: u64) -> Self {
         Self {
             inner,
             header: [0; 5],
             header_len: 0,
             remaining: 0,
             compression_allowed,
+            max_frame_bytes,
+            saw_trailers: false,
             finished: false,
         }
     }
@@ -737,6 +906,11 @@ impl EnvelopeValidateBody {
                     self.header[3],
                     self.header[4],
                 ]);
+                if u64::from(self.remaining) > self.max_frame_bytes {
+                    return Err(protocol_body_error(
+                        "browser gRPC request frame exceeds configured limit",
+                    ));
+                }
                 self.header_len = 0;
             }
         }
@@ -763,6 +937,12 @@ impl Body for EnvelopeValidateBody {
         }
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(_data) if self.saw_trailers => {
+                    self.finished = true;
+                    Poll::Ready(Some(Err(protocol_body_error(
+                        "browser gRPC request DATA followed trailers",
+                    ))))
+                }
                 Ok(data) => match self.validate(&data) {
                     Ok(()) => Poll::Ready(Some(Ok(Frame::data(data)))),
                     Err(error) => {
@@ -771,13 +951,35 @@ impl Body for EnvelopeValidateBody {
                     }
                 },
                 Err(frame) => {
-                    self.finished = true;
-                    let message = if frame.into_trailers().is_ok() {
-                        "browser gRPC request trailers are not supported"
+                    if let Ok(trailers) = frame.into_trailers() {
+                        if self.saw_trailers {
+                            self.finished = true;
+                            return Poll::Ready(Some(Err(protocol_body_error(
+                                "browser gRPC request contains duplicate trailer blocks",
+                            ))));
+                        }
+                        if self.header_len != 0 || self.remaining != 0 {
+                            self.finished = true;
+                            return Poll::Ready(Some(Err(protocol_body_error(
+                                "browser gRPC request trailers arrived inside an envelope",
+                            ))));
+                        }
+                        match validate_browser_request_trailers(&trailers) {
+                            Ok(()) => {
+                                self.saw_trailers = true;
+                                Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+                            }
+                            Err(error) => {
+                                self.finished = true;
+                                Poll::Ready(Some(Err(protocol_body_error(error.message()))))
+                            }
+                        }
                     } else {
-                        "browser gRPC request contains an unsupported body frame"
-                    };
-                    Poll::Ready(Some(Err(protocol_body_error(message))))
+                        self.finished = true;
+                        Poll::Ready(Some(Err(protocol_body_error(
+                            "browser gRPC request contains an unsupported body frame",
+                        ))))
+                    }
                 }
             },
             Poll::Ready(Some(Err(error))) => {
@@ -1019,10 +1221,20 @@ impl Body for StreamingJsonBody {
                     Err(frame) => {
                         let trailers = frame.into_trailers().ok();
                         if matches!(self.direction, StreamingJsonDirection::Request) {
-                            self.finished = true;
-                            return Poll::Ready(Some(Err(protocol_body_error(
-                                "Connect streaming request trailers are not supported",
-                            ))));
+                            if let Some(trailers) = trailers {
+                                if let Err(error) = validate_browser_request_trailers(&trailers) {
+                                    self.finished = true;
+                                    return Poll::Ready(Some(Err(protocol_body_error(
+                                        error.message(),
+                                    ))));
+                                }
+                                if let Err(error) = self.validate_finish(Some(&trailers)) {
+                                    self.finished = true;
+                                    return Poll::Ready(Some(Err(error)));
+                                }
+                                self.finished = true;
+                                return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                            }
                         }
                         if let Err(error) = self.validate_finish(trailers.as_ref()) {
                             self.finished = true;
@@ -1063,6 +1275,7 @@ struct Base64DecodeBody {
     inner: BoxBody,
     pending: BytesMut,
     saw_padding: bool,
+    pending_trailers: Option<HeaderMap>,
     done: bool,
 }
 
@@ -1077,6 +1290,7 @@ impl Base64DecodeBody {
             inner,
             pending: BytesMut::new(),
             saw_padding: false,
+            pending_trailers: None,
             done: false,
         }
     }
@@ -1127,6 +1341,12 @@ impl Body for Base64DecodeBody {
             if self.done {
                 return Poll::Ready(None);
             }
+            if self.pending.is_empty() {
+                if let Some(trailers) = self.pending_trailers.take() {
+                    self.done = true;
+                    return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                }
+            }
             match Pin::new(&mut self.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Ok(data) => {
@@ -1154,11 +1374,24 @@ impl Body for Base64DecodeBody {
                         }
                     }
                     Err(frame) => {
-                        if frame.into_trailers().is_ok() {
-                            self.done = true;
-                            return Poll::Ready(Some(Err(protocol_body_error(
-                                "gRPC-Web request trailers are not supported",
-                            ))));
+                        if let Ok(trailers) = frame.into_trailers() {
+                            if let Err(error) = validate_browser_request_trailers(&trailers) {
+                                self.done = true;
+                                return Poll::Ready(Some(Err(protocol_body_error(
+                                    error.message(),
+                                ))));
+                            }
+                            self.pending_trailers = Some(trailers);
+                            match self.decode_ready(true) {
+                                Ok(Some(decoded)) => {
+                                    return Poll::Ready(Some(Ok(Frame::data(decoded))))
+                                }
+                                Ok(None) => continue,
+                                Err(error) => {
+                                    self.done = true;
+                                    return Poll::Ready(Some(Err(error)));
+                                }
+                            }
                         }
                     }
                 },

@@ -14,13 +14,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use futures::StreamExt;
+use hmac::{Hmac, Mac};
 use hyper::{Response, StatusCode};
 use instant_acme::{
     Account, AccountBuilder, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier,
     NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::{AcmeChallenge, AcmeDns01RuntimeCfg, AcmeRuntimeCfg, TlsRuntimeCfg};
+use crate::config::{AcmeChallenge, AcmeDns01ProviderRuntime, AcmeRuntimeCfg, TlsRuntimeCfg};
 use crate::{full_body, BoxBody};
 
 /// RFC 8555 HTTP-01 challenge 的固定 URI 前缀。
@@ -198,26 +201,31 @@ pub trait Dns01Provider: Send + Sync {
 /// action/record/value 只放环境变量，不经过 shell、也不进入 argv/日志；provider 自己可从 env/file/K8s
 /// Secret/Vault 读取云厂商凭据。
 struct CommandDns01Provider {
-    cfg: AcmeDns01RuntimeCfg,
+    command: PathBuf,
+    args: Arc<[String]>,
+    timeout: Duration,
 }
 
 impl CommandDns01Provider {
-    /// 执行一次有界 provider 操作。
+    /// 业务作用：在固定 deadline 内直接执行 DNS provider，不经 shell 且不暴露 challenge 到 argv。
+    ///
+    /// 参数说明：`action` 只能是固定 present/cleanup；`record`/`value` 只进入子进程环境。
+    ///
+    /// 返回：命令按时以成功状态退出时成功；启动、超时或非零退出均失败闭合。
     async fn run(&self, action: &'static str, record: &str, value: &str) -> Result<()> {
-        let mut command = tokio::process::Command::new(&self.cfg.command);
+        let mut command = tokio::process::Command::new(&self.command);
         command
-            .args(self.cfg.args.iter())
+            .args(self.args.iter())
             .env("GW_ACME_DNS_ACTION", action)
             .env("GW_ACME_DNS_RECORD", record)
             .env("GW_ACME_DNS_VALUE", value)
             .kill_on_drop(true)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let status =
-            tokio::time::timeout(Duration::from_millis(self.cfg.timeout_ms), command.status())
-                .await
-                .with_context(|| format!("ACME DNS-01 provider {action} timeout"))?
-                .with_context(|| format!("execute ACME DNS-01 provider {action}"))?;
+        let status = tokio::time::timeout(self.timeout, command.status())
+            .await
+            .with_context(|| format!("ACME DNS-01 provider {action} timeout"))?
+            .with_context(|| format!("execute ACME DNS-01 provider {action}"))?;
         if !status.success() {
             // provider 输出可能含云凭据，错误只暴露退出码，不回显 stdout/stderr。
             anyhow::bail!("ACME DNS-01 provider {action} failed with status {status}");
@@ -242,6 +250,858 @@ impl Dns01Provider for CommandDns01Provider {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(self.run("cleanup", record, value))
     }
+}
+
+#[derive(Clone)]
+struct HttpDns01Limits {
+    timeout: Duration,
+    retry_attempts: usize,
+    retry_backoff: Duration,
+    max_response_bytes: usize,
+    ttl_seconds: u32,
+}
+
+/// Cloudflare DNS Records API provider；record id 只保存在本进程内且有固定容量。
+struct CloudflareDns01Provider {
+    client: reqwest::Client,
+    api_base: String,
+    zone_id: String,
+    api_token: String,
+    limits: HttpDns01Limits,
+    record_ids: std::sync::Mutex<HashMap<(String, String), String>>,
+}
+
+impl CloudflareDns01Provider {
+    /// 业务作用：调用固定 Cloudflare zone authority，并对网络、状态码、重试和响应体统一设硬门。
+    ///
+    /// 参数说明：`method`/`url` 由已校验配置派生；`body` 只含公开 TXT challenge。
+    ///
+    /// 返回：获得 2xx 且完整响应不超限时返回字节；认证、输入、超限或最终依赖故障失败闭合。
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<&serde_json::Value>,
+        query: Option<&[(&str, &str)]>,
+    ) -> Result<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + self.limits.timeout;
+        let mut last_error = None;
+        for attempt in 0..self.limits.retry_attempts {
+            let mut request = self
+                .client
+                .request(method.clone(), url)
+                .bearer_auth(&self.api_token);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            if let Some(query) = query {
+                request = request.query(query);
+            }
+            let result = tokio::time::timeout_at(deadline, request.send()).await;
+            match result {
+                Ok(Ok(response)) if response.status().is_success() => {
+                    return read_bounded_http_body(response, self.limits.max_response_bytes).await;
+                }
+                Ok(Ok(response)) => {
+                    let status = response.status();
+                    let _ = read_bounded_http_body(response, self.limits.max_response_bytes).await;
+                    if !status.is_server_error() && status.as_u16() != 429 {
+                        anyhow::bail!("Cloudflare DNS API rejected request with status {status}");
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "Cloudflare DNS API temporary status {status}"
+                    ));
+                }
+                Ok(Err(error)) => {
+                    last_error = Some(anyhow::Error::new(error).context("call Cloudflare DNS API"));
+                }
+                Err(_) => anyhow::bail!("Cloudflare DNS API operation timeout"),
+            }
+            if attempt + 1 < self.limits.retry_attempts {
+                tokio::time::timeout_at(deadline, tokio::time::sleep(self.limits.retry_backoff))
+                    .await
+                    .context("Cloudflare DNS API retry deadline exceeded")?;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Cloudflare DNS API failed")))
+    }
+
+    /// 业务作用：创建本订单唯一 TXT 并冻结返回的 record id，供取消路径精确回收。
+    ///
+    /// 参数说明：`record`/`value` 来自当前 ACME authorization。
+    ///
+    /// 返回：Cloudflare 确认创建并返回合法 id 时成功；映射容量或响应结构异常时立即清理并失败。
+    async fn present_record(&self, record: &str, value: &str) -> Result<()> {
+        anyhow::ensure!(
+            value.len() <= 255,
+            "ACME DNS-01 TXT value exceeds 255 bytes"
+        );
+        let url = format!("{}/zones/{}/dns_records", self.api_base, self.zone_id);
+        let body = serde_json::json!({
+            "type": "TXT",
+            "name": record,
+            "content": value,
+            "ttl": self.limits.ttl_seconds,
+        });
+        let bytes = self
+            .request(reqwest::Method::POST, &url, Some(&body), None)
+            .await?;
+        let document: serde_json::Value =
+            serde_json::from_slice(&bytes).context("parse Cloudflare DNS create response")?;
+        anyhow::ensure!(
+            document.get("success").and_then(serde_json::Value::as_bool) == Some(true),
+            "Cloudflare DNS create response did not report success"
+        );
+        let id = document
+            .pointer("/result/id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 128
+                    && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .context("Cloudflare DNS create response has invalid record id")?
+            .to_owned();
+        let over_capacity = {
+            let ids = self
+                .record_ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Cloudflare DNS record map is poisoned"))?;
+            ids.len() >= 256 && !ids.contains_key(&(record.to_owned(), value.to_owned()))
+        };
+        if over_capacity {
+            let _ = self.delete_id(&id).await;
+            anyhow::bail!("Cloudflare DNS outstanding record limit exceeded");
+        }
+        self.record_ids
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cloudflare DNS record map is poisoned"))?
+            .insert((record.to_owned(), value.to_owned()), id);
+        Ok(())
+    }
+
+    /// 业务作用：按 Cloudflare record id 幂等删除单个 challenge，不影响同名并行 TXT。
+    ///
+    /// 参数说明：`id` 是 create/list 返回并经过字符门校验的固定标识。
+    ///
+    /// 返回：2xx 或已不存在时成功；其它最终错误保留给租约重试/告警。
+    async fn delete_id(&self, id: &str) -> Result<()> {
+        let url = format!("{}/zones/{}/dns_records/{id}", self.api_base, self.zone_id);
+        match self
+            .request(reqwest::Method::DELETE, &url, None, None)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if format!("{error:#}").contains("404") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 业务作用：恢复缺失的本地 record id 后精确删除本订单 TXT，使重复 cleanup 仍保持幂等。
+    ///
+    /// 参数说明：`record`/`value` 共同构成完整删除键。
+    ///
+    /// 返回：所有匹配 id 已删除或记录不存在时成功；列表异常、超限或删除失败时返回错误。
+    async fn cleanup_record(&self, record: &str, value: &str) -> Result<()> {
+        let key = (record.to_owned(), value.to_owned());
+        let known_id = {
+            self.record_ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Cloudflare DNS record map is poisoned"))?
+                .remove(&key)
+        };
+        if let Some(id) = known_id {
+            return self.delete_id(&id).await;
+        }
+        let url = format!("{}/zones/{}/dns_records", self.api_base, self.zone_id);
+        let query = [
+            ("type", "TXT"),
+            ("name", record),
+            ("content", value),
+            ("per_page", "100"),
+        ];
+        let bytes = self
+            .request(reqwest::Method::GET, &url, None, Some(&query))
+            .await?;
+        let document: serde_json::Value =
+            serde_json::from_slice(&bytes).context("parse Cloudflare DNS list response")?;
+        let records = document
+            .get("result")
+            .and_then(serde_json::Value::as_array)
+            .context("Cloudflare DNS list response has no result array")?;
+        anyhow::ensure!(
+            records.len() <= 100,
+            "Cloudflare DNS list result exceeds 100 records"
+        );
+        for record_value in records {
+            if record_value.get("type").and_then(serde_json::Value::as_str) != Some("TXT")
+                || record_value.get("name").and_then(serde_json::Value::as_str) != Some(record)
+                || record_value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(value)
+            {
+                continue;
+            }
+            let id = record_value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| {
+                    !id.is_empty()
+                        && id.len() <= 128
+                        && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+                .context("Cloudflare DNS list returned invalid record id")?;
+            self.delete_id(id).await?;
+        }
+        Ok(())
+    }
+}
+
+impl Dns01Provider for CloudflareDns01Provider {
+    fn present<'a>(
+        &'a self,
+        record: &'a str,
+        value: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.present_record(record, value))
+    }
+
+    fn cleanup<'a>(
+        &'a self,
+        record: &'a str,
+        value: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.cleanup_record(record, value))
+    }
+}
+
+/// Vault 固定 action endpoint provider；Vault policy 决定 token 仅能调用两个配置 path。
+struct VaultDns01Provider {
+    client: reqwest::Client,
+    endpoint: String,
+    token: String,
+    namespace: Option<String>,
+    present_path: String,
+    cleanup_path: String,
+    limits: HttpDns01Limits,
+}
+
+impl VaultDns01Provider {
+    /// 业务作用：向固定 Vault action path 提交有界 challenge，不允许重定向把 token 带到其它 authority。
+    ///
+    /// 参数说明：`path` 来自构建期校验计划；`record`/`value` 是公开 DNS challenge。
+    ///
+    /// 返回：Vault 返回 2xx 或 cleanup 返回 404 时成功；其它客户端拒绝和最终依赖失败均失败闭合。
+    async fn action(&self, path: &str, record: &str, value: &str, cleanup: bool) -> Result<()> {
+        let url = format!("{}/{}", self.endpoint, path);
+        let deadline = tokio::time::Instant::now() + self.limits.timeout;
+        let body = serde_json::json!({
+            "name": record,
+            "value": value,
+            "ttl": self.limits.ttl_seconds,
+        });
+        let mut last_error = None;
+        for attempt in 0..self.limits.retry_attempts {
+            let mut request = self
+                .client
+                .post(&url)
+                .header("X-Vault-Token", &self.token)
+                .json(&body);
+            if let Some(namespace) = &self.namespace {
+                request = request.header("X-Vault-Namespace", namespace);
+            }
+            match tokio::time::timeout_at(deadline, request.send()).await {
+                Ok(Ok(response)) if response.status().is_success() => {
+                    read_bounded_http_body(response, self.limits.max_response_bytes).await?;
+                    return Ok(());
+                }
+                Ok(Ok(response))
+                    if cleanup && response.status() == reqwest::StatusCode::NOT_FOUND =>
+                {
+                    read_bounded_http_body(response, self.limits.max_response_bytes).await?;
+                    return Ok(());
+                }
+                Ok(Ok(response)) => {
+                    let status = response.status();
+                    let _ = read_bounded_http_body(response, self.limits.max_response_bytes).await;
+                    if !status.is_server_error() && status.as_u16() != 429 {
+                        anyhow::bail!("Vault DNS action rejected request with status {status}");
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "Vault DNS action temporary status {status}"
+                    ));
+                }
+                Ok(Err(error)) => {
+                    last_error = Some(anyhow::Error::new(error).context("call Vault DNS action"));
+                }
+                Err(_) => anyhow::bail!("Vault DNS action timeout"),
+            }
+            if attempt + 1 < self.limits.retry_attempts {
+                tokio::time::timeout_at(deadline, tokio::time::sleep(self.limits.retry_backoff))
+                    .await
+                    .context("Vault DNS action retry deadline exceeded")?;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Vault DNS action failed")))
+    }
+}
+
+impl Dns01Provider for VaultDns01Provider {
+    fn present<'a>(
+        &'a self,
+        record: &'a str,
+        value: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.action(&self.present_path, record, value, false))
+    }
+
+    fn cleanup<'a>(
+        &'a self,
+        record: &'a str,
+        value: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.action(&self.cleanup_path, record, value, true))
+    }
+}
+
+/// 业务作用：读取 HTTP provider 响应时执行增量硬门，避免错误页或恶意端点撑高控制面内存。
+///
+/// 参数说明：`response` 是禁用重定向客户端返回的响应；`limit` 是配置期约束后的字节上限。
+///
+/// 返回：完整 body 不超过上限时返回；传输错误或多出任一字节即失败。
+async fn read_bounded_http_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        anyhow::bail!("ACME DNS provider response exceeds {limit} bytes");
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read ACME DNS provider response")?;
+        anyhow::ensure!(
+            bytes.len().saturating_add(chunk.len()) <= limit,
+            "ACME DNS provider response exceeds {limit} bytes"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// RFC2136 DNS UPDATE provider；所有请求走 TCP，并用 HMAC-SHA256 TSIG 同时认证请求与响应。
+struct Rfc2136Dns01Provider {
+    server: std::net::SocketAddr,
+    zone: String,
+    tsig_key_name: String,
+    tsig_secret: Arc<[u8]>,
+    ttl_seconds: u32,
+    timeout: Duration,
+    retry_attempts: usize,
+    retry_backoff: Duration,
+}
+
+impl Rfc2136Dns01Provider {
+    /// 业务作用：在总 deadline 内执行带 TSIG 的 DNS UPDATE；cleanup 只删除完全匹配的 TXT RR。
+    ///
+    /// 参数说明：`record`/`value` 是本订单 challenge；`cleanup` 决定 IN 新增或 NONE 精确删除。
+    ///
+    /// 返回：权威 DNS 返回经 TSIG 验证的 NOERROR 时成功；超时、网络、认证或 DNS 错误均失败。
+    async fn update(&self, record: &str, value: &str, cleanup: bool) -> Result<()> {
+        let record = normalize_dns_wire_name(record)?;
+        anyhow::ensure!(
+            record == self.zone || record.ends_with(&format!(".{}", self.zone)),
+            "ACME RFC2136 record is outside configured zone"
+        );
+        anyhow::ensure!(
+            value.len() <= 255,
+            "ACME RFC2136 TXT value exceeds 255 bytes"
+        );
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let mut last_error = None;
+        for attempt in 0..self.retry_attempts {
+            match tokio::time::timeout_at(deadline, self.update_once(&record, value, cleanup)).await
+            {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => anyhow::bail!("ACME RFC2136 operation timeout"),
+            }
+            if attempt + 1 < self.retry_attempts {
+                tokio::time::timeout_at(deadline, tokio::time::sleep(self.retry_backoff))
+                    .await
+                    .context("ACME RFC2136 retry deadline exceeded")?;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("ACME RFC2136 update failed")))
+    }
+
+    /// 业务作用：完成一次 TCP DNS UPDATE 并认证对应响应，防止伪造成功导致 ACME 无效等待。
+    ///
+    /// 参数说明：输入已完成 zone、TXT 长度和 DNS name 校验；`cleanup` 选择 UPDATE class。
+    ///
+    /// 返回：请求完整写出且响应 ID/opcode/rcode/TSIG/MAC 全部一致时成功。
+    async fn update_once(&self, record: &str, value: &str, cleanup: bool) -> Result<()> {
+        let mut id_bytes = [0_u8; 2];
+        getrandom::getrandom(&mut id_bytes).context("generate RFC2136 transaction id")?;
+        let id = u16::from_be_bytes(id_bytes);
+        let (request, request_mac) = build_rfc2136_request(
+            id,
+            &self.zone,
+            record,
+            value,
+            cleanup,
+            self.ttl_seconds,
+            &self.tsig_key_name,
+            &self.tsig_secret,
+        )?;
+        anyhow::ensure!(
+            request.len() <= u16::MAX as usize,
+            "RFC2136 request exceeds TCP DNS limit"
+        );
+        let mut stream = tokio::net::TcpStream::connect(self.server)
+            .await
+            .with_context(|| format!("connect RFC2136 authority {}", self.server))?;
+        stream
+            .write_all(&(request.len() as u16).to_be_bytes())
+            .await
+            .context("write RFC2136 TCP length")?;
+        stream
+            .write_all(&request)
+            .await
+            .context("write RFC2136 request")?;
+        stream.flush().await.context("flush RFC2136 request")?;
+        let response_len = stream
+            .read_u16()
+            .await
+            .context("read RFC2136 TCP response length")? as usize;
+        anyhow::ensure!(
+            (12..=u16::MAX as usize).contains(&response_len),
+            "invalid RFC2136 response length"
+        );
+        let mut response = vec![0_u8; response_len];
+        stream
+            .read_exact(&mut response)
+            .await
+            .context("read RFC2136 response")?;
+        verify_rfc2136_response(
+            &response,
+            id,
+            &self.tsig_key_name,
+            &self.tsig_secret,
+            &request_mac,
+        )
+    }
+}
+
+impl Dns01Provider for Rfc2136Dns01Provider {
+    fn present<'a>(
+        &'a self,
+        record: &'a str,
+        value: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.update(record, value, false))
+    }
+
+    fn cleanup<'a>(
+        &'a self,
+        record: &'a str,
+        value: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.update(record, value, true))
+    }
+}
+
+type HmacSha256 = Hmac<sha2::Sha256>;
+const TSIG_ALGORITHM: &str = "hmac-sha256";
+const TSIG_FUDGE_SECONDS: u16 = 300;
+
+/// 业务作用：编码并签名一条 RFC2136 TXT UPDATE，确保删除语义只命中本订单的精确 RDATA。
+///
+/// 参数说明：所有 name/value 已校验；`cleanup` 选择 class NONE，`secret` 是构建期解析凭据。
+///
+/// 返回：返回含 TSIG 的完整 DNS message 及请求 MAC，供响应 TSIG 链式验证。
+#[allow(clippy::too_many_arguments)]
+fn build_rfc2136_request(
+    id: u16,
+    zone: &str,
+    record: &str,
+    value: &str,
+    cleanup: bool,
+    ttl_seconds: u32,
+    key_name: &str,
+    secret: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut unsigned = Vec::with_capacity(512);
+    push_u16(&mut unsigned, id);
+    push_u16(&mut unsigned, 5 << 11);
+    push_u16(&mut unsigned, 1);
+    push_u16(&mut unsigned, 0);
+    push_u16(&mut unsigned, 1);
+    push_u16(&mut unsigned, 0);
+    encode_dns_name(&mut unsigned, zone)?;
+    push_u16(&mut unsigned, 6);
+    push_u16(&mut unsigned, 1);
+    encode_dns_name(&mut unsigned, record)?;
+    push_u16(&mut unsigned, 16);
+    push_u16(&mut unsigned, if cleanup { 254 } else { 1 });
+    push_u32(&mut unsigned, if cleanup { 0 } else { ttl_seconds });
+    push_u16(&mut unsigned, value.len() as u16 + 1);
+    unsigned.push(value.len() as u8);
+    unsigned.extend_from_slice(value.as_bytes());
+
+    let signed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    let mut mac_input = unsigned.clone();
+    append_tsig_variables(
+        &mut mac_input,
+        key_name,
+        TSIG_ALGORITHM,
+        signed_at,
+        TSIG_FUDGE_SECONDS,
+        0,
+        &[],
+    )?;
+    let mut signer = HmacSha256::new_from_slice(secret).context("initialize RFC2136 TSIG")?;
+    signer.update(&mac_input);
+    let mac = signer.finalize().into_bytes().to_vec();
+
+    let mut request = unsigned;
+    request[10..12].copy_from_slice(&1_u16.to_be_bytes());
+    encode_dns_name(&mut request, key_name)?;
+    push_u16(&mut request, 250);
+    push_u16(&mut request, 255);
+    push_u32(&mut request, 0);
+    let rdlength_at = request.len();
+    push_u16(&mut request, 0);
+    let rdata_start = request.len();
+    encode_dns_name(&mut request, TSIG_ALGORITHM)?;
+    push_u48(&mut request, signed_at);
+    push_u16(&mut request, TSIG_FUDGE_SECONDS);
+    push_u16(&mut request, mac.len() as u16);
+    request.extend_from_slice(&mac);
+    push_u16(&mut request, id);
+    push_u16(&mut request, 0);
+    push_u16(&mut request, 0);
+    let rdlength = request.len() - rdata_start;
+    request[rdlength_at..rdlength_at + 2].copy_from_slice(&(rdlength as u16).to_be_bytes());
+    Ok((request, mac))
+}
+
+struct ParsedTsig {
+    message_without_tsig: Vec<u8>,
+    owner: String,
+    algorithm: String,
+    signed_at: u64,
+    fudge: u16,
+    mac: Vec<u8>,
+    original_id: u16,
+    error: u16,
+    other: Vec<u8>,
+}
+
+/// 业务作用：验证 RFC2136 响应与本请求属于同一认证链，拒绝未签名或被篡改的伪成功。
+///
+/// 参数说明：`response` 是单个有界 TCP DNS message；其余参数来自当前请求权威。
+///
+/// 返回：协议头、TSIG 元数据、时间窗和 HMAC 全部合法且 rcode=NOERROR 时成功。
+fn verify_rfc2136_response(
+    response: &[u8],
+    id: u16,
+    key_name: &str,
+    secret: &[u8],
+    request_mac: &[u8],
+) -> Result<()> {
+    anyhow::ensure!(response.len() >= 12, "RFC2136 response is truncated");
+    anyhow::ensure!(
+        read_u16(response, 0)? == id,
+        "RFC2136 response transaction id mismatch"
+    );
+    let flags = read_u16(response, 2)?;
+    anyhow::ensure!(
+        flags & 0x8000 != 0 && (flags >> 11) & 0x0f == 5,
+        "RFC2136 response opcode is invalid"
+    );
+    let parsed = parse_response_tsig(response)?;
+    anyhow::ensure!(
+        parsed.owner == key_name,
+        "RFC2136 response TSIG key name mismatch"
+    );
+    anyhow::ensure!(
+        parsed.algorithm == TSIG_ALGORITHM,
+        "RFC2136 response TSIG algorithm mismatch"
+    );
+    anyhow::ensure!(
+        parsed.original_id == id,
+        "RFC2136 response TSIG original id mismatch"
+    );
+    anyhow::ensure!(
+        parsed.error == 0,
+        "RFC2136 response TSIG error {}",
+        parsed.error
+    );
+    anyhow::ensure!(
+        parsed.fudge <= TSIG_FUDGE_SECONDS,
+        "RFC2136 response TSIG fudge exceeds policy"
+    );
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    anyhow::ensure!(
+        now.abs_diff(parsed.signed_at) <= u64::from(parsed.fudge),
+        "RFC2136 response TSIG time is outside allowed skew"
+    );
+    let mut input = Vec::with_capacity(parsed.message_without_tsig.len() + 256);
+    push_u16(&mut input, request_mac.len() as u16);
+    input.extend_from_slice(request_mac);
+    input.extend_from_slice(&parsed.message_without_tsig);
+    append_tsig_variables(
+        &mut input,
+        &parsed.owner,
+        &parsed.algorithm,
+        parsed.signed_at,
+        parsed.fudge,
+        parsed.error,
+        &parsed.other,
+    )?;
+    let mut verifier =
+        HmacSha256::new_from_slice(secret).context("initialize RFC2136 TSIG verifier")?;
+    verifier.update(&input);
+    verifier
+        .verify_slice(&parsed.mac)
+        .context("RFC2136 response TSIG MAC mismatch")?;
+    let rcode = flags & 0x000f;
+    anyhow::ensure!(rcode == 0, "RFC2136 authority returned rcode {rcode}");
+    Ok(())
+}
+
+/// 业务作用：定位且拆除 DNS additional 尾部 TSIG RR，保留规范要求的待验签 message。
+///
+/// 参数说明：`message` 是已通过 TCP 长度门的 DNS response。
+///
+/// 返回：唯一末尾 TSIG 与解码字段；缺失、压缩越界或附加尾随 RR 均失败。
+fn parse_response_tsig(message: &[u8]) -> Result<ParsedTsig> {
+    let qd = read_u16(message, 4)? as usize;
+    let an = read_u16(message, 6)? as usize;
+    let ns = read_u16(message, 8)? as usize;
+    let ar = read_u16(message, 10)? as usize;
+    anyhow::ensure!(ar > 0, "RFC2136 response has no TSIG");
+    let mut offset = 12;
+    for _ in 0..qd {
+        offset = skip_dns_name(message, offset)?;
+        offset = offset
+            .checked_add(4)
+            .context("DNS question offset overflow")?;
+        anyhow::ensure!(offset <= message.len(), "DNS question is truncated");
+    }
+    for _ in 0..an.saturating_add(ns) {
+        offset = skip_dns_rr(message, offset)?;
+    }
+    for index in 0..ar {
+        let rr_start = offset;
+        let (owner, name_end) = decode_dns_name(message, offset)?;
+        offset = name_end;
+        anyhow::ensure!(
+            offset + 10 <= message.len(),
+            "DNS additional RR is truncated"
+        );
+        let rr_type = read_u16(message, offset)?;
+        let class = read_u16(message, offset + 2)?;
+        let ttl = read_u32(message, offset + 4)?;
+        let rdlength = read_u16(message, offset + 8)? as usize;
+        let rdata = offset + 10;
+        let rr_end = rdata
+            .checked_add(rdlength)
+            .context("DNS RDATA offset overflow")?;
+        anyhow::ensure!(rr_end <= message.len(), "DNS additional RDATA is truncated");
+        offset = rr_end;
+        if rr_type != 250 {
+            continue;
+        }
+        anyhow::ensure!(
+            index + 1 == ar && rr_end == message.len(),
+            "RFC2136 TSIG must be the final RR"
+        );
+        anyhow::ensure!(
+            class == 255 && ttl == 0,
+            "RFC2136 TSIG class/TTL is invalid"
+        );
+        let (algorithm, mut cursor) = decode_dns_name(message, rdata)?;
+        anyhow::ensure!(cursor + 10 <= rr_end, "RFC2136 TSIG RDATA is truncated");
+        let signed_at = read_u48(message, cursor)?;
+        cursor += 6;
+        let fudge = read_u16(message, cursor)?;
+        cursor += 2;
+        let mac_len = read_u16(message, cursor)? as usize;
+        cursor += 2;
+        anyhow::ensure!(
+            (16..=64).contains(&mac_len) && cursor + mac_len + 6 <= rr_end,
+            "RFC2136 TSIG MAC length is invalid"
+        );
+        let mac = message[cursor..cursor + mac_len].to_vec();
+        cursor += mac_len;
+        let original_id = read_u16(message, cursor)?;
+        let error = read_u16(message, cursor + 2)?;
+        let other_len = read_u16(message, cursor + 4)? as usize;
+        cursor += 6;
+        anyhow::ensure!(
+            cursor + other_len == rr_end,
+            "RFC2136 TSIG other data length mismatch"
+        );
+        let other = message[cursor..rr_end].to_vec();
+        let mut message_without_tsig = message[..rr_start].to_vec();
+        message_without_tsig[10..12].copy_from_slice(&((ar - 1) as u16).to_be_bytes());
+        return Ok(ParsedTsig {
+            message_without_tsig,
+            owner,
+            algorithm,
+            signed_at,
+            fudge,
+            mac,
+            original_id,
+            error,
+            other,
+        });
+    }
+    anyhow::bail!("RFC2136 response has no TSIG RR")
+}
+
+fn append_tsig_variables(
+    output: &mut Vec<u8>,
+    key_name: &str,
+    algorithm: &str,
+    signed_at: u64,
+    fudge: u16,
+    error: u16,
+    other: &[u8],
+) -> Result<()> {
+    encode_dns_name(output, key_name)?;
+    push_u16(output, 255);
+    push_u32(output, 0);
+    encode_dns_name(output, algorithm)?;
+    push_u48(output, signed_at);
+    push_u16(output, fudge);
+    push_u16(output, error);
+    push_u16(output, other.len() as u16);
+    output.extend_from_slice(other);
+    Ok(())
+}
+
+fn normalize_dns_wire_name(raw: &str) -> Result<String> {
+    let name = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    anyhow::ensure!(
+        !name.is_empty()
+            && name.len() <= 253
+            && name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            }),
+        "invalid DNS name"
+    );
+    Ok(name)
+}
+
+fn encode_dns_name(output: &mut Vec<u8>, raw: &str) -> Result<()> {
+    let name = normalize_dns_wire_name(raw)?;
+    for label in name.split('.') {
+        output.push(label.len() as u8);
+        output.extend_from_slice(label.as_bytes());
+    }
+    output.push(0);
+    Ok(())
+}
+
+fn decode_dns_name(message: &[u8], start: usize) -> Result<(String, usize)> {
+    let mut labels = Vec::new();
+    let mut cursor = start;
+    let mut next = None;
+    for _ in 0..128 {
+        let length = *message.get(cursor).context("DNS name is truncated")?;
+        if length & 0xc0 == 0xc0 {
+            let low = *message
+                .get(cursor + 1)
+                .context("DNS compression pointer is truncated")?;
+            let target = (usize::from(length & 0x3f) << 8) | usize::from(low);
+            anyhow::ensure!(
+                target < message.len(),
+                "DNS compression pointer is out of bounds"
+            );
+            next.get_or_insert(cursor + 2);
+            cursor = target;
+            continue;
+        }
+        anyhow::ensure!(length & 0xc0 == 0, "DNS label type is unsupported");
+        cursor += 1;
+        if length == 0 {
+            let end = next.unwrap_or(cursor);
+            return Ok((labels.join(".").to_ascii_lowercase(), end));
+        }
+        let end = cursor + usize::from(length);
+        anyhow::ensure!(length <= 63 && end <= message.len(), "DNS label is invalid");
+        let label = std::str::from_utf8(&message[cursor..end]).context("DNS label is not UTF-8")?;
+        labels.push(label);
+        anyhow::ensure!(labels.len() <= 127, "DNS name has too many labels");
+        cursor = end;
+    }
+    anyhow::bail!("DNS compression pointer loop")
+}
+
+fn skip_dns_name(message: &[u8], offset: usize) -> Result<usize> {
+    decode_dns_name(message, offset).map(|(_, end)| end)
+}
+
+fn skip_dns_rr(message: &[u8], offset: usize) -> Result<usize> {
+    let offset = skip_dns_name(message, offset)?;
+    anyhow::ensure!(offset + 10 <= message.len(), "DNS RR is truncated");
+    let length = read_u16(message, offset + 8)? as usize;
+    let end = offset + 10 + length;
+    anyhow::ensure!(end <= message.len(), "DNS RR RDATA is truncated");
+    Ok(end)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    let data: [u8; 2] = bytes
+        .get(offset..offset + 2)
+        .context("binary u16 is truncated")?
+        .try_into()
+        .expect("slice length was checked");
+    Ok(u16::from_be_bytes(data))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let data: [u8; 4] = bytes
+        .get(offset..offset + 4)
+        .context("binary u32 is truncated")?
+        .try_into()
+        .expect("slice length was checked");
+    Ok(u32::from_be_bytes(data))
+}
+
+fn read_u48(bytes: &[u8], offset: usize) -> Result<u64> {
+    let data = bytes
+        .get(offset..offset + 6)
+        .context("binary u48 is truncated")?;
+    Ok(data
+        .iter()
+        .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte)))
+}
+
+fn push_u16(output: &mut Vec<u8>, value: u16) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn push_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn push_u48(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_be_bytes()[2..]);
 }
 
 /// 一个 ACME order 已发布的 DNS TXT 集合。
@@ -479,30 +1339,105 @@ fn build_dns01_provider(acme: &AcmeRuntimeCfg) -> Result<Option<Arc<dyn Dns01Pro
                 .dns01
                 .clone()
                 .context("DNS-01 runtime config is missing")?;
-            if !cfg.command.is_file() {
-                anyhow::bail!(
-                    "DNS-01 provider command does not exist: {}",
-                    cfg.command.display()
-                );
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(&cfg.command)
-                    .with_context(|| {
-                        format!("stat DNS-01 provider command {}", cfg.command.display())
-                    })?
-                    .permissions()
-                    .mode();
-                anyhow::ensure!(
-                    mode & 0o111 != 0,
-                    "DNS-01 provider command is not executable: {}",
-                    cfg.command.display()
-                );
-            }
-            Ok(Some(Arc::new(CommandDns01Provider { cfg })))
+            let timeout = Duration::from_millis(cfg.timeout_ms);
+            let retry_backoff = Duration::from_millis(cfg.retry_backoff_ms);
+            let http_limits = HttpDns01Limits {
+                timeout,
+                retry_attempts: cfg.retry_attempts,
+                retry_backoff,
+                max_response_bytes: cfg.max_response_bytes,
+                ttl_seconds: cfg.ttl_seconds,
+            };
+            let provider: Arc<dyn Dns01Provider> = match cfg.provider {
+                AcmeDns01ProviderRuntime::Command { command, args } => {
+                    if !command.is_file() {
+                        anyhow::bail!(
+                            "DNS-01 provider command does not exist: {}",
+                            command.display()
+                        );
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = std::fs::metadata(&command)
+                            .with_context(|| {
+                                format!("stat DNS-01 provider command {}", command.display())
+                            })?
+                            .permissions()
+                            .mode();
+                        anyhow::ensure!(
+                            mode & 0o111 != 0,
+                            "DNS-01 provider command is not executable: {}",
+                            command.display()
+                        );
+                    }
+                    Arc::new(CommandDns01Provider {
+                        command,
+                        args,
+                        timeout,
+                    })
+                }
+                AcmeDns01ProviderRuntime::Cloudflare {
+                    api_base,
+                    zone_id,
+                    api_token,
+                } => Arc::new(CloudflareDns01Provider {
+                    client: dns01_http_client(timeout)?,
+                    api_base,
+                    zone_id,
+                    api_token,
+                    limits: http_limits,
+                    record_ids: std::sync::Mutex::new(HashMap::new()),
+                }),
+                AcmeDns01ProviderRuntime::Rfc2136 {
+                    server,
+                    zone,
+                    tsig_key_name,
+                    tsig_secret,
+                } => Arc::new(Rfc2136Dns01Provider {
+                    server,
+                    zone,
+                    tsig_key_name,
+                    tsig_secret,
+                    ttl_seconds: cfg.ttl_seconds,
+                    timeout,
+                    retry_attempts: cfg.retry_attempts,
+                    retry_backoff,
+                }),
+                AcmeDns01ProviderRuntime::Vault {
+                    endpoint,
+                    token,
+                    namespace,
+                    present_path,
+                    cleanup_path,
+                } => Arc::new(VaultDns01Provider {
+                    client: dns01_http_client(timeout)?,
+                    endpoint,
+                    token,
+                    namespace,
+                    present_path,
+                    cleanup_path,
+                    limits: http_limits,
+                }),
+            };
+            Ok(Some(provider))
         }
     }
+}
+
+/// 业务作用：构造不跟随重定向的 DNS provider HTTPS 客户端，固定凭据只能送往配置 authority。
+///
+/// 参数说明：`timeout` 是单次 provider 操作的总上限。
+///
+/// 返回：TLS/连接池参数可构建时返回客户端；本步骤不发网络请求，也不产生外部副作用。
+fn dns01_http_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .connect_timeout(timeout.min(Duration::from_secs(10)))
+        .pool_max_idle_per_host(2)
+        .build()
+        .context("build ACME DNS provider HTTPS client")
 }
 
 /// 业务作用：在 worker prepare 阶段构造单机或 Redis 签发锁，确保候选发布前已具备唯一签发权威。
@@ -891,13 +1826,110 @@ fn certificate_needs_renewal(tls: &TlsRuntimeCfg, renew_before_days: u64) -> Res
     Ok(not_after <= now.saturating_add(renew_window))
 }
 
-/// 校验 ACME 返回的 PEM keypair后，以同目录临时文件 + rename 安装到 TLS 事实源。
+/// 业务作用：串行化 ACME/自动续期的证书安装，避免同一进程内两个完整 pair 交错发布。
 ///
-/// # 参数
-/// - `tls`: 最终 cert/key 路径及其它 TLS 配置。
-/// - `certificate_pem`: ACME 返回的完整证书链。
-/// - `private_key_pem`: 与 leaf 匹配的私钥。
-fn install_keypair_atomically(
+/// 参数说明：`tls` 定位事实源；`certificate_pem` 是完整证书链；`private_key_pem` 是匹配私钥。
+///
+/// 返回：pair 通过密码学校验并完整发布时成功；锁、校验或 I/O 失败时返回错误且不得宣告换版。
+pub(crate) fn install_keypair_atomically(
+    tls: &TlsRuntimeCfg,
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+) -> Result<()> {
+    let _guard = keypair_install_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("TLS keypair install lock is poisoned"))?;
+    recover_legacy_keypair_transaction_locked(tls)?;
+    install_keypair_atomically_locked(tls, certificate_pem, private_key_pem)
+}
+
+/// 手工证书 CAS 安装结果。
+pub(crate) enum KeypairCasInstallOutcome {
+    /// 比较基线仍一致，完整 pair 已发布。
+    Installed,
+    /// 安装前证书已变化，未写入任何文件。
+    Changed(String),
+}
+
+/// 业务作用：在与 ACME 续期共享的进程锁内复验证书摘要并安装完整 pair，防止 Console 覆盖刚完成
+/// 的自动续期。
+///
+/// 参数说明：`tls` 定位当前事实源；`expected_etag` 来自证书读接口；两个 PEM 是有界上传内容。
+///
+/// 返回：基线一致且 pair 合法时返回 Installed；摘要变化返回当前 ETag 且无副作用；读取、校验或落盘
+/// 失败返回错误。
+pub(crate) fn install_keypair_atomically_if_match(
+    tls: &TlsRuntimeCfg,
+    expected_etag: &str,
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+) -> Result<KeypairCasInstallOutcome> {
+    let _guard = keypair_install_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("TLS keypair install lock is poisoned"))?;
+    recover_legacy_keypair_transaction_locked(tls)?;
+    let (certificate_path, _) = crate::tls::active_keypair_paths_unrecovered(tls)?;
+    let current = crate::bounded_io::read_file(
+        &certificate_path,
+        MAX_ACME_CERTIFICATE_BYTES,
+        "TLS certificate CAS baseline",
+    )?;
+    let current_etag = certificate_etag(&current);
+    if expected_etag.trim() != current_etag {
+        return Ok(KeypairCasInstallOutcome::Changed(current_etag));
+    }
+    install_keypair_atomically_locked(tls, certificate_pem, private_key_pem)?;
+    Ok(KeypairCasInstallOutcome::Installed)
+}
+
+/// 业务作用：返回 ACME 与手工轮换共享的证书安装互斥锁，保证比较和 manifest/pair 发布不交错。
+///
+/// 参数说明：无。
+///
+/// 返回：返回进程生命周期内唯一互斥锁。
+fn keypair_install_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// 业务作用：在任何旧双文件 pair 读取前完成上次崩溃事务恢复，使 loader 只能看到恢复后的完整代。
+///
+/// 参数说明：`tls` 固定 cert/key 目标；manifest 模式没有双文件事务，直接成功。
+///
+/// 返回：无待恢复事务或已恢复/确认提交时成功；journal 损坏或 I/O 失败时拒绝加载证书。
+pub(crate) fn recover_legacy_keypair_transaction(tls: &TlsRuntimeCfg) -> Result<()> {
+    if tls.keypair_manifest_file.is_some() {
+        return Ok(());
+    }
+    let _guard = keypair_install_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("TLS keypair install lock is poisoned"))?;
+    recover_legacy_keypair_transaction_locked(tls)
+}
+
+/// 业务作用：为证书原始字节生成强 ETag，供读接口与手工轮换 CAS 使用同一比较语义。
+///
+/// 参数说明：`certificate_pem` 是有界读取或上传的完整证书链字节。
+///
+/// 返回：返回带引号的 `sha256-<hex>` 强 ETag。
+pub(crate) fn certificate_etag(certificate_pem: &[u8]) -> String {
+    use sha2::Digest as _;
+
+    let digest = sha2::Sha256::digest(certificate_pem);
+    let mut encoded = String::with_capacity(64);
+    use std::fmt::Write as _;
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing SHA-256 hex to String cannot fail");
+    }
+    format!("\"sha256-{encoded}\"")
+}
+
+/// 业务作用：在调用方已持有证书安装锁时校验并发布 pair，集中维护 manifest 与兼容文件模式语义。
+///
+/// 参数说明：`tls` 定位事实源；两个 PEM 是待校验和安装的完整材料。
+///
+/// 返回：pair 合法且事实源完整切换时成功；校验或任一步 I/O 失败时返回错误。
+fn install_keypair_atomically_locked(
     tls: &TlsRuntimeCfg,
     certificate_pem: &[u8],
     private_key_pem: &[u8],
@@ -911,13 +1943,241 @@ fn install_keypair_atomically(
             manifest = %manifest_file.display(),
             "activated immutable TLS keypair version"
         );
+        let retention = tls
+            .acme
+            .as_ref()
+            .map(|acme| acme.keypair_retention_generations)
+            .unwrap_or(3);
+        if let Err(error) = gc_keypair_versions(manifest_file, retention) {
+            // 当前 manifest 已持久化；回收失败只留下额外历史，不能谎称激活失败并诱发重复签发。
+            tracing::warn!(error = %format!("{error:#}"), "TLS keypair history cleanup failed");
+        }
     } else {
-        // 兼容未开启 manifest 的旧配置。watcher 遇到两个 rename 之间的混合 pair 会
-        // 构建失败并保留旧 ServerConfig；对崩溃一致性有强需求时必须配 manifest。
-        atomic_write(&tls.key_file, private_key_pem, true)?;
-        atomic_write(&tls.cert_file, certificate_pem, false)?;
+        install_legacy_keypair_transaction(tls, certificate_pem, private_key_pem)?;
     }
     Ok(())
+}
+
+/// 业务作用：以持久 journal 发布旧式 cert/key 双文件，并在任一步失败时恢复安装前事实。
+///
+/// 参数说明：`tls` 固定两个目标路径；PEM 已完成 pair 密码学校验。
+///
+/// 返回：两个目标均成为新代且 journal 已结算时成功；失败时先恢复旧代再返回原错误。
+fn install_legacy_keypair_transaction(
+    tls: &TlsRuntimeCfg,
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+) -> Result<()> {
+    recover_legacy_keypair_transaction_locked(tls)?;
+    let transaction = legacy_keypair_transaction_dir(tls)?;
+    let parent = transaction
+        .parent()
+        .context("legacy keypair transaction has no parent")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "create legacy keypair transaction parent {}",
+            parent.display()
+        )
+    })?;
+    let mut random = [0_u8; 8];
+    getrandom::getrandom(&mut random).context("generate legacy keypair transaction suffix")?;
+    let temporary = parent.join(format!(
+        ".naway-keypair-prepare-{:016x}",
+        u64::from_le_bytes(random)
+    ));
+    fs::create_dir(&temporary)
+        .with_context(|| format!("create legacy keypair transaction {}", temporary.display()))?;
+    let prepared = (|| -> Result<()> {
+        let old_cert = crate::bounded_io::read_optional_file(
+            &tls.cert_file,
+            MAX_ACME_CERTIFICATE_BYTES,
+            "legacy TLS certificate backup",
+        )?;
+        let old_key = crate::bounded_io::read_optional_file(
+            &tls.key_file,
+            MAX_ACME_CERTIFICATE_BYTES,
+            "legacy TLS private key backup",
+        )?;
+        if let Some(bytes) = &old_cert {
+            atomic_write(&temporary.join("old-cert.pem"), bytes, false)?;
+        }
+        if let Some(bytes) = &old_key {
+            atomic_write(&temporary.join("old-key.pem"), bytes, true)?;
+        }
+        atomic_write(&temporary.join("new-cert.pem"), certificate_pem, false)?;
+        atomic_write(&temporary.join("new-key.pem"), private_key_pem, true)?;
+        atomic_write(
+            &temporary.join("state.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "old_cert_present": old_cert.is_some(),
+                "old_key_present": old_key.is_some(),
+            }))?,
+            false,
+        )?;
+        sync_directory(&temporary)?;
+        fs::rename(&temporary, &transaction).with_context(|| {
+            format!(
+                "publish legacy keypair transaction {}",
+                transaction.display()
+            )
+        })?;
+        sync_directory(parent)
+    })();
+    if let Err(error) = prepared {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+
+    let publish = (|| -> Result<()> {
+        // journal 已经持久化，两个 rename 之间即使崩溃也能在下一次读取前恢复旧代或确认新代。
+        atomic_write(&tls.key_file, private_key_pem, true)?;
+        atomic_write(&tls.cert_file, certificate_pem, false)?;
+        Ok(())
+    })();
+    if let Err(error) = publish {
+        recover_legacy_keypair_transaction_locked(tls)
+            .context("restore legacy TLS pair after failed publish")?;
+        return Err(error);
+    }
+    finish_legacy_keypair_transaction(&transaction)?;
+    Ok(())
+}
+
+/// 业务作用：检查旧式 pair journal；完整新代已落盘则提交，否则按备份恢复安装前状态。
+///
+/// 参数说明：`tls` 固定 journal 身份和两个目标；调用方持有全局安装锁。
+///
+/// 返回：journal 不存在、确认提交或恢复完成时成功；任何不可信 journal/材料拒绝继续读取。
+fn recover_legacy_keypair_transaction_locked(tls: &TlsRuntimeCfg) -> Result<()> {
+    if tls.keypair_manifest_file.is_some() {
+        return Ok(());
+    }
+    let transaction = legacy_keypair_transaction_dir(tls)?;
+    let metadata = match fs::symlink_metadata(&transaction) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("stat legacy keypair transaction"),
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "legacy keypair transaction path is not a directory"
+    );
+    let state_bytes = crate::bounded_io::read_file(
+        &transaction.join("state.json"),
+        64 * 1024,
+        "legacy keypair transaction state",
+    )?;
+    let state: serde_json::Value =
+        serde_json::from_slice(&state_bytes).context("parse legacy keypair transaction state")?;
+    anyhow::ensure!(
+        state
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1),
+        "legacy keypair transaction schema is invalid"
+    );
+    let old_cert_present = state
+        .get("old_cert_present")
+        .and_then(serde_json::Value::as_bool)
+        .context("legacy keypair transaction old_cert_present is missing")?;
+    let old_key_present = state
+        .get("old_key_present")
+        .and_then(serde_json::Value::as_bool)
+        .context("legacy keypair transaction old_key_present is missing")?;
+    let new_cert = crate::bounded_io::read_file(
+        &transaction.join("new-cert.pem"),
+        MAX_ACME_CERTIFICATE_BYTES,
+        "legacy keypair transaction new certificate",
+    )?;
+    let new_key = crate::bounded_io::read_file(
+        &transaction.join("new-key.pem"),
+        MAX_ACME_CERTIFICATE_BYTES,
+        "legacy keypair transaction new key",
+    )?;
+    validate_keypair(&new_cert, &new_key)?;
+    let live_cert = crate::bounded_io::read_optional_file(
+        &tls.cert_file,
+        MAX_ACME_CERTIFICATE_BYTES,
+        "legacy TLS live certificate",
+    )?;
+    let live_key = crate::bounded_io::read_optional_file(
+        &tls.key_file,
+        MAX_ACME_CERTIFICATE_BYTES,
+        "legacy TLS live key",
+    )?;
+    if live_cert.as_deref() == Some(new_cert.as_slice())
+        && live_key.as_deref() == Some(new_key.as_slice())
+    {
+        return finish_legacy_keypair_transaction(&transaction);
+    }
+
+    // 新代不完整就先恢复 secret key、再恢复证书；loader 持有同一安装锁，恢复期间不能发布中间态。
+    restore_legacy_file(
+        &tls.key_file,
+        &transaction.join("old-key.pem"),
+        old_key_present,
+        true,
+    )?;
+    restore_legacy_file(
+        &tls.cert_file,
+        &transaction.join("old-cert.pem"),
+        old_cert_present,
+        false,
+    )?;
+    finish_legacy_keypair_transaction(&transaction)
+}
+
+fn restore_legacy_file(target: &Path, backup: &Path, present: bool, secret: bool) -> Result<()> {
+    if present {
+        let bytes = crate::bounded_io::read_file(
+            backup,
+            MAX_ACME_CERTIFICATE_BYTES,
+            "legacy keypair transaction backup",
+        )?;
+        atomic_write(target, &bytes, secret)
+    } else {
+        match fs::remove_file(target) {
+            Ok(()) => sync_directory(target.parent().unwrap_or_else(|| Path::new("."))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("remove partial TLS file {}", target.display()))
+            }
+        }
+    }
+}
+
+fn legacy_keypair_transaction_dir(tls: &TlsRuntimeCfg) -> Result<PathBuf> {
+    use sha2::Digest as _;
+    anyhow::ensure!(
+        tls.cert_file != tls.key_file,
+        "TLS cert_file and key_file must differ"
+    );
+    let parent = tls
+        .cert_file
+        .parent()
+        .context("TLS cert_file has no parent")?;
+    let mut digest = sha2::Sha256::new();
+    digest.update(tls.cert_file.as_os_str().as_encoded_bytes());
+    digest.update([0]);
+    digest.update(tls.key_file.as_os_str().as_encoded_bytes());
+    let encoded = digest.finalize();
+    let mut suffix = String::with_capacity(24);
+    use std::fmt::Write as _;
+    for byte in &encoded[..12] {
+        write!(&mut suffix, "{byte:02x}").expect("writing digest to String cannot fail");
+    }
+    Ok(parent.join(format!(".naway-keypair-transaction-{suffix}")))
+}
+
+fn finish_legacy_keypair_transaction(transaction: &Path) -> Result<()> {
+    fs::remove_dir_all(transaction).with_context(|| {
+        format!(
+            "remove legacy keypair transaction {}",
+            transaction.display()
+        )
+    })?;
+    sync_directory(transaction.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 struct PreparedKeypairVersion {
@@ -986,6 +2246,154 @@ fn prepare_keypair_version(
             Err(error)
         }
     }
+}
+
+/// 业务作用：按保留代数回收 manifest 历史目录，同时永久保护当前指针和崩溃遗留临时指针。
+///
+/// 参数说明：`manifest_file` 是唯一激活指针；`retention` 是至少两代的配置硬门。
+///
+/// 返回：所有可安全判定的过期完整目录已删除时成功；路径、指针或目录事实不可信时停止回收。
+fn gc_keypair_versions(manifest_file: &Path, retention: usize) -> Result<()> {
+    anyhow::ensure!(
+        (2..=64).contains(&retention),
+        "TLS keypair retention is out of range"
+    );
+    let parent = manifest_file.parent().unwrap_or_else(|| Path::new("."));
+    let root = parent.join(".gateway-keypairs");
+    let root_metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("stat TLS keypair versions root"),
+    };
+    anyhow::ensure!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        "TLS keypair versions root is not a directory"
+    );
+    let root_canonical =
+        fs::canonicalize(&root).context("canonicalize TLS keypair versions root")?;
+    let current =
+        crate::bounded_io::read_file(manifest_file, 64 * 1024, "TLS keypair manifest for cleanup")?;
+    let current_version = manifest_version_name(&current)?;
+    let mut protected = std::collections::HashSet::new();
+    protected.insert(current_version.clone());
+
+    let manifest_name = manifest_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("TLS keypair manifest file name is invalid")?;
+    let temporary_prefix = format!(".{manifest_name}.tmp-");
+    for entry in fs::read_dir(parent).context("scan TLS keypair manifest directory")? {
+        let entry = entry.context("read TLS keypair manifest directory entry")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(&temporary_prefix) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        if let Ok(bytes) =
+            crate::bounded_io::read_file(&entry.path(), 64 * 1024, "temporary TLS keypair manifest")
+        {
+            if let Ok(version) = manifest_version_name(&bytes) {
+                protected.insert(version);
+            }
+        }
+    }
+
+    let mut versions = Vec::new();
+    for entry in fs::read_dir(&root).context("scan TLS keypair versions")? {
+        let entry = entry.context("read TLS keypair version entry")?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !valid_keypair_version_name(&name) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let cert = fs::symlink_metadata(entry.path().join("cert.pem"));
+        let key = fs::symlink_metadata(entry.path().join("key.pem"));
+        if !matches!(cert, Ok(ref value) if value.is_file() && !value.file_type().is_symlink())
+            || !matches!(key, Ok(ref value) if value.is_file() && !value.file_type().is_symlink())
+        {
+            continue;
+        }
+        versions.push((name, entry.path()));
+    }
+    versions.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut retained = std::collections::HashSet::new();
+    retained.insert(current_version);
+    for (name, _) in &versions {
+        if retained.len() >= retention {
+            break;
+        }
+        retained.insert(name.clone());
+    }
+    protected.extend(retained);
+    for (name, path) in versions {
+        if protected.contains(&name) {
+            continue;
+        }
+        let canonical = fs::canonicalize(&path)
+            .with_context(|| format!("canonicalize TLS keypair version {}", path.display()))?;
+        anyhow::ensure!(
+            canonical.parent() == Some(root_canonical.as_path()),
+            "TLS keypair cleanup target escaped versions root"
+        );
+        fs::remove_dir_all(&canonical)
+            .with_context(|| format!("remove TLS keypair history {}", canonical.display()))?;
+    }
+    sync_directory(&root)
+}
+
+fn manifest_version_name(bytes: &[u8]) -> Result<String> {
+    let document: serde_json::Value =
+        serde_json::from_slice(bytes).context("parse TLS keypair manifest for cleanup")?;
+    anyhow::ensure!(
+        document
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1),
+        "TLS keypair cleanup manifest schema is invalid"
+    );
+    let directory = document
+        .get("directory")
+        .and_then(serde_json::Value::as_str)
+        .context("TLS keypair cleanup manifest directory is missing")?;
+    let path = Path::new(directory);
+    let mut components = path.components();
+    anyhow::ensure!(
+        matches!(components.next(), Some(std::path::Component::Normal(root)) if root == ".gateway-keypairs")
+            && matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none(),
+        "TLS keypair cleanup manifest directory is outside version root"
+    );
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("TLS keypair cleanup manifest version name is invalid")?;
+    anyhow::ensure!(
+        valid_keypair_version_name(name),
+        "TLS keypair cleanup manifest version name is invalid"
+    );
+    Ok(name.to_owned())
+}
+
+fn valid_keypair_version_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("v-") else {
+        return false;
+    };
+    let Some((timestamp, suffix)) = rest.split_once('-') else {
+        return false;
+    };
+    !timestamp.is_empty()
+        && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+        && suffix.len() == 16
+        && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// 在落盘前验证证书链可解析、私钥算法受 rustls 支持且 leaf/key 匹配。

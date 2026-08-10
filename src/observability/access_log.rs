@@ -23,7 +23,9 @@ use crate::metrics::Metrics;
 /// 数据面到后台日志 worker 的非阻塞发送句柄。
 #[derive(Clone)]
 pub struct AccessLogger {
-    inner: Arc<AccessLoggerInner>,
+    active: Arc<ArcSwap<AccessLoggerInner>>,
+    metrics: Arc<Metrics>,
+    snapshot: Arc<ArcSwap<GatewaySnapshot>>,
 }
 
 struct AccessLoggerInner {
@@ -47,9 +49,25 @@ impl AccessLogger {
         snap: Arc<ArcSwap<GatewaySnapshot>>,
         queue_size: usize,
     ) -> Result<Self> {
-        // Sink clients/channels are bootstrap resources. Build all of them before returning so a
-        // bad endpoint/Kafka config fails startup instead of silently starting without audit logs.
-        let sink_specs = snap.load().access_log.sink_specs.clone();
+        let runtime = snap.load().access_log.clone();
+        Self::spawn_with_runtime(metrics, snap, queue_size, &runtime)
+    }
+
+    /// 业务作用：为尚未发布的候选快照准备独立 access-log dispatcher 与 sink worker。
+    ///
+    /// 参数说明：`metrics` 承载丢弃计数；`snap` 在提交后提供当前格式；`queue_size`
+    /// 是硬队列上限；`runtime` 提供候选 sink 拓扑。
+    ///
+    /// 返回：所有 sink 客户端与有界 worker 已就绪时返回未接收业务记录的候选代；
+    /// 任一初始化失败则返回错误，在线代不受影响。
+    pub fn spawn_with_runtime(
+        metrics: Arc<Metrics>,
+        snap: Arc<ArcSwap<GatewaySnapshot>>,
+        queue_size: usize,
+        runtime: &AccessLogRuntime,
+    ) -> Result<Self> {
+        // 候选必须在发布前建好全部 sink，避免快照已上线却丢失审计出口。
+        let sink_specs = runtime.sink_specs.clone();
         let spawned = crate::log_sink::spawn_sink_workers(sink_specs.as_ref(), metrics.clone())?;
         let shutdown_timeout = sink_specs
             .iter()
@@ -60,9 +78,10 @@ impl AccessLogger {
         let worker_metrics = metrics.clone();
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let worker_snapshot = snap.clone();
         tokio::spawn(async move {
             let process = |record: AccessRecord| {
-                let snap = snap.load_full();
+                let snap = worker_snapshot.load_full();
                 let runtime = &snap.access_log;
                 if !runtime.should_log(&record) {
                     return;
@@ -103,15 +122,31 @@ impl AccessLogger {
             let _ = done_tx.send(());
         });
         Ok(Self {
-            inner: Arc::new(AccessLoggerInner {
+            active: Arc::new(ArcSwap::from_pointee(AccessLoggerInner {
                 tx,
-                metrics,
+                metrics: metrics.clone(),
                 accepting: AtomicBool::new(true),
                 shutdown_tx: Mutex::new(Some(shutdown_tx)),
                 done_rx: Mutex::new(Some(done_rx)),
                 shutdown_timeout,
-            }),
+            })),
+            metrics,
+            snapshot: snap,
         })
+    }
+
+    /// 业务作用：复用当前 logger 的指标与快照句柄，完整准备候选 sink 代。
+    ///
+    /// 参数说明：`runtime` 是候选快照编译得到的格式、队列与 sink 计划。
+    ///
+    /// 返回：全部 sink worker 已就绪时返回候选 logger；失败时在线代不变。
+    pub fn prepare_replacement(&self, runtime: &AccessLogRuntime) -> Result<Self> {
+        Self::spawn_with_runtime(
+            self.metrics.clone(),
+            self.snapshot.clone(),
+            runtime.queue_size,
+            runtime,
+        )
     }
 
     /// 尝试写入一条 access log 记录。
@@ -119,40 +154,64 @@ impl AccessLogger {
     /// # 参数
     /// - `record`: 已在请求管线收集好的低基数字段。
     pub fn log(&self, record: AccessRecord) {
-        if !self.inner.accepting.load(Ordering::Acquire) {
+        let active = self.active.load_full();
+        if !active.accepting.load(Ordering::Acquire) {
             return;
         }
-        if self.inner.tx.try_send(record).is_err() {
-            self.inner.metrics.inc_access_log_dropped();
+        if active.tx.try_send(record).is_err() {
+            active.metrics.inc_access_log_dropped();
         }
+    }
+
+    /// 业务作用：在快照发布后原子切换 access-log 写入代，并异步排空旧 sink。
+    ///
+    /// 参数说明：`candidate` 是已成功准备但尚未接收数据面记录的候选代。
+    ///
+    /// 返回：无返回值；新记录立即只进入候选代，旧队列在自身 deadline 内排空。
+    pub fn replace(&self, candidate: &Self) {
+        let next = candidate.active.load_full();
+        let old = self.active.swap(next);
+        old.accepting.store(false, Ordering::Release);
+        tokio::spawn(async move {
+            if let Err(error) = shutdown_generation(old).await {
+                tracing::warn!(%error, "old access log generation drain failed");
+            }
+        });
     }
 
     /// 停止接收新记录，排空 dispatcher 与所有 sink queue，并执行 backend flush/shutdown。
     pub async fn shutdown(&self) -> Result<()> {
-        self.inner.accepting.store(false, Ordering::Release);
-        if let Some(tx) = self
-            .inner
-            .shutdown_tx
-            .lock()
-            .expect("access log shutdown mutex poisoned")
-            .take()
-        {
-            let _ = tx.send(());
-        }
-        let done = self
-            .inner
-            .done_rx
-            .lock()
-            .expect("access log done mutex poisoned")
-            .take();
-        let Some(done) = done else {
-            return Ok(());
-        };
-        tokio::time::timeout(self.inner.shutdown_timeout, done)
-            .await
-            .context("access log sink shutdown timed out")?
-            .context("access log dispatcher exited before shutdown acknowledgement")
+        shutdown_generation(self.active.load_full()).await
     }
+}
+
+/// 业务作用：停收并有界排空单个 access-log 代，不影响已切换的新代。
+///
+/// 参数说明：`generation` 持有该代唯一队列、sink worker 和完成回执。
+///
+/// 返回：全部排空并确认退出时成功；超时或 worker 异常时返回错误。
+async fn shutdown_generation(generation: Arc<AccessLoggerInner>) -> Result<()> {
+    generation.accepting.store(false, Ordering::Release);
+    if let Some(tx) = generation
+        .shutdown_tx
+        .lock()
+        .expect("access log shutdown mutex poisoned")
+        .take()
+    {
+        let _ = tx.send(());
+    }
+    let done = generation
+        .done_rx
+        .lock()
+        .expect("access log done mutex poisoned")
+        .take();
+    let Some(done) = done else {
+        return Ok(());
+    };
+    tokio::time::timeout(generation.shutdown_timeout, done)
+        .await
+        .context("access log sink shutdown timed out")?
+        .context("access log dispatcher exited before shutdown acknowledgement")
 }
 
 /// access log 的运行期配置。

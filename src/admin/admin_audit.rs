@@ -6,10 +6,12 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -89,7 +91,9 @@ pub struct AdminAuditInput<'a> {
 /// 进程级管理审计器；内部 mutex 串行低频写动作，维护严格 hash-chain 顺序。
 #[derive(Clone)]
 pub struct AdminAuditLog {
-    inner: Option<Arc<AdminAuditInner>>,
+    active: Arc<ArcSwapOption<AdminAuditInner>>,
+    write_gate: Arc<Mutex<()>>,
+    transitioning: Arc<AtomicBool>,
 }
 
 struct AdminAuditInner {
@@ -110,45 +114,102 @@ impl AdminAuditLog {
     /// # 参数
     /// - `config`: 快照构建期已解析 SecretSource/endpoint/资源上限的审计计划。
     pub fn open(config: &AdminAuditRuntimeCfg) -> Result<Self> {
-        if !config.enabled {
-            return Ok(Self { inner: None });
-        }
-        if let Some(parent) = config.file.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create admin audit dir {}", parent.display()))?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&config.file)
-            .with_context(|| format!("open admin audit spool {}", config.file.display()))?;
-        let chain = verify_spool(
-            BufReader::new(file),
-            config.signing_key.as_ref(),
-            config.max_record_bytes,
-            config.history_limit,
-        )?;
-        let client = config
-            .endpoint
-            .as_ref()
-            .map(|_| {
-                reqwest::Client::builder()
-                    .timeout(config.timeout)
-                    .user_agent("nate-admin-audit/1")
-                    .build()
-                    .context("build admin audit HTTP client")
-            })
-            .transpose()?;
+        let active = build_audit_generation(config)?;
         Ok(Self {
-            inner: Some(Arc::new(AdminAuditInner {
-                config: config.clone(),
-                client,
-                chain: Mutex::new(chain),
-            })),
+            active: Arc::new(ArcSwapOption::from(active)),
+            write_gate: Arc::new(Mutex::new(())),
+            transitioning: Arc::new(AtomicBool::new(false)),
         })
     }
 
+    /// 业务作用：在快照发布前准备新的审计 spool、hash-chain 和远端客户端。
+    ///
+    /// 参数说明：`config` 是候选快照已解密且完成边界校验的审计计划。
+    ///
+    /// 返回：本地链完整验证且 HTTP client 构建成功时返回候选代；失败不改变在线代。
+    pub fn prepare_replacement(&self, config: &AdminAuditRuntimeCfg) -> Result<Self> {
+        let active = build_audit_generation(config)?;
+        Ok(Self {
+            active: Arc::new(ArcSwapOption::from(active)),
+            write_gate: self.write_gate.clone(),
+            transitioning: self.transitioning.clone(),
+        })
+    }
+
+    /// 业务作用：在快照切换前关闭审计写入准入，防止跨代序列或密钥混写。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；后续写操作失败闭合，直到候选代提交或取消。
+    pub fn begin_transition(&self) {
+        self.transitioning.store(true, Ordering::Release);
+    }
+
+    /// 业务作用：取消尚未发布的审计换代门禁，恢复旧代写入。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值。
+    pub fn cancel_transition(&self) {
+        self.transitioning.store(false, Ordering::Release);
+    }
+
+    /// 业务作用：在已发布快照后切换审计 owner，并等待已进入旧代的唯一写入结束。
+    ///
+    /// 参数说明：`candidate` 是通过 [`Self::prepare_replacement`] 构建的候选代。
+    ///
+    /// 返回：无返回值；方法返回时新写入只能看到候选 owner。
+    pub async fn replace(&self, candidate: &Self) {
+        let _gate = self.write_gate.lock().await;
+        self.active.store(candidate.active.load_full());
+        self.transitioning.store(false, Ordering::Release);
+    }
+}
+
+/// 业务作用：打开并完整验证单个审计代，关闭态则构建空 owner。
+///
+/// 参数说明：`config` 是已解析的 spool、签名与远端 sink 计划。
+///
+/// 返回：启用时返回已验证代，关闭时返回 None；任一完整性或客户端错误失败。
+fn build_audit_generation(config: &AdminAuditRuntimeCfg) -> Result<Option<Arc<AdminAuditInner>>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    if let Some(parent) = config.file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create admin audit dir {}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(&config.file)
+        .with_context(|| format!("open admin audit spool {}", config.file.display()))?;
+    let chain = verify_spool(
+        BufReader::new(file),
+        config.signing_key.as_ref(),
+        config.max_record_bytes,
+        config.history_limit,
+    )?;
+    let client = config
+        .endpoint
+        .as_ref()
+        .map(|_| {
+            reqwest::Client::builder()
+                .timeout(config.timeout)
+                .user_agent("nate-admin-audit/1")
+                .build()
+                .context("build admin audit HTTP client")
+        })
+        .transpose()?;
+    Ok(Some(Arc::new(AdminAuditInner {
+        config: config.clone(),
+        client,
+        chain: Mutex::new(chain),
+    })))
+}
+
+impl AdminAuditLog {
     /// 追加一条审计记录：本地 O_APPEND + 可选 fsync 成功后，再等待外部 sink 2xx。
     ///
     /// 写动作应在副作用前先写 `attempt`；任何错误均 fail-closed。`completed` 记录响应状态。
@@ -156,7 +217,15 @@ impl AdminAuditLog {
     /// # 参数
     /// - `input`: 已通过认证/RBAC 的小型审计字段，不含敏感 header/query 原文。
     pub async fn record(&self, input: AdminAuditInput<'_>) -> Result<()> {
-        let Some(inner) = &self.inner else {
+        if self.transitioning.load(Ordering::Acquire) {
+            bail!("admin audit generation is transitioning");
+        }
+        // 换代与记录共用写门，确保旧 owner 不会在新代验证完 sequence 后迟到追加。
+        let _write_gate = self.write_gate.lock().await;
+        if self.transitioning.load(Ordering::Acquire) {
+            bail!("admin audit generation is transitioning");
+        }
+        let Some(inner) = self.active.load_full() else {
             return Ok(());
         };
         // 串行锁跨本地/远端确认是刻意设计：审计低频，严格 sequence 比吞吐更重要；数据面不经过此锁。
@@ -196,7 +265,7 @@ impl AdminAuditLog {
         }
         // `Bytes` owns serializer Vec without copying；HTTP body clone below只增加 refcount。
         let encoded = Bytes::from(encoded);
-        append_local(inner, encoded.as_ref()).await?;
+        append_local(&inner, encoded.as_ref()).await?;
 
         // 本地 append 成功后必须推进 chain，即使远端失败；否则下一次会与磁盘 sequence 分叉。
         chain.next_sequence = chain.next_sequence.saturating_add(1);
@@ -206,17 +275,18 @@ impl AdminAuditLog {
             chain.recent.pop_front();
         }
         if let (Some(client), Some(endpoint)) = (&inner.client, &inner.config.endpoint) {
-            send_remote(inner, client, endpoint.as_ref(), encoded).await?;
+            send_remote(&inner, client, endpoint.as_ref(), encoded).await?;
         }
         Ok(())
     }
 
     /// 返回内存中的已验证尾部窗口；完整记录保留在 spool/外部 sink。
     pub async fn snapshot(&self) -> Vec<StoredAdminAuditEvent> {
-        let Some(inner) = &self.inner else {
+        let Some(inner) = self.active.load_full() else {
             return Vec::new();
         };
-        inner.chain.lock().await.recent.iter().cloned().collect()
+        let events = inner.chain.lock().await.recent.iter().cloned().collect();
+        events
     }
 }
 

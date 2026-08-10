@@ -27,6 +27,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Notify;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, Sleep};
@@ -971,6 +972,12 @@ pub(super) enum ExtAuthzDecision {
     Unavailable,
 }
 
+enum ExtAuthzRuntimeGate {
+    Cached(super::ExtAuthzCachedDecision),
+    CircuitOpen,
+    Call,
+}
+
 impl ForwardError {
     pub(super) fn status(&self) -> StatusCode {
         match self {
@@ -1775,7 +1782,118 @@ impl super::GatewayProxy {
         }
     }
 
-    /// 执行 route 的 ext_authz 外部鉴权策略。
+    /// 业务作用：在单个 ext_authz 后端的缓存与熔断 owner 域内取得本请求执行权。
+    ///
+    /// 参数说明：`state_key` 标识 route/policy 槽；`fingerprint` 绑定当前策略；`decision_key` 覆盖完整决策输入。
+    ///
+    /// 返回：命中未过期决策、熔断拒绝或取得一次正常/half-open 外呼权。
+    fn begin_ext_authz_runtime(
+        &self,
+        state_key: &str,
+        fingerprint: [u8; 32],
+        decision_key: [u8; 32],
+        policy: &ExtAuthzPolicy,
+    ) -> ExtAuthzRuntimeGate {
+        let now = std::time::Instant::now();
+        let mut runtimes = self.ext_authz_runtime.lock();
+        let state =
+            runtimes
+                .entry(state_key.to_owned())
+                .or_insert_with(|| super::ExtAuthzBackendState {
+                    policy_fingerprint: fingerprint,
+                    consecutive_failures: 0,
+                    open_until: None,
+                    half_open_probe: false,
+                    cache: std::collections::HashMap::new(),
+                });
+        if state.policy_fingerprint != fingerprint {
+            // 策略换代后旧 decision/failure 不能跨 owner 域影响新 endpoint 或新凭据输入。
+            *state = super::ExtAuthzBackendState {
+                policy_fingerprint: fingerprint,
+                consecutive_failures: 0,
+                open_until: None,
+                half_open_probe: false,
+                cache: std::collections::HashMap::new(),
+            };
+        }
+        state.cache.retain(|_, entry| entry.expires_at > now);
+        if policy.cache_ttl.is_some() {
+            if let Some(entry) = state.cache.get(&decision_key) {
+                return ExtAuthzRuntimeGate::Cached(entry.clone());
+            }
+        } else {
+            state.cache.clear();
+        }
+        if policy.circuit_failure_threshold == 0 {
+            state.open_until = None;
+            state.half_open_probe = false;
+            return ExtAuthzRuntimeGate::Call;
+        }
+        if let Some(open_until) = state.open_until {
+            if now < open_until || state.half_open_probe {
+                return ExtAuthzRuntimeGate::CircuitOpen;
+            }
+            // 到期后只授予一个 half-open 探测；其余请求继续失败闭合，避免恢复时惊群。
+            state.half_open_probe = true;
+        }
+        ExtAuthzRuntimeGate::Call
+    }
+
+    /// 业务作用：提交 ext_authz 后端外呼结果，成功关闭熔断并可缓存明确决策，依赖故障推进独立熔断。
+    ///
+    /// 参数说明：key/指纹绑定 owner；`cached` 只允许明确 allow/deny；`dependency_ok` 区分协议决策与依赖故障。
+    ///
+    /// 返回：无；迟到的旧策略结果无权修改新 owner 域。
+    fn finish_ext_authz_runtime(
+        &self,
+        state_key: &str,
+        fingerprint: [u8; 32],
+        decision_key: [u8; 32],
+        policy: &ExtAuthzPolicy,
+        dependency_ok: bool,
+        cached: Option<super::ExtAuthzCachedDecision>,
+    ) {
+        let mut runtimes = self.ext_authz_runtime.lock();
+        let Some(state) = runtimes.get_mut(state_key) else {
+            return;
+        };
+        if state.policy_fingerprint != fingerprint {
+            return;
+        }
+        state.half_open_probe = false;
+        if dependency_ok {
+            state.consecutive_failures = 0;
+            state.open_until = None;
+            if let Some(entry) = cached {
+                if policy.cache_max_entries > 0 {
+                    if state.cache.len() >= policy.cache_max_entries
+                        && !state.cache.contains_key(&decision_key)
+                    {
+                        if let Some(oldest) = state
+                            .cache
+                            .iter()
+                            .min_by_key(|(_, entry)| entry.expires_at)
+                            .map(|(key, _)| *key)
+                        {
+                            state.cache.remove(&oldest);
+                        }
+                    }
+                    state.cache.insert(decision_key, entry);
+                }
+            }
+            return;
+        }
+        if policy.circuit_failure_threshold == 0 {
+            return;
+        }
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= policy.circuit_failure_threshold {
+            // 熔断只由超时、网络或异常状态触发；401/403 是业务拒绝，永远不会打开依赖熔断。
+            state.open_until = std::time::Instant::now().checked_add(policy.circuit_open);
+        }
+    }
+
+    /// 业务作用：执行 route 的 ext_authz 外部鉴权策略，并复用完整键缓存与每后端独立熔断。
     ///
     /// # 参数
     /// - `snap`: 当前配置快照,用于解析 `lb://auth-service`。
@@ -1798,6 +1916,7 @@ impl super::GatewayProxy {
         downstream_proto: &'static str,
         request_id: &str,
         trace: &crate::telemetry::ServerTrace,
+        auth_body: Option<&Bytes>,
     ) -> ExtAuthzDecision {
         // 多个 ext_authz 策略属于同一种认证方式，按 OR 组合；它们作为一个认证组再参与 route 的
         // `satisfy any|all`。因此一个后端明确拒绝不能覆盖后续后端的成功，否则会把配置模型中的
@@ -1805,7 +1924,39 @@ impl super::GatewayProxy {
         // 后端成功时才返回 Unavailable。指标按【最终请求决策】计 allowed/denied，error 按后端异常计。
         let mut denied: Option<(StatusCode, Option<http::HeaderValue>)> = None;
         let mut unavailable = false;
-        for policy in &route.ext_authz {
+        for (index, policy) in route.ext_authz.iter().enumerate() {
+            let state_key = format!("{}:{index}", route.id);
+            let fingerprint = ext_authz_policy_fingerprint(policy);
+            let decision_key = ext_authz_decision_key(
+                policy,
+                parts,
+                client_ip,
+                trusted_inbound,
+                downstream_proto,
+                auth_body,
+            );
+            match self.begin_ext_authz_runtime(&state_key, fingerprint, decision_key, policy) {
+                ExtAuthzRuntimeGate::Cached(entry) => {
+                    if entry.allowed {
+                        apply_ext_authz_upstream_headers(parts, &entry.upstream_headers);
+                        self.metrics.inc_ext_authz_allowed();
+                        return ExtAuthzDecision::Allowed;
+                    }
+                    denied.get_or_insert((entry.status, entry.challenge));
+                    continue;
+                }
+                ExtAuthzRuntimeGate::CircuitOpen => {
+                    self.metrics.inc_ext_authz_error();
+                    if policy.fail_open {
+                        tracing::warn!(route = %route.id, policy = index, "ext_authz circuit open, fail-open");
+                        self.metrics.inc_ext_authz_allowed();
+                        return ExtAuthzDecision::Allowed;
+                    }
+                    unavailable = true;
+                    continue;
+                }
+                ExtAuthzRuntimeGate::Call => {}
+            }
             match self
                 .send_ext_authz_request(
                     snap,
@@ -1818,11 +1969,28 @@ impl super::GatewayProxy {
                     downstream_proto,
                     request_id,
                     trace,
+                    auth_body,
                 )
                 .await
             {
                 Ok(resp) if resp.status().is_success() => {
-                    copy_ext_authz_upstream_headers(parts, policy, &resp);
+                    let upstream_headers = ext_authz_upstream_headers(policy, &resp);
+                    let cached = policy.cache_ttl.map(|ttl| super::ExtAuthzCachedDecision {
+                        allowed: true,
+                        status: resp.status(),
+                        challenge: None,
+                        upstream_headers: upstream_headers.clone(),
+                        expires_at: std::time::Instant::now() + ttl,
+                    });
+                    self.finish_ext_authz_runtime(
+                        &state_key,
+                        fingerprint,
+                        decision_key,
+                        policy,
+                        true,
+                        cached,
+                    );
+                    apply_ext_authz_upstream_headers(parts, &upstream_headers);
                     drop(resp);
                     self.metrics.inc_ext_authz_allowed();
                     return ExtAuthzDecision::Allowed;
@@ -1831,14 +1999,34 @@ impl super::GatewayProxy {
                     if resp.status() == StatusCode::UNAUTHORIZED
                         || resp.status() == StatusCode::FORBIDDEN =>
                 {
-                    denied.get_or_insert_with(|| {
-                        (
-                            resp.status(),
-                            resp.headers().get(http::header::WWW_AUTHENTICATE).cloned(),
-                        )
+                    let status = resp.status();
+                    let challenge = resp.headers().get(http::header::WWW_AUTHENTICATE).cloned();
+                    let cached = policy.cache_ttl.map(|ttl| super::ExtAuthzCachedDecision {
+                        allowed: false,
+                        status,
+                        challenge: challenge.clone(),
+                        upstream_headers: Vec::new(),
+                        expires_at: std::time::Instant::now() + ttl,
                     });
+                    self.finish_ext_authz_runtime(
+                        &state_key,
+                        fingerprint,
+                        decision_key,
+                        policy,
+                        true,
+                        cached,
+                    );
+                    denied.get_or_insert((status, challenge));
                 }
                 Ok(resp) => {
+                    self.finish_ext_authz_runtime(
+                        &state_key,
+                        fingerprint,
+                        decision_key,
+                        policy,
+                        false,
+                        None,
+                    );
                     self.metrics.inc_ext_authz_error();
                     if policy.fail_open {
                         tracing::warn!(
@@ -1857,6 +2045,14 @@ impl super::GatewayProxy {
                     unavailable = true;
                 }
                 Err(err) => {
+                    self.finish_ext_authz_runtime(
+                        &state_key,
+                        fingerprint,
+                        decision_key,
+                        policy,
+                        false,
+                        None,
+                    );
                     self.metrics.inc_ext_authz_error();
                     if policy.fail_open {
                         tracing::warn!(route = %route.id, error = %err, "ext_authz failed, fail-open");
@@ -1904,6 +2100,7 @@ impl super::GatewayProxy {
         downstream_proto: &'static str,
         request_id: &str,
         trace: &crate::telemetry::ServerTrace,
+        auth_body: Option<&Bytes>,
     ) -> Result<Response<BoxBody>, ForwardError> {
         let target = ext_authz_target(policy)?;
         validate_upstream_target(snap, target.upstream.as_ref(), false)?;
@@ -1925,9 +2122,26 @@ impl super::GatewayProxy {
             downstream_proto,
             request_id,
         )?;
+        let request_body = if policy.body_max_bytes.is_some() {
+            let body = auth_body.cloned().ok_or_else(|| {
+                ForwardError::BadGateway(anyhow::anyhow!(
+                    "ext_authz body policy is missing the collected request entity"
+                ))
+            })?;
+            if let Some(content_type) = base_parts.headers.get(CONTENT_TYPE).cloned() {
+                parts.headers.insert(CONTENT_TYPE, content_type);
+            }
+            parts.headers.insert(
+                CONTENT_LENGTH,
+                header_value(&body.len().to_string(), "content-length")?,
+            );
+            full_body(body)
+        } else {
+            empty_body()
+        };
         let client_trace = trace.begin_client(&mut parts.headers, reservation.base.as_ref(), 1);
         parts.extensions.clear();
-        let request = Request::from_parts(parts, empty_body());
+        let request = Request::from_parts(parts, request_body);
         let use_h2c = reservation.protocol == UpstreamProtocol::H2c;
         #[cfg(feature = "http3")]
         let use_h3 = reservation.protocol == UpstreamProtocol::H3;
@@ -3031,21 +3245,133 @@ fn build_ext_authz_parts(
     Ok(parts)
 }
 
-/// 把鉴权响应中 allowlist header 注入主上游请求。
+/// 业务作用：为 ext_authz 运行态生成绑定 endpoint、输入 allowlist、body 与缓存/熔断参数的策略指纹。
 ///
-/// # 参数
-/// - `parts`: 主请求 head。
-/// - `policy`: 当前 ext_authz 策略。
-/// - `resp`: 鉴权服务响应。
-fn copy_ext_authz_upstream_headers(
-    parts: &mut Parts,
+/// 参数说明：`policy` 是当前快照已编译策略。
+///
+/// 返回：任一影响决策或运行态所有权的配置变化都会产生不同 SHA-256。
+fn ext_authz_policy_fingerprint(policy: &ExtAuthzPolicy) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for value in [
+        policy.target.as_bytes(),
+        policy.path.as_deref().unwrap_or_default().as_bytes(),
+        policy.method.as_str().as_bytes(),
+    ] {
+        ext_authz_hash_field(&mut digest, value);
+    }
+    ext_authz_hash_field(&mut digest, &[u8::from(policy.fail_open)]);
+    ext_authz_hash_field(
+        &mut digest,
+        &policy.body_max_bytes.unwrap_or_default().to_be_bytes(),
+    );
+    ext_authz_hash_field(
+        &mut digest,
+        &policy
+            .cache_ttl
+            .map(|ttl| ttl.as_millis() as u64)
+            .unwrap_or_default()
+            .to_be_bytes(),
+    );
+    ext_authz_hash_field(&mut digest, &policy.cache_max_entries.to_be_bytes());
+    ext_authz_hash_field(&mut digest, &policy.circuit_failure_threshold.to_be_bytes());
+    ext_authz_hash_field(
+        &mut digest,
+        &(policy.circuit_open.as_millis() as u64).to_be_bytes(),
+    );
+    for name in &policy.request_headers {
+        ext_authz_hash_field(&mut digest, name.as_str().as_bytes());
+    }
+    ext_authz_hash_field(&mut digest, b"upstream-headers");
+    for name in &policy.upstream_headers {
+        ext_authz_hash_field(&mut digest, name.as_str().as_bytes());
+    }
+    digest.finalize().into()
+}
+
+/// 业务作用：构造 ext_authz 决策缓存的完整输入键，避免不同主体、URI、header 或 body 共享授权。
+///
+/// 参数说明：策略限定可见 header/body；其余参数是鉴权子请求会收到的原始请求与连接信任上下文。
+///
+/// 返回：长度分隔 SHA-256，不含原始凭据文本且稳定区分缺失、重复和顺序。
+fn ext_authz_decision_key(
+    policy: &ExtAuthzPolicy,
+    parts: &Parts,
+    client_ip: IpAddr,
+    trusted_inbound: bool,
+    downstream_proto: &str,
+    auth_body: Option<&Bytes>,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    ext_authz_hash_field(&mut digest, parts.method.as_str().as_bytes());
+    ext_authz_hash_field(&mut digest, parts.uri.to_string().as_bytes());
+    ext_authz_hash_field(&mut digest, client_ip.to_string().as_bytes());
+    ext_authz_hash_field(&mut digest, &[u8::from(trusted_inbound)]);
+    ext_authz_hash_field(&mut digest, downstream_proto.as_bytes());
+    ext_authz_hash_field(
+        &mut digest,
+        parts
+            .headers
+            .get(HOST)
+            .map(HeaderValue::as_bytes)
+            .unwrap_or_default(),
+    );
+    for name in &policy.request_headers {
+        ext_authz_hash_field(&mut digest, name.as_str().as_bytes());
+        let values = parts.headers.get_all(name);
+        ext_authz_hash_field(&mut digest, &values.iter().count().to_be_bytes());
+        for value in values {
+            ext_authz_hash_field(&mut digest, value.as_bytes());
+        }
+    }
+    if policy.body_max_bytes.is_some() {
+        ext_authz_hash_field(&mut digest, b"body-present");
+        let body_digest = Sha256::digest(auth_body.map_or(&[][..], Bytes::as_ref));
+        ext_authz_hash_field(&mut digest, &body_digest);
+    } else {
+        ext_authz_hash_field(&mut digest, b"body-absent");
+    }
+    digest.finalize().into()
+}
+
+/// 业务作用：以显式长度分隔字段写入摘要，防止字符串拼接边界碰撞。
+///
+/// 参数说明：`digest` 是当前 SHA-256；`value` 是单个结构化字段。
+///
+/// 返回：无；先写八字节长度再写字段原值。
+fn ext_authz_hash_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+/// 业务作用：从明确 allow 响应提取唯一 allowlist header 快照，供即时注入与缓存命中复用相同语义。
+///
+/// 参数说明：`policy` 声明可复制字段；`resp` 是成功鉴权响应。
+///
+/// 返回：只包含响应实际出现的首值，不含未声明字段。
+fn ext_authz_upstream_headers(
     policy: &ExtAuthzPolicy,
     resp: &Response<BoxBody>,
-) {
-    for name in &policy.upstream_headers {
-        if let Some(value) = resp.headers().get(name).cloned() {
-            parts.headers.insert(name.clone(), value);
-        }
+) -> Vec<(HeaderName, HeaderValue)> {
+    policy
+        .upstream_headers
+        .iter()
+        .filter_map(|name| {
+            resp.headers()
+                .get(name)
+                .cloned()
+                .map(|value| (name.clone(), value))
+        })
+        .collect()
+}
+
+/// 业务作用：把已验证或缓存的 ext_authz allowlist header 注入主上游请求。
+///
+/// 参数说明：`parts` 是主请求 head；`headers` 只来自明确 allow 响应的已过滤快照。
+///
+/// 返回：无；同名客户端值被可信鉴权结果覆盖。
+fn apply_ext_authz_upstream_headers(parts: &mut Parts, headers: &[(HeaderName, HeaderValue)]) {
+    for (name, value) in headers {
+        parts.headers.insert(name.clone(), value.clone());
     }
 }
 
@@ -3138,6 +3464,7 @@ fn prepare_attempt_parts(
         downstream_proto,
         request_id,
         route_id: route.id.as_str(),
+        response_status: None,
     };
     let request_headers =
         render_request_headers(&route.request_headers, route.variables.as_ref(), &eval_ctx)?;
@@ -3183,6 +3510,7 @@ fn prepare_attempt_parts_owned(
             downstream_proto,
             request_id,
             route_id: route.id.as_str(),
+            response_status: None,
         };
         render_request_headers(&route.request_headers, route.variables.as_ref(), &eval_ctx)?
     };
@@ -4530,6 +4858,7 @@ fn route_upstream_target<'a>(
         downstream_proto,
         request_id,
         route_id: route.id.as_str(),
+        response_status: None,
     };
     Cow::Owned(
         route

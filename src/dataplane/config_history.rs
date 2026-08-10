@@ -83,6 +83,7 @@ struct ArchivedConfigSet {
 /// 某归档版本的三文件配置原文。
 ///
 /// 字段与 Nacos 配置源的三个 dataId 一一对应,供 CAS 回滚把归档内容写回 Nacos。
+#[derive(Clone)]
 pub struct ArchivedDocs {
     /// 主配置 `gateway.yml` 原文。
     pub gateway: String,
@@ -261,6 +262,55 @@ impl ConfigHistory {
         write_atomic(&guard, &target_guard)?;
         write_atomic(&sentinel, &target_sentinel)?;
         write_atomic(&gateway, target_cfg_path)?;
+        Ok(())
+    }
+
+    /// 业务作用：把已完成统一候选构建的三份配置文档发布到本地事实源，避免管理接口只改其中一份而
+    /// 让 reload 观察到跨版本组合。
+    ///
+    /// 参数说明：`docs` 是彼此一致的主配置、接口守卫和 Sentinel 文档；`target_cfg_path` 是当前
+    /// bootstrap 主配置路径。
+    ///
+    /// 返回：三份文件均以固定目标替换后成功；任一读取或写入失败时尽力补偿已经替换的文件并返回
+    /// 错误，调用方不得触发 reload。
+    pub fn publish_documents(&self, docs: &ArchivedDocs, target_cfg_path: &Path) -> Result<()> {
+        let _transaction = self.file_transaction.write();
+        let target_cfg = load_gateway_config(target_cfg_path)
+            .with_context(|| format!("read publish target {}", target_cfg_path.display()))?;
+        let target_guard = resolve_relative(target_cfg_path, &target_cfg.interface_guard_file);
+        let target_sentinel = resolve_relative(target_cfg_path, &target_cfg.sentinel_rules_file);
+        let previous_gateway = crate::bounded_io::read_file(
+            target_cfg_path,
+            MAX_ARCHIVED_DOCUMENT_BYTES,
+            "publish gateway backup",
+        )?;
+        let previous_guard = crate::bounded_io::read_file(
+            &target_guard,
+            MAX_ARCHIVED_DOCUMENT_BYTES,
+            "publish interface guard backup",
+        )?;
+        let previous_sentinel = crate::bounded_io::read_file(
+            &target_sentinel,
+            MAX_ARCHIVED_DOCUMENT_BYTES,
+            "publish sentinel backup",
+        )?;
+        let publish = || -> Result<()> {
+            // 依赖文档先发布、主配置最后发布；进程内 reload 持共享锁，不能观察到中间态。
+            write_atomic(docs.interface_guard.as_bytes(), &target_guard)?;
+            write_atomic(docs.sentinel_rules.as_bytes(), &target_sentinel)?;
+            write_atomic(docs.gateway.as_bytes(), target_cfg_path)
+        };
+        if let Err(error) = publish() {
+            // 任一固定路径失败都恢复完整旧集合，禁止残留下一次外部 reload 会采用的半完成事实源。
+            let guard_restore = write_atomic(&previous_guard, &target_guard);
+            let sentinel_restore = write_atomic(&previous_sentinel, &target_sentinel);
+            let gateway_restore = write_atomic(&previous_gateway, target_cfg_path);
+            if let Err(restore_error) = guard_restore.and(sentinel_restore).and(gateway_restore) {
+                return Err(error)
+                    .context(format!("publish compensation also failed: {restore_error}"));
+            }
+            return Err(error);
+        }
         Ok(())
     }
 

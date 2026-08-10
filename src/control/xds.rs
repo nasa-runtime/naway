@@ -15,6 +15,7 @@ use prost::Message;
 use prost_types::{Any, Duration as ProtoDuration, Struct, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::client::Grpc;
 use tonic::transport::{
@@ -184,6 +185,21 @@ impl Default for XdsStatus {
 }
 
 impl XdsStatus {
+    /// 业务作用：撤销上一 ADS 代的 readiness 与详情权威，防止新身份复用旧 ACK。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无返回值；累计计数保留，本代的 version/nonce/resource 从空状态重新取证。
+    fn begin_generation(&self) {
+        self.ready.store(false, Ordering::Release);
+        self.stream_up.store(false, Ordering::Release);
+        self.active_resources.store(0, Ordering::Release);
+        self.apply_queue_depth.store(0, Ordering::Release);
+        *self.detail.write().expect("xDS status lock poisoned") = XdsStatusDetail::default();
+        self.state
+            .store(XdsConnectionState::Disconnected as u8, Ordering::Release);
+    }
+
     /// 业务作用：判断 require_xds 启动门是否已由一份完整 ACK 的 EDS 打开。
     ///
     /// 参数说明：无。
@@ -692,6 +708,105 @@ pub struct XdsSnapshotRuntime {
     pub listener_topology: Option<Arc<dyn ListenerTopologyReconciler>>,
 }
 
+/// xDS ADS 任务的进程级 owner，使 bootstrap/ownership 变更可以经过预连接后换代。
+pub struct XdsGenerationManager {
+    dynamic: Arc<DynamicUpstreamStore>,
+    snapshot_runtime: XdsSnapshotRuntime,
+    status: Arc<XdsStatus>,
+    active: parking_lot::Mutex<Option<JoinHandle<()>>>,
+}
+
+/// 已完成 management server 传输与身份复验的 xDS 候选代。
+pub struct PreparedXdsGeneration {
+    manager: Arc<XdsGenerationManager>,
+    cfg: Option<XdsCfg>,
+    specs: Vec<XdsWatchSpec>,
+}
+
+impl XdsGenerationManager {
+    /// 业务作用：创建 xDS 单 owner 管理器，使所有代共用快照写锁、状态与动态实例表。
+    ///
+    /// 参数说明：`dynamic` 是 EDS 事实源；`snapshot_runtime` 是 CDS/RDS/LDS 唯一发布边界；
+    /// `status` 是 admin/readiness 持有的稳定状态句柄。
+    ///
+    /// 返回：返回尚未启动 ADS 任务的管理器。
+    pub fn new(
+        dynamic: Arc<DynamicUpstreamStore>,
+        snapshot_runtime: XdsSnapshotRuntime,
+        status: Arc<XdsStatus>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            dynamic,
+            snapshot_runtime,
+            status,
+            active: parking_lot::Mutex::new(None),
+        })
+    }
+
+    /// 业务作用：启动初始 ADS 代，只在 listener supervisor 已建立后调用。
+    ///
+    /// 参数说明：`cfg` 是启动期 xDS 计划；`specs` 是 EDS 服务映射。
+    ///
+    /// 返回：无返回值；网络故障由后台退避并反映为未就绪。
+    pub fn start_initial(&self, cfg: XdsCfg, specs: Vec<XdsWatchSpec>) {
+        self.status.begin_generation();
+        let task = spawn_inner_with_status(
+            cfg,
+            specs,
+            self.dynamic.clone(),
+            Some(self.snapshot_runtime.clone()),
+            self.status.clone(),
+        );
+        *self.active.lock() = Some(task);
+    }
+
+    /// 业务作用：在不触碰当前 ADS owner 的前提下，复验候选 server、TLS/mTLS 身份与连接 deadline。
+    ///
+    /// 参数说明：`cfg` 为 None 表示候选关闭 xDS；`specs` 是候选 EDS owner 映射。
+    ///
+    /// 返回：传输与身份成功时返回可提交代；解析、建连、TLS 或 deadline 失败保留旧代。
+    pub async fn prepare(
+        self: &Arc<Self>,
+        cfg: Option<XdsCfg>,
+        specs: Vec<XdsWatchSpec>,
+    ) -> Result<PreparedXdsGeneration> {
+        if let Some(cfg) = &cfg {
+            // 预连接会完整执行 DNS/TCP/TLS/mTLS，但不发送 DiscoveryRequest，
+            // 因此候选在发布前不可写 EDS 或 Snapshot owner 域。
+            let _channel = connect_channel(cfg).await?;
+        }
+        Ok(PreparedXdsGeneration {
+            manager: self.clone(),
+            cfg,
+            specs,
+        })
+    }
+}
+
+impl PreparedXdsGeneration {
+    /// 业务作用：在候选快照已发布后撤销旧 ADS owner，并启动候选代。
+    ///
+    /// 参数说明：无；事务已持有候选计划和唯一管理器。
+    ///
+    /// 返回：无返回值；旧 task 先失去后续写权，新 task 才使用同一发布锁。
+    pub fn commit(self) {
+        if let Some(old) = self.manager.active.lock().take() {
+            old.abort();
+        }
+        self.manager.status.begin_generation();
+        if let Some(cfg) = self.cfg {
+            let task = spawn_inner_with_status(
+                cfg,
+                self.specs,
+                self.manager.dynamic.clone(),
+                Some(self.manager.snapshot_runtime.clone()),
+                self.manager.status.clone(),
+            );
+            *self.manager.active.lock() = Some(task);
+        }
+    }
+}
+
 /// 启动单一 ADS task。
 ///
 /// 业务作用：为所有 `source: xds` 服务建立共享有界 stream，并把 EDS response 通过统一
@@ -745,7 +860,13 @@ pub fn start_with_snapshot_status(
     snapshot_runtime: XdsSnapshotRuntime,
     status: Arc<XdsStatus>,
 ) {
-    spawn_inner_with_status(cfg, specs, dynamic, Some(snapshot_runtime), status);
+    drop(spawn_inner_with_status(
+        cfg,
+        specs,
+        dynamic,
+        Some(snapshot_runtime),
+        status,
+    ));
 }
 
 /// 业务作用：统一创建 EDS-only 或 CDS/RDS/EDS profile 的常驻状态与后台任务。
@@ -760,7 +881,13 @@ fn spawn_inner(
     snapshot_runtime: Option<XdsSnapshotRuntime>,
 ) -> Arc<XdsStatus> {
     let status = Arc::new(XdsStatus::default());
-    spawn_inner_with_status(cfg, specs, dynamic, snapshot_runtime, status.clone());
+    drop(spawn_inner_with_status(
+        cfg,
+        specs,
+        dynamic,
+        snapshot_runtime,
+        status.clone(),
+    ));
     status
 }
 
@@ -768,17 +895,17 @@ fn spawn_inner(
 ///
 /// 参数说明：全部依赖均已通过 bootstrap 校验；`status` 可能已被 admin 持有。
 ///
-/// 返回：无；立即调度后台任务。
+/// 返回：返回 task 句柄，换代 owner 可以撤销旧 stream 及其迟到写入。
 fn spawn_inner_with_status(
     cfg: XdsCfg,
     specs: Vec<XdsWatchSpec>,
     dynamic: Arc<DynamicUpstreamStore>,
     snapshot_runtime: Option<XdsSnapshotRuntime>,
     status: Arc<XdsStatus>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         run_forever(cfg, specs, dynamic, snapshot_runtime, status).await;
-    });
+    })
 }
 
 /// 业务作用：永久维护 ADS 连接，以带 jitter 的指数退避抵抗 management server 故障风暴。
