@@ -5956,10 +5956,12 @@ fn parse_limit_except(spec: &str) -> Result<Vec<Method>> {
     Ok(methods)
 }
 
-/// 解析 V4 `auth_basic` 基础规则。
+/// 业务作用：解析 `auth_basic` 基础认证规则，冻结用户名、凭据与对外 challenge realm。
 ///
-/// # 参数
-/// - `spec`: route filter 原始字符串,如 `auth_basic user=admin password=secret realm=ops`。
+/// 参数说明：`spec` 是 route filter 原始字符串，例如
+/// `auth_basic user=admin password=secret realm=ops`；`config_dir` 用于解析 SecretSource 相对路径。
+///
+/// 返回：规则关闭时返回 None；配置合法时返回认证策略；缺少凭据、未知选项或非法 realm 时拒绝候选。
 fn parse_auth_basic(spec: &str, config_dir: &Path) -> Result<Option<BasicAuthPolicy>> {
     let rest = filter_args(spec, "auth_basic").trim();
     if rest.eq_ignore_ascii_case("off") {
@@ -5970,7 +5972,7 @@ fn parse_auth_basic(spec: &str, config_dir: &Path) -> Result<Option<BasicAuthPol
     }
     let mut user = None;
     let mut password = None;
-    let mut realm = "nate".to_string();
+    let mut realm = "naway".to_string();
     let mut positional = Vec::new();
     for token in rest.split_whitespace() {
         if let Some((key, value)) = token.split_once('=') {

@@ -580,14 +580,14 @@ impl AccessLogVar {
     }
 }
 
-/// 写出单条 access log。
+/// 业务作用：把一条已完成请求的访问事实写入 Naway access tracing target，供本地日志层消费。
 ///
-/// # 参数
-/// - `record`: 当前 access log 记录。
-/// - `line`: 当前快照已渲染的可选自定义行。
+/// 参数说明：`record` 是当前 access log 记录；`line` 是当前快照已渲染的可选自定义行。
+///
+/// 返回：无；日志层是否保留记录由当前 subscriber 与过滤配置决定。
 pub(crate) fn log_record(record: &AccessRecord, line: Option<&str>) {
     tracing::info!(
-        target: "nate::access",
+        target: "naway::access",
         request_id = %record.request_id,
         trace_id = %record.trace_id.as_deref().unwrap_or("-"),
         method = record.method.as_str(),

@@ -472,7 +472,7 @@
 - `admin_config_history` 改 SIGHUP 确定性触发 reload（macOS FSEvents 在全套件并发下延迟无上界；notify 通道由 reload_stress 专测）。
 - `wait_for_health`/`wait_for_ready_version` 轮询窗口 4s/6s → 12s（通过路径首轮返回）。
 - 门禁跑法固化 `cargo test -- --test-threads=4`（重型真实 socket 集成 binary 的设计负载口径，验收记录 留档）；t4 下三形态全量 0 failed ×3。
-- 品牌断言同步（"Nate Control Plane"→"Naway Control Plane"，7-25 迁移遗留）。
+- 控制面品牌标题统一为 "Naway Control Plane"。
 
 ### gRPC 边缘模式契约修订（2026-08-02，按架构规范 §25.2 深审修订版）
 
@@ -489,12 +489,12 @@
 - 构建期拒绝矩阵落地于 `extensions/grpc_edge.rs`：值校验先于 feature 门，三种构建形态报错一致；`enabled=true` 无 feature、actions 空/重复、header 非法/大写/重名、队列 0/超硬上限、msg 上限越界、static peers 空/非法/重复、nacos 成员未启用 Nacos、relay_listen 缺失/非法、`session_registry=redis` 无 `redis-runtime` —— 逐条拒绝且 reload 保留旧快照。
 - 快照接线（数据面 no-op）：`Route.grpc_edge` 编译计划、`GatewaySnapshot.grpc_edge_cluster`、摘要新增 `grpc_edge_routes`/`grpc_edge_cluster` 低基数字段。
 - 新增 `tests/unit/grpc_edge.rs` 9 条契约用例（拒绝矩阵逐条 + 三形态分支断言）。
-- 修复既有测试漂移：7-25 品牌迁移后 `admin_ui.html` 标题已为 "Naway Control Plane"，旧测试仍断言 "Nate Control Plane"，现已同步。
+- 管理页标题和相关品牌断言统一为 "Naway Control Plane"。
 
 ### Naway 品牌迁移（2026-07-22）
 
 - Cargo 包、默认可执行文件、容器镜像与 UI 品牌统一为 `naway` / **Naway**。
-- 新部署默认使用 `/data/naway/naway.yml` 和 `NATE_*` 环境变量；`GW_*` 保留兼容但不再提供 `/data/gateway/gateway.yml` 兜底。
+- 新部署默认使用 `/data/naway/naway.yml` 和 `NAWAY_*` 环境变量；`GW_*` 保留兼容但不再提供 `/data/gateway/gateway.yml` 兜底。
 - A2 的参赛角色字段仍保留 `gateway`（表示“被测网关”而非品牌），镜像与源码指纹标签改为 Naway。
 
 ### 基础实现复核（2026-07-19）

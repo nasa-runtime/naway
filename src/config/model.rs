@@ -6335,8 +6335,13 @@ fn default_auto_ban_ttl_ms() -> u64 {
     300_000
 }
 
+/// 业务作用：提供共享运行态 Redis key 的默认品牌 namespace，隔离不同网关产品的状态。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `naway`；部署可通过显式配置覆盖。
 fn default_runtime_redis_namespace() -> String {
-    "nate".to_string()
+    "naway".to_string()
 }
 
 fn default_runtime_redis_profile() -> String {
@@ -6455,8 +6460,13 @@ fn default_otel_endpoint() -> String {
     "http://127.0.0.1:4318".to_string()
 }
 
+/// 业务作用：提供 OpenTelemetry resource 的默认服务名，使 Naway 信号可被稳定归类。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `naway`；部署可通过 telemetry 配置覆盖。
 fn default_otel_service_name() -> String {
-    "nate".to_string()
+    "naway".to_string()
 }
 
 fn default_otel_sample_ratio() -> f64 {
@@ -6491,8 +6501,13 @@ fn default_nacos_group() -> String {
     "DEFAULT_GROUP".to_string()
 }
 
+/// 业务作用：提供 Nacos discovery 与配置客户端的默认应用名，保持注册和配置身份一致。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `naway`；部署可通过 Nacos 配置覆盖。
 fn default_nacos_app_name() -> String {
-    "nate".to_string()
+    "naway".to_string()
 }
 
 fn default_nacos_poll_interval_ms() -> u64 {

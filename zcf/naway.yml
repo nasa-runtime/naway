@@ -91,7 +91,7 @@ discovery:
     server_addr: "" # 例如 "127.0.0.1:8848";启用后 source: nacos 的 upstream 会 watch 实例变化
     namespace: ""
     group: "DEFAULT_GROUP"
-    app_name: "nate"
+    app_name: "naway"
     # 网关节点自注册。启用时需设置 discovery_ip 或 self_register.ip,避免把 0.0.0.0 注册到 Nacos。
     discovery_ip: null
     self_register:
@@ -115,7 +115,7 @@ config_source:
     server_addr: "" # 例如 "127.0.0.1:8848";启用后真实传输需 --features nacos-sdk
     namespace: ""
     group: "DEFAULT_GROUP"
-    app_name: "nate"
+    app_name: "naway"
     username: ""
     password: ""
     # 推荐：JSON 一次携带 schema_version/bundle_version/gateway/interface_guard/sentinel_rules，
@@ -135,7 +135,7 @@ runtime_state:
       root: "runtime-state" # 相对本 gateway.yml 所在目录
     redis:
       url: "" # 例如 "redis://:password@127.0.0.1:6379";backend=redis 时必填
-      namespace: "nate"
+      namespace: "naway"
       profile: "RustV2"
       prefix: "gw:dynamic"
   blacklist:
@@ -156,7 +156,7 @@ runtime_state:
     fail_mode: open # redis 异常时 open=放行,closed=拒绝
     redis:
       url: "" # 例如 "redis://:password@127.0.0.1:6379";backend=redis 时必填
-      namespace: "nate"
+      namespace: "naway"
       profile: "RustV2"
 
 # V3 L4 stream TCP 起步:独立 TCP listener,不跑 HTTP/L7 filter。

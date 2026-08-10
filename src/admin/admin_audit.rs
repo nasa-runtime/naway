@@ -197,7 +197,7 @@ fn build_audit_generation(config: &AdminAuditRuntimeCfg) -> Result<Option<Arc<Ad
         .map(|_| {
             reqwest::Client::builder()
                 .timeout(config.timeout)
-                .user_agent("nate-admin-audit/1")
+                .user_agent("naway-admin-audit/1")
                 .build()
                 .context("build admin audit HTTP client")
         })

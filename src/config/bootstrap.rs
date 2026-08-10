@@ -188,7 +188,7 @@ access_log:
 telemetry:
   enabled: false
   endpoint: "http://127.0.0.1:4318"
-  service_name: "nate"
+  service_name: "naway"
   sample_ratio: 1.0
   queue_size: 2048
   batch_size: 512
@@ -219,7 +219,7 @@ discovery:
     server_addr: ""
     namespace: ""
     group: "DEFAULT_GROUP"
-    app_name: "nate"
+    app_name: "naway"
     # 网关节点自注册。启用时需设置 discovery_ip 或 self_register.ip,避免把 0.0.0.0 注册到 Nacos。
     discovery_ip: null
     self_register:
@@ -311,7 +311,7 @@ config_source:
     server_addr: ""
     namespace: ""
     group: "DEFAULT_GROUP"
-    app_name: "nate"
+    app_name: "naway"
     username: ""
     password: ""
     gateway_data_id: "gateway.yml"

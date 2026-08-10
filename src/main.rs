@@ -70,7 +70,7 @@ struct Args {
     /// 运行形态；省略时兼容旧命令，按 `all-in-one` 启动。
     #[command(subcommand)]
     command: Option<RunMode>,
-    /// 主配置文件路径(默认 /data/naway/naway.yml,或环境变量 NATE_CONFIG；兼容旧 GW_CONFIG)。
+    /// 主配置文件路径（默认 `/data/naway/naway.yml`，或环境变量 `NAWAY_CONFIG`；兼容 `GW_CONFIG`）。
     #[arg(long)]
     config: Option<String>,
     /// 向运行中的进程发信号:`reload` = SIGHUP 热更(nginx `-s reload` 风格)。
@@ -921,20 +921,23 @@ impl Drop for KafkaConnectionGuard {
     }
 }
 
-/// 主配置文件路径解析，优先级：`--config` > `NATE_CONFIG` > 兼容 `GW_CONFIG` >
-/// `${NATE_CONFIG_DIR:-/data/naway}/naway.yml`。接口守卫 `interface-guard.yml` 相对主配置目录解析,
-/// 故与主配置同放该固定目录(便于整目录挂载)。
+/// 业务作用：解析 Naway 主配置路径，并保持显式参数、品牌环境变量与通用兼容变量的确定优先级。
+///
+/// 参数说明：`args` 提供命令行显式配置路径。
+///
+/// 返回：依次选择 `--config`、`NAWAY_CONFIG`、`GW_CONFIG`、`NAWAY_CONFIG_DIR`、
+/// `GW_CONFIG_DIR` 或默认目录下的 `naway.yml`；接口守卫相对最终主配置目录解析。
 fn config_path(args: &Args) -> PathBuf {
     if let Some(c) = &args.config {
         return c.into();
     }
-    if let Ok(c) = std::env::var("NATE_CONFIG") {
+    if let Ok(c) = std::env::var("NAWAY_CONFIG") {
         return c.into();
     }
     if let Ok(c) = std::env::var("GW_CONFIG") {
         return c.into();
     }
-    if let Ok(dir) = std::env::var("NATE_CONFIG_DIR") {
+    if let Ok(dir) = std::env::var("NAWAY_CONFIG_DIR") {
         return PathBuf::from(dir).join(DEFAULT_CONFIG_FILE);
     }
     if let Ok(dir) = std::env::var("GW_CONFIG_DIR") {
@@ -945,8 +948,13 @@ fn config_path(args: &Args) -> PathBuf {
     PathBuf::from(DEFAULT_CONFIG_DIR).join(DEFAULT_CONFIG_FILE)
 }
 
+/// 业务作用：解析 Naway pidfile 路径，确保信号发送端与运行进程使用同一品牌配置入口。
+///
+/// 参数说明：无。
+///
+/// 返回：优先返回 `NAWAY_PIDFILE`，其次兼容 `GW_PIDFILE`，否则返回当前目录的 `naway.pid`。
 fn pidfile_path() -> PathBuf {
-    std::env::var("NATE_PIDFILE")
+    std::env::var("NAWAY_PIDFILE")
         .or_else(|_| std::env::var("GW_PIDFILE"))
         .unwrap_or_else(|_| "naway.pid".to_string())
         .into()

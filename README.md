@@ -17,14 +17,14 @@
 └── interface-guard.yml   # 接口级拦截(独立文件):某接口对外关闭 → 直接返回配置的 response
 ```
 
-配置路径优先级：`--config <路径>` > `NATE_CONFIG=<路径>` > `GW_CONFIG=<路径>` > `${NATE_CONFIG_DIR:-/data/naway}/naway.yml`。
+配置路径优先级：`--config <路径>` > `NAWAY_CONFIG=<路径>` > `GW_CONFIG=<路径>` > `${NAWAY_CONFIG_DIR:-/data/naway}/naway.yml`。
 `interface-guard.yml` 相对主配置目录解析，因此与 `naway.yml` 同目录、一起挂载和热更。
 
 ## 快速开始
 
 ```bash
 # 本地开发:用仓库示例配置目录 zcf/
-NATE_CONFIG_DIR=zcf cargo run
+NAWAY_CONFIG_DIR=zcf cargo run
 # 或显式指定主配置
 cargo run -- --config zcf/naway.yml
 
@@ -247,7 +247,7 @@ HTTP/3 / QUIC 通过独立 `http3` feature 提供下游与上游双向代理，�
 ./scripts/build.sh  # 默认构建 naway 镜像；上下文仍同时纳入源码目录和 nasa-runtime-rust
 # 把 yml 放宿主 /data/naway，直接启动（挂载到容器同路径，修改 yml 即热更）：
 ./scripts/start.sh
-# 或指定别的宿主配置目录：NATE_CONFIG_DIR=/your/conf ./scripts/start.sh
+# 或指定别的宿主配置目录：NAWAY_CONFIG_DIR=/your/conf ./scripts/start.sh
 ```
 
 ## 源码结构(按模块目录组织)

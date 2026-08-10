@@ -2476,6 +2476,11 @@ impl LocalResponse {
     }
 }
 
+/// 业务作用：初始化进程共享的 Wasm engine，并启动 epoch ticker 为扩展执行提供可抢占的时间边界。
+///
+/// 参数说明：无。
+///
+/// 返回：初始化成功时返回全局 engine；配置、线程或 engine 创建失败时返回错误并拒绝加载扩展。
 fn engine() -> Result<&'static Engine> {
     match WASM_ENGINE.get_or_init(|| {
         let mut config = wasmtime::Config::new();
@@ -2485,7 +2490,7 @@ fn engine() -> Result<&'static Engine> {
         let engine = Engine::new(&config).map_err(|error| error.to_string())?;
         let ticker = engine.clone();
         std::thread::Builder::new()
-            .name("nate-wasm-epoch".to_owned())
+            .name("naway-wasm-epoch".to_owned())
             .spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(EPOCH_TICK_MS));
                 ticker.increment_epoch();
@@ -2722,11 +2727,11 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
                 let message = read_guest(&mut caller, ptr, size, 16 * 1024)?;
                 let message = String::from_utf8_lossy(&message);
                 match level {
-                    0 | 1 => tracing::trace!(target: "nate::wasm", %message),
-                    2 => tracing::debug!(target: "nate::wasm", %message),
-                    3 => tracing::info!(target: "nate::wasm", %message),
-                    4 => tracing::warn!(target: "nate::wasm", %message),
-                    _ => tracing::error!(target: "nate::wasm", %message),
+                    0 | 1 => tracing::trace!(target: "naway::wasm", %message),
+                    2 => tracing::debug!(target: "naway::wasm", %message),
+                    3 => tracing::info!(target: "naway::wasm", %message),
+                    4 => tracing::warn!(target: "naway::wasm", %message),
+                    _ => tracing::error!(target: "naway::wasm", %message),
                 }
                 Ok(())
             })())

@@ -144,11 +144,10 @@ impl ConnectionRegistry {
         self.notify_matching(1001, |e| e.snapshot_version < before_version)
     }
 
-    /// 为旧快照长连接安排带宽限期的 drain。
+    /// 业务作用：为旧快照长连接安排带宽限期的 drain，避免 reload 同时硬切全部长连接。
     ///
-    /// # 参数
-    /// - `before_version`: 建连版本早于它的连接进入本轮 drain。
-    /// - `grace`: 继续完成在途帧的宽限期；0 表示立即发送关闭信号。
+    /// 参数说明：`before_version` 之前建连的连接进入本轮 drain；`grace` 是继续完成在途帧的宽限期，
+    /// 0 表示立即发送关闭信号。
     ///
     /// 返回：安排时匹配的连接数。宽限期内已自然结束的连接不会再次操作；新连接版本不匹配。
     /// 重叠计划合并进单 worker：版本取最大值、deadline 取最小值，任务数不会随 reload 次数增长。
@@ -176,7 +175,7 @@ impl ConnectionRegistry {
         } else {
             let (sender, receiver) = watch::channel(Some(request));
             *scheduler = Some(sender);
-            // worker 只持有 Weak，注册表随 Nate 退出时 sender 被释放，任务随 channel 关闭结束；
+            // worker 只持有 Weak，注册表随 Naway 退出时 sender 被释放，任务随 channel 关闭结束；
             // 不能让低频控制面定时器反向延长整个数据面对象的生命周期。
             tokio::spawn(run_stale_drain_scheduler(Arc::downgrade(self), receiver));
         }
@@ -245,13 +244,12 @@ impl ConnectionRegistry {
     }
 }
 
-/// 驱动一个注册表唯一的 stale-drain 定时器。
+/// 业务作用：驱动一个注册表唯一的 stale-drain 定时器，合并重叠计划并在最早截止时间关闭旧连接。
 ///
-/// # 参数
-/// - `registry`: 弱引用，防止调度任务让已停机的 Nate 注册表泄漏。
-/// - `receiver`: 最新合并计划；reload 更新会唤醒 worker 并重新计算最早截止时间。
+/// 参数说明：`registry` 是弱引用，防止调度任务让已停机的 Naway 注册表泄漏；`receiver` 提供最新
+/// 合并计划，reload 更新会唤醒 worker 并重新计算最早截止时间。
 ///
-/// channel 关闭、注册表销毁时退出。到期后仅在计划仍与已执行值相同时清空，避免覆盖并发到达
+/// 返回：无；channel 关闭、注册表销毁时退出。到期后仅在计划仍与已执行值相同时清空，避免覆盖并发到达
 /// 的更新；若更新已经提高版本，下一轮会立即按保留的 deadline 继续处理。
 async fn run_stale_drain_scheduler(
     registry: Weak<ConnectionRegistry>,

@@ -21,7 +21,7 @@ rules:
       status: 403
       headers:
         Content-Type: "application/json"
-        X-Blocked-By: "nate"
+        X-Blocked-By: "naway"
       body: '{"code":40301,"msg":"export 接口已下线"}'
 
   # 示例:维护期禁写(默认关闭,应急时改 enabled: true;用 default_response)。

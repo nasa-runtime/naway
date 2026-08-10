@@ -3598,7 +3598,7 @@ fn prepare_attempt_parts_rendered(
     // 先固定最终上游协议，再决定由哪一层清洗 hop-by-hop 头。Hyper 的 HTTP/2 client 在
     // 编码 HEADERS frame 前必定按 RFC 9113 再清一次 Connection/TE/Upgrade 等字段；这里若
     // 仍走 H1 的完整清洗，会让每条 gRPC stream 对同一 HeaderMap 重复做约十次哈希查表。
-    // HTTP/1.1（含 WS）没有这层协议兜底，仍严格执行 Nate 的完整 Connection-token 清洗。
+    // HTTP/1.1（含 WS）没有这层协议兜底，仍严格执行 Naway 的完整 Connection-token 清洗。
     let upstream_version = if is_ws {
         http::Version::HTTP_11
     } else {
@@ -5689,13 +5689,18 @@ fn sanitize_hop_headers(parts: &mut Parts, keep_upgrade: bool) {
     sanitize_te(parts);
 }
 
-/// 按最终上游协议分工清理请求 hop-by-hop header。
+/// 业务作用：按最终上游协议分工清理请求 hop-by-hop header，防止连接级字段泄漏到 origin。
 ///
 /// HTTP/2 的 Hyper client 在真正编码 frame 的同一所有权链上强制移除 `Connection` 及其
 /// token、`Keep-Alive`、`Proxy-Connection`、`Transfer-Encoding`、`Upgrade`，并只允许
-/// `TE: trailers`。那一步无法绕过，也最接近 wire；Nate 不在前一层重复扫描这些字段，只补
+/// `TE: trailers`。那一步无法绕过，也最接近 wire；Naway 不在前一层重复扫描这些字段，只补
 /// Hyper 不负责、但不能泄漏给 origin 的代理认证头。整个过程原地修改 HeaderMap，不复制
-/// header value，更不读取 body。HTTP/1.1 则继续由 Nate 完整清洗。
+/// header value，更不读取 body。HTTP/1.1 则继续由 Naway 完整清洗。
+///
+/// 参数说明：`parts` 是待转发请求头；`keep_upgrade` 表示保留 WebSocket upgrade；
+/// `upstream_version` 是已经冻结的最终上游 HTTP 版本。
+///
+/// 返回：无；函数原地清理请求头，HTTP/2 只补充移除 Hyper 不负责的代理认证字段。
 #[inline]
 fn sanitize_hop_headers_for_upstream(
     parts: &mut Parts,
