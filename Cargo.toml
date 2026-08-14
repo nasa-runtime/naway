@@ -149,13 +149,18 @@ wtransport = { version = "0.7.1", optional = true, default-features = false, fea
 # 不能让 crates.io 制品依赖本机目录。V4 数据面 HMAC/JWT 验签复用 nasa::crypto。
 nasa = { version = "1.0.2", features = ["log", "base", "nacos", "crypto", "cache", "web"] }
 
-# 联调期把 nasa 的 crates.io nanacos 解析统一到 sibling 源码；否则 Cargo 会同时存在两个同名
-# package，Naway 编译到旧发布 API，而本地验证的 CAS/not-found 修复不会进入制品。
+# 联调期把 nasa 依赖且尚未成套发布的 crate 统一到 sibling 源码，避免本地 `napp` 与 crates.io
+# 上较早的配置、指标合同混用。公开发布前必须恢复为完整的 registry 依赖并复核最终归档。
 [patch.crates-io]
 nanacos = { path = "../nasa-runtime-rust/nanacos" }
 napp = { path = "../nasa-runtime-rust/napp" }
 nabase = { path = "../nasa-runtime-rust/nabase" }
 macro-support = { path = "../nasa-runtime-rust/macro-support" }
+naml = { path = "../nasa-runtime-rust/naml" }
+nametrics-core = { path = "../nasa-runtime-rust/nametrics-core" }
+nasecret = { path = "../nasa-runtime-rust/nasecret" }
+naweb = { path = "../nasa-runtime-rust/naweb" }
+rest-discovery-nacos = { path = "../nasa-runtime-rust/rest-discovery-nacos" }
 
 [dev-dependencies]
 maxminddb-writer = "0.1.2"

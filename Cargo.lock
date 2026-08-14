@@ -3176,7 +3176,7 @@ checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
 name = "macro-support"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3531,15 +3531,11 @@ dependencies = [
 
 [[package]]
 name = "nametrics-core"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bf70c7ea345df3c807c7e3999e842d8db08efef00d4b9835784e66b0400f82a"
+version = "1.0.2"
 
 [[package]]
 name = "naml"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8df1a55915832a877c5d8e2015fb3916ff8ffe51fe9b68b0a8605fb52615aa66"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "config",
@@ -3552,7 +3548,7 @@ dependencies = [
 
 [[package]]
 name = "nanacos"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3635,9 +3631,7 @@ dependencies = [
 
 [[package]]
 name = "nasecret"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a9516d5f3a257d3c51362b728ef427a298c2e2e530c6d8df9ef1e3dff8d7e8"
+version = "1.0.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3766,9 +3760,7 @@ dependencies = [
 
 [[package]]
 name = "naweb"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32311e5a4913d8895a187e05a8c8a19a81ae1ffed7c2950d24327576e309dd45"
+version = "1.0.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -5100,9 +5092,7 @@ dependencies = [
 
 [[package]]
 name = "rest-discovery-nacos"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16108786a8c231b4632ca7966ba4de93061548023319dbd1d27b306efeac42d8"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "nanacos",
