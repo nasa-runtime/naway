@@ -457,19 +457,6 @@ impl ConnectionBudget {
         entry
     }
 
-    /// 非阻塞尝试占用一个物理连接名额。
-    ///
-    /// # 参数
-    /// - `proxy_id`: 数据面 listener 的稳定 id。
-    /// - `limit`: 当前 Snapshot 的连接上限；`0` 表示不限制，但仍记账以支持后续热调小。
-    ///
-    /// 返回：成功时返回 RAII 名额；达到上限返回 `None`，调用方不得继续创建连接 task。
-    #[cfg(test)]
-    fn try_acquire(&self, proxy_id: &str, limit: usize) -> Option<ConnectionSlot> {
-        let entry = self.entry(proxy_id);
-        Self::try_acquire_entry(&entry, limit)
-    }
-
     /// 在已经定位预算条目的情况下执行无锁 CAS；成功前不 clone `Arc`，失败路径零分配。
     fn try_acquire_entry(
         entry: &Arc<ConnectionBudgetEntry>,
@@ -1239,6 +1226,7 @@ fn spawn_tls_accept_loop(
     listener: TcpListener,
     proxy_id: Arc<str>,
     tls_config: SharedServerConfig,
+    client_auth: Option<gateway::config::ClientAuthRuntime>,
     state: DataPlaneState,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -1291,10 +1279,28 @@ fn spawn_tls_accept_loop(
             let acceptor = TlsAcceptor::from(tls_config.load_full());
             let state = state.clone();
             let proxy_id = proxy_id.clone();
+            let client_auth = client_auth.clone();
             tokio::spawn(async move {
                 match strip_proxy_protocol(stream, peer, &proxy_protocol).await {
                     Ok((stream, mut conn)) => match acceptor.accept(stream).await {
                         Ok(tls_stream) => {
+                            if let Err(error) = gateway::tls::verify_client_certificate_spiffe(
+                                tls_stream.get_ref().1.peer_certificates(),
+                                client_auth.as_ref(),
+                            ) {
+                                warn!(peer = %peer, %error, "client SPIFFE identity rejected");
+                                return;
+                            }
+                            // 在线吊销证据必须在业务协议读取前完成；否则被吊销身份可能先发送一条请求。
+                            if let Err(error) = gateway::tls::verify_client_certificate_ocsp(
+                                tls_stream.get_ref().1.peer_certificates(),
+                                client_auth.as_ref(),
+                            )
+                            .await
+                            {
+                                warn!(peer = %peer, %error, "client certificate OCSP check failed");
+                                return;
+                            }
                             // mTLS(§19):握手成功且出示了客户端证书(已被 verifier 校验通过)→ 标记 verified,
                             // 供数据面注入 X-Client-Cert-Verified。require 模式下无证书握手会在上面 accept 失败。
                             conn.client_cert_verified = tls_stream
@@ -1435,30 +1441,57 @@ fn spawn_http3_accept_loop(
             let proxy_id = proxy_id.clone();
             let active_connections = state.active_connections.clone();
             let metrics = state.metrics.clone();
-            let max_header_bytes = runtime.max_request_header_bytes;
+            let connection_runtime = runtime.clone();
             let mut connection_shutdown = shutdown.clone();
             tokio::spawn(async move {
                 // 从 Initial 到 connection task 完整结束都计入来源预算，握手失败/取消也由 RAII 归还。
                 let _peer_slot = peer_slot;
-                let connection = tokio::select! {
-                    result = connecting => match result {
-                        Ok(connection) => connection,
-                        Err(error) => {
-                            metrics.inc_quic_handshake_error();
-                            tracing::debug!(%peer, %error, "HTTP/3 QUIC handshake failed");
-                            return;
-                        }
-                    },
-                    changed = connection_shutdown.changed() => {
-                        if changed.is_err() || *connection_shutdown.borrow() {
-                            return;
-                        }
-                        return;
+                // 只有 listener 与 route 共同启用 early data 时才允许 H3 在握手确认前读取 stream；
+                // 每条流仍由 Quinn 真值标记和统一代理门禁裁决，不能因提早调度绕过鉴权或 anti-replay。
+                let early_attempt = if connection_runtime.zero_rtt {
+                    connecting
+                        .into_0rtt()
+                        .map(|(connection, established)| (connection, Some(established)))
+                } else {
+                    Err(connecting)
+                };
+                let (connection, early_established) = match early_attempt {
+                    Ok(ready) => ready,
+                    Err(connecting) => {
+                        let connection = tokio::select! {
+                            result = connecting => match result {
+                                Ok(connection) => connection,
+                                Err(error) => {
+                                    metrics.inc_quic_handshake_error();
+                                    tracing::debug!(%peer, %error, "HTTP/3 QUIC handshake failed");
+                                    return;
+                                }
+                            },
+                            changed = connection_shutdown.changed() => {
+                                if changed.is_err() || *connection_shutdown.borrow() {
+                                    return;
+                                }
+                                return;
+                            }
+                        };
+                        (connection, None)
                     }
                 };
                 active_connections.fetch_add(1, Ordering::Relaxed);
                 metrics.inc_active_connection();
                 metrics.inc_quic_connection();
+                if let Some(established) = early_established {
+                    let handshake_metrics = metrics.clone();
+                    tokio::spawn(async move {
+                        if established.await {
+                            handshake_metrics.inc_quic_handshake_success();
+                        } else {
+                            handshake_metrics.inc_quic_handshake_error();
+                        }
+                    });
+                } else {
+                    metrics.inc_quic_handshake_success();
+                }
                 let _lifetime = ConnectionLifetime {
                     _slot: slot,
                     active_connections,
@@ -1470,7 +1503,7 @@ fn spawn_http3_accept_loop(
                     proxy,
                     proxy_id,
                     peer,
-                    max_header_bytes,
+                    connection_runtime,
                     metrics,
                     connection_shutdown,
                 );
@@ -1599,7 +1632,14 @@ fn spawn_deferred_tls_accept_loop(
                     let shared_tls: SharedServerConfig = Arc::new(ArcSwap::new(server_config));
                     spawn_cert_watcher_until(tls_cfg.clone(), shared_tls.clone(), shutdown.clone());
                     let listen = listener.local_addr().ok();
-                    spawn_tls_accept_loop(listener, proxy_id.clone(), shared_tls, state, shutdown);
+                    spawn_tls_accept_loop(
+                        listener,
+                        proxy_id.clone(),
+                        shared_tls,
+                        tls_cfg.client_auth.clone(),
+                        state,
+                        shutdown,
+                    );
                     info!(proxy = %proxy_id, ?listen, "ACME bootstrap keypair installed; TLS listener activated without restart");
                     return;
                 }
@@ -2089,7 +2129,43 @@ fn spawn_stream_connection(
                 )
                 .await
                 {
-                    Ok(Ok(stream)) => Box::new(stream),
+                    Ok(Ok(stream)) => {
+                        if let Err(error) = gateway::tls::verify_client_certificate_spiffe(
+                            stream.get_ref().1.peer_certificates(),
+                            runtime
+                                .tls
+                                .as_ref()
+                                .and_then(|tls| tls.client_auth.as_ref()),
+                        ) {
+                            warn!(stream = %runtime.id, peer = %peer, %error, "stream client SPIFFE identity rejected");
+                            state.metrics.inc_stream_error();
+                            log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
+                            finish_stream_connection(
+                                state.active_connections.clone(),
+                                state.metrics.clone(),
+                            );
+                            return;
+                        }
+                        if let Err(error) = gateway::tls::verify_client_certificate_ocsp(
+                            stream.get_ref().1.peer_certificates(),
+                            runtime
+                                .tls
+                                .as_ref()
+                                .and_then(|tls| tls.client_auth.as_ref()),
+                        )
+                        .await
+                        {
+                            warn!(stream = %runtime.id, peer = %peer, %error, "stream client certificate OCSP check failed");
+                            state.metrics.inc_stream_error();
+                            log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
+                            finish_stream_connection(
+                                state.active_connections.clone(),
+                                state.metrics.clone(),
+                            );
+                            return;
+                        }
+                        Box::new(stream)
+                    }
                     Ok(Err(error)) => {
                         warn!(stream = %runtime.id, peer = %peer, %error, "stream TLS handshake failed");
                         state.metrics.inc_stream_error();
@@ -2262,7 +2338,43 @@ fn spawn_stream_connection(
             )
             .await
             {
-                Ok(Ok(stream)) => Box::new(stream),
+                Ok(Ok(stream)) => {
+                    if let Err(error) = gateway::tls::verify_client_certificate_spiffe(
+                        stream.get_ref().1.peer_certificates(),
+                        runtime
+                            .tls
+                            .as_ref()
+                            .and_then(|tls| tls.client_auth.as_ref()),
+                    ) {
+                        warn!(stream = %runtime.id, peer = %peer, %error, "selected stream client SPIFFE identity rejected");
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                    if let Err(error) = gateway::tls::verify_client_certificate_ocsp(
+                        stream.get_ref().1.peer_certificates(),
+                        runtime
+                            .tls
+                            .as_ref()
+                            .and_then(|tls| tls.client_auth.as_ref()),
+                    )
+                    .await
+                    {
+                        warn!(stream = %runtime.id, peer = %peer, %error, "selected stream client certificate OCSP check failed");
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                    Box::new(stream)
+                }
                 Ok(Err(error)) => {
                     warn!(stream = %runtime.id, peer = %peer, %error, "stream selected-route TLS handshake failed");
                     state.metrics.inc_stream_error();
@@ -3827,6 +3939,7 @@ impl ListenerSupervisor {
                         tls.listener,
                         proxy_id.clone(),
                         config,
+                        tls.runtime.client_auth.clone(),
                         self.data_plane.clone(),
                         stop_rx.clone(),
                     );

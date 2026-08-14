@@ -1658,6 +1658,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
+ "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
 ]
@@ -2216,6 +2217,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3-datagram"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d2c9f77921668673721ae40f17c729fc48b9e38a663858097cea547484fdf0f"
+dependencies = [
+ "bytes",
+ "h3",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "h3-quinn"
 version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2224,9 +2236,26 @@ dependencies = [
  "bytes",
  "futures",
  "h3",
+ "h3-datagram",
  "quinn",
  "tokio",
  "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "h3-webtransport"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d91a50fd582a5d67b1f756fba3cd9c66367ff4f23e1017c882f664d63b350a7"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "h3",
+ "h3-datagram",
+ "http",
+ "pin-project-lite",
+ "tokio",
  "tracing",
 ]
 
@@ -2319,6 +2348,12 @@ checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
 ]
+
+[[package]]
+name = "httlib-huffman"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a9fcbcc408c5526c3ab80d534e5c86e7967c1fb7aa0a8c76abd1edc27deb877"
 
 [[package]]
 name = "http"
@@ -2675,6 +2710,12 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+
+[[package]]
+name = "ipnetwork"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -3159,6 +3200,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "maxminddb"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7bd67e2f5d65937ff283e418fcad53c8e2eeda0719e455508b62dad8ffe6180"
+dependencies = [
+ "ipnetwork",
+ "memchr",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "maxminddb-writer"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c310fee474c1e6358b4a6e8c41a63c9fc50a5a3d942863d1d0ac0e7c87e4a100"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3518,7 +3581,9 @@ dependencies = [
  "axum",
  "cacheable",
  "futures",
+ "futures-util",
  "ipnet",
+ "linkme",
  "matchit",
  "naauthz",
  "nabudget",
@@ -3612,6 +3677,7 @@ dependencies = [
 name = "naway"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm 0.10.3",
  "anyhow",
  "arc-swap",
  "async-compression",
@@ -3619,8 +3685,11 @@ dependencies = [
  "base64",
  "bytes",
  "casbin",
+ "chrono",
  "clap",
+ "crossbeam-channel",
  "crossbeam-utils",
+ "cryptoki",
  "dashmap",
  "ed25519-dalek",
  "flate2",
@@ -3629,7 +3698,9 @@ dependencies = [
  "getrandom 0.2.17",
  "globset",
  "h3",
+ "h3-datagram",
  "h3-quinn",
+ "h3-webtransport",
  "hmac 0.12.1",
  "http",
  "http-body-util",
@@ -3643,6 +3714,8 @@ dependencies = [
  "jsonwebtoken",
  "ldap3",
  "libc",
+ "maxminddb",
+ "maxminddb-writer",
  "mimalloc",
  "naml",
  "nasa",
@@ -3655,6 +3728,7 @@ dependencies = [
  "prost",
  "prost-reflect",
  "prost-types",
+ "quick-xml",
  "quinn",
  "rcgen 0.12.1",
  "regex",
@@ -3667,6 +3741,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "sha1",
  "sha2 0.10.9",
  "socket2",
  "tar",
@@ -3677,11 +3752,15 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-prost",
+ "tower",
  "tower-service",
  "tracing",
  "tracing-opentelemetry",
+ "tsp-ltv",
  "wasmtime",
  "wat",
+ "wtransport",
+ "x509-cert",
  "x509-parser",
 ]
 
@@ -3953,6 +4032,12 @@ dependencies = [
  "indexmap",
  "memchr",
 ]
+
+[[package]]
+name = "octets"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "866cb5af6f3aa3c1b44c3c2d79d22165fbb1b102e1b3fb499864bfe34736ec4b"
 
 [[package]]
 name = "oid-registry"
@@ -6314,13 +6399,16 @@ dependencies = [
  "p384",
  "p521",
  "pem-rfc7468",
+ "reqwest 0.12.28",
  "rsa",
  "sha1",
  "sha2 0.10.9",
  "sha3 0.10.9",
  "signature 2.2.0",
  "spki 0.7.3",
+ "subtle",
  "thiserror 2.0.18",
+ "tokio",
  "x509-cert",
 ]
 
@@ -7137,6 +7225,42 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "wtransport"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea4aacf790813ee1956751491800537f4e04af7557b7b370501ccbfbc85963e4"
+dependencies = [
+ "bytes",
+ "pem",
+ "quinn",
+ "rcgen 0.14.8",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "sha2 0.11.0",
+ "socket2",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+ "url",
+ "wtransport-proto",
+ "x509-parser",
+]
+
+[[package]]
+name = "wtransport-proto"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5867c629e4252f7439d82315923daaf27f4fa442410d51b78ab93ef4c432a11"
+dependencies = [
+ "httlib-huffman",
+ "octets",
+ "thiserror 2.0.18",
+ "url",
+]
 
 [[package]]
 name = "x25519-dalek"

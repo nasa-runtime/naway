@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use naml::{LoadedYml, YmlLoader, YmlLocalSources};
 use serde::Serialize;
+use sha2::Digest as _;
 
 use crate::access_log::AccessLogRuntime;
 use crate::guard::InterfaceGuard;
@@ -83,6 +84,8 @@ pub struct GatewaySnapshot {
     /// 不同:那是"当前磁盘文件"的指纹(编辑基线),这里是"这份快照构建时读到的配置集"的指纹。
     /// 构建期算不出时为 None(不阻断上线,只让该节点在集群视图里显示为未知)。
     pub config_fingerprint: Option<u64>,
+    /// 构建本快照的主配置来源；远程 secret 定时刷新必须复用同一物化候选而非猜测 bootstrap。
+    pub(crate) source_config_path: Arc<PathBuf>,
     /// 配置 schema 版本，用于兼容性判断、迁移和告警。
     pub schema_version: u32,
     /// 主数据面监听地址；拓扑变化由 listener supervisor 在快照发布前 prepare 并在发布后换代。
@@ -125,6 +128,8 @@ pub struct GatewaySnapshot {
     pub long_connections: model::LongConnectionCfg,
     /// 当前快照在构建期实际解析的文件型 SecretSource；reload watcher 据此独立轮换。
     pub secret_files: Arc<[PathBuf]>,
+    /// 已使用远程 Secret provider 的最短后台刷新周期；空值表示本快照没有远程依赖。
+    pub(crate) remote_secret_refresh_ms: Option<u64>,
     /// 数据面资源上限,由 main/proxy 在真实执行点使用。
     pub limits: ServerLimitsCfg,
     /// 数据面超时与优雅停机预算。
@@ -185,12 +190,20 @@ pub struct TlsRuntimeCfg {
     pub cert_file: PathBuf,
     /// 默认 PEM 私钥文件；ACME 成功后原子替换它。
     pub key_file: PathBuf,
+    /// 外部 signer 计划；存在时握手私钥操作只允许走远程 provider。
+    pub(crate) private_key_provider: Option<crate::external_crypto::ExternalPrivateKeyPlan>,
+    /// SPIRE Workload API 动态身份来源；存在时文件证书、外部 signer 与 SNI 身份均为空。
+    pub(crate) spire: Option<Arc<crate::spire::SpireTlsSource>>,
     /// cert/key pair 的单一原子指针；存在时 TLS loader/watcher 只消费其指向的完整版本。
     pub keypair_manifest_file: Option<PathBuf>,
-    /// SNI 多证书(§19):运行期已解析路径 + 小写化 server_names;空 = 只用默认 cert/key。
+    /// SNI 多证书：运行期已解析路径与小写化 server_names；空值只使用默认身份。
     pub certs: Vec<SniCertRuntime>,
-    /// mTLS 客户端证书校验(§19);None = 不要求客户端证书。
+    /// mTLS 客户端证书校验；None 表示不要求客户端证书。
     pub client_auth: Option<ClientAuthRuntime>,
+    /// 默认证书的 OCSP staple 来源与 freshness 门禁。
+    pub ocsp_stapling: Option<OcspStaplingRuntime>,
+    /// 显式共享的 session ticket key 集；空值保持无状态 ticket 关闭。
+    pub session_tickets: Option<SessionTicketRuntime>,
     /// ACME 自动签发/续期策略；None 表示静态证书模式。
     pub acme: Option<AcmeRuntimeCfg>,
     /// SDS 下发且仅驻留内存的证书材料；存在时禁止回退到文件、manifest、SNI 文件或 ACME。
@@ -236,18 +249,38 @@ pub struct Http3RuntimeCfg {
     pub max_pending_handshake_bytes: u64,
     /// 单连接 request stream 上限。
     pub max_bidi_streams_per_connection: u32,
+    /// 单连接客户端单向 stream 总上限，同时覆盖 H3 控制流与 WebTransport。
+    pub max_uni_streams_per_connection: u32,
     /// H3 header section 上限。
     pub max_request_header_bytes: usize,
     /// 单 stream 内部 buffer/queue 字节上限。
     pub max_stream_buffer_bytes: usize,
+    /// 是否开放 CONNECT-UDP extended CONNECT 数据通路。
+    pub connect_udp: bool,
+    /// 是否协商并处理 HTTP/3 DATAGRAM。
+    pub datagram: bool,
+    /// 是否开放 WebTransport session。
+    pub webtransport: bool,
+    /// 单连接同时存活的 CONNECT-UDP 会话上限。
+    pub max_connect_udp_sessions: usize,
+    /// 单会话下行 DATAGRAM 有界队列长度。
+    pub max_datagram_queue: usize,
+    /// 单个 UDP payload 字节上限。
+    pub max_datagram_bytes: usize,
     /// Retry 地址验证策略。
     pub retry: model::Http3RetryCfg,
     /// Retry token 有效期。
     pub retry_token_lifetime_seconds: u64,
     /// Retry token 认证主密钥轮换周期。
     pub retry_token_rotation_seconds: u64,
-    /// 首版恒为 false；字段保留是为了显式拒绝危险配置。
+    /// 是否已打开 TLS 0-RTT 接收；请求仍必须通过 route 与 anti-replay 门禁。
     pub zero_rtt: bool,
+    /// 有状态 TLS 恢复代轮换周期；轮换只影响后续握手。
+    pub early_data_session_rotation_seconds: u64,
+    /// 声明本 listener 的 anti-replay 后端可跨节点共享。
+    pub early_data_shared_replay_cache: bool,
+    /// 是否按多节点形态校验 0-RTT 失败闭合。
+    pub multi_node: bool,
 }
 
 /// 构建期校验并规范化后的 ACME worker 配置。
@@ -357,9 +390,116 @@ pub struct ClientAuthRuntime {
     pub allow_untrusted: bool,
     /// 受信任的客户端 CA PEM 路径。
     pub ca_file: PathBuf,
+    /// 已规范化的客户端证书 CRL PEM 路径。
+    pub crl_files: Vec<PathBuf>,
+    /// true 表示 CRL 无法覆盖证书状态时允许握手，明确 revoked 仍拒绝。
+    pub allow_unknown_revocation_status: bool,
+    /// true 表示超过 `nextUpdate` 的 CRL 立即失效。
+    pub enforce_crl_expiration: bool,
+    /// 可选握手后在线 OCSP 复验状态；缓存与并发门绑定当前 listener generation。
+    pub client_ocsp: Option<ClientCertificateOcspRuntime>,
+    /// 已规范化的精确 SPIFFE ID allowlist。
+    pub(crate) allowed_spiffe_ids: Arc<[String]>,
+    /// 已规范化的 SPIFFE trust domain allowlist。
+    pub(crate) allowed_spiffe_trust_domains: Arc<[String]>,
 }
 
-/// 一组 SNI 证书运行期配置(§19):命中这些 server_name 的握手用这套 cert/key。
+/// 客户端证书 OCSP 对依赖故障的处理模式。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ClientCertificateOcspMode {
+    /// responder 不可用或超时均拒绝连接。
+    HardFail,
+    /// 只对依赖不可用放行；明确坏响应或吊销仍拒绝。
+    SoftFail,
+}
+
+/// 一张客户端证书已验证 good 的 OCSP 缓存窗口。
+#[derive(Clone)]
+pub(crate) struct ClientOcspCacheRecord {
+    /// 严格 freshness 截止时刻。
+    pub(crate) valid_until: chrono::DateTime<chrono::Utc>,
+    /// soft-fail 可沿用的最大陈旧截止时刻。
+    pub(crate) stale_until: chrono::DateTime<chrono::Utc>,
+}
+
+/// 客户端证书在线 OCSP 的有界运行态。
+#[derive(Clone)]
+pub struct ClientCertificateOcspRuntime {
+    /// 依赖故障模式。
+    pub(crate) mode: ClientCertificateOcspMode,
+    /// 单次检查总 deadline。
+    pub(crate) timeout_ms: u64,
+    /// soft-fail 缓存最大陈旧期。
+    pub(crate) max_stale_seconds: u64,
+    /// 响应无 `nextUpdate` 时的年龄上限。
+    pub(crate) max_age_without_next_update_seconds: u64,
+    /// responder 时间容差。
+    pub(crate) clock_skew_seconds: u64,
+    /// 缓存身份数硬上限。
+    pub(crate) max_cache_entries: usize,
+    /// responder 并发请求数硬上限。
+    pub(crate) max_concurrency: usize,
+    /// 客户端 AIA 被允许访问的私网 responder 地址范围。
+    pub(crate) allowed_responder_cidrs: Arc<Vec<Cidr>>,
+    /// 已验证 good 状态；key 是客户端叶证书 SHA-256，不含主体信息。
+    pub(crate) cache: Arc<dashmap::DashMap<[u8; 32], ClientOcspCacheRecord>>,
+    /// 对 responder 的并发请求门。
+    pub(crate) concurrency: Arc<tokio::sync::Semaphore>,
+}
+
+impl PartialEq for ClientCertificateOcspRuntime {
+    /// 业务作用：比较会改变握手安全语义的配置，不让运行缓存内容制造 listener 拓扑抖动。
+    ///
+    /// 参数说明：`other` 是候选运行策略。
+    ///
+    /// 返回：所有声明式门限和模式一致时为 true；缓存及当前 permit 不参与配置等价。
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.timeout_ms == other.timeout_ms
+            && self.max_stale_seconds == other.max_stale_seconds
+            && self.max_age_without_next_update_seconds == other.max_age_without_next_update_seconds
+            && self.clock_skew_seconds == other.clock_skew_seconds
+            && self.max_cache_entries == other.max_cache_entries
+            && self.max_concurrency == other.max_concurrency
+            && self.allowed_responder_cidrs == other.allowed_responder_cidrs
+    }
+}
+
+impl Eq for ClientCertificateOcspRuntime {}
+
+/// 已解析且不实现公开调试输出的 TLS session ticket key 集。
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionTicketRuntime {
+    /// 首项用于签发，全部项用于解密；每项固定 256 bit。
+    pub(crate) keys: Arc<[[u8; 32]]>,
+    /// TLS ticket lifetime hint，秒。
+    pub(crate) lifetime_seconds: u32,
+}
+
+/// 已完成路径归一和数值门禁的服务端 OCSP staple 配置。
+#[derive(Clone, PartialEq, Eq)]
+pub struct OcspStaplingRuntime {
+    /// DER OCSPResponse 文件。
+    pub(crate) response_file: PathBuf,
+    /// 显式 issuer PEM；为空时从证书链取第二张。
+    pub(crate) issuer_file: Option<PathBuf>,
+    /// true 表示无有效 staple 时拒绝新握手。
+    pub(crate) required: bool,
+    /// 无 `nextUpdate` 响应的最长年龄。
+    pub(crate) max_age_without_next_update_seconds: u64,
+    /// responder 与网关的允许时钟偏差。
+    pub(crate) clock_skew_seconds: u64,
+    /// true 表示后台从叶证书 AIA 主动获取新响应。
+    pub(crate) fetch_from_aia: bool,
+    /// 主动获取周期。
+    pub(crate) refresh_interval_seconds: u64,
+    /// 单次 responder 交互 deadline。
+    pub(crate) request_timeout_ms: u64,
+    /// 显式授权的私网 responder 地址范围。
+    pub(crate) allowed_responder_cidrs: Arc<Vec<Cidr>>,
+}
+
+/// 一组 SNI 证书运行期配置：命中这些 server_name 的握手使用该身份。
 #[derive(Clone, PartialEq, Eq)]
 pub struct SniCertRuntime {
     /// 小写化的 server_name 列表(精确或 `*.foo.com` 通配)。
@@ -368,6 +508,10 @@ pub struct SniCertRuntime {
     pub cert_file: PathBuf,
     /// 与证书匹配的 PEM 私钥。
     pub key_file: PathBuf,
+    /// 该身份的外部 signer；存在时不得读取本地私钥。
+    pub(crate) private_key_provider: Option<crate::external_crypto::ExternalPrivateKeyPlan>,
+    /// 该证书专属的 OCSP staple 来源与 freshness 门禁。
+    pub ocsp_stapling: Option<OcspStaplingRuntime>,
 }
 
 #[derive(Clone)]
@@ -404,7 +548,7 @@ pub struct ProxyRuntime {
     pub gateway_listeners: Arc<Vec<GatewayListenerRuntime>>,
     /// PROXY 协议策略。
     pub proxy_protocol: ProxyProtocolRuntimeCfg,
-    /// 可信前置代理网段(review L6 / §12):决定是否信任入站 XFF / traceparent。构建期预解析。
+    /// 可信前置代理网段：决定是否信任入站 XFF / traceparent，构建期预解析。
     pub trusted_proxies: Arc<Vec<Cidr>>,
     /// 请求及连接资源上限。
     pub limits: ServerLimitsCfg,
@@ -773,9 +917,13 @@ impl PartialEq for TlsRuntimeCfg {
         self.listen == other.listen
             && self.cert_file == other.cert_file
             && self.key_file == other.key_file
+            && self.private_key_provider == other.private_key_provider
+            && self.spire == other.spire
             && self.keypair_manifest_file == other.keypair_manifest_file
             && self.certs == other.certs
             && self.client_auth == other.client_auth
+            && self.ocsp_stapling == other.ocsp_stapling
+            && self.session_tickets == other.session_tickets
             && self.acme == other.acme
             && self.in_memory == other.in_memory
     }
@@ -882,11 +1030,16 @@ fn build_snapshot_from_config(
 ) -> Result<GatewaySnapshot> {
     let schema_version = resolve_schema_version(cfg.schema_version, "gateway.yml")?;
     let config_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
+    let crypto_catalog = crate::external_crypto::build_catalog(config_dir, &cfg.crypto_providers)
+        .context("build external crypto providers")?;
     crate::kubernetes_routes::apply_generated_routes(&mut cfg, config_dir)
         .context("merge Kubernetes generated routes")?;
     let developer_portal =
         crate::developer_portal::DeveloperPortalRuntime::build_and_apply(&mut cfg, config_dir)
             .context("build developer portal and generated OpenAPI routes")?;
+    let remote_secret_refresh_ms =
+        crate::upstream_credential::resolve_references(&mut cfg, config_dir, &crypto_catalog)
+            .context("resolve upstream credential references")?;
     validate_control_plane(&mut cfg.control_plane, &cfg.upstreams, config_dir)
         .context("validate control_plane.xds bootstrap")?;
     validate_xds_owned_native_domains(&cfg)
@@ -952,8 +1105,15 @@ fn build_snapshot_from_config(
             TimeoutCfg::default(),
         )
     } else {
-        let proxies = build_proxies(cfg_path, &cfg, &sentinel, variables.clone(), usage_plans)
-            .context("build proxies")?;
+        let proxies = build_proxies(
+            cfg_path,
+            &cfg,
+            &sentinel,
+            variables.clone(),
+            usage_plans,
+            &crypto_catalog,
+        )
+        .context("build proxies")?;
         let default_proxy = proxies
             .first()
             .cloned()
@@ -967,6 +1127,8 @@ fn build_snapshot_from_config(
     };
     crate::http_cache::validate_runtime_config(&cfg.runtime_state.http_cache)
         .context("validate runtime_state.http_cache")?;
+    validate_early_data_runtime(&proxies, &cfg.runtime_state)
+        .context("validate HTTP/3 early-data runtime state")?;
     if proxies
         .iter()
         .any(|proxy| proxy.router.uses_http_cache_l2())
@@ -989,8 +1151,8 @@ fn build_snapshot_from_config(
     {
         bail!("llm.semantic_cache l2=true requires runtime_state.http_cache.backend=redis");
     }
-    let stream_listeners =
-        build_stream_listeners(&cfg.stream, cfg_path).context("build stream listeners")?;
+    let stream_listeners = build_stream_listeners(&cfg.stream, cfg_path, &crypto_catalog)
+        .context("build stream listeners")?;
     let upstreams = UpstreamDirectory::build_with_dynamic_at_discovery(
         &cfg.upstreams,
         dynamic_upstreams,
@@ -1014,6 +1176,7 @@ fn build_snapshot_from_config(
         version,
         // 指纹覆盖主配置及其依赖;失败不阻断上线(集群视图显示未知即可)。
         config_fingerprint: config_fingerprint(cfg_path).ok(),
+        source_config_path: Arc::new(cfg_path.to_path_buf()),
         schema_version,
         listen: proxies
             .first()
@@ -1038,6 +1201,7 @@ fn build_snapshot_from_config(
         config_watch,
         long_connections: cfg.long_connections,
         secret_files: secret_files.into(),
+        remote_secret_refresh_ms,
         limits: bootstrap_limits,
         timeouts: bootstrap_timeouts,
         router: bootstrap_router,
@@ -1049,6 +1213,54 @@ fn build_snapshot_from_config(
         variables,
         grpc_edge_cluster,
     })
+}
+
+/// 业务作用：用真实 runtime-state 配置复核 HTTP/3 0-RTT 的跨节点防重放声明，
+/// 防止一个独立布尔开关冒充已安装的共享账本。
+///
+/// 参数说明：`proxies` 是已编译 listener 计划；`runtime_state` 是同一候选的
+/// ReplayGuard 后端与故障策略。
+///
+/// 返回：单节点使用本地账本成功；多节点仅在 Redis 且 fail-closed 时成功；
+/// 声明与真实后端不一致时拒绝候选快照。
+fn validate_early_data_runtime(
+    proxies: &[ProxyRuntime],
+    runtime_state: &RuntimeStateCfg,
+) -> Result<()> {
+    let enabled = proxies.iter().filter(|proxy| proxy.http3.zero_rtt);
+    let backend = runtime_state
+        .replay_guard
+        .backend
+        .trim()
+        .to_ascii_lowercase();
+    let fail_mode = runtime_state
+        .replay_guard
+        .fail_mode
+        .trim()
+        .to_ascii_lowercase();
+    for proxy in enabled {
+        let shared = backend == "redis";
+        anyhow::ensure!(
+            proxy.http3.early_data_shared_replay_cache == shared,
+            "proxy `{}` http3.early_data_shared_replay_cache must match runtime_state.replay_guard.backend=redis",
+            proxy.id
+        );
+        if shared {
+            anyhow::ensure!(
+                fail_mode == "closed",
+                "proxy `{}` HTTP/3 early_data requires runtime_state.replay_guard.fail_mode=closed",
+                proxy.id
+            );
+        }
+        if proxy.http3.multi_node {
+            anyhow::ensure!(
+                shared,
+                "proxy `{}` multi-node HTTP/3 early_data requires runtime_state.replay_guard.backend=redis",
+                proxy.id
+            );
+        }
+    }
+    Ok(())
 }
 
 /// 业务作用：在任何 ADS socket/task 创建前锁定本地 trust root、Node identity、资源预算与
@@ -1992,11 +2204,16 @@ fn validate_auth_secret(field: &str, value: &str) -> Result<()> {
 /// 业务作用：把 L4 listener 配置编译为不可变运行时，并在发布快照前拒绝
 /// 协议/profile/feature 不匹配与越界资源预算。
 ///
-/// 参数说明：`cfg` 是顶层 stream 配置；`cfg_path` 为 TLS 等相对文件提供可信基目录。
+/// 参数说明：`cfg` 是顶层 stream 配置；`cfg_path` 为 TLS 等相对文件提供可信基目录；
+/// `crypto_catalog` 提供 stream TLS 外部私钥引用所需的共享签名 provider。
 ///
 /// 返回：全部 listener 都通过门禁时返回 runtime 列表；任一 listener 无效时返回错误，
 /// 旧快照不受影响。
-fn build_stream_listeners(cfg: &StreamCfg, cfg_path: &Path) -> Result<Vec<StreamRuntime>> {
+fn build_stream_listeners(
+    cfg: &StreamCfg,
+    cfg_path: &Path,
+    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
+) -> Result<Vec<StreamRuntime>> {
     let mut out = Vec::with_capacity(cfg.listeners.len());
     let mut ids = HashSet::new();
     for listener in &cfg.listeners {
@@ -2044,7 +2261,7 @@ fn build_stream_listeners(cfg: &StreamCfg, cfg_path: &Path) -> Result<Vec<Stream
         let tls = listener
             .tls
             .as_ref()
-            .map(|tls| build_stream_server_tls(cfg_path, listener, tls))
+            .map(|tls| build_stream_server_tls(cfg_path, listener, tls, crypto_catalog))
             .transpose()?;
         let tls_handshake_timeout_ms = listener
             .tls
@@ -2386,56 +2603,459 @@ fn build_stream_routes(
 /// 业务作用：把 stream TLS 终止配置编译为与 L7 共用的 rustls server runtime，
 /// 保持默认身份、SNI 身份和客户端认证策略一致。
 ///
-/// 参数说明：`cfg_path` 是路径信任根；`listener` 提供业务身份；`tls` 是待编译配置。
+/// 参数说明：`cfg_path` 是路径信任根；`listener` 提供业务身份；`tls` 是待编译配置；
+/// `crypto_catalog` 提供外部私钥引用所需的共享签名 provider。
 ///
 /// 返回：配置完整时返回可热换 TLS runtime；认证模式或路径语义无效时返回错误。
 fn build_stream_server_tls(
     cfg_path: &Path,
     listener: &model::StreamListenerCfg,
     tls: &model::StreamTlsCfg,
+    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
 ) -> Result<TlsRuntimeCfg> {
     let client_auth = tls
         .client_auth
         .as_ref()
         .map(|auth| {
-            let (require, allow_untrusted) =
-                match auth.mode.trim().to_ascii_lowercase().as_str() {
-                "require" => (true, false),
-                "optional" => (false, false),
-                "insecure_fallback" => (false, true),
-                other => anyhow::bail!(
-                    "stream `{}` tls.client_auth.mode must be require|optional|insecure_fallback, got `{other}`",
-                    listener.id
-                ),
-            };
-            Ok::<_, anyhow::Error>(ClientAuthRuntime {
-                require,
-                allow_untrusted,
-                ca_file: resolve_relative(cfg_path, &auth.ca_file),
-            })
+            build_client_auth_runtime(cfg_path, listener.id.as_str(), auth, tls.spire.is_some())
         })
         .transpose()?;
+    let spire = tls
+        .spire
+        .as_ref()
+        .map(crate::spire::build_source)
+        .transpose()?;
+    let (key_file, private_key_provider) = if spire.is_some() {
+        anyhow::ensure!(tls.cert_file.trim().is_empty() && tls.key_file.trim().is_empty() && tls.private_key_provider.is_none() && tls.certs.is_empty() && tls.session_tickets.is_none(), "listener `{}` SPIRE identity cannot be combined with file certificate, external signer, SNI identities, or session tickets", listener.id);
+        (PathBuf::new(), None)
+    } else {
+        build_tls_private_key(
+            cfg_path,
+            listener.id.as_str(),
+            tls.key_file.as_str(),
+            tls.private_key_provider.as_ref(),
+            crypto_catalog,
+        )?
+    };
     Ok(TlsRuntimeCfg {
         listen: listener.listen.clone(),
-        cert_file: resolve_relative(cfg_path, &tls.cert_file),
-        key_file: resolve_relative(cfg_path, &tls.key_file),
+        cert_file: if spire.is_some() {
+            PathBuf::new()
+        } else {
+            resolve_relative(cfg_path, &tls.cert_file)
+        },
+        key_file,
+        private_key_provider,
+        spire,
         keypair_manifest_file: None,
         certs: tls
             .certs
             .iter()
-            .map(|cert| SniCertRuntime {
-                server_names: cert
-                    .server_names
-                    .iter()
-                    .map(|name| name.trim_end_matches('.').to_ascii_lowercase())
-                    .collect(),
-                cert_file: resolve_relative(cfg_path, &cert.cert_file),
-                key_file: resolve_relative(cfg_path, &cert.key_file),
+            .map(|cert| {
+                let (key_file, private_key_provider) = build_tls_private_key(
+                    cfg_path,
+                    listener.id.as_str(),
+                    cert.key_file.as_str(),
+                    cert.private_key_provider.as_ref(),
+                    crypto_catalog,
+                )?;
+                Ok(SniCertRuntime {
+                    server_names: cert
+                        .server_names
+                        .iter()
+                        .map(|name| name.trim_end_matches('.').to_ascii_lowercase())
+                        .collect(),
+                    cert_file: resolve_relative(cfg_path, &cert.cert_file),
+                    key_file,
+                    private_key_provider,
+                    ocsp_stapling: cert
+                        .ocsp_stapling
+                        .as_ref()
+                        .map(|ocsp| {
+                            build_ocsp_stapling_runtime(cfg_path, listener.id.as_str(), ocsp)
+                        })
+                        .transpose()?,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
         client_auth,
+        ocsp_stapling: tls
+            .ocsp_stapling
+            .as_ref()
+            .map(|ocsp| build_ocsp_stapling_runtime(cfg_path, listener.id.as_str(), ocsp))
+            .transpose()?,
+        session_tickets: tls
+            .session_tickets
+            .as_ref()
+            .map(|tickets| build_session_ticket_runtime(cfg_path, listener.id.as_str(), tickets))
+            .transpose()?,
         acme: None,
         in_memory: None,
+    })
+}
+
+/// 业务作用：把本地私钥路径与外部 signer 引用收敛成互斥的单一 TLS 私钥来源。
+///
+/// 参数说明：`cfg_path` 是相对路径基准；`owner` 标识 listener；`key_file` 与 `reference`
+/// 是候选来源；`crypto_catalog` 提供本快照共享的远程 provider。
+///
+/// 返回：恰好声明一种来源时返回规范路径或外部签名计划；缺失、同时声明或引用无效时失败。
+fn build_tls_private_key(
+    cfg_path: &Path,
+    owner: &str,
+    key_file: &str,
+    reference: Option<&model::ExternalPrivateKeyCfg>,
+    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
+) -> Result<(
+    PathBuf,
+    Option<crate::external_crypto::ExternalPrivateKeyPlan>,
+)> {
+    let has_local_key = !key_file.trim().is_empty();
+    anyhow::ensure!(
+        has_local_key != reference.is_some(),
+        "listener `{owner}` TLS identity must configure exactly one of key_file or private_key_provider"
+    );
+    if let Some(reference) = reference {
+        return Ok((
+            PathBuf::new(),
+            Some(crate::external_crypto::build_private_key_plan(
+                reference,
+                crypto_catalog,
+            )?),
+        ));
+    }
+    Ok((resolve_relative(cfg_path, key_file), None))
+}
+
+/// 业务作用：把 HTTP/stream 共用的客户端证书认证与 CRL 失败策略编译为单一运行契约。
+///
+/// 参数说明：`cfg_path` 是路径基准；`owner` 是 listener 标识；`auth` 是 mTLS 声明；
+/// `spire_bundles` 表示客户端信任根是否来自当前 SPIRE 完整响应。
+///
+/// 返回：认证和吊销模式自洽时返回规范路径；未知模式、缺 CRL 或不安全组合拒绝候选。
+fn build_client_auth_runtime(
+    cfg_path: &Path,
+    owner: &str,
+    auth: &model::ClientAuthCfg,
+    spire_bundles: bool,
+) -> Result<ClientAuthRuntime> {
+    let (require, allow_untrusted) = match auth.mode.trim().to_ascii_lowercase().as_str() {
+        "require" => (true, false),
+        "optional" => (false, false),
+        "insecure_fallback" => (false, true),
+        other => anyhow::bail!(
+            "listener `{owner}` tls.client_auth.mode must be require|optional|insecure_fallback, got `{other}`"
+        ),
+    };
+    if auth.crl_files.len() > 16 {
+        anyhow::bail!("listener `{owner}` tls.client_auth.crl_files exceeds 16 entries");
+    }
+    let revocation = auth.revocation_mode.trim().to_ascii_lowercase();
+    let allow_unknown_revocation_status = match revocation.as_str() {
+        "off" if auth.crl_files.is_empty() => false,
+        "off" => anyhow::bail!(
+            "listener `{owner}` client CRL files require revocation_mode=hard_fail|soft_fail"
+        ),
+        "hard_fail" if !auth.crl_files.is_empty() => false,
+        "soft_fail" if !auth.crl_files.is_empty() => true,
+        "hard_fail" | "soft_fail" => anyhow::bail!(
+            "listener `{owner}` client revocation mode requires at least one CRL file"
+        ),
+        _ => anyhow::bail!(
+            "listener `{owner}` tls.client_auth.revocation_mode must be off|hard_fail|soft_fail"
+        ),
+    };
+    if allow_untrusted
+        && (revocation != "off"
+            || auth.ocsp.is_some()
+            || !auth.allowed_spiffe_ids.is_empty()
+            || !auth.allowed_spiffe_trust_domains.is_empty())
+    {
+        // 不可信兼容模式没有稳定 issuer 链，CRL 覆盖关系无法成立；若允许组合就会给运维造成
+        // 已执行吊销检查的假象，因此必须在发布前拒绝。
+        anyhow::bail!(
+            "listener `{owner}` insecure_fallback cannot combine with client revocation checks"
+        );
+    }
+    if spire_bundles {
+        anyhow::ensure!(
+            auth.ca_file.trim().is_empty(),
+            "listener `{owner}` SPIRE client trust cannot be combined with ca_file"
+        );
+        anyhow::ensure!(
+            auth.crl_files.is_empty(),
+            "listener `{owner}` SPIRE client trust cannot be combined with file CRLs"
+        );
+        anyhow::ensure!(
+            !allow_untrusted,
+            "listener `{owner}` SPIRE client trust cannot use insecure_fallback"
+        );
+        anyhow::ensure!(revocation == "off", "listener `{owner}` SPIRE client trust consumes Agent CRLs directly and requires revocation_mode=off");
+        anyhow::ensure!(
+            auth.ocsp.is_none(),
+            "listener `{owner}` SPIRE client trust cannot combine with file-root client OCSP"
+        );
+        anyhow::ensure!(!auth.allowed_spiffe_ids.is_empty() || !auth.allowed_spiffe_trust_domains.is_empty(), "listener `{owner}` SPIRE client trust requires an explicit SPIFFE ID or trust-domain allowlist");
+    } else {
+        anyhow::ensure!(
+            !auth.ca_file.trim().is_empty(),
+            "listener `{owner}` tls.client_auth.ca_file must not be empty"
+        );
+    }
+    let client_ocsp = auth
+        .ocsp
+        .as_ref()
+        .map(|cfg| build_client_ocsp_runtime(owner, cfg))
+        .transpose()?;
+    anyhow::ensure!(
+        auth.allowed_spiffe_ids.len() <= 1024,
+        "listener `{owner}` client SPIFFE ID allowlist exceeds 1024 entries"
+    );
+    anyhow::ensure!(
+        auth.allowed_spiffe_trust_domains.len() <= 128,
+        "listener `{owner}` client SPIFFE trust-domain allowlist exceeds 128 entries"
+    );
+    let mut allowed_spiffe_ids = auth
+        .allowed_spiffe_ids
+        .iter()
+        .map(|identity| normalize_spiffe_id(identity).map(|(identity, _)| identity))
+        .collect::<Result<Vec<_>>>()?;
+    allowed_spiffe_ids.sort();
+    allowed_spiffe_ids.dedup();
+    let mut allowed_spiffe_trust_domains = auth
+        .allowed_spiffe_trust_domains
+        .iter()
+        .map(|domain| normalize_spiffe_trust_domain(domain))
+        .collect::<Result<Vec<_>>>()?;
+    allowed_spiffe_trust_domains.sort();
+    allowed_spiffe_trust_domains.dedup();
+    Ok(ClientAuthRuntime {
+        require,
+        allow_untrusted,
+        ca_file: resolve_relative(cfg_path, &auth.ca_file),
+        crl_files: auth
+            .crl_files
+            .iter()
+            .map(|path| resolve_relative(cfg_path, path))
+            .collect(),
+        allow_unknown_revocation_status,
+        enforce_crl_expiration: auth.enforce_crl_expiration,
+        client_ocsp,
+        allowed_spiffe_ids: allowed_spiffe_ids.into(),
+        allowed_spiffe_trust_domains: allowed_spiffe_trust_domains.into(),
+    })
+}
+
+/// 业务作用：规范化并验证 SPIFFE ID，拒绝 userinfo、port、query、fragment 和路径歧义。
+///
+/// 参数说明：`raw` 是控制面声明或证书 URI SAN。
+///
+/// 返回：合法时返回规范 SPIFFE ID 与 trust domain；不符合 SPIFFE URI 约束时失败。
+pub(crate) fn normalize_spiffe_id(raw: &str) -> Result<(String, String)> {
+    let parsed = reqwest::Url::parse(raw).context("parse SPIFFE ID")?;
+    anyhow::ensure!(parsed.scheme() == "spiffe", "SPIFFE ID must use spiffe://");
+    anyhow::ensure!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "SPIFFE ID must not contain userinfo"
+    );
+    anyhow::ensure!(parsed.port().is_none(), "SPIFFE ID must not contain a port");
+    anyhow::ensure!(
+        parsed.query().is_none() && parsed.fragment().is_none(),
+        "SPIFFE ID must not contain query or fragment"
+    );
+    let domain = parsed
+        .host_str()
+        .context("SPIFFE ID must contain a trust domain")?
+        .to_ascii_lowercase();
+    anyhow::ensure!(
+        !domain.is_empty()
+            && domain.len() <= 253
+            && domain.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }),
+        "SPIFFE trust domain is invalid"
+    );
+    let path = parsed.path();
+    anyhow::ensure!(
+        path.len() <= 2048
+            && !path.contains('%')
+            && !path.contains('\\')
+            && !path.split('/').any(|segment| matches!(segment, "." | "..")),
+        "SPIFFE workload path is ambiguous or exceeds 2048 bytes"
+    );
+    let normalized = if path == "/" || path.is_empty() {
+        format!("spiffe://{domain}")
+    } else {
+        format!("spiffe://{domain}{path}")
+    };
+    Ok((normalized, domain))
+}
+
+/// 业务作用：验证并小写化 SPIFFE trust domain，供证书身份按边界精确授权。
+///
+/// 参数说明：`raw` 是不带 scheme 和 path 的 trust domain。
+///
+/// 返回：合法域名返回小写值；带 URI 其它部分或非法 label 时失败。
+pub(crate) fn normalize_spiffe_trust_domain(raw: &str) -> Result<String> {
+    anyhow::ensure!(
+        !raw.contains('/') && !raw.contains(':') && !raw.contains('@'),
+        "SPIFFE trust domain must be a bare domain"
+    );
+    normalize_spiffe_id(&format!("spiffe://{}", raw.trim().to_ascii_lowercase()))
+        .map(|(_, domain)| domain)
+}
+
+/// 业务作用：编译客户端证书在线 OCSP 的失败模式、freshness、缓存和并发硬门。
+///
+/// 参数说明：`owner` 标识 listener；`cfg` 是待校验的在线吊销策略。
+///
+/// 返回：全部预算有界时返回空缓存运行态；未知模式或无界预算拒绝候选。
+fn build_client_ocsp_runtime(
+    owner: &str,
+    cfg: &model::ClientCertificateOcspCfg,
+) -> Result<ClientCertificateOcspRuntime> {
+    let mode = match cfg.mode.trim().to_ascii_lowercase().as_str() {
+        "hard_fail" => ClientCertificateOcspMode::HardFail,
+        "soft_fail" => ClientCertificateOcspMode::SoftFail,
+        _ => anyhow::bail!(
+            "listener `{owner}` client certificate OCSP mode must be hard_fail|soft_fail"
+        ),
+    };
+    anyhow::ensure!(
+        (100..=30_000).contains(&cfg.timeout_ms),
+        "listener `{owner}` client certificate OCSP timeout must be within 100..=30000 ms"
+    );
+    anyhow::ensure!(
+        cfg.max_stale_seconds <= 7 * 24 * 60 * 60,
+        "listener `{owner}` client certificate OCSP max stale must not exceed 604800 seconds"
+    );
+    anyhow::ensure!(
+        (60..=7 * 24 * 60 * 60).contains(&cfg.max_age_without_next_update_seconds),
+        "listener `{owner}` client certificate OCSP max age must be within 60..=604800 seconds"
+    );
+    anyhow::ensure!(
+        cfg.clock_skew_seconds <= 15 * 60,
+        "listener `{owner}` client certificate OCSP clock skew must not exceed 900 seconds"
+    );
+    anyhow::ensure!(
+        (1..=100_000).contains(&cfg.max_cache_entries),
+        "listener `{owner}` client certificate OCSP cache must contain 1..=100000 entries"
+    );
+    anyhow::ensure!(
+        (1..=64).contains(&cfg.max_concurrency),
+        "listener `{owner}` client certificate OCSP concurrency must be within 1..=64"
+    );
+    Ok(ClientCertificateOcspRuntime {
+        mode,
+        timeout_ms: cfg.timeout_ms,
+        max_stale_seconds: cfg.max_stale_seconds,
+        max_age_without_next_update_seconds: cfg.max_age_without_next_update_seconds,
+        clock_skew_seconds: cfg.clock_skew_seconds,
+        max_cache_entries: cfg.max_cache_entries,
+        max_concurrency: cfg.max_concurrency,
+        allowed_responder_cidrs: Arc::new(
+            net::parse_cidrs(&cfg.allowed_responder_cidrs)
+                .context("parse client certificate OCSP responder CIDR allowlist")?,
+        ),
+        cache: Arc::new(dashmap::DashMap::new()),
+        concurrency: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrency)),
+    })
+}
+
+/// 业务作用：解析共享 session ticket key，冻结签发顺序并拒绝弱密钥或无界重叠代。
+///
+/// 参数说明：`cfg_path` 是 SecretSource 基准；`owner` 是 listener 标识；`cfg` 是 ticket 声明。
+///
+/// 返回：1..=4 个唯一 AES-256 key 与有界 lifetime 成功，否则拒绝候选且不回退随机本机 key。
+fn build_session_ticket_runtime(
+    cfg_path: &Path,
+    owner: &str,
+    cfg: &model::SessionTicketCfg,
+) -> Result<SessionTicketRuntime> {
+    if cfg.keys.is_empty() || cfg.keys.len() > 4 {
+        anyhow::bail!("listener `{owner}` session ticket keys must contain 1..=4 entries");
+    }
+    if !(60..=7 * 24 * 60 * 60).contains(&cfg.lifetime_seconds) {
+        anyhow::bail!("listener `{owner}` session ticket lifetime must be within 60..=604800");
+    }
+    let config_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut keys = Vec::with_capacity(cfg.keys.len());
+    let mut seen = HashSet::new();
+    for source in &cfg.keys {
+        let encoded = crate::secret::resolve_text(source, config_dir, "TLS session ticket key")?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .context("TLS session ticket key is not valid Base64")?;
+        let key: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("TLS session ticket key must decode to 32 bytes"))?;
+        let digest: [u8; 32] = sha2::Sha256::digest(key).into();
+        if !seen.insert(digest) {
+            anyhow::bail!("listener `{owner}` repeats a TLS session ticket key");
+        }
+        keys.push(key);
+    }
+    Ok(SessionTicketRuntime {
+        keys: keys.into(),
+        lifetime_seconds: cfg.lifetime_seconds,
+    })
+}
+
+/// 业务作用：把服务端 OCSP staple 声明编译为证书身份专属的文件与 freshness 契约。
+///
+/// 参数说明：`cfg_path` 是路径基准；`owner` 标识 listener；`cfg` 是待校验策略。
+///
+/// 返回：模式、时钟偏差和最大年龄均有界时返回运行配置，否则拒绝候选快照。
+fn build_ocsp_stapling_runtime(
+    cfg_path: &Path,
+    owner: &str,
+    cfg: &model::OcspStaplingCfg,
+) -> Result<OcspStaplingRuntime> {
+    let required = match cfg.mode.trim().to_ascii_lowercase().as_str() {
+        "optional" => false,
+        "required" => true,
+        _ => anyhow::bail!("listener `{owner}` tls.ocsp_stapling.mode must be optional|required"),
+    };
+    anyhow::ensure!(
+        (60..=7 * 24 * 60 * 60).contains(&cfg.max_age_without_next_update_seconds),
+        "listener `{owner}` OCSP max age must be within 60..=604800 seconds"
+    );
+    anyhow::ensure!(
+        cfg.clock_skew_seconds <= 15 * 60,
+        "listener `{owner}` OCSP clock skew must not exceed 900 seconds"
+    );
+    if cfg.fetch_from_aia {
+        anyhow::ensure!(
+            (60..=24 * 60 * 60).contains(&cfg.refresh_interval_seconds),
+            "listener `{owner}` OCSP refresh interval must be within 60..=86400 seconds"
+        );
+        anyhow::ensure!(
+            (100..=30_000).contains(&cfg.request_timeout_ms),
+            "listener `{owner}` OCSP request timeout must be within 100..=30000 ms"
+        );
+    }
+    Ok(OcspStaplingRuntime {
+        response_file: resolve_relative(cfg_path, &cfg.response_file),
+        issuer_file: cfg
+            .issuer_file
+            .as_deref()
+            .map(|path| resolve_relative(cfg_path, path)),
+        required,
+        max_age_without_next_update_seconds: cfg.max_age_without_next_update_seconds,
+        clock_skew_seconds: cfg.clock_skew_seconds,
+        fetch_from_aia: cfg.fetch_from_aia,
+        refresh_interval_seconds: cfg.refresh_interval_seconds,
+        request_timeout_ms: cfg.request_timeout_ms,
+        allowed_responder_cidrs: Arc::new(
+            net::parse_cidrs(&cfg.allowed_responder_cidrs)
+                .context("parse OCSP responder CIDR allowlist")?,
+        ),
     })
 }
 
@@ -2558,38 +3178,50 @@ fn normalize_sni(raw: &str) -> Result<String> {
     Ok(sni)
 }
 
+/// 业务作用：把旧式单入口或多入口配置统一编译为数据面 listener 运行计划，并对 CONNECT
+/// 自访问地址和 Sentinel 路由归属做全局校验。
+///
+/// 参数说明：`cfg_path` 提供相对路径基准；`cfg` 是完整候选；`sentinel`、`variables` 与
+/// `usage_plans` 是已编译共享依赖；`crypto_catalog` 提供各 listener 共用的外部密码 provider。
+///
+/// 返回：全部入口、路由及跨入口拓扑合法时返回运行计划；任一配置非法时拒绝候选快照。
 fn build_proxies(
     cfg_path: &Path,
     cfg: &GatewayConfig,
     sentinel: &SentinelRouteFilters,
     variables: Arc<VariablePlan>,
     usage_plans: Arc<crate::routing::UsagePlanCatalog>,
+    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
 ) -> Result<Vec<ProxyRuntime>> {
     let mut proxies = Vec::new();
     let mut sentinel_matched_routes = HashSet::new();
+    let self_addrs = collect_forward_proxy_self_addrs(cfg)?;
+    let mut context = ProxyBuildContext {
+        cfg_path,
+        sentinel,
+        self_addrs: &self_addrs,
+        sentinel_matched_routes: &mut sentinel_matched_routes,
+        crypto_catalog,
+    };
     if cfg.proxies.is_empty() {
         let server = cfg
             .server
             .as_ref()
             .context("missing `server` or `proxies[]`; configure one data-plane listener")?;
         proxies.push(build_legacy_proxy(
-            cfg_path,
+            &mut context,
             server,
             &cfg.routes,
-            sentinel,
             variables.clone(),
             usage_plans.clone(),
-            &mut sentinel_matched_routes,
         )?);
     } else {
         for proxy in &cfg.proxies {
             proxies.push(build_proxy(
-                cfg_path,
+                &mut context,
                 proxy,
-                sentinel,
                 variables.clone(),
                 usage_plans.clone(),
-                &mut sentinel_matched_routes,
             )?);
         }
     }
@@ -2598,17 +3230,71 @@ fn build_proxies(
     Ok(proxies)
 }
 
+/// 构建所有 proxy 时共享的只读依赖与可变归属记录。
+struct ProxyBuildContext<'a> {
+    /// 主配置路径，用于解析相对依赖。
+    cfg_path: &'a Path,
+    /// 已编译的 Sentinel route filter 集合。
+    sentinel: &'a SentinelRouteFilters,
+    /// 所有本地数据面与管理面监听地址，供 CONNECT 自访问门禁使用。
+    self_addrs: &'a [std::net::SocketAddr],
+    /// 已被入口消费的 Sentinel route id，构建完成后用于发现悬空规则。
+    sentinel_matched_routes: &'a mut HashSet<String>,
+    /// 当前候选快照共享的外部密码 provider 目录。
+    crypto_catalog: &'a crate::external_crypto::ExternalCryptoCatalog,
+}
+
+/// 业务作用：收集候选快照中的全部数据面、TLS 与管理面监听地址，作为 CONNECT 自访问门禁。
+///
+/// 参数说明：`cfg` 是已经完成基础字段校验的网关配置。
+///
+/// 返回：地址均可解析时返回去重后的监听集合；任一地址非法时拒绝候选快照。
+fn collect_forward_proxy_self_addrs(cfg: &GatewayConfig) -> Result<Vec<std::net::SocketAddr>> {
+    let mut raw = vec![cfg.admin.listen.as_str()];
+    if cfg.proxies.is_empty() {
+        if let Some(server) = cfg.server.as_ref() {
+            raw.push(server.listen.as_str());
+            if let Some(tls) = server.tls.as_ref() {
+                raw.push(tls.listen.as_str());
+            }
+        }
+    } else {
+        for proxy in &cfg.proxies {
+            raw.push(proxy.listen.as_str());
+            if let Some(tls) = proxy.tls.as_ref() {
+                raw.push(tls.listen.as_str());
+            }
+        }
+    }
+    let mut addrs = raw
+        .into_iter()
+        .map(|value| {
+            value
+                .parse::<std::net::SocketAddr>()
+                .with_context(|| format!("invalid local listener `{value}`"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    addrs.sort_unstable();
+    addrs.dedup();
+    Ok(addrs)
+}
+
+/// 业务作用：把兼容形态的 `server + routes` 映射为名为 `default` 的统一 proxy 运行计划。
+///
+/// 参数说明：`context` 保存路径基准、CONNECT 自访问地址与 Sentinel 归属记录；`server`
+/// 和 `routes` 是旧式入口；`variables` 与 `usage_plans` 是已编译共享依赖。
+///
+/// 返回：映射及全部门禁通过时返回运行计划；配置冲突或资源越界时返回错误。
 fn build_legacy_proxy(
-    cfg_path: &Path,
+    context: &mut ProxyBuildContext<'_>,
     server: &ServerCfg,
     routes: &[model::RouteCfg],
-    sentinel: &SentinelRouteFilters,
     variables: Arc<VariablePlan>,
     usage_plans: Arc<crate::routing::UsagePlanCatalog>,
-    sentinel_matched_routes: &mut HashSet<String>,
 ) -> Result<ProxyRuntime> {
     build_proxy_from_parts(
-        cfg_path,
+        context.cfg_path,
+        context.crypto_catalog,
         "default",
         &server.listen,
         true,
@@ -2624,23 +3310,29 @@ fn build_legacy_proxy(
         false, // 旧版 server 配置不支持 redirect_https/hsts(用 proxies[] 才有)
         308,
         0,
-        sentinel,
+        context.sentinel,
         variables,
         usage_plans,
-        sentinel_matched_routes,
+        context.self_addrs,
+        &mut *context.sentinel_matched_routes,
     )
 }
 
+/// 业务作用：编译一个显式 proxy 入口，并把全局共享依赖和 CONNECT 自访问门禁注入其路由器。
+///
+/// 参数说明：`context` 保存路径基准、监听地址和 Sentinel 归属记录；`proxy` 是单入口配置；
+/// `variables` 与 `usage_plans` 是已编译共享依赖。
+///
+/// 返回：入口、TLS、HTTP/3、路由与资源预算全部合法时返回运行计划，否则拒绝候选。
 fn build_proxy(
-    cfg_path: &Path,
+    context: &mut ProxyBuildContext<'_>,
     proxy: &ProxyCfg,
-    sentinel: &SentinelRouteFilters,
     variables: Arc<VariablePlan>,
     usage_plans: Arc<crate::routing::UsagePlanCatalog>,
-    sentinel_matched_routes: &mut HashSet<String>,
 ) -> Result<ProxyRuntime> {
     build_proxy_from_parts(
-        cfg_path,
+        context.cfg_path,
+        context.crypto_catalog,
         &proxy.id,
         &proxy.listen,
         proxy.plain_enabled,
@@ -2656,10 +3348,11 @@ fn build_proxy(
         proxy.redirect_https,
         proxy.redirect_https_status,
         proxy.hsts_max_age,
-        sentinel,
+        context.sentinel,
         variables,
         usage_plans,
-        sentinel_matched_routes,
+        context.self_addrs,
+        &mut *context.sentinel_matched_routes,
     )
 }
 
@@ -3096,8 +3789,18 @@ fn build_gateway_listener_runtime(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 业务作用：在单一事务中完成一个 proxy 的监听、TLS、HTTP/3、路由与响应安全策略编译，
+/// 防止某一子计划通过后被单独发布。
+///
+/// 参数说明：`cfg_path` 是相对路径基准；`id`、监听与协议参数描述入口；`routes` 及共享依赖
+/// 描述业务路由；`self_addrs` 是 CONNECT 禁止回连的本机监听集合；
+/// `sentinel_matched_routes` 记录规则归属；`crypto_catalog` 提供 TLS 外部私钥所需的共享签名
+/// provider。
+///
+/// 返回：全部配置通过安全与资源门禁时返回不可变运行计划；任何失败均返回错误且不产生半成品。
 fn build_proxy_from_parts(
     cfg_path: &Path,
+    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
     id: &str,
     listen: &str,
     plain_enabled: bool,
@@ -3116,6 +3819,7 @@ fn build_proxy_from_parts(
     sentinel: &SentinelRouteFilters,
     variables: Arc<VariablePlan>,
     usage_plans: Arc<crate::routing::UsagePlanCatalog>,
+    self_addrs: &[std::net::SocketAddr],
     sentinel_matched_routes: &mut HashSet<String>,
 ) -> Result<ProxyRuntime> {
     if id.trim().is_empty() {
@@ -3134,29 +3838,43 @@ fn build_proxy_from_parts(
         None => None,
         Some(tls) => {
             // 客户端认证模式在构建期收敛，避免未知值把严格校验静默降级。
-            let client_auth = match &tls.client_auth {
-                None => None,
-                Some(ca) => {
-                    let (require, allow_untrusted) =
-                        match ca.mode.trim().to_ascii_lowercase().as_str() {
-                        "require" => (true, false),
-                        "optional" => (false, false),
-                        "insecure_fallback" => (false, true),
-                        other => anyhow::bail!(
-                            "proxy `{id}` tls.client_auth.mode must be require|optional|insecure_fallback, got `{other}`"
-                        ),
-                    };
-                    Some(ClientAuthRuntime {
-                        require,
-                        allow_untrusted,
-                        ca_file: resolve_relative(cfg_path, &ca.ca_file),
-                    })
-                }
+            let client_auth = tls
+                .client_auth
+                .as_ref()
+                .map(|auth| build_client_auth_runtime(cfg_path, id, auth, tls.spire.is_some()))
+                .transpose()?;
+            anyhow::ensure!(
+                tls.private_key_provider.is_none()
+                    || tls.keypair_manifest_file.is_none() && tls.acme.is_none(),
+                "proxy `{id}` external private key cannot be combined with keypair manifest or ACME"
+            );
+            let spire = tls
+                .spire
+                .as_ref()
+                .map(crate::spire::build_source)
+                .transpose()?;
+            let (key_file, private_key_provider) = if spire.is_some() {
+                anyhow::ensure!(tls.cert_file.trim().is_empty() && tls.key_file.trim().is_empty() && tls.private_key_provider.is_none() && tls.certs.is_empty() && tls.keypair_manifest_file.is_none() && tls.acme.is_none() && tls.ocsp_stapling.is_none() && tls.session_tickets.is_none(), "proxy `{id}` SPIRE identity cannot be combined with file certificate, external signer, SNI, manifest, ACME, OCSP staple, or session tickets");
+                (PathBuf::new(), None)
+            } else {
+                build_tls_private_key(
+                    cfg_path,
+                    id,
+                    tls.key_file.as_str(),
+                    tls.private_key_provider.as_ref(),
+                    crypto_catalog,
+                )?
             };
             Some(TlsRuntimeCfg {
                 listen: tls.listen.clone(),
-                cert_file: resolve_relative(cfg_path, &tls.cert_file),
-                key_file: resolve_relative(cfg_path, &tls.key_file),
+                cert_file: if spire.is_some() {
+                    PathBuf::new()
+                } else {
+                    resolve_relative(cfg_path, &tls.cert_file)
+                },
+                key_file,
+                private_key_provider,
+                spire,
                 keypair_manifest_file: tls
                     .keypair_manifest_file
                     .as_deref()
@@ -3164,18 +3882,43 @@ fn build_proxy_from_parts(
                 certs: tls
                     .certs
                     .iter()
-                    .map(|c| SniCertRuntime {
-                        // server_name 小写化 + 去尾点,匹配时零分配比较(与 host_allowed 同口径)。
-                        server_names: c
-                            .server_names
-                            .iter()
-                            .map(|n| n.trim_end_matches('.').to_ascii_lowercase())
-                            .collect(),
-                        cert_file: resolve_relative(cfg_path, &c.cert_file),
-                        key_file: resolve_relative(cfg_path, &c.key_file),
+                    .map(|c| {
+                        let (key_file, private_key_provider) = build_tls_private_key(
+                            cfg_path,
+                            id,
+                            c.key_file.as_str(),
+                            c.private_key_provider.as_ref(),
+                            crypto_catalog,
+                        )?;
+                        Ok(SniCertRuntime {
+                            // server_name 在发布前统一规范化，防止大小写或尾点制造重复身份分支。
+                            server_names: c
+                                .server_names
+                                .iter()
+                                .map(|n| n.trim_end_matches('.').to_ascii_lowercase())
+                                .collect(),
+                            cert_file: resolve_relative(cfg_path, &c.cert_file),
+                            key_file,
+                            private_key_provider,
+                            ocsp_stapling: c
+                                .ocsp_stapling
+                                .as_ref()
+                                .map(|ocsp| build_ocsp_stapling_runtime(cfg_path, id, ocsp))
+                                .transpose()?,
+                        })
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>>>()?,
                 client_auth,
+                ocsp_stapling: tls
+                    .ocsp_stapling
+                    .as_ref()
+                    .map(|ocsp| build_ocsp_stapling_runtime(cfg_path, id, ocsp))
+                    .transpose()?,
+                session_tickets: tls
+                    .session_tickets
+                    .as_ref()
+                    .map(|tickets| build_session_ticket_runtime(cfg_path, id, tickets))
+                    .transpose()?,
                 acme: tls
                     .acme
                     .as_ref()
@@ -3225,6 +3968,46 @@ fn build_proxy_from_parts(
     let routes = routes_with_sentinel(routes, sentinel, sentinel_matched_routes);
     let gateway_listeners = build_gateway_listener_runtime(id, gateway_listeners)?;
     let config_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
+    let router = Router::build_with_usage_plans_and_self_addrs(
+        &routes,
+        variables,
+        config_dir,
+        usage_plans,
+        self_addrs,
+    )
+    .with_context(|| format!("proxy `{id}` routes"))?;
+    if http3.webtransport {
+        let (route_bidi, route_uni) = router.webtransport_stream_budget();
+        let required_bidi = route_bidi
+            .checked_add(1)
+            .context("WebTransport bidi stream budget overflow")?;
+        let required_uni = route_uni
+            .checked_add(3)
+            .context("WebTransport uni stream budget overflow")?;
+        // WebTransport 业务流与 session CONNECT、H3 control/QPACK 共用 QUIC
+        // `MAX_STREAMS`。若 listener 小于 route 声明，运行期会在达到 route 限额前
+        // 永久阻塞，因此必须在发布候选前拒绝这种虚假容量。
+        anyhow::ensure!(
+            required_bidi <= u64::from(http3.max_bidi_streams_per_connection),
+            "proxy `{id}` WebTransport route requires {required_bidi} bidi streams including the session request, exceeding http3.max_bidi_streams_per_connection={} ",
+            http3.max_bidi_streams_per_connection
+        );
+        anyhow::ensure!(
+            required_uni <= u64::from(http3.max_uni_streams_per_connection),
+            "proxy `{id}` WebTransport route requires {required_uni} uni streams including H3 control/QPACK, exceeding http3.max_uni_streams_per_connection={} ",
+            http3.max_uni_streams_per_connection
+        );
+    }
+    anyhow::ensure!(
+        router.uses_early_data() == http3.zero_rtt,
+        if router.uses_early_data() {
+            format!("proxy `{id}` has an early_data route but HTTP/3 0-RTT is not enabled")
+        } else {
+            format!(
+                "proxy `{id}` enables HTTP/3 0-RTT but no route explicitly authorizes early_data"
+            )
+        }
+    );
     Ok(ProxyRuntime {
         id: id.to_string(),
         listen: listen.to_string(),
@@ -3244,10 +4027,7 @@ fn build_proxy_from_parts(
         timeouts: timeouts.clone(),
         redirect_https,
         hsts_header,
-        router: Arc::new(
-            Router::build_with_usage_plans(&routes, variables, config_dir, usage_plans)
-                .with_context(|| format!("proxy `{id}` routes"))?,
-        ),
+        router: Arc::new(router),
     })
 }
 
@@ -3268,6 +4048,64 @@ fn build_http3_runtime(
     proxy_protocol: &ProxyProtocolCfg,
     limits: &ServerLimitsCfg,
 ) -> Result<Http3RuntimeCfg> {
+    // 能力声明必须先于 `enabled` 短路判定完成校验。若放在短路之后，
+    // 「http3 未开启却声明了 webtransport」会被静默忽略,运维以为能力已生效,
+    // 静默降级会让运维以为扩展协议已经开放，实际客户端只能落到普通 HTTP/3 路径。
+    let declared = cfg
+        .capabilities
+        .iter()
+        .map(|raw| crate::masque::Capability::parse(raw))
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("proxy `{proxy_id}` http3.capabilities"))?;
+    if !declared.is_empty() {
+        anyhow::ensure!(
+            cfg.enabled,
+            "proxy `{proxy_id}` 声明了 QUIC 扩展能力但 http3.enabled=false;不允许静默忽略"
+        );
+        for capability in &declared {
+            // 这些能力只在 HTTP/3 传输上成立,在 TCP 形态没有等价物。
+            crate::masque::check_support(*capability, crate::masque::Transport::Http3)
+                .with_context(|| format!("proxy `{proxy_id}` http3.capabilities"))?;
+        }
+        if declared.contains(&crate::masque::Capability::EarlyData) {
+            // 0-RTT 的重放防护在多节点下依赖共享缓存;缺失时必须失败闭合,
+            // 否则每个节点都把同一份 early data 判为「首次」,防护实际为零。
+            anyhow::ensure!(
+                !cfg.multi_node || cfg.early_data_shared_replay_cache,
+                "proxy `{proxy_id}` multi-node HTTP/3 early_data requires a shared anti-replay cache"
+            );
+        }
+    }
+
+    let connect_udp = declared.contains(&crate::masque::Capability::ConnectUdp);
+    let datagram = declared.contains(&crate::masque::Capability::Datagram);
+    let webtransport = declared.contains(&crate::masque::Capability::WebTransport);
+    let early_data = declared.contains(&crate::masque::Capability::EarlyData);
+    let distinct_capabilities = usize::from(connect_udp)
+        + usize::from(datagram)
+        + usize::from(webtransport)
+        + usize::from(early_data);
+    anyhow::ensure!(
+        distinct_capabilities == declared.len(),
+        "proxy `{proxy_id}` http3.capabilities contains duplicate declarations"
+    );
+    anyhow::ensure!(
+        !connect_udp || datagram,
+        "proxy `{proxy_id}` connect_udp requires the datagram capability"
+    );
+    anyhow::ensure!(
+        !webtransport || datagram,
+        "proxy `{proxy_id}` webtransport requires the datagram capability"
+    );
+    anyhow::ensure!(
+        datagram || (!connect_udp && !webtransport),
+        "proxy `{proxy_id}` QUIC session capabilities require datagram"
+    );
+    anyhow::ensure!(
+        !datagram || connect_udp || webtransport,
+        "proxy `{proxy_id}` standalone datagram has no configured session consumer"
+    );
+
     if !cfg.enabled {
         return Ok(Http3RuntimeCfg::default());
     }
@@ -3294,12 +4132,24 @@ fn build_http3_runtime(
             !proxy_protocol.enabled,
             "proxy `{proxy_id}` HTTP/3 does not yet support PROXY protocol on QUIC datagrams"
         );
-        // Early data 会在连接完全认证前重放请求；首版没有幂等 allowlist/anti-replay ledger，
-        // 必须构建期拒绝，不能只在运行时忽略配置制造虚假安全感。
         anyhow::ensure!(
-            !cfg.zero_rtt,
-            "proxy `{proxy_id}` http3.zero_rtt is not supported; keep it false"
+            cfg.zero_rtt == early_data,
+            "proxy `{proxy_id}` http3.zero_rtt and the early_data capability must be enabled or disabled together"
         );
+        if early_data {
+            let tls = tls.expect("HTTP/3 TLS presence checked above");
+            // rustls 只对有状态、单次消费的 TLS 1.3 session 接受 early data；
+            // 自定义无状态 ticketer 会被库明确禁用 0-RTT。与其让配置看似开启却永远
+            // 回落 1-RTT，不如在发布前拒绝矛盾组合。
+            anyhow::ensure!(
+                tls.session_tickets.is_none(),
+                "proxy `{proxy_id}` HTTP/3 early_data requires rustls stateful single-use sessions and cannot combine with tls.session_tickets stateless keys"
+            );
+            anyhow::ensure!(
+                tls.client_auth.is_none(),
+                "proxy `{proxy_id}` HTTP/3 early_data cannot combine with TLS client authentication"
+            );
+        }
         anyhow::ensure!(
             (1..=31_536_000).contains(&cfg.alt_svc_max_age_seconds),
             "proxy `{proxy_id}` http3.alt_svc_max_age_seconds must be within 1..=31536000"
@@ -3340,6 +4190,10 @@ fn build_http3_runtime(
             "proxy `{proxy_id}` http3.max_bidi_streams_per_connection must be within 1..=1000000"
         );
         anyhow::ensure!(
+            (3..=1_000_000).contains(&cfg.max_uni_streams_per_connection),
+            "proxy `{proxy_id}` http3.max_uni_streams_per_connection must be within 3..=1000000"
+        );
+        anyhow::ensure!(
             (8 * 1024..=16 * 1024 * 1024).contains(&cfg.max_request_header_bytes),
             "proxy `{proxy_id}` http3.max_request_header_bytes must be within 8192..=16777216"
         );
@@ -3350,6 +4204,29 @@ fn build_http3_runtime(
         anyhow::ensure!(
             (4 * 1024..=1024 * 1024 * 1024).contains(&cfg.max_stream_buffer_bytes),
             "proxy `{proxy_id}` http3.max_stream_buffer_bytes must be within 4096..=1073741824"
+        );
+        if connect_udp {
+            anyhow::ensure!(
+                (1..=4096).contains(&cfg.max_connect_udp_sessions),
+                "proxy `{proxy_id}` http3.max_connect_udp_sessions must be within 1..=4096"
+            );
+            anyhow::ensure!(
+                cfg.max_connect_udp_sessions <= cfg.max_bidi_streams_per_connection as usize,
+                "proxy `{proxy_id}` http3.max_connect_udp_sessions cannot exceed max_bidi_streams_per_connection"
+            );
+        }
+        anyhow::ensure!(
+            (1..=4096).contains(&cfg.max_datagram_queue),
+            "proxy `{proxy_id}` http3.max_datagram_queue must be within 1..=4096"
+        );
+        anyhow::ensure!(
+            (1..=crate::masque::MAX_DATAGRAM_PAYLOAD).contains(&cfg.max_datagram_bytes),
+            "proxy `{proxy_id}` http3.max_datagram_bytes must be within 1..={} ",
+            crate::masque::MAX_DATAGRAM_PAYLOAD
+        );
+        anyhow::ensure!(
+            cfg.max_datagram_queue.saturating_mul(cfg.max_datagram_bytes) <= 16 * 1024 * 1024,
+            "proxy `{proxy_id}` HTTP/3 per-session DATAGRAM queue budget must not exceed 16777216 bytes"
         );
         anyhow::ensure!(
             (1..=60).contains(&cfg.retry_token_lifetime_seconds),
@@ -3363,6 +4240,10 @@ fn build_http3_runtime(
             cfg.retry_token_rotation_seconds
                 >= cfg.retry_token_lifetime_seconds.saturating_mul(2),
             "proxy `{proxy_id}` http3.retry_token_rotation_seconds must be at least twice retry_token_lifetime_seconds"
+        );
+        anyhow::ensure!(
+            (60..=86_400).contains(&cfg.early_data_session_rotation_seconds),
+            "proxy `{proxy_id}` http3.early_data_session_rotation_seconds must be within 60..=86400"
         );
         let alt_svc_header = if cfg.advertise_alt_svc {
             let tls_listen: std::net::SocketAddr = tls
@@ -3393,12 +4274,22 @@ fn build_http3_runtime(
             max_pending_handshakes: cfg.max_pending_handshakes,
             max_pending_handshake_bytes: cfg.max_pending_handshake_bytes,
             max_bidi_streams_per_connection: cfg.max_bidi_streams_per_connection,
+            max_uni_streams_per_connection: cfg.max_uni_streams_per_connection,
             max_request_header_bytes: cfg.max_request_header_bytes,
             max_stream_buffer_bytes: cfg.max_stream_buffer_bytes,
+            connect_udp,
+            datagram,
+            webtransport,
+            max_connect_udp_sessions: cfg.max_connect_udp_sessions,
+            max_datagram_queue: cfg.max_datagram_queue,
+            max_datagram_bytes: cfg.max_datagram_bytes,
             retry: cfg.retry,
             retry_token_lifetime_seconds: cfg.retry_token_lifetime_seconds,
             retry_token_rotation_seconds: cfg.retry_token_rotation_seconds,
-            zero_rtt: false,
+            zero_rtt: cfg.zero_rtt,
+            early_data_session_rotation_seconds: cfg.early_data_session_rotation_seconds,
+            early_data_shared_replay_cache: cfg.early_data_shared_replay_cache,
+            multi_node: cfg.multi_node,
         })
     }
 }
@@ -4137,6 +5028,14 @@ pub(crate) fn config_fingerprint(main_cfg: &Path) -> Result<u64> {
     for secret_file in collect_secret_dependencies(&cfg, config_dir) {
         hash_config_file(&mut hasher, &secret_file)?;
     }
+    for geoip_file in collect_geoip_dependencies(&cfg, config_dir) {
+        hash_config_file_with_limit(
+            &mut hasher,
+            &geoip_file,
+            crate::geoip::MAX_DATABASE_BYTES,
+            "GeoIP database",
+        )?;
+    }
     for snippet_file in &cfg.snippet_files {
         hash_config_file(&mut hasher, snippet_file)?;
     }
@@ -4164,6 +5063,7 @@ fn config_watch_dependencies<'a>(
         paths.push(path);
     }
     paths.extend(collect_secret_dependencies(cfg, config_dir));
+    paths.extend(collect_geoip_dependencies(cfg, config_dir));
     paths.extend(cfg.snippet_files.iter().cloned());
     for sources in auxiliary_sources {
         paths.extend(sources.watch_files().map(Path::to_path_buf));
@@ -4179,7 +5079,76 @@ fn config_watch_dependencies<'a>(
 ///
 /// 返回：去重前的依赖路径集合；调用方按各自需要排序去重，函数不读取文件内容。
 fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+    let mut paths = crate::upstream_credential::dependency_paths(cfg, config_dir);
+    paths.extend(crate::external_crypto::dependency_paths(
+        &cfg.crypto_providers,
+        config_dir,
+    ));
+    for tls in cfg
+        .server
+        .as_ref()
+        .and_then(|server| server.tls.as_ref())
+        .into_iter()
+        .chain(cfg.proxies.iter().filter_map(|proxy| proxy.tls.as_ref()))
+    {
+        if let Some(auth) = &tls.client_auth {
+            paths.extend(auth.crl_files.iter().map(|path| {
+                let path = Path::new(path);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    config_dir.join(path)
+                }
+            }));
+        }
+        paths.extend(ocsp_dependency_paths(
+            tls.ocsp_stapling.iter().chain(
+                tls.certs
+                    .iter()
+                    .filter_map(|cert| cert.ocsp_stapling.as_ref()),
+            ),
+            config_dir,
+        ));
+        if let Some(tickets) = &tls.session_tickets {
+            paths.extend(
+                tickets
+                    .keys
+                    .iter()
+                    .filter_map(|source| crate::secret::dependency_path(source, config_dir)),
+            );
+        }
+    }
+    for listener in &cfg.stream.listeners {
+        let Some(tls) = &listener.tls else {
+            continue;
+        };
+        if let Some(auth) = &tls.client_auth {
+            paths.extend(auth.crl_files.iter().map(|path| {
+                let path = Path::new(path);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    config_dir.join(path)
+                }
+            }));
+        }
+        paths.extend(ocsp_dependency_paths(
+            tls.ocsp_stapling.iter().chain(
+                tls.certs
+                    .iter()
+                    .filter_map(|cert| cert.ocsp_stapling.as_ref()),
+            ),
+            config_dir,
+        ));
+        if let Some(tickets) = &tls.session_tickets {
+            paths.extend(
+                tickets
+                    .keys
+                    .iter()
+                    .filter_map(|source| crate::secret::dependency_path(source, config_dir)),
+            );
+        }
+    }
     if cfg.control_plane.xds.enabled {
         // xDS trust/identity 虽是不可由远端修改的 bootstrap authority，仍必须进入配置指纹和
         // 文件 watcher；明文 loopback profile 没有 PEM，不能把空路径误当工作目录依赖。
@@ -4270,6 +5239,31 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
         .iter()
         .chain(cfg.proxies.iter().flat_map(|proxy| proxy.routes.iter()))
     {
+        if let Some(waf) = &route.waf {
+            paths.extend(crate::waf::dependency_paths(config_dir, waf));
+        }
+        if let Some(bot) = &route.bot {
+            for trusted in &bot.trusted_search_bots {
+                if let Some(path) =
+                    crate::secret::dependency_path(trusted.signature_secret.as_str(), config_dir)
+                {
+                    paths.push(path);
+                }
+            }
+        }
+        if let Some(csrf) = &route.csrf {
+            paths.extend(crate::csrf::dependency_paths(config_dir, csrf));
+        }
+        if let Some(ca_file) = route
+            .webtransport
+            .as_ref()
+            .and_then(|policy| policy.ca_file.as_deref())
+            .filter(|path| !path.trim().is_empty())
+        {
+            paths.push(crate::masque::resolve_webtransport_path(
+                config_dir, ca_file,
+            ));
+        }
         if let Some(transcoding) = &route.grpc_transcoding {
             let path = Path::new(&transcoding.descriptor_set_file);
             paths.push(if path.is_absolute() {
@@ -4298,6 +5292,12 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
                 });
             }
         }
+        paths.extend(crate::proxy::response_contract::dependency_paths(
+            config_dir,
+            route.response_contract.as_ref(),
+            route.request_transform.as_ref(),
+            route.response_transform.as_ref(),
+        ));
         if let Some(opa) = &route.opa_authorization {
             paths.extend(crate::opa::dependency_paths(config_dir, opa));
         }
@@ -4305,12 +5305,15 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
             paths.extend(crate::casbin_auth::dependency_paths(config_dir, casbin));
         }
         for plugin in &route.wasm_plugins {
-            if let Some(path) = crate::wasm::dependency_path(config_dir, &plugin.module_file) {
-                paths.push(path);
-            }
+            paths.extend(crate::wasm::dependency_paths(config_dir, plugin));
         }
         for plugin in &route.external_plugins {
             if let Some(path) = crate::external_plugin::dependency_path(config_dir, plugin) {
+                paths.push(path);
+            }
+        }
+        if let Some(ext_proc) = &route.ext_proc {
+            if let Some(path) = crate::ext_proc::dependency_path(config_dir, ext_proc) {
                 paths.push(path);
             }
         }
@@ -4354,6 +5357,48 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
     paths
 }
 
+/// 业务作用：收集 OCSP response 与显式 issuer 文件，确保其更新参与配置指纹和精确热换。
+///
+/// 参数说明：`configs` 是默认证书与 SNI 证书的 OCSP 声明；`config_dir` 是相对路径根。
+///
+/// 返回：返回未去重的绝对或基准拼接路径，不读取响应或证书内容。
+fn ocsp_dependency_paths<'a>(
+    configs: impl IntoIterator<Item = &'a model::OcspStaplingCfg>,
+    config_dir: &Path,
+) -> Vec<PathBuf> {
+    let resolve = |raw: &str| {
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            config_dir.join(path)
+        }
+    };
+    let mut paths = Vec::new();
+    for cfg in configs {
+        paths.push(resolve(&cfg.response_file));
+        if let Some(issuer) = cfg.issuer_file.as_deref() {
+            paths.push(resolve(issuer));
+        }
+    }
+    paths
+}
+
+/// 业务作用：收集 GeoIP 策略声明的 MMDB 文件，使较大的地理数据库使用独立读取上限，
+/// 不会扩大 Secret、schema 和扩展文件的通用指纹预算。
+///
+/// 参数说明：`cfg` 是已解析配置；`config_dir` 是相对路径的共同基准。
+///
+/// 返回：返回去重前的 MMDB 依赖路径，调用方负责排序与内容读取。
+fn collect_geoip_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) -> Vec<PathBuf> {
+    cfg.routes
+        .iter()
+        .chain(cfg.proxies.iter().flat_map(|proxy| proxy.routes.iter()))
+        .filter_map(|route| route.geoip.as_ref())
+        .flat_map(|geoip| crate::geoip::dependency_paths(config_dir, geoip))
+        .collect()
+}
+
 /// 业务作用：把一次 naml tracked load 实际读取的基础文件和活动 profile 按稳定顺序加入配置指纹。
 ///
 /// 参数说明：`hasher` 是当前候选摘要；`sources` 必须来自与该候选相同 loader 约定。
@@ -4372,11 +5417,29 @@ fn hash_yml_sources(hasher: &mut DefaultHasher, sources: &YmlLocalSources) -> Re
 ///
 /// 返回：文件可在硬上限内完整读取时成功；缺失、超限或读取失败时返回错误。
 fn hash_config_file(hasher: &mut DefaultHasher, path: &Path) -> Result<()> {
-    // 集群收敛比较的是配置内容，不是每台机器的部署目录。调用方已经按
-    // main/guard/sentinel/依赖的固定角色顺序喂入文件；把绝对路径也哈希进去会让
-    // 两台内容完全一致、目录不同的节点永久显示 diverged。
-    crate::bounded_io::read_file(path, MAX_FINGERPRINT_FILE_BYTES, "config dependency")?
-        .hash(hasher);
+    hash_config_file_with_limit(
+        hasher,
+        path,
+        MAX_FINGERPRINT_FILE_BYTES,
+        "config dependency",
+    )
+}
+
+/// 业务作用：在调用方声明的硬上限内读取依赖内容并加入配置指纹，部署绝对路径不参与比较。
+///
+/// 参数说明：`hasher` 是当前候选摘要；`path` 是依赖文件；`max_bytes` 是独立读取硬门；
+/// `kind` 用于错误定位且不得包含敏感值。
+///
+/// 返回：文件可完整有界读取时更新摘要并成功；缺失、超限或读取失败时返回错误。
+fn hash_config_file_with_limit(
+    hasher: &mut DefaultHasher,
+    path: &Path,
+    max_bytes: usize,
+    kind: &str,
+) -> Result<()> {
+    // 集群收敛比较的是配置内容，不是每台机器的部署目录。调用方已经按固定业务角色顺序
+    // 喂入文件；把绝对路径也哈希进去会让内容相同、目录不同的节点永久显示 diverged。
+    crate::bounded_io::read_file(path, max_bytes, kind)?.hash(hasher);
     Ok(())
 }
 

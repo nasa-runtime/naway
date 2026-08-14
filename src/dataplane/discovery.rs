@@ -1140,18 +1140,32 @@ async fn fetch_kubernetes(
         &spec.registry_service,
         percent_encoding::NON_ALPHANUMERIC,
     );
-    let url = format!(
-        "{}/api/v1/namespaces/{encoded_namespace}/endpoints/{service}",
-        cfg.api_server
-    );
-    let value = fetch_kubernetes_object(client, cfg, url).await?;
     let port_selector = match (spec.port_name.as_deref(), spec.port) {
         (Some(name), _) => KubernetesEndpointPortSelector::Name(name.to_owned()),
         (None, Some(port)) => {
-            resolve_kubernetes_service_port(client, cfg, namespace, &spec.registry_service, port)
+            if spec.service_import {
+                KubernetesEndpointPortSelector::Number(port)
+            } else {
+                resolve_kubernetes_service_port(
+                    client,
+                    cfg,
+                    namespace,
+                    &spec.registry_service,
+                    port,
+                )
                 .await?
+            }
         }
         (None, None) => KubernetesEndpointPortSelector::Single,
+    };
+    let value = if spec.service_import {
+        Value::Null
+    } else {
+        let url = format!(
+            "{}/api/v1/namespaces/{encoded_namespace}/endpoints/{service}",
+            cfg.api_server
+        );
+        fetch_kubernetes_object(client, cfg, url).await?
     };
     let subsets = value
         .get("subsets")
@@ -1159,7 +1173,14 @@ async fn fetch_kubernetes(
         .cloned()
         .unwrap_or_default();
     if subsets.is_empty() {
-        let selector = format!("kubernetes.io/service-name={}", spec.registry_service);
+        let selector = if spec.service_import {
+            format!(
+                "multicluster.kubernetes.io/service-name={}",
+                spec.registry_service
+            )
+        } else {
+            format!("kubernetes.io/service-name={}", spec.registry_service)
+        };
         let encoded_selector =
             percent_encoding::utf8_percent_encode(&selector, percent_encoding::NON_ALPHANUMERIC);
         let slices_url = format!(
@@ -1167,9 +1188,13 @@ async fn fetch_kubernetes(
             cfg.api_server
         );
         let slices = fetch_kubernetes_object(client, cfg, slices_url).await?;
-        if let Some(instances) =
-            parse_kubernetes_endpoint_slices(&slices, &port_selector, namespace, cfg.max_instances)?
-        {
+        if let Some(instances) = parse_kubernetes_endpoint_slices(
+            &slices,
+            &port_selector,
+            namespace,
+            spec.service_import,
+            cfg.max_instances,
+        )? {
             return Ok(instances);
         }
     }
@@ -1227,6 +1252,7 @@ fn parse_kubernetes_endpoint_slices(
     value: &Value,
     port_selector: &KubernetesEndpointPortSelector,
     namespace: &str,
+    service_import: bool,
     max_instances: usize,
 ) -> anyhow::Result<Option<Vec<RegistryInstance>>> {
     if value.is_null() {
@@ -1290,6 +1316,22 @@ fn parse_kubernetes_endpoint_slices(
                     ("registry".to_owned(), "kubernetes".to_owned()),
                     ("namespace".to_owned(), namespace.to_owned()),
                 ]);
+                if service_import {
+                    metadata.insert("service_import".to_owned(), "true".to_owned());
+                    if let Some(cluster) = slice
+                        .pointer("/metadata/labels/multicluster.kubernetes.io~1source-cluster")
+                        .and_then(Value::as_str)
+                    {
+                        metadata.insert("cluster".to_owned(), cluster.to_owned());
+                    }
+                }
+                if let Some(zone) = endpoint.get("zone").and_then(Value::as_str).or_else(|| {
+                    endpoint
+                        .pointer("/topology/topology.kubernetes.io~1zone")
+                        .and_then(Value::as_str)
+                }) {
+                    metadata.insert("zone".to_owned(), zone.to_owned());
+                }
                 if let Some(name) = endpoint
                     .get("targetRef")
                     .and_then(|target| string_field(target, "name"))

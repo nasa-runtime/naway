@@ -26,10 +26,14 @@ pub mod acme;
 pub mod admin;
 #[path = "admin/admin_audit.rs"]
 pub mod admin_audit;
+#[path = "dataplane/admission.rs"]
+pub mod admission;
 #[path = "security/auth.rs"]
 pub mod auth;
 #[path = "security/blacklist.rs"]
 pub mod blacklist;
+#[path = "security/bot.rs"]
+mod bot;
 #[path = "io/bounded_io.rs"]
 mod bounded_io;
 #[path = "security/casbin_auth.rs"]
@@ -41,12 +45,16 @@ pub mod config;
 pub mod config_history;
 #[path = "dataplane/conn_registry.rs"]
 pub mod conn_registry;
+#[path = "security/csrf.rs"]
+mod csrf;
 #[path = "extensions/degraphql.rs"]
 mod degraphql;
 #[path = "extensions/developer_portal.rs"]
 pub mod developer_portal;
 #[path = "dataplane/discovery.rs"]
 pub mod discovery;
+#[path = "security/dlp.rs"]
+mod dlp;
 #[path = "extensions/dubbo.rs"]
 mod dubbo;
 #[cfg(all(feature = "grpc-edge", feature = "redis-runtime"))]
@@ -66,8 +74,16 @@ pub mod edge_relay;
 pub mod edge_ws_bridge;
 #[path = "security/enterprise_identity.rs"]
 mod enterprise_identity;
+#[path = "extensions/ext_proc.rs"]
+mod ext_proc;
+#[path = "security/external_crypto.rs"]
+pub mod external_crypto;
 #[path = "extensions/external_plugin.rs"]
 mod external_plugin;
+#[path = "dataplane/forward_proxy.rs"]
+pub mod forward_proxy;
+#[path = "security/geoip.rs"]
+mod geoip;
 #[path = "extensions/graphql.rs"]
 mod graphql;
 #[path = "extensions/grpc_edge.rs"]
@@ -75,6 +91,9 @@ pub mod grpc_edge;
 #[path = "extensions/grpc_transcoding.rs"]
 pub(crate) mod grpc_transcoding;
 pub mod guard;
+#[cfg(feature = "http3")]
+#[path = "dataplane/h3_quinn_tracked.rs"]
+pub(crate) mod h3_quinn_tracked;
 #[path = "dataplane/health.rs"]
 pub mod health;
 #[cfg(feature = "http3")]
@@ -87,10 +106,16 @@ pub mod http_cache;
 pub mod kafka;
 #[path = "dataplane/kubernetes_routes.rs"]
 pub mod kubernetes_routes;
+#[path = "dataplane/lb_hash.rs"]
+pub mod lb_hash;
+#[path = "dataplane/lb_load.rs"]
+pub mod lb_load;
 #[path = "extensions/llm.rs"]
 pub mod llm;
 #[path = "observability/log_sink.rs"]
 mod log_sink;
+#[path = "dataplane/masque.rs"]
+pub mod masque;
 #[path = "observability/metrics.rs"]
 pub mod metrics;
 #[cfg(feature = "mqtt-governance")]
@@ -104,6 +129,8 @@ pub mod proxy;
 #[path = "dataplane/proxy_protocol.rs"]
 pub mod proxy_protocol;
 pub mod reload;
+#[path = "security/remote_secret.rs"]
+mod remote_secret;
 #[path = "io/resp.rs"]
 pub mod resp;
 pub mod routing;
@@ -111,18 +138,28 @@ pub mod routing;
 pub mod runtime_state;
 #[path = "security/secret.rs"]
 pub mod secret;
+#[path = "security/spire.rs"]
+pub mod spire;
 #[path = "io/static_serve.rs"]
 pub mod static_serve;
 #[path = "observability/telemetry.rs"]
 pub mod telemetry;
 #[path = "dataplane/tls.rs"]
 pub mod tls;
+#[path = "dataplane/traffic_limit.rs"]
+pub mod traffic_limit;
 #[path = "dataplane/upstream.rs"]
 pub mod upstream;
+#[path = "security/upstream_credential.rs"]
+mod upstream_credential;
 #[path = "extensions/variable.rs"]
 pub mod variable;
+#[path = "security/waf.rs"]
+mod waf;
 #[path = "extensions/wasm.rs"]
 mod wasm;
+#[path = "dataplane/ws_frame.rs"]
+pub mod ws_frame;
 #[cfg(feature = "xds-client")]
 #[path = "control/xds.rs"]
 pub mod xds;

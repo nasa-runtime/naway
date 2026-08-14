@@ -129,9 +129,12 @@ struct GatewayInfrastructureIntent {
     annotations: BTreeMap<String, String>,
 }
 
+/// Kubernetes LIST 与后续 watch 之间的连续性凭据。
 #[derive(Clone)]
 struct WatchResource {
+    /// 已完成完整 LIST 的 collection 路径。
     path: String,
+    /// LIST 返回且通过字符门禁的 `metadata.resourceVersion`。
     resource_version: String,
 }
 
@@ -209,9 +212,43 @@ pub(crate) fn validate_config(
         cfg.gateway_api_version == "v1.5.1",
         "kubernetes_routes.gateway_api_version must be v1.5.1"
     );
+    anyhow::ensure!(
+        !cfg.inference_gateway_enabled || cfg.gateway_api_enabled,
+        "inference_gateway_enabled requires gateway_api_enabled=true"
+    );
+    anyhow::ensure!(
+        cfg.inference_extension_version == "v1.5.0",
+        "kubernetes_routes.inference_extension_version must be v1.5.0"
+    );
+    #[cfg(not(feature = "inference-gateway"))]
+    anyhow::ensure!(
+        !cfg.inference_gateway_enabled,
+        "InferencePool resources require the inference-gateway feature"
+    );
+    #[cfg(not(feature = "gateway-api-experimental"))]
+    anyhow::ensure!(
+        !cfg.gateway_api_experimental && !cfg.gateway_mesh_interception_ready,
+        "Gateway API experimental resources require the gateway-api-experimental feature"
+    );
+    anyhow::ensure!(
+        !cfg.gateway_mesh_interception_ready || cfg.gateway_api_experimental,
+        "gateway_mesh_interception_ready requires gateway_api_experimental=true"
+    );
     cfg.gateway_bind_address
         .parse::<std::net::IpAddr>()
         .context("kubernetes_routes.gateway_bind_address must be an IP address")?;
+    let mesh_bind_address = cfg
+        .gateway_mesh_bind_address
+        .parse::<std::net::IpAddr>()
+        .context("kubernetes_routes.gateway_mesh_bind_address must be an IP address")?;
+    anyhow::ensure!(
+        cfg.gateway_mesh_port > 0,
+        "kubernetes_routes.gateway_mesh_port must be non-zero"
+    );
+    anyhow::ensure!(
+        !cfg.gateway_mesh_interception_ready || mesh_bind_address.is_loopback(),
+        "gateway_mesh_interception_ready requires a loopback gateway_mesh_bind_address"
+    );
     cfg.gateway_stream_bind_address
         .parse::<std::net::IpAddr>()
         .context("kubernetes_routes.gateway_stream_bind_address must be an IP address")?;
@@ -432,6 +469,8 @@ pub(crate) fn apply_generated_routes(
             listen: generated.listen,
             cert_file: generated.cert_file,
             key_file: generated.key_file,
+            private_key_provider: None,
+            spire: None,
             keypair_manifest_file: None,
             certs: generated
                 .certs
@@ -440,9 +479,13 @@ pub(crate) fn apply_generated_routes(
                     server_names: cert.server_names,
                     cert_file: cert.cert_file,
                     key_file: cert.key_file,
+                    private_key_provider: None,
+                    ocsp_stapling: None,
                 })
                 .collect(),
             client_auth: None,
+            ocsp_stapling: None,
+            session_tickets: None,
             acme: None,
         };
         if cfg.proxies.is_empty() {
@@ -506,8 +549,14 @@ fn validate_generated_http_proxy(
         .gateway_bind_address
         .parse::<std::net::IpAddr>()
         .context("configured Gateway bind address is invalid")?;
+    let expected_mesh_ip = cfg
+        .gateway_mesh_bind_address
+        .parse::<std::net::IpAddr>()
+        .context("configured Gateway mesh bind address is invalid")?;
     anyhow::ensure!(
-        listen.ip() == expected_ip && listen.port() > 0,
+        (listen.ip() == expected_ip
+            || (listen.ip() == expected_mesh_ip && listen.port() == cfg.gateway_mesh_port))
+            && listen.port() > 0,
         "generated Gateway HTTP listen escapes configured bind address"
     );
     anyhow::ensure!(
@@ -575,6 +624,8 @@ fn generated_tls_cfg(generated: GeneratedProxyTls) -> TlsCfg {
         listen: generated.listen,
         cert_file: generated.cert_file,
         key_file: generated.key_file,
+        private_key_provider: None,
+        spire: None,
         keypair_manifest_file: None,
         certs: generated
             .certs
@@ -583,6 +634,8 @@ fn generated_tls_cfg(generated: GeneratedProxyTls) -> TlsCfg {
                 server_names: cert.server_names,
                 cert_file: cert.cert_file,
                 key_file: cert.key_file,
+                private_key_provider: None,
+                ocsp_stapling: None,
             })
             .collect(),
         client_auth: generated.client_ca_file.map(|ca_file| ClientAuthCfg {
@@ -594,7 +647,15 @@ fn generated_tls_cfg(generated: GeneratedProxyTls) -> TlsCfg {
                 "optional".to_owned()
             },
             ca_file,
+            crl_files: Vec::new(),
+            revocation_mode: "off".to_owned(),
+            enforce_crl_expiration: true,
+            ocsp: None,
+            allowed_spiffe_ids: Vec::new(),
+            allowed_spiffe_trust_domains: Vec::new(),
         }),
+        ocsp_stapling: None,
+        session_tickets: None,
         acme: None,
     }
 }
@@ -844,6 +905,13 @@ pub fn spawn_controller(
     });
 }
 
+/// 业务作用：累计 Kubernetes 控制面连续失败时间，并在陈旧上限到达后撤销由该来源生成的路由。
+///
+/// 参数说明：`config_dir`/`cfg`/`discovery` 固定物化目标与来源；`reload` 串行发布空候选；
+/// `failure_since` 和 `expired_published` 跨轮保存失败代际状态。
+///
+/// 返回：无；未到陈旧上限时保留 last-known-good，到期后只尝试发布一次空候选，发布失败留待
+/// 下一轮继续恢复，不能用未确认状态覆盖数据面。
 async fn mark_failure_and_maybe_expire(
     config_dir: &Path,
     cfg: &KubernetesRouteSourceCfg,
@@ -989,6 +1057,11 @@ async fn watch_one_resource(
     Ok(())
 }
 
+/// 业务作用：为 Kubernetes 路由控制器构建禁重定向并绑定声明式 CA 的 HTTP client。
+///
+/// 参数说明：`cfg` 提供 API server 信任根；Bearer token 在每次请求处单独注入。
+///
+/// 返回：CA 与 client 配置有效时返回复用连接的 client，否则拒绝启动控制器。
 fn build_client(cfg: &KubernetesDiscoveryCfg) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if !cfg.ca_certificate.is_empty() {
@@ -1192,6 +1265,40 @@ async fn fetch_and_compile(
             cfg.max_response_bytes,
         )
         .await?;
+        let (inference_pools, inference_pods) = if cfg.inference_gateway_enabled {
+            (
+                fetch_resource(
+                    client,
+                    discovery,
+                    "/apis/inference.networking.k8s.io/v1/inferencepools",
+                    cfg.max_response_bytes,
+                )
+                .await?,
+                fetch_resource(client, discovery, "/api/v1/pods", cfg.max_response_bytes).await?,
+            )
+        } else {
+            (json!({"items": []}), json!({"items": []}))
+        };
+        let (service_imports, backend_traffic_policies) = if cfg.gateway_api_experimental {
+            (
+                fetch_resource(
+                    client,
+                    discovery,
+                    "/apis/multicluster.x-k8s.io/v1alpha1/serviceimports",
+                    cfg.max_response_bytes,
+                )
+                .await?,
+                fetch_resource(
+                    client,
+                    discovery,
+                    "/apis/gateway.networking.x-k8s.io/v1alpha1/xbackendtrafficpolicies",
+                    cfg.max_response_bytes,
+                )
+                .await?,
+            )
+        } else {
+            (json!({"items": []}), json!({"items": []}))
+        };
         for (path, value) in [
             (
                 "/apis/gateway.networking.k8s.io/v1/gatewayclasses",
@@ -1229,12 +1336,27 @@ async fn fetch_and_compile(
             ),
             ("/api/v1/namespaces", &namespaces),
             ("/api/v1/services", &service_objects),
+            (
+                "/apis/inference.networking.k8s.io/v1/inferencepools",
+                &inference_pools,
+            ),
+            ("/api/v1/pods", &inference_pods),
+            (
+                "/apis/multicluster.x-k8s.io/v1alpha1/serviceimports",
+                &service_imports,
+            ),
+            (
+                "/apis/gateway.networking.x-k8s.io/v1alpha1/xbackendtrafficpolicies",
+                &backend_traffic_policies,
+            ),
         ] {
             if cfg.status_updates_enabled
                 && (path.contains("gatewayclasses")
                     || path.ends_with("/gateways")
                     || path.ends_with("/listenersets")
                     || path.ends_with("/backendtlspolicies")
+                    || path.ends_with("/xbackendtrafficpolicies")
+                    || path.ends_with("/inferencepools")
                     || path.ends_with("routes"))
             {
                 // status subresource 更新也会推进 resourceVersion；避免 controller 被自己的写入
@@ -1255,7 +1377,11 @@ async fn fetch_and_compile(
             &reference_grants,
             &namespaces,
             &service_objects,
+            &inference_pools,
+            &inference_pods,
+            &service_imports,
             &backend_tls_policies,
+            &backend_traffic_policies,
             &backend_tls_config_maps,
             &gateway_backend_clients,
             cfg,
@@ -1308,6 +1434,36 @@ async fn fetch_and_compile(
                 &service_catalog,
                 cfg,
             )?);
+            let service_import_catalog =
+                build_service_import_catalog(&service_imports, cfg.max_objects)?;
+            let backend_traffic_catalog = build_backend_traffic_catalog(
+                &backend_traffic_policies,
+                &service_catalog,
+                &service_import_catalog,
+                cfg,
+            )?;
+            control_statuses.extend(build_backend_traffic_status_intents(
+                &backend_traffic_catalog,
+                cfg,
+            )?);
+            if cfg.inference_gateway_enabled {
+                let inference_catalog = build_inference_pool_catalog(
+                    &inference_pools,
+                    &inference_pods,
+                    &service_catalog,
+                    cfg,
+                )?;
+                control_statuses.extend(build_inference_pool_status_intents(
+                    &classes,
+                    &gateways,
+                    &listener_sets,
+                    &namespaces,
+                    &http_routes,
+                    &inference_pools,
+                    &inference_catalog,
+                    cfg,
+                )?);
+            }
             anyhow::ensure!(
                 control_statuses.len() <= cfg.max_status_updates,
                 "Gateway control status updates exceed max_status_updates"
@@ -1919,35 +2075,6 @@ fn collect_finalizer_intents<const N: usize>(
         "Gateway API finalizer mutations exceed max_status_updates"
     );
     Ok(output)
-}
-
-/// 业务作用：为不含 ListenerSet 的 Gateway 快照构造控制面状态，保持基础 Gateway
-/// 编译入口的稳定边界。
-///
-/// 参数说明：Gateway API LIST、Secret 目录与 Route 诊断来自同轮；`cfg` 固定控制器边界。
-///
-/// 返回：返回 GatewayClass/Gateway 状态意图；语义异常时拒绝本轮状态。
-#[cfg(test)]
-fn build_control_status_intents(
-    classes_value: &Value,
-    gateways_value: &Value,
-    reference_grants_value: &Value,
-    secrets: &SecretCatalog,
-    cfg: &KubernetesRouteSourceCfg,
-    diagnostics: &[RouteDiagnostic],
-) -> anyhow::Result<Vec<ControlStatusIntent>> {
-    let empty = json!({"items":[]});
-    build_control_status_intents_with_listener_sets(
-        classes_value,
-        gateways_value,
-        &empty,
-        reference_grants_value,
-        &empty,
-        secrets,
-        &GatewayFrontendValidationCatalog::default(),
-        cfg,
-        diagnostics,
-    )
 }
 
 /// 业务作用：构造 GatewayClass/Gateway/ListenerSet 的 owned status，公开 listener 冲突、支持 kind 与附着计数。
@@ -2774,6 +2901,187 @@ fn gateway_condition(
     })
 }
 
+/// 业务作用：按被已接纳 HTTPRoute 引用的 Gateway 生成 InferencePool parent status，并在
+/// 引用撤销后删除本控制器旧条目，同时保留其它控制器已有的原子列表成员。
+///
+/// 参数说明：Gateway、Route、namespace 与 pool 目录均来自同轮 LIST；`cfg` 固定控制器身份。
+///
+/// 返回：每个 InferencePool 返回一个有界 status apply 意图；关联父级超过协议上限时拒绝本轮。
+#[allow(clippy::too_many_arguments)]
+fn build_inference_pool_status_intents(
+    classes_value: &Value,
+    gateways_value: &Value,
+    listener_sets_value: &Value,
+    namespaces_value: &Value,
+    http_routes_value: &Value,
+    pools_value: &Value,
+    pools: &InferencePoolCatalog,
+    cfg: &KubernetesRouteSourceCfg,
+) -> anyhow::Result<Vec<ControlStatusIntent>> {
+    let transition_time = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format InferencePool status timestamp")?;
+    let namespaces = build_namespace_catalog(namespaces_value, cfg.max_objects)?;
+    let gateways = build_gateway_catalog_with_listener_sets(
+        classes_value,
+        gateways_value,
+        listener_sets_value,
+        namespaces_value,
+        cfg,
+    )?;
+    let routes = resource_items(http_routes_value, cfg.max_objects, "HTTPRoute")?;
+    let mut output = Vec::new();
+    for pool_object in resource_items(pools_value, cfg.max_objects, "InferencePool")? {
+        let (pool_namespace, pool_name) = object_identity(pool_object, "InferencePool")?;
+        let resolved = pools
+            .pools
+            .get(&(pool_namespace.to_owned(), pool_name.to_owned()))
+            .is_some_and(|pool| pool.resolved);
+        let mut parents = BTreeSet::new();
+        for route in routes {
+            let (route_namespace, _) = object_identity(route, "HTTPRoute")?;
+            if route.pointer("/metadata/deletionTimestamp").is_some()
+                || !namespace_allowed(cfg, route_namespace)
+            {
+                continue;
+            }
+            let references_pool = route
+                .pointer("/spec/rules")
+                .and_then(Value::as_array)
+                .is_some_and(|rules| {
+                    rules.iter().any(|rule| {
+                        rule.get("backendRefs")
+                            .and_then(Value::as_array)
+                            .is_some_and(|backends| {
+                                backends.iter().any(|backend| {
+                                    backend.get("group").and_then(Value::as_str)
+                                        == Some("inference.networking.k8s.io")
+                                        && backend.get("kind").and_then(Value::as_str)
+                                            == Some("InferencePool")
+                                        && backend.get("name").and_then(Value::as_str)
+                                            == Some(pool_name)
+                                        && backend
+                                            .get("namespace")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or(route_namespace)
+                                            == pool_namespace
+                                })
+                            })
+                    })
+                });
+            if !references_pool {
+                continue;
+            }
+            for attached in
+                attached_listeners(route, route_namespace, "HTTPRoute", &gateways, &namespaces)?
+            {
+                parents.insert((
+                    attached.listener.gateway_namespace,
+                    attached.listener.gateway_name,
+                ));
+            }
+        }
+        anyhow::ensure!(
+            parents.len() <= 32,
+            "InferencePool {pool_namespace}/{pool_name} exceeds 32 parent Gateways"
+        );
+        let generation = pool_object
+            .pointer("/metadata/generation")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        let existing_parents = pool_object
+            .pointer("/status/parents")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut parent_statuses = existing_parents
+            .iter()
+            .filter(|parent| {
+                parent.get("controllerName").and_then(Value::as_str)
+                    != Some(cfg.gateway_controller_name.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for (gateway_namespace, gateway_name) in parents {
+            let parent_ref = json!({
+                "group": "gateway.networking.k8s.io",
+                "kind": "Gateway",
+                "namespace": gateway_namespace,
+                "name": gateway_name
+            });
+            let existing = existing_parents.iter().find(|parent| {
+                parent.get("controllerName").and_then(Value::as_str)
+                    == Some(cfg.gateway_controller_name.as_str())
+                    && parent.get("parentRef") == Some(&parent_ref)
+            });
+            let message = if resolved {
+                "InferencePool is referenced by an accepted HTTPRoute"
+            } else {
+                "InferencePool endpointPickerRef is unresolved"
+            };
+            let (accepted_transition, _) = condition_transition_time(
+                existing,
+                "Accepted",
+                "True",
+                "Accepted",
+                message,
+                generation,
+                &transition_time,
+            );
+            let resolved_status = if resolved { "True" } else { "False" };
+            let resolved_reason = if resolved {
+                "ResolvedRefs"
+            } else {
+                "InvalidExtensionRef"
+            };
+            let (resolved_transition, _) = condition_transition_time(
+                existing,
+                "ResolvedRefs",
+                resolved_status,
+                resolved_reason,
+                message,
+                generation,
+                &transition_time,
+            );
+            parent_statuses.push(json!({
+                "parentRef": parent_ref,
+                "controllerName": cfg.gateway_controller_name,
+                "conditions": [
+                    {
+                        "type": "Accepted",
+                        "status": "True",
+                        "observedGeneration": generation,
+                        "lastTransitionTime": accepted_transition,
+                        "reason": "Accepted",
+                        "message": message
+                    },
+                    {
+                        "type": "ResolvedRefs",
+                        "status": resolved_status,
+                        "observedGeneration": generation,
+                        "lastTransitionTime": resolved_transition,
+                        "reason": resolved_reason,
+                        "message": message
+                    }
+                ]
+            }));
+        }
+        anyhow::ensure!(
+            parent_statuses.len() <= 32,
+            "InferencePool {pool_namespace}/{pool_name} status exceeds 32 parent entries"
+        );
+        output.push(ControlStatusIntent {
+            api_version: "inference.networking.k8s.io/v1".to_owned(),
+            kind: "InferencePool".to_owned(),
+            plural: "inferencepools".to_owned(),
+            namespace: Some(pool_namespace.to_owned()),
+            name: pool_name.to_owned(),
+            status: json!({"parents": parent_statuses}),
+        });
+    }
+    Ok(output)
+}
+
 /// 业务作用：以独立 field manager 发布本 controller 拥有的 Route parent conditions，
 /// 不覆盖其它 Gateway controller 的 status entries。
 ///
@@ -2982,12 +3290,46 @@ async fn publish_route_status(
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or("Gateway");
-        if group != "gateway.networking.k8s.io" || !matches!(kind, "Gateway" | "ListenerSet") {
+        let gateway_parent =
+            group == "gateway.networking.k8s.io" && matches!(kind, "Gateway" | "ListenerSet");
+        let mesh_parent = (group.is_empty() && kind == "Service")
+            || (group == "multicluster.x-k8s.io" && kind == "ServiceImport");
+        if !gateway_parent && !mesh_parent {
             continue;
         }
         let parent_ref = normalized_parent_ref(parent, namespace)?;
-        let accepted_reason = if diagnostic.accepted {
+        let parent_namespace = parent
+            .get("namespace")
+            .and_then(Value::as_str)
+            .unwrap_or(namespace);
+        let parent_name = parent
+            .get("name")
+            .and_then(Value::as_str)
+            .context("Gateway Route parentRef missing name")?;
+        let parent_section = parent
+            .get("sectionName")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        // 未指定 sectionName 的 parentRef 授权该 parent 上任一匹配 listener；状态判断必须沿用
+        // 数据面附件语义，否则路由已发布时仍会对外声明 NoMatchingParent。
+        let parent_attached = diagnostic.attached_listeners.iter().any(
+            |(attached_kind, attached_namespace, attached_name, attached_section)| {
+                attached_kind == kind
+                    && attached_namespace == parent_namespace
+                    && attached_name == parent_name
+                    && (parent_section.is_empty() || attached_section == parent_section)
+            },
+        );
+        let parent_accepted = diagnostic.accepted && parent_attached;
+        let detached_reason = if mesh_parent && !cfg.gateway_mesh_interception_ready {
+            "UnsupportedValue"
+        } else {
+            "NoMatchingParent"
+        };
+        let accepted_reason = if parent_accepted {
             "Accepted"
+        } else if diagnostic.accepted {
+            detached_reason
         } else {
             diagnostic.reason.as_str()
         };
@@ -3007,7 +3349,7 @@ async fn publish_route_status(
                         && existing.get("parentRef") == Some(&parent_ref)
                 })
             });
-        let accepted_status = if diagnostic.accepted { "True" } else { "False" };
+        let accepted_status = if parent_accepted { "True" } else { "False" };
         let resolved_status = if diagnostic.resolved_refs {
             "True"
         } else {
@@ -3283,11 +3625,13 @@ enum AllowedNamespaces {
 struct GatewayListener {
     gateway_namespace: String,
     gateway_name: String,
+    parent_group: String,
     parent_kind: String,
     parent_namespace: String,
     parent_name: String,
     section_name: String,
     protocol: String,
+    parent_port: u16,
     port: u16,
     bind_address: String,
     hostname: Option<String>,
@@ -3304,6 +3648,9 @@ struct AllowedRouteKinds {
 struct GatewayCatalog {
     gateways: HashSet<(String, String)>,
     listener_sets: HashSet<(String, String)>,
+    mesh_parents: HashSet<(String, String, String, String)>,
+    mesh_interception_ready: bool,
+    mesh_source_namespace_header: String,
     listeners: Vec<GatewayListener>,
     address_decisions: HashMap<(String, String), GatewayAddressDecision>,
     listener_set_decisions: HashMap<(String, String), ListenerSetDecision>,
@@ -3339,6 +3686,90 @@ struct NamespaceCatalog {
 struct ServiceCatalog {
     ports: HashMap<(String, String), BTreeMap<(u16, String), Option<String>>>,
     port_names: HashMap<(String, String), BTreeMap<String, u16>>,
+    service_types: HashMap<(String, String), String>,
+}
+
+/// 同轮 InferencePool 身份到已验证后端与 EPP 计划的只读目录。
+#[derive(Default)]
+struct InferencePoolCatalog {
+    pools: HashMap<(String, String), InferencePoolBackend>,
+}
+
+/// 一个 InferencePool 可原子写入生成文档的完整后端计划。
+#[derive(Clone)]
+struct InferencePoolBackend {
+    resolved: bool,
+    pool_service: Value,
+    pool_logical: String,
+    epp_service: Value,
+    epp_logical: String,
+    fail_open: bool,
+}
+
+/// 同轮 ServiceImport 身份到端口、协议和具名端口的只读目录。
+#[derive(Default)]
+struct ServiceImportCatalog {
+    /// namespace/name 到数字端口、L4 protocol 与可选 appProtocol 的映射。
+    ports: HashMap<(String, String), BTreeMap<(u16, String), Option<String>>>,
+    /// namespace/name 下的具名端口到数字端口映射。
+    port_names: HashMap<(String, String), BTreeMap<String, u16>>,
+}
+
+/// `XBackendTrafficPolicy.targetRefs` 的完整后端身份。
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct BackendTrafficTargetKey {
+    /// 目标 API group；core Service 使用空串。
+    group: String,
+    /// 目标 kind，仅接受 Service 或 ServiceImport。
+    kind: String,
+    /// 策略与目标共同所在的 namespace。
+    namespace: String,
+    /// 目标对象名。
+    name: String,
+}
+
+/// 已可无损表达为 Naway 服务配置的后端流量策略。
+#[derive(Clone)]
+struct BackendTrafficPolicyConfig {
+    /// 可选的共享重试预算。
+    retry_budget: Option<Value>,
+    /// 可选的 cookie 或 header 会话保持配置。
+    session_affinity: Option<Value>,
+}
+
+/// 单个 targetRef 的接纳与引用解析结论。
+struct BackendTrafficTargetDecision {
+    /// 完整目标身份。
+    key: BackendTrafficTargetKey,
+    /// 当前策略是否取得该目标的唯一所有权。
+    accepted: bool,
+    /// 目标是否存在且属于受支持资源。
+    resolved_refs: bool,
+    /// 写入 Accepted condition 的稳定原因。
+    accepted_reason: &'static str,
+    /// 写入 ResolvedRefs condition 的稳定原因。
+    resolved_reason: &'static str,
+    /// 有界且不含敏感信息的诊断文本。
+    message: String,
+}
+
+/// 一个策略对象及其所有目标的确定性裁决结果。
+struct BackendTrafficPolicyDecision {
+    /// 原对象 metadata，用于生成 status owner 意图。
+    object: Value,
+    /// 每个 targetRef 的独立 condition 事实。
+    targets: Vec<BackendTrafficTargetDecision>,
+    /// 语法有效时的原生配置；策略体无效时为空且不得占用目标。
+    config: Option<BackendTrafficPolicyConfig>,
+}
+
+/// 全部后端流量策略及每个目标唯一赢家的只读目录。
+#[derive(Default)]
+struct BackendTrafficCatalog {
+    /// 按稳定对象顺序保存的策略及 status 事实。
+    policies: Vec<BackendTrafficPolicyDecision>,
+    /// 目标到最早有效策略下标的映射。
+    selected: BTreeMap<BackendTrafficTargetKey, usize>,
 }
 
 #[derive(Default)]
@@ -3970,27 +4401,6 @@ fn append_gateway_stream_tls_identity(
     Ok(())
 }
 
-/// 业务作用：为不含 ListenerSet 的 Gateway 构造 HTTP/HTTPS listener 权威表。
-///
-/// 参数说明：GatewayClass/Gateway 来自同轮 LIST；`cfg` 固定 controller 与绑定边界。
-///
-/// 返回：返回按 socket 分组的 listener 计划；对象异常或预算越界时失败闭合。
-#[cfg(test)]
-fn build_gateway_listener_plans(
-    classes_value: &Value,
-    gateways_value: &Value,
-    cfg: &KubernetesRouteSourceCfg,
-) -> anyhow::Result<BTreeMap<HttpListenerKey, Vec<GatewayListenerPlan>>> {
-    let empty = json!({"items":[]});
-    build_gateway_listener_plans_with_listener_sets(
-        classes_value,
-        gateways_value,
-        &empty,
-        &empty,
-        cfg,
-    )
-}
-
 /// 业务作用：从已裁决冲突的 Gateway HTTP/HTTPS listener 构造共享 socket 的逻辑权威表，
 /// 供请求层隔离 Host 路由，并在 HTTPS 上判断 TLS SNI 是否选择同一 listener。
 ///
@@ -4203,6 +4613,8 @@ struct BackendTarget {
     logical: String,
     weight: u32,
     filters: Vec<String>,
+    inference_pool: Option<Value>,
+    ext_proc: Option<Value>,
 }
 
 #[derive(Default)]
@@ -4321,56 +4733,6 @@ fn diagnostic_reason(message: &str) -> &'static str {
     }
 }
 
-/// 业务作用：编译不含 ListenerSet 的 Gateway API Route，保持基础 Route 编译入口稳定。
-///
-/// 参数说明：各 LIST 与输出集合来自同一候选 generation；`cfg` 固定控制器边界。
-///
-/// 返回：成功时填充 HTTP/L4 候选与诊断；任何安全门失败时返回错误。
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn compile_gateway_api_full(
-    classes_value: &Value,
-    gateways_value: &Value,
-    http_routes_value: &Value,
-    grpc_routes_value: &Value,
-    tls_routes_value: &Value,
-    tcp_routes_value: &Value,
-    udp_routes_value: &Value,
-    reference_grants_value: &Value,
-    namespaces_value: &Value,
-    service_objects_value: &Value,
-    cfg: &KubernetesRouteSourceCfg,
-    routes: &mut Vec<Value>,
-    http_listener_routes: &mut BTreeMap<HttpListenerKey, Vec<Value>>,
-    services: &mut BTreeMap<String, Value>,
-    stream_listeners: &mut Vec<Value>,
-    diagnostics: &mut Vec<RouteDiagnostic>,
-) -> anyhow::Result<()> {
-    let empty = json!({"items":[]});
-    compile_gateway_api_full_with_listener_sets(
-        classes_value,
-        gateways_value,
-        &empty,
-        http_routes_value,
-        grpc_routes_value,
-        tls_routes_value,
-        tcp_routes_value,
-        udp_routes_value,
-        reference_grants_value,
-        namespaces_value,
-        service_objects_value,
-        &empty,
-        &ConfigMapCatalog::default(),
-        &GatewayBackendClientCatalog::default(),
-        cfg,
-        routes,
-        http_listener_routes,
-        services,
-        stream_listeners,
-        diagnostics,
-    )
-}
-
 /// 业务作用：把 Gateway API 各 Route 类型编译为统一 HTTP/L4 候选，并在任何外部副作用前
 /// 完成 listener、namespace、ReferenceGrant、Service port 与 filter 安全门校验。
 ///
@@ -4391,7 +4753,11 @@ fn compile_gateway_api_full_with_listener_sets(
     reference_grants_value: &Value,
     namespaces_value: &Value,
     service_objects_value: &Value,
+    inference_pools_value: &Value,
+    inference_pods_value: &Value,
+    service_imports_value: &Value,
     backend_tls_policies_value: &Value,
+    backend_traffic_policies_value: &Value,
     backend_tls_config_maps: &ConfigMapCatalog,
     gateway_backend_clients: &GatewayBackendClientCatalog,
     cfg: &KubernetesRouteSourceCfg,
@@ -4403,6 +4769,25 @@ fn compile_gateway_api_full_with_listener_sets(
 ) -> anyhow::Result<()> {
     let namespaces = build_namespace_catalog(namespaces_value, cfg.max_objects)?;
     let service_catalog = build_service_catalog(service_objects_value, cfg.max_objects)?;
+    let inference_pools = cfg
+        .inference_gateway_enabled
+        .then(|| {
+            build_inference_pool_catalog(
+                inference_pools_value,
+                inference_pods_value,
+                &service_catalog,
+                cfg,
+            )
+        })
+        .transpose()?;
+    let service_import_catalog =
+        build_service_import_catalog(service_imports_value, cfg.max_objects)?;
+    let backend_traffic = build_backend_traffic_catalog(
+        backend_traffic_policies_value,
+        &service_catalog,
+        &service_import_catalog,
+        cfg,
+    )?;
     let backend_tls = build_backend_tls_catalog(
         backend_tls_policies_value,
         backend_tls_config_maps,
@@ -4412,11 +4797,19 @@ fn compile_gateway_api_full_with_listener_sets(
     let grants = ReferenceGrantCatalog {
         grants: resource_items(reference_grants_value, cfg.max_objects, "ReferenceGrant")?,
     };
-    let gateways = build_gateway_catalog_with_listener_sets(
+    let mut gateways = build_gateway_catalog_with_listener_sets(
         classes_value,
         gateways_value,
         listener_sets_value,
         namespaces_value,
+        cfg,
+    )?;
+    extend_gateway_catalog_with_mesh_parents(
+        &mut gateways,
+        http_routes_value,
+        grpc_routes_value,
+        &service_catalog,
+        &service_import_catalog,
         cfg,
     )?;
     for listener in &gateways.listeners {
@@ -4436,6 +4829,9 @@ fn compile_gateway_api_full_with_listener_sets(
         &gateways,
         &namespaces,
         &service_catalog,
+        &service_import_catalog,
+        inference_pools.as_ref(),
+        &backend_traffic,
         &grants,
         http_listener_routes,
         services,
@@ -4447,6 +4843,8 @@ fn compile_gateway_api_full_with_listener_sets(
         &gateways,
         &namespaces,
         &service_catalog,
+        &service_import_catalog,
+        &backend_traffic,
         &grants,
         http_listener_routes,
         services,
@@ -4467,6 +4865,8 @@ fn compile_gateway_api_full_with_listener_sets(
         &gateways,
         &namespaces,
         &service_catalog,
+        &service_import_catalog,
+        &backend_traffic,
         &grants,
         services,
         &mut l4,
@@ -4479,6 +4879,8 @@ fn compile_gateway_api_full_with_listener_sets(
         &gateways,
         &namespaces,
         &service_catalog,
+        &service_import_catalog,
+        &backend_traffic,
         &grants,
         services,
         &mut l4,
@@ -4491,6 +4893,8 @@ fn compile_gateway_api_full_with_listener_sets(
         &gateways,
         &namespaces,
         &service_catalog,
+        &service_import_catalog,
+        &backend_traffic,
         &grants,
         services,
         &mut l4,
@@ -4559,6 +4963,17 @@ fn build_service_catalog(value: &Value, max_objects: usize) -> anyhow::Result<Se
     let mut catalog = ServiceCatalog::default();
     for service in resource_items(value, max_objects, "Service")? {
         let (namespace, name) = object_identity(service, "Service")?;
+        let service_type = service
+            .pointer("/spec/type")
+            .and_then(Value::as_str)
+            .unwrap_or("ClusterIP");
+        anyhow::ensure!(
+            matches!(
+                service_type,
+                "ClusterIP" | "NodePort" | "LoadBalancer" | "ExternalName"
+            ),
+            "Service {namespace}/{name} has invalid type"
+        );
         let mut ports = BTreeMap::new();
         let mut port_names = BTreeMap::new();
         for port in service
@@ -4610,9 +5025,1013 @@ fn build_service_catalog(value: &Value, max_objects: usize) -> anyhow::Result<Se
         catalog
             .ports
             .insert((namespace.to_owned(), name.to_owned()), ports);
+        catalog.service_types.insert(
+            (namespace.to_owned(), name.to_owned()),
+            service_type.to_owned(),
+        );
         catalog
             .port_names
             .insert((namespace.to_owned(), name.to_owned()), port_names);
+    }
+    Ok(catalog)
+}
+
+/// 业务作用：把 InferencePool、Ready Pod 与 EPP Service 的同轮事实编译为静态池目录和
+/// 标准 External Processing 计划，避免选择器、端口与扩展引用跨 LIST 版本拼接。
+///
+/// 参数说明：`pools_value`、`pods_value` 和 `service_catalog` 来自同一轮 relist；`cfg`
+/// 提供对象与 endpoint 预算。
+///
+/// 返回：全部池合同合法时返回只读目录；未知字段、非法选择器、ExternalName EPP、坏端口
+/// 或重复身份拒绝整轮候选并保留已发布版本。
+fn build_inference_pool_catalog(
+    pools_value: &Value,
+    pods_value: &Value,
+    service_catalog: &ServiceCatalog,
+    cfg: &KubernetesRouteSourceCfg,
+) -> anyhow::Result<InferencePoolCatalog> {
+    let pods = resource_items(pods_value, cfg.max_objects, "Pod")?;
+    let mut catalog = InferencePoolCatalog::default();
+    for pool in resource_items(pools_value, cfg.max_objects, "InferencePool")? {
+        let (namespace, name) = object_identity(pool, "InferencePool")?;
+        let spec = pool.get("spec").context("InferencePool missing spec")?;
+        ensure_json_object_fields(
+            spec,
+            "InferencePool spec",
+            &[
+                "selector",
+                "targetPorts",
+                "appProtocol",
+                "endpointPickerRef",
+            ],
+        )?;
+        let selector = spec
+            .get("selector")
+            .context("InferencePool missing spec.selector")?;
+        ensure_json_object_fields(selector, "InferencePool selector", &["matchLabels"])?;
+        let match_labels = selector
+            .get("matchLabels")
+            .and_then(Value::as_object)
+            .context("InferencePool selector.matchLabels must be an object")?;
+        anyhow::ensure!(
+            (1..=64).contains(&match_labels.len()),
+            "InferencePool {namespace}/{name} selector requires 1..=64 labels"
+        );
+        let match_labels = match_labels
+            .iter()
+            .map(|(key, value)| {
+                anyhow::ensure!(
+                    !key.is_empty() && key.len() <= 253,
+                    "InferencePool {namespace}/{name} selector key has invalid length"
+                );
+                let value = value
+                    .as_str()
+                    .context("InferencePool selector.matchLabels values must be strings")?;
+                anyhow::ensure!(
+                    value.len() <= 63,
+                    "InferencePool {namespace}/{name} selector value is too long"
+                );
+                Ok((key.clone(), value.to_owned()))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let target_ports = spec
+            .get("targetPorts")
+            .and_then(Value::as_array)
+            .context("InferencePool targetPorts must be an array")?;
+        anyhow::ensure!(
+            (1..=8).contains(&target_ports.len()),
+            "InferencePool {namespace}/{name} targetPorts requires 1..=8 entries"
+        );
+        let mut ports = BTreeSet::new();
+        for port in target_ports {
+            ensure_json_object_fields(port, "InferencePool targetPort", &["number"])?;
+            let number = port
+                .get("number")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .context("InferencePool targetPort.number must be within 1..=65535")?;
+            anyhow::ensure!(
+                ports.insert(number),
+                "InferencePool {namespace}/{name} repeats target port {number}"
+            );
+        }
+        let app_protocol = spec
+            .get("appProtocol")
+            .and_then(Value::as_str)
+            .unwrap_or("http");
+        let protocol = match app_protocol {
+            "http" => None,
+            "kubernetes.io/h2c" => Some("h2c"),
+            other => bail!("InferencePool {namespace}/{name} appProtocol `{other}` is unsupported"),
+        };
+        let endpoint_picker = spec
+            .get("endpointPickerRef")
+            .context("InferencePool missing endpointPickerRef")?;
+        ensure_json_object_fields(
+            endpoint_picker,
+            "InferencePool endpointPickerRef",
+            &["group", "kind", "name", "port", "failureMode"],
+        )?;
+        anyhow::ensure!(
+            endpoint_picker
+                .get("group")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty(),
+            "InferencePool {namespace}/{name} EPP group must be core"
+        );
+        anyhow::ensure!(
+            endpoint_picker
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("Service")
+                == "Service",
+            "InferencePool {namespace}/{name} EPP kind must be Service"
+        );
+        let epp_name = endpoint_picker
+            .get("name")
+            .and_then(Value::as_str)
+            .context("InferencePool endpointPickerRef missing name")?;
+        validate_kubernetes_name("InferencePool EPP Service", epp_name)?;
+        let epp_port_value = endpoint_picker
+            .get("port")
+            .context("InferencePool Service endpointPickerRef requires port")?;
+        ensure_json_object_fields(epp_port_value, "InferencePool EPP port", &["number"])?;
+        let epp_port = epp_port_value
+            .get("number")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .context("InferencePool EPP port.number must be within 1..=65535")?;
+        let service_key = (namespace.to_owned(), epp_name.to_owned());
+        let epp_resolved = service_catalog
+            .ports
+            .get(&service_key)
+            .is_some_and(|ports| ports.contains_key(&(epp_port, "TCP".to_owned())))
+            && service_catalog
+                .service_types
+                .get(&service_key)
+                .is_some_and(|service_type| service_type != "ExternalName");
+        let fail_open = match endpoint_picker
+            .get("failureMode")
+            .and_then(Value::as_str)
+            .unwrap_or("FailClose")
+        {
+            "FailOpen" => true,
+            "FailClose" => false,
+            other => {
+                bail!("InferencePool {namespace}/{name} EPP failureMode `{other}` is unsupported")
+            }
+        };
+        if !epp_resolved {
+            let key = (namespace.to_owned(), name.to_owned());
+            anyhow::ensure!(
+                catalog
+                    .pools
+                    .insert(
+                        key,
+                        InferencePoolBackend {
+                            resolved: false,
+                            pool_service: Value::Null,
+                            pool_logical: String::new(),
+                            epp_service: Value::Null,
+                            epp_logical: String::new(),
+                            fail_open,
+                        },
+                    )
+                    .is_none(),
+                "InferencePool {namespace}/{name} is duplicated"
+            );
+            continue;
+        }
+
+        let mut instances = Vec::new();
+        for pod in pods {
+            let (pod_namespace, _) = object_identity(pod, "Pod")?;
+            if pod_namespace != namespace
+                || pod
+                    .pointer("/metadata/deletionTimestamp")
+                    .is_some_and(|value| !value.is_null())
+                || pod.pointer("/status/phase").and_then(Value::as_str) != Some("Running")
+            {
+                continue;
+            }
+            let pod_labels = pod.pointer("/metadata/labels").and_then(Value::as_object);
+            if !match_labels.iter().all(|(key, expected)| {
+                pod_labels
+                    .and_then(|labels| labels.get(key))
+                    .and_then(Value::as_str)
+                    == Some(expected.as_str())
+            }) {
+                continue;
+            }
+            let ready = pod
+                .pointer("/status/conditions")
+                .and_then(Value::as_array)
+                .is_some_and(|conditions| {
+                    conditions.iter().any(|condition| {
+                        condition.get("type").and_then(Value::as_str) == Some("Ready")
+                            && condition.get("status").and_then(Value::as_str) == Some("True")
+                    })
+                });
+            if !ready {
+                continue;
+            }
+            let pod_ip = pod
+                .pointer("/status/podIP")
+                .and_then(Value::as_str)
+                .context("Ready InferencePool Pod missing status.podIP")?
+                .parse::<std::net::IpAddr>()
+                .context("Ready InferencePool Pod has invalid status.podIP")?;
+            for port in &ports {
+                instances.push(json!({
+                    "uri": format!("http://{}", std::net::SocketAddr::new(pod_ip, *port))
+                }));
+                anyhow::ensure!(
+                    instances.len() <= cfg.max_objects,
+                    "InferencePool {namespace}/{name} expands beyond max_objects endpoints"
+                );
+            }
+        }
+        instances.sort_by(|left, right| {
+            left.get("uri")
+                .and_then(Value::as_str)
+                .cmp(&right.get("uri").and_then(Value::as_str))
+        });
+        let pool_logical = stable_id("k8s-inference-pool", &[namespace, name, app_protocol]);
+        let mut pool_service = json!({"instances": instances});
+        if let Some(protocol) = protocol {
+            pool_service["protocol"] = json!(protocol);
+        }
+        let mut generated_epp = BTreeMap::new();
+        let epp_logical = insert_generated_service_with_protocol(
+            &mut generated_epp,
+            namespace,
+            epp_name,
+            &BackendPort::Number(epp_port),
+            "https",
+            Some("h2"),
+        )?;
+        let mut epp_service = generated_epp
+            .remove(&epp_logical)
+            .context("generated EPP service disappeared")?;
+        // EPP 的 HTTPS 端点使用启动期动态自签证书；同 namespace 的 core Service 与发现实例
+        // 已限定目标权威，因此这里只关闭证书身份认证，仍使用 TLS/H2 保护传输和握手完整性。
+        epp_service["tls"] = json!({"insecure_skip_verify": true});
+        let key = (namespace.to_owned(), name.to_owned());
+        anyhow::ensure!(
+            catalog
+                .pools
+                .insert(
+                    key,
+                    InferencePoolBackend {
+                        resolved: true,
+                        pool_service,
+                        pool_logical,
+                        epp_service,
+                        epp_logical,
+                        fail_open,
+                    },
+                )
+                .is_none(),
+            "InferencePool {namespace}/{name} is duplicated"
+        );
+    }
+    Ok(catalog)
+}
+
+/// 业务作用：冻结 MCS ServiceImport 的端口与协议目录，使跨集群后端和本地 Service
+/// 经过同一引用、权重及 transport 校验链。
+///
+/// 参数说明：`value` 是 multicluster.x-k8s.io/v1alpha1 ServiceImport LIST；
+/// `max_objects` 是对象硬上限。
+///
+/// 返回：返回可路由的 ClusterSetIP ServiceImport 目录；Headless、坏端口或重复身份
+/// 使本轮候选失败闭合。
+fn build_service_import_catalog(
+    value: &Value,
+    max_objects: usize,
+) -> anyhow::Result<ServiceImportCatalog> {
+    let mut catalog = ServiceImportCatalog::default();
+    for service in resource_items(value, max_objects, "ServiceImport")? {
+        ensure_json_object_fields(
+            service,
+            "ServiceImport",
+            &["apiVersion", "kind", "metadata", "spec", "status"],
+        )?;
+        anyhow::ensure!(
+            service.get("apiVersion").and_then(Value::as_str)
+                == Some("multicluster.x-k8s.io/v1alpha1")
+                && service.get("kind").and_then(Value::as_str) == Some("ServiceImport"),
+            "ServiceImport resource identity is unsupported"
+        );
+        let (namespace, name) = object_identity(service, "ServiceImport")?;
+        let spec = service.get("spec").context("ServiceImport missing spec")?;
+        ensure_json_object_fields(
+            spec,
+            "ServiceImport spec",
+            &[
+                "ips",
+                "ports",
+                "sessionAffinity",
+                "sessionAffinityConfig",
+                "type",
+            ],
+        )?;
+        anyhow::ensure!(
+            service.pointer("/spec/type").and_then(Value::as_str) == Some("ClusterSetIP"),
+            "ServiceImport {namespace}/{name} must use type ClusterSetIP"
+        );
+        anyhow::ensure!(
+            service
+                .pointer("/spec/sessionAffinity")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value == "None")
+                && service.pointer("/spec/sessionAffinityConfig").is_none(),
+            "ServiceImport {namespace}/{name} sessionAffinity is unsupported"
+        );
+        let mut ports = BTreeMap::new();
+        let mut port_names = BTreeMap::new();
+        for port in service
+            .pointer("/spec/ports")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            ensure_json_object_fields(
+                &port,
+                "ServiceImport port",
+                &["appProtocol", "name", "port", "protocol"],
+            )?;
+            let number = port
+                .get("port")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port > 0)
+                .context("ServiceImport port must be a non-zero number")?;
+            let protocol = port
+                .get("protocol")
+                .and_then(Value::as_str)
+                .unwrap_or("TCP")
+                .to_ascii_uppercase();
+            anyhow::ensure!(
+                matches!(protocol.as_str(), "TCP" | "UDP" | "SCTP"),
+                "ServiceImport {namespace}/{name} port {number} has invalid protocol"
+            );
+            let app_protocol = port
+                .get("appProtocol")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(app_protocol) = &app_protocol {
+                anyhow::ensure!(
+                    !app_protocol.is_empty() && app_protocol.len() <= 63,
+                    "ServiceImport {namespace}/{name} port {number} appProtocol has invalid length"
+                );
+            }
+            anyhow::ensure!(
+                ports
+                    .insert((number, protocol.clone()), app_protocol)
+                    .is_none(),
+                "ServiceImport {namespace}/{name} repeats {protocol} port {number}"
+            );
+            if let Some(port_name) = port.get("name").and_then(Value::as_str) {
+                validate_kubernetes_name("ServiceImport port name", port_name)?;
+                anyhow::ensure!(
+                    port_names.insert(port_name.to_owned(), number).is_none(),
+                    "ServiceImport {namespace}/{name} repeats port name {port_name}"
+                );
+            }
+        }
+        anyhow::ensure!(
+            !ports.is_empty(),
+            "ServiceImport {namespace}/{name} has no usable ports"
+        );
+        catalog
+            .ports
+            .insert((namespace.to_owned(), name.to_owned()), ports);
+        catalog
+            .port_names
+            .insert((namespace.to_owned(), name.to_owned()), port_names);
+    }
+    Ok(catalog)
+}
+
+/// 业务作用：把 HTTPRoute/GRPCRoute 的 Service 与 ServiceImport parent 物化为独立
+/// Mesh listener 权威，只有透明流量捕获已就绪时才开放业务路由。
+///
+/// 参数说明：Route 与 backend 目录来自同轮 LIST；`catalog` 接收合成 listener；
+/// `cfg` 固定受保护 socket 和源 namespace header。
+///
+/// 返回：所有 mesh parent、sectionName 与 port 可解析且不会占用 Gateway socket 时成功；
+/// 未就绪时只记录 parent 存在性供 status 拒绝，不生成可达 listener。
+#[allow(clippy::too_many_arguments)]
+fn extend_gateway_catalog_with_mesh_parents(
+    catalog: &mut GatewayCatalog,
+    http_routes: &Value,
+    grpc_routes: &Value,
+    services: &ServiceCatalog,
+    service_imports: &ServiceImportCatalog,
+    cfg: &KubernetesRouteSourceCfg,
+) -> anyhow::Result<()> {
+    let mesh_ip = cfg
+        .gateway_mesh_bind_address
+        .parse::<std::net::IpAddr>()
+        .context("parse Gateway mesh bind address")?;
+    let mesh_socket = std::net::SocketAddr::new(mesh_ip, cfg.gateway_mesh_port);
+    anyhow::ensure!(
+        !catalog.listeners.iter().any(|listener| {
+            listener.bind_address == cfg.gateway_mesh_bind_address
+                && listener.port == cfg.gateway_mesh_port
+        }),
+        "Gateway mesh listener conflicts with a Gateway API listener socket"
+    );
+    let mut synthesized = BTreeSet::new();
+    for (route_kind, value) in [("HTTPRoute", http_routes), ("GRPCRoute", grpc_routes)] {
+        for route in resource_items(value, cfg.max_objects, route_kind)? {
+            let (route_namespace, _) = object_identity(route, route_kind)?;
+            if !namespace_allowed(cfg, route_namespace)
+                || route.pointer("/metadata/deletionTimestamp").is_some()
+            {
+                continue;
+            }
+            let parents = route
+                .pointer("/spec/parentRefs")
+                .and_then(Value::as_array)
+                .context("Gateway Route missing spec.parentRefs")?;
+            for parent in parents {
+                let group = parent
+                    .get("group")
+                    .and_then(Value::as_str)
+                    .unwrap_or("gateway.networking.k8s.io");
+                let kind = parent
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Gateway");
+                let service_import = group == "multicluster.x-k8s.io" && kind == "ServiceImport";
+                if !(group.is_empty() && kind == "Service") && !service_import {
+                    continue;
+                }
+                let name = parent
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .context("Mesh Route parentRef missing name")?;
+                let namespace = parent
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or(route_namespace);
+                validate_kubernetes_name("Mesh parent namespace", namespace)?;
+                validate_kubernetes_name("Mesh parent name", name)?;
+                let (ports, port_names) = if service_import {
+                    (&service_imports.ports, &service_imports.port_names)
+                } else {
+                    (&services.ports, &services.port_names)
+                };
+                let identity = (namespace.to_owned(), name.to_owned());
+                let available_ports = ports.get(&identity).with_context(|| {
+                    format!("Mesh parent {kind} {namespace}/{name} does not exist")
+                })?;
+                let section = parent.get("sectionName").and_then(Value::as_str);
+                let declared_port = parent
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok());
+                let named_port = section
+                    .map(|section| {
+                        validate_kubernetes_name("Mesh parent sectionName", section)?;
+                        port_names
+                            .get(&identity)
+                            .and_then(|names| names.get(section))
+                            .copied()
+                            .with_context(|| {
+                                format!(
+                                    "Mesh parent {kind} {namespace}/{name} has no port named {section}"
+                                )
+                            })
+                    })
+                    .transpose()?;
+                if let (Some(declared), Some(named)) = (declared_port, named_port) {
+                    anyhow::ensure!(
+                        declared == named,
+                        "Mesh parent sectionName and port select different Service ports"
+                    );
+                }
+                let parent_port = declared_port.or(named_port).unwrap_or(0);
+                if parent_port != 0 {
+                    anyhow::ensure!(
+                        available_ports.contains_key(&(parent_port, "TCP".to_owned())),
+                        "Mesh parent {kind} {namespace}/{name} has no TCP port {parent_port}"
+                    );
+                }
+                catalog.mesh_parents.insert((
+                    group.to_owned(),
+                    kind.to_owned(),
+                    namespace.to_owned(),
+                    name.to_owned(),
+                ));
+                if !cfg.gateway_mesh_interception_ready {
+                    continue;
+                }
+                let hostname = if service_import {
+                    format!("{name}.{namespace}.svc.clusterset.local")
+                } else {
+                    format!("{name}.{namespace}.svc.cluster.local")
+                };
+                let synthesis_key = (
+                    group.to_owned(),
+                    kind.to_owned(),
+                    namespace.to_owned(),
+                    name.to_owned(),
+                    section.unwrap_or("").to_owned(),
+                    parent_port,
+                    hostname.clone(),
+                );
+                if !synthesized.insert(synthesis_key) {
+                    continue;
+                }
+                catalog.listeners.push(GatewayListener {
+                    gateway_namespace: namespace.to_owned(),
+                    gateway_name: name.to_owned(),
+                    parent_group: group.to_owned(),
+                    parent_kind: kind.to_owned(),
+                    parent_namespace: namespace.to_owned(),
+                    parent_name: name.to_owned(),
+                    section_name: section.unwrap_or("").to_owned(),
+                    protocol: "HTTP".to_owned(),
+                    parent_port,
+                    port: mesh_socket.port(),
+                    bind_address: mesh_socket.ip().to_string(),
+                    hostname: Some(hostname),
+                    tls_mode: None,
+                    allowed_namespaces: AllowedNamespaces::All,
+                    allowed_kinds: ["HTTPRoute".to_owned(), "GRPCRoute".to_owned()]
+                        .into_iter()
+                        .collect(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 业务作用：把 Gateway API BackendTrafficPolicy 的重试与会话字段编译为 Naway
+/// 原生服务策略，确保所有 Route 类型共享同一份执行结果。
+///
+/// 参数说明：`policy` 是已通过对象身份门禁的策略对象；`default_session_name` 是
+/// 未显式命名时按 policy 身份生成的隔离名称。
+///
+/// 返回：字段组合可由原生策略精确表达时返回配置；未知或越界值拒绝当前候选。
+fn compile_backend_traffic_policy_config(
+    policy: &Value,
+    default_session_name: &str,
+) -> anyhow::Result<BackendTrafficPolicyConfig> {
+    ensure_json_object_fields(
+        policy,
+        "XBackendTrafficPolicy",
+        &["apiVersion", "kind", "metadata", "spec", "status"],
+    )?;
+    let spec = policy
+        .get("spec")
+        .context("XBackendTrafficPolicy missing spec")?;
+    ensure_json_object_fields(
+        spec,
+        "XBackendTrafficPolicy spec",
+        &["retryConstraint", "sessionPersistence", "targetRefs"],
+    )?;
+    let retry_budget = policy
+        .pointer("/spec/retryConstraint")
+        .map(|constraint| -> anyhow::Result<Value> {
+            ensure_json_object_fields(constraint, "retryConstraint", &["budget", "minRetryRate"])?;
+            if let Some(budget) = constraint.get("budget") {
+                ensure_json_object_fields(
+                    budget,
+                    "retryConstraint budget",
+                    &["interval", "percent"],
+                )?;
+            }
+            if let Some(minimum) = constraint.get("minRetryRate") {
+                ensure_json_object_fields(
+                    minimum,
+                    "retryConstraint minRetryRate",
+                    &["count", "interval"],
+                )?;
+            }
+            let percent = constraint
+                .pointer("/budget/percent")
+                .and_then(Value::as_u64)
+                .unwrap_or(20);
+            anyhow::ensure!(percent <= 100, "retry budget percent exceeds 100");
+            let interval_ms = constraint
+                .pointer("/budget/interval")
+                .and_then(Value::as_str)
+                .unwrap_or("10s");
+            let interval_ms = parse_gateway_duration_ms(interval_ms)?;
+            anyhow::ensure!(
+                (1_000..=3_600_000).contains(&interval_ms),
+                "retry budget interval must be within 1s..=1h"
+            );
+            let min_count = constraint
+                .pointer("/minRetryRate/count")
+                .and_then(Value::as_u64)
+                .unwrap_or(10);
+            anyhow::ensure!(
+                (1..=1_000_000).contains(&min_count),
+                "minRetryRate count is out of range"
+            );
+            let min_interval_ms = constraint
+                .pointer("/minRetryRate/interval")
+                .and_then(Value::as_str)
+                .unwrap_or("1s");
+            let min_interval_ms = parse_gateway_duration_ms(min_interval_ms)?;
+            anyhow::ensure!(
+                (1..=3_600_000).contains(&min_interval_ms),
+                "minRetryRate interval must be within 1ms..=1h"
+            );
+            let minimum = u128::from(min_count)
+                .saturating_mul(u128::from(interval_ms))
+                .div_ceil(u128::from(min_interval_ms));
+            let minimum = u64::try_from(minimum)
+                .context("minRetryRate exceeds local retry budget capacity")?;
+            anyhow::ensure!(
+                minimum <= 1_000_000,
+                "minRetryRate exceeds one million retries per budget interval"
+            );
+            Ok(json!({
+                "enabled": true,
+                "budget_percent": percent,
+                "min_retry_concurrency": 1,
+                "min_retries_per_window": minimum.max(1),
+                "window_ms": interval_ms
+            }))
+        })
+        .transpose()?;
+
+    let session_affinity = policy
+        .pointer("/spec/sessionPersistence")
+        .map(|session| compile_session_persistence_config(session, default_session_name))
+        .transpose()?;
+    anyhow::ensure!(
+        retry_budget.is_some() || session_affinity.is_some(),
+        "BackendTrafficPolicy must configure retryConstraint or sessionPersistence"
+    );
+    Ok(BackendTrafficPolicyConfig {
+        retry_budget,
+        session_affinity,
+    })
+}
+
+/// 业务作用：为实验 API 的对象字段执行白名单校验，防止 CRD 转换或宽松 mock 留下的
+/// 未知字段被 controller 静默忽略后产生近似配置。
+///
+/// 参数说明：`value` 是待校验对象；`context` 标识错误位置；`allowed` 是当前固定协议版本
+/// 明确接受的字段集合。
+///
+/// 返回：对象形态且所有字段均在白名单时返回成功；其它输入返回错误，由调用方发布拒绝状态。
+fn ensure_json_object_fields(value: &Value, context: &str, allowed: &[&str]) -> anyhow::Result<()> {
+    let fields = value
+        .as_object()
+        .with_context(|| format!("{context} must be an object"))?;
+    for field in fields.keys() {
+        anyhow::ensure!(
+            allowed.contains(&field.as_str()),
+            "{context} contains unknown field `{field}`"
+        );
+    }
+    Ok(())
+}
+
+/// 业务作用：把 Gateway API `SessionPersistence` 精确编译为原生无状态会话策略，
+/// 使 backend policy 与 Route rule 共用同一套期限和 cookie 安全语义。
+///
+/// 参数说明：`session` 是标准字段对象；`default_name` 是按声明作用域生成的稳定名称，
+/// 防止未指定 `sessionName` 时不同策略共享同一载体。
+///
+/// 返回：字段结构、期限与载体组合合法时返回原生配置；未知字段、零期限或非法组合
+/// 返回错误，调用方不得发布近似语义。
+fn compile_session_persistence_config(
+    session: &Value,
+    default_name: &str,
+) -> anyhow::Result<Value> {
+    let fields = session
+        .as_object()
+        .context("sessionPersistence must be an object")?;
+    for field in fields.keys() {
+        anyhow::ensure!(
+            matches!(
+                field.as_str(),
+                "absoluteTimeout" | "cookieConfig" | "idleTimeout" | "sessionName" | "type"
+            ),
+            "sessionPersistence contains unknown field `{field}`"
+        );
+    }
+    let mode = session
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("Cookie");
+    anyhow::ensure!(
+        matches!(mode, "Cookie" | "Header"),
+        "sessionPersistence type must be Cookie or Header"
+    );
+    let name = session
+        .get("sessionName")
+        .and_then(Value::as_str)
+        .unwrap_or(default_name);
+    anyhow::ensure!(
+        !name.is_empty()
+            && name.len() <= 128
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "sessionPersistence sessionName is invalid"
+    );
+    let absolute_ms = session
+        .get("absoluteTimeout")
+        .map(|value| {
+            value
+                .as_str()
+                .context("sessionPersistence absoluteTimeout must be a duration string")
+                .and_then(parse_gateway_duration_ms)
+        })
+        .transpose()?;
+    let idle_ms = session
+        .get("idleTimeout")
+        .map(|value| {
+            value
+                .as_str()
+                .context("sessionPersistence idleTimeout must be a duration string")
+                .and_then(parse_gateway_duration_ms)
+        })
+        .transpose()?;
+    anyhow::ensure!(
+        absolute_ms.is_none_or(|value| value > 0) && idle_ms.is_none_or(|value| value > 0),
+        "sessionPersistence timeouts must be greater than zero"
+    );
+    let cookie_config = session.get("cookieConfig");
+    if let Some(cookie_config) = cookie_config {
+        let cookie_fields = cookie_config
+            .as_object()
+            .context("sessionPersistence cookieConfig must be an object")?;
+        anyhow::ensure!(
+            cookie_fields.keys().all(|field| field == "lifetimeType"),
+            "sessionPersistence cookieConfig contains an unknown field"
+        );
+    }
+    let lifetime = session
+        .pointer("/cookieConfig/lifetimeType")
+        .and_then(Value::as_str)
+        .unwrap_or("Session");
+    anyhow::ensure!(
+        matches!(lifetime, "Session" | "Permanent"),
+        "sessionPersistence cookie lifetimeType is invalid"
+    );
+    anyhow::ensure!(
+        mode == "Cookie" || cookie_config.is_none(),
+        "sessionPersistence cookieConfig requires Cookie type"
+    );
+    anyhow::ensure!(
+        lifetime != "Permanent" || absolute_ms.is_some(),
+        "Permanent sessionPersistence requires absoluteTimeout"
+    );
+    let absolute_timeout_seconds = absolute_ms.map(|value| value.div_ceil(1_000)).unwrap_or(0);
+    let idle_timeout_seconds = idle_ms.map(|value| value.div_ceil(1_000)).unwrap_or(0);
+    anyhow::ensure!(
+        absolute_timeout_seconds <= 31_536_000 && idle_timeout_seconds <= 31_536_000,
+        "sessionPersistence timeout exceeds 365 days"
+    );
+    Ok(json!({
+        "mode": mode.to_ascii_lowercase(),
+        "name": name,
+        "ttl_seconds": 0,
+        "absolute_timeout_seconds": absolute_timeout_seconds,
+        "idle_timeout_seconds": idle_timeout_seconds,
+        "permanent_cookie": mode == "Cookie" && lifetime == "Permanent",
+        "omit_path": true,
+        "same_site": "Strict",
+        "secure": true,
+        "http_only": true
+    }))
+}
+
+/// 业务作用：让 HTTPRoute/GRPCRoute rule 的内联会话策略覆盖 backend policy，且通过
+/// 独立逻辑服务隔离作用域，避免同一 backend 被其它 Route 意外继承。
+///
+/// 参数说明：`rule` 与对象身份生成稳定作用域；`cookie_path` 是该 HTTP match 的规范化
+/// 路径；`backends`/`services` 是尚未合并到全局候选的本 rule 子结果。
+///
+/// 返回：未配置时保持原结果；单 backend 配置成功时替换为隔离服务；多 backend 当前
+/// 无法在路由选择前保证跨服务粘滞，因而明确拒绝而不发布近似行为。
+#[allow(clippy::too_many_arguments)]
+fn apply_inline_session_persistence(
+    rule: &Value,
+    route_namespace: &str,
+    route_name: &str,
+    route_kind: &str,
+    rule_index: usize,
+    cookie_path: &str,
+    backends: &mut [BackendTarget],
+    services: &mut BTreeMap<String, Value>,
+) -> anyhow::Result<()> {
+    let Some(session) = rule.get("sessionPersistence") else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        backends.len() == 1,
+        "{route_kind} {route_namespace}/{route_name} inline sessionPersistence with multiple backendRefs is unsupported"
+    );
+    let default_name = stable_id(
+        "naway-session",
+        &[
+            route_kind,
+            route_namespace,
+            route_name,
+            &rule_index.to_string(),
+        ],
+    );
+    let mut session_affinity = compile_session_persistence_config(session, default_name.as_str())?;
+    if session_affinity.get("mode").and_then(Value::as_str) == Some("cookie") {
+        session_affinity["omit_path"] = Value::Bool(false);
+        session_affinity["path"] = Value::String(cookie_path.to_owned());
+    }
+    let backend = backends
+        .first_mut()
+        .expect("single backend was checked above");
+    let mut service = services
+        .get(backend.logical.as_str())
+        .cloned()
+        .context("inline sessionPersistence backend service disappeared")?;
+    service["session_affinity"] = session_affinity;
+    let scoped_logical = stable_id(
+        "k8s-inline-session",
+        &[
+            route_kind,
+            route_namespace,
+            route_name,
+            &rule_index.to_string(),
+            backend.logical.as_str(),
+        ],
+    );
+    if let Some(existing) = services.get(scoped_logical.as_str()) {
+        anyhow::ensure!(
+            existing == &service,
+            "inline sessionPersistence generated conflicting service definitions"
+        );
+    } else {
+        services.insert(scoped_logical.clone(), service);
+    }
+    backend.logical = scoped_logical;
+    Ok(())
+}
+
+/// 业务作用：冻结 BackendTrafficPolicy 的目标、冲突赢家和原生服务策略，使数据面应用
+/// 与 status 条件来自同一轮确定性裁决。
+///
+/// 参数说明：策略、Service 与 ServiceImport 目录来自同轮 LIST；`cfg` 固定接管范围。
+///
+/// 返回：返回按目标索引的策略目录；对象结构异常时拒绝本轮，目标缺失或冲突则记录条件。
+fn build_backend_traffic_catalog(
+    policies_value: &Value,
+    services: &ServiceCatalog,
+    service_imports: &ServiceImportCatalog,
+    cfg: &KubernetesRouteSourceCfg,
+) -> anyhow::Result<BackendTrafficCatalog> {
+    let mut objects = resource_items(policies_value, cfg.max_objects, "XBackendTrafficPolicy")?
+        .iter()
+        .collect::<Vec<_>>();
+    objects.sort_by_key(|object| object_order_key(object));
+    let mut catalog = BackendTrafficCatalog::default();
+    for policy in objects {
+        anyhow::ensure!(
+            policy.get("apiVersion").and_then(Value::as_str)
+                == Some("gateway.networking.x-k8s.io/v1alpha1")
+                && policy.get("kind").and_then(Value::as_str) == Some("XBackendTrafficPolicy"),
+            "BackendTrafficPolicy resource identity is unsupported"
+        );
+        let (namespace, policy_name) = object_identity(policy, "XBackendTrafficPolicy")?;
+        if !namespace_allowed(cfg, namespace)
+            || policy.pointer("/metadata/deletionTimestamp").is_some()
+        {
+            continue;
+        }
+        let default_session_name = stable_id("naway-session", &[namespace, policy_name]);
+        let (config, config_error) =
+            match compile_backend_traffic_policy_config(policy, default_session_name.as_str()) {
+                Ok(config) => (Some(config), None),
+                Err(error) => (None, Some(bounded_status_message(error.to_string()))),
+            };
+        let target_refs = policy
+            .pointer("/spec/targetRefs")
+            .and_then(Value::as_array)
+            .context("BackendTrafficPolicy missing spec.targetRefs")?;
+        anyhow::ensure!(
+            (1..=16).contains(&target_refs.len()),
+            "BackendTrafficPolicy targetRefs must contain 1..=16 entries"
+        );
+        let policy_index = catalog.policies.len();
+        let mut targets = Vec::new();
+        let mut unique = BTreeSet::new();
+        for target in target_refs {
+            ensure_json_object_fields(
+                target,
+                "BackendTrafficPolicy targetRef",
+                &["group", "kind", "name"],
+            )?;
+            let group = target
+                .get("group")
+                .and_then(Value::as_str)
+                .context("BackendTrafficPolicy targetRef missing group")?;
+            let kind = target
+                .get("kind")
+                .and_then(Value::as_str)
+                .context("BackendTrafficPolicy targetRef missing kind")?;
+            let name = target
+                .get("name")
+                .and_then(Value::as_str)
+                .context("BackendTrafficPolicy targetRef missing name")?;
+            validate_kubernetes_name("BackendTrafficPolicy target", name)?;
+            let key = BackendTrafficTargetKey {
+                group: group.to_owned(),
+                kind: kind.to_owned(),
+                namespace: namespace.to_owned(),
+                name: name.to_owned(),
+            };
+            anyhow::ensure!(
+                unique.insert(key.clone()),
+                "BackendTrafficPolicy repeats a targetRef"
+            );
+            let supported = (group.is_empty() && kind == "Service")
+                || (group == "multicluster.x-k8s.io" && kind == "ServiceImport");
+            let exists = if group.is_empty() && kind == "Service" {
+                services
+                    .ports
+                    .contains_key(&(namespace.to_owned(), name.to_owned()))
+            } else if group == "multicluster.x-k8s.io" && kind == "ServiceImport" {
+                service_imports
+                    .ports
+                    .contains_key(&(namespace.to_owned(), name.to_owned()))
+            } else {
+                false
+            };
+            let conflict =
+                supported && exists && config.is_some() && catalog.selected.contains_key(&key);
+            let (accepted, resolved_refs, accepted_reason, resolved_reason, message) = if !supported
+            {
+                (
+                    false,
+                    false,
+                    "InvalidTargetRef",
+                    "InvalidKind",
+                    "targetRef kind is not supported".to_owned(),
+                )
+            } else if !exists {
+                (
+                    false,
+                    false,
+                    "InvalidTargetRef",
+                    "BackendNotFound",
+                    "targetRef backend does not exist".to_owned(),
+                )
+            } else if let Some(message) = config_error.as_ref() {
+                (
+                    false,
+                    true,
+                    "UnsupportedValue",
+                    "ResolvedRefs",
+                    message.clone(),
+                )
+            } else if conflict {
+                (
+                    false,
+                    true,
+                    "Conflicted",
+                    "ResolvedRefs",
+                    "an older policy already owns this backend".to_owned(),
+                )
+            } else {
+                // 只有目标和策略体都有效时才能取得 backend 权威；无效策略只发布拒绝状态，
+                // 不能遮挡同一目标后续仍可生效的合法策略。
+                catalog.selected.insert(key.clone(), policy_index);
+                (
+                    true,
+                    true,
+                    "Accepted",
+                    "ResolvedRefs",
+                    "policy is accepted for this backend".to_owned(),
+                )
+            };
+            targets.push(BackendTrafficTargetDecision {
+                key,
+                accepted,
+                resolved_refs,
+                accepted_reason,
+                resolved_reason,
+                message,
+            });
+        }
+        catalog.policies.push(BackendTrafficPolicyDecision {
+            object: policy.clone(),
+            targets,
+            config,
+        });
     }
     Ok(catalog)
 }
@@ -5121,6 +6540,13 @@ fn apply_backend_tls_policies(
         if service.get("source").and_then(Value::as_str) != Some("kubernetes") {
             continue;
         }
+        if service
+            .get("registry_service_import")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let namespace = service
             .get("registry_namespace")
             .and_then(Value::as_str)
@@ -5443,6 +6869,84 @@ fn build_backend_tls_status_intents(
     Ok(output)
 }
 
+/// 业务作用：为 BackendTrafficPolicy 的每个 targetRef 发布独立 ancestor condition，
+/// 使部分目标冲突或缺失时不会掩盖同一策略的其它有效目标。
+///
+/// 参数说明：`policies` 是本轮数据面使用的确定性策略目录；`cfg` 提供 controller identity
+/// 与状态条目预算。
+///
+/// 返回：返回 XBackendTrafficPolicy status 意图；资源身份或条目预算异常时拒绝本轮状态发布。
+fn build_backend_traffic_status_intents(
+    policies: &BackendTrafficCatalog,
+    cfg: &KubernetesRouteSourceCfg,
+) -> anyhow::Result<Vec<ControlStatusIntent>> {
+    let transition_time = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format BackendTrafficPolicy status timestamp")?;
+    let mut output = Vec::new();
+    for policy in &policies.policies {
+        let (namespace, name) = object_identity(&policy.object, "XBackendTrafficPolicy")?;
+        anyhow::ensure!(
+            policy.object.get("apiVersion").and_then(Value::as_str)
+                == Some("gateway.networking.x-k8s.io/v1alpha1")
+                && policy.object.get("kind").and_then(Value::as_str)
+                    == Some("XBackendTrafficPolicy"),
+            "BackendTrafficPolicy resource identity is unsupported"
+        );
+        let generation = policy
+            .object
+            .pointer("/metadata/generation")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let ancestors = policy
+            .targets
+            .iter()
+            .map(|target| {
+                json!({
+                    "ancestorRef": {
+                        "group": target.key.group,
+                        "kind": target.key.kind,
+                        "namespace": target.key.namespace,
+                        "name": target.key.name
+                    },
+                    "controllerName": cfg.gateway_controller_name,
+                    "conditions": [
+                        gateway_condition(
+                            "Accepted",
+                            target.accepted,
+                            target.accepted_reason,
+                            target.message.as_str(),
+                            generation,
+                            &transition_time,
+                        ),
+                        gateway_condition(
+                            "ResolvedRefs",
+                            target.resolved_refs,
+                            target.resolved_reason,
+                            target.message.as_str(),
+                            generation,
+                            &transition_time,
+                        )
+                    ]
+                })
+            })
+            .collect::<Vec<_>>();
+        output.push(ControlStatusIntent {
+            api_version: "gateway.networking.x-k8s.io/v1alpha1".to_owned(),
+            kind: "XBackendTrafficPolicy".to_owned(),
+            plural: "xbackendtrafficpolicies".to_owned(),
+            namespace: Some(namespace.to_owned()),
+            name: name.to_owned(),
+            status: json!({"ancestors": ancestors}),
+        });
+    }
+    anyhow::ensure!(
+        output.len() <= cfg.max_status_updates,
+        "BackendTrafficPolicy status updates exceed max_status_updates"
+    );
+    Ok(output)
+}
+
 /// 业务作用：判断 HTTPRoute 或 TLSRoute 是否消费策略目标端口，避免给无关 Gateway
 /// 发布虚假 ancestor 状态。
 ///
@@ -5608,21 +7112,6 @@ fn gateway_address_decision(
             value: bind_address,
         }],
     })
-}
-
-/// 业务作用：选择本 controller 拥有且不含 ListenerSet 扩展的 Gateway listener 目录。
-///
-/// 参数说明：GatewayClass/Gateway 来自同轮 LIST；`cfg` 提供 controller 与接管范围。
-///
-/// 返回：返回基础 Gateway listener 目录；对象语义异常时失败闭合。
-#[cfg(test)]
-fn build_gateway_catalog(
-    classes_value: &Value,
-    gateways_value: &Value,
-    cfg: &KubernetesRouteSourceCfg,
-) -> anyhow::Result<GatewayCatalog> {
-    let empty = json!({"items":[]});
-    build_gateway_catalog_with_listener_sets(classes_value, gateways_value, &empty, &empty, cfg)
 }
 
 /// 业务作用：选择本 controller 拥有的 Gateway，并把 listener 附着边界编译为稳定目录。
@@ -5800,11 +7289,13 @@ fn build_gateway_catalog_with_listener_sets(
             listeners.push(GatewayListener {
                 gateway_namespace: namespace.to_owned(),
                 gateway_name: name.to_owned(),
+                parent_group: "gateway.networking.k8s.io".to_owned(),
                 parent_kind: "Gateway".to_owned(),
                 parent_namespace: namespace.to_owned(),
                 parent_name: name.to_owned(),
                 section_name: section_name.to_owned(),
                 protocol: protocol.to_owned(),
+                parent_port: port,
                 port,
                 bind_address: bind_address.to_owned(),
                 hostname: hostname.clone(),
@@ -5986,11 +7477,13 @@ fn build_gateway_catalog_with_listener_sets(
             listeners.push(GatewayListener {
                 gateway_namespace: gateway_namespace.to_owned(),
                 gateway_name: gateway_name.to_owned(),
+                parent_group: "gateway.networking.k8s.io".to_owned(),
                 parent_kind: "ListenerSet".to_owned(),
                 parent_namespace: namespace.to_owned(),
                 parent_name: name.to_owned(),
                 section_name: section_name.to_owned(),
                 protocol: protocol.to_owned(),
+                parent_port: port,
                 port,
                 bind_address: bind_address.to_owned(),
                 hostname: hostname.clone(),
@@ -6012,6 +7505,9 @@ fn build_gateway_catalog_with_listener_sets(
     Ok(GatewayCatalog {
         gateways,
         listener_sets,
+        mesh_parents: HashSet::new(),
+        mesh_interception_ready: cfg.gateway_mesh_interception_ready,
+        mesh_source_namespace_header: "x-naway-mesh-source-namespace".to_owned(),
         listeners,
         address_decisions,
         listener_set_decisions,
@@ -6171,7 +7667,11 @@ fn attached_listeners(
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or("Gateway");
-        if group != "gateway.networking.k8s.io" || !matches!(kind, "Gateway" | "ListenerSet") {
+        let gateway_parent =
+            group == "gateway.networking.k8s.io" && matches!(kind, "Gateway" | "ListenerSet");
+        let mesh_parent = (group.is_empty() && kind == "Service")
+            || (group == "multicluster.x-k8s.io" && kind == "ServiceImport");
+        if !gateway_parent && !mesh_parent {
             continue;
         }
         let name = parent
@@ -6189,19 +7689,26 @@ fn attached_listeners(
             "ListenerSet" => gateways
                 .listener_sets
                 .contains(&(namespace.to_owned(), name.to_owned())),
+            "Service" | "ServiceImport" => gateways.mesh_parents.contains(&(
+                group.to_owned(),
+                kind.to_owned(),
+                namespace.to_owned(),
+                name.to_owned(),
+            )),
             _ => false,
         };
-        if !parent_exists {
+        if !parent_exists || (mesh_parent && !gateways.mesh_interception_ready) {
             continue;
         }
         let section = parent.get("sectionName").and_then(Value::as_str);
         let port = parent.get("port").and_then(Value::as_u64);
         for listener in gateways.listeners.iter().filter(|listener| {
-            listener.parent_kind == kind
+            listener.parent_group == group
+                && listener.parent_kind == kind
                 && listener.parent_namespace == namespace
                 && listener.parent_name == name
                 && section.is_none_or(|section| section == listener.section_name)
-                && port.is_none_or(|port| port == u64::from(listener.port))
+                && port.is_none_or(|port| port == u64::from(listener.parent_port))
                 && listener.allowed_kinds.contains(route_kind)
         }) {
             if namespace_policy_allows(
@@ -6219,6 +7726,7 @@ fn attached_listeners(
     attached.sort_by(|left, right| {
         (
             left.listener.gateway_namespace.as_str(),
+            left.listener.parent_group.as_str(),
             left.listener.parent_kind.as_str(),
             left.listener.parent_namespace.as_str(),
             left.listener.parent_name.as_str(),
@@ -6226,6 +7734,7 @@ fn attached_listeners(
         )
             .cmp(&(
                 right.listener.gateway_namespace.as_str(),
+                right.listener.parent_group.as_str(),
                 right.listener.parent_kind.as_str(),
                 right.listener.parent_namespace.as_str(),
                 right.listener.parent_name.as_str(),
@@ -6233,10 +7742,12 @@ fn attached_listeners(
             ))
     });
     attached.dedup_by(|left, right| {
-        left.listener.parent_kind == right.listener.parent_kind
+        left.listener.parent_group == right.listener.parent_group
+            && left.listener.parent_kind == right.listener.parent_kind
             && left.listener.parent_namespace == right.listener.parent_namespace
             && left.listener.parent_name == right.listener.parent_name
             && left.listener.section_name == right.listener.section_name
+            && left.listener.hostname == right.listener.hostname
     });
     Ok(attached)
 }
@@ -6269,7 +7780,11 @@ fn attachment_rejection_reason(
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or("Gateway");
-        if group != "gateway.networking.k8s.io" || !matches!(kind, "Gateway" | "ListenerSet") {
+        let gateway_parent =
+            group == "gateway.networking.k8s.io" && matches!(kind, "Gateway" | "ListenerSet");
+        let mesh_parent = (group.is_empty() && kind == "Service")
+            || (group == "multicluster.x-k8s.io" && kind == "ServiceImport");
+        if !gateway_parent && !mesh_parent {
             continue;
         }
         let name = parent
@@ -6287,19 +7802,29 @@ fn attachment_rejection_reason(
             "ListenerSet" => gateways
                 .listener_sets
                 .contains(&(namespace.to_owned(), name.to_owned())),
+            "Service" | "ServiceImport" => gateways.mesh_parents.contains(&(
+                group.to_owned(),
+                kind.to_owned(),
+                namespace.to_owned(),
+                name.to_owned(),
+            )),
             _ => false,
         };
         if !parent_exists {
             continue;
         }
+        if mesh_parent && !gateways.mesh_interception_ready {
+            return Ok("UnsupportedValue");
+        }
         let section = parent.get("sectionName").and_then(Value::as_str);
         let port = parent.get("port").and_then(Value::as_u64);
         for listener in gateways.listeners.iter().filter(|listener| {
-            listener.parent_kind == kind
+            listener.parent_group == group
+                && listener.parent_kind == kind
                 && listener.parent_namespace == namespace
                 && listener.parent_name == name
                 && section.is_none_or(|section| section == listener.section_name)
-                && port.is_none_or(|port| port == u64::from(listener.port))
+                && port.is_none_or(|port| port == u64::from(listener.parent_port))
         }) {
             let namespace_allowed = namespace_policy_allows(
                 &listener.allowed_namespaces,
@@ -6610,6 +8135,61 @@ fn scope_routes_to_gateway_listener(routes: &mut [Value], listener_id: &str) -> 
     Ok(())
 }
 
+/// 业务作用：区分 Mesh parent 与 Gateway/ListenerSet parent，确保两类 listener
+/// 使用各自的隔离凭据和状态语义。
+///
+/// 参数说明：`listener` 是已解析的合成或真实 listener。
+///
+/// 返回：Service 或 ServiceImport parent 返回 true。
+fn is_mesh_listener(listener: &GatewayListener) -> bool {
+    (listener.parent_group.is_empty() && listener.parent_kind == "Service")
+        || (listener.parent_group == "multicluster.x-k8s.io"
+            && listener.parent_kind == "ServiceImport")
+}
+
+/// 业务作用：把 Mesh Route 限定到目标 Service，并为 consumer Route 增加受信源 namespace
+/// 门禁，防止其它 namespace 借同一透明 listener 越权使用规则。
+///
+/// 参数说明：`routes` 是单个 mesh parent 产生的 IR；`listener` 固定目标身份；
+/// `route_namespace` 区分 producer/consumer；`source_header` 只在受保护 listener 上可信。
+///
+/// 返回：所有 Route 结构完整时写入稳定 parent 身份；consumer 额外写入 namespace predicate。
+fn scope_routes_to_mesh_parent(
+    routes: &mut [Value],
+    listener: &GatewayListener,
+    route_namespace: &str,
+    source_header: &str,
+) -> anyhow::Result<()> {
+    for route in routes {
+        let original_id = route
+            .get("id")
+            .and_then(Value::as_str)
+            .context("generated Mesh route missing id")?;
+        route["id"] = Value::String(stable_id(
+            "mesh-route",
+            &[
+                original_id,
+                listener.parent_group.as_str(),
+                listener.parent_kind.as_str(),
+                listener.parent_namespace.as_str(),
+                listener.parent_name.as_str(),
+                listener.section_name.as_str(),
+                &listener.parent_port.to_string(),
+            ],
+        ));
+        if route_namespace != listener.parent_namespace {
+            route
+                .get_mut("predicates")
+                .and_then(Value::as_array_mut)
+                .context("generated Mesh route missing predicates")?
+                .push(Value::String(format!(
+                    "Header={source_header},exact,{route_namespace}"
+                )));
+        }
+    }
+    Ok(())
+}
+
 /// 业务作用：提供 Gateway listener 冲突解析的稳定对象顺序，不依赖 API LIST 返回顺序。
 ///
 /// 参数说明：`object` 是 Kubernetes 对象。
@@ -6647,6 +8227,9 @@ fn compile_http_routes(
     gateways: &GatewayCatalog,
     namespaces: &NamespaceCatalog,
     service_catalog: &ServiceCatalog,
+    service_import_catalog: &ServiceImportCatalog,
+    inference_pools: Option<&InferencePoolCatalog>,
+    backend_traffic: &BackendTrafficCatalog,
     grants: &ReferenceGrantCatalog<'_>,
     listener_routes: &mut BTreeMap<HttpListenerKey, Vec<Value>>,
     services: &mut BTreeMap<String, Value>,
@@ -6735,6 +8318,9 @@ fn compile_http_routes(
                             &hostnames,
                             unrestricted_hostname,
                             service_catalog,
+                            service_import_catalog,
+                            inference_pools,
+                            backend_traffic,
                             grants,
                             &mut rule_routes,
                             &mut rule_services,
@@ -6763,7 +8349,16 @@ fn compile_http_routes(
                             }
                         }
                     }
-                    scope_routes_to_gateway_listener(&mut object_routes, &listener_id)?;
+                    if is_mesh_listener(&attached_listener.listener) {
+                        scope_routes_to_mesh_parent(
+                            &mut object_routes,
+                            &attached_listener.listener,
+                            namespace,
+                            &gateways.mesh_source_namespace_header,
+                        )?;
+                    } else {
+                        scope_routes_to_gateway_listener(&mut object_routes, &listener_id)?;
+                    }
                     socket_routes.extend(object_routes);
                 }
             }
@@ -6835,6 +8430,9 @@ fn compile_http_route_rule(
     hostnames: &[String],
     unrestricted_hostname: bool,
     service_catalog: &ServiceCatalog,
+    service_import_catalog: &ServiceImportCatalog,
+    inference_pools: Option<&InferencePoolCatalog>,
+    backend_traffic: &BackendTrafficCatalog,
     grants: &ReferenceGrantCatalog<'_>,
     routes: &mut Vec<Value>,
     services: &mut BTreeMap<String, Value>,
@@ -6867,6 +8465,8 @@ fn compile_http_route_rule(
             path,
             path_type,
             service_catalog,
+            service_import_catalog,
+            backend_traffic,
             grants,
             services,
         )?;
@@ -6896,7 +8496,7 @@ fn compile_http_route_rule(
             }));
             continue;
         }
-        let backends = compile_backend_refs(
+        let mut backends = compile_backend_refs(
             rule,
             namespace,
             route_name,
@@ -6904,7 +8504,20 @@ fn compile_http_route_rule(
             "http",
             None,
             service_catalog,
+            service_import_catalog,
+            inference_pools,
+            backend_traffic,
             grants,
+            services,
+        )?;
+        apply_inline_session_persistence(
+            rule,
+            namespace,
+            route_name,
+            "HTTPRoute",
+            rule_index,
+            normalized_path_element_prefix(path),
+            &mut backends,
             services,
         )?;
         let group = stable_id(
@@ -6928,6 +8541,8 @@ fn compile_http_route_rule(
                 "preserve_host": true,
                 "predicates": predicates,
                 "filters": filters,
+                "inference_pool": backend.inference_pool,
+                "ext_proc": backend.ext_proc,
                 "request_timeout_ms": request_timeout_ms,
                 "backend_request_timeout_ms": backend_request_timeout_ms,
                 "order": order
@@ -7170,6 +8785,8 @@ fn compile_http_filters(
     matched_path: &str,
     matched_path_type: &str,
     service_catalog: &ServiceCatalog,
+    service_import_catalog: &ServiceImportCatalog,
+    backend_traffic: &BackendTrafficCatalog,
     grants: &ReferenceGrantCatalog<'_>,
     services: &mut BTreeMap<String, Value>,
 ) -> anyhow::Result<HttpFilterPlan> {
@@ -7246,6 +8863,9 @@ fn compile_http_filters(
                     "http",
                     None,
                     service_catalog,
+                    service_import_catalog,
+                    None,
+                    backend_traffic,
                     grants,
                     services,
                 )?;
@@ -7670,6 +9290,9 @@ fn compile_backend_refs(
     scheme: &str,
     protocol: Option<&str>,
     service_catalog: &ServiceCatalog,
+    service_import_catalog: &ServiceImportCatalog,
+    inference_pools: Option<&InferencePoolCatalog>,
+    backend_traffic: &BackendTrafficCatalog,
     grants: &ReferenceGrantCatalog<'_>,
     services: &mut BTreeMap<String, Value>,
 ) -> anyhow::Result<Vec<BackendTarget>> {
@@ -7692,6 +9315,9 @@ fn compile_backend_refs(
                 scheme,
                 protocol,
                 service_catalog,
+                service_import_catalog,
+                inference_pools,
+                backend_traffic,
                 grants,
                 services,
             )
@@ -7720,6 +9346,9 @@ fn compile_backend_ref(
     scheme: &str,
     protocol: Option<&str>,
     service_catalog: &ServiceCatalog,
+    service_import_catalog: &ServiceImportCatalog,
+    inference_pools: Option<&InferencePoolCatalog>,
+    backend_traffic: &BackendTrafficCatalog,
     grants: &ReferenceGrantCatalog<'_>,
     services: &mut BTreeMap<String, Value>,
 ) -> anyhow::Result<BackendTarget> {
@@ -7755,9 +9384,13 @@ fn compile_backend_ref(
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or("Service");
+    let service_import = group == "multicluster.x-k8s.io" && kind == "ServiceImport";
+    let inference_pool = group == "inference.networking.k8s.io" && kind == "InferencePool";
     anyhow::ensure!(
-        group.is_empty() && kind == "Service",
-        "{route_kind} {route_namespace}/{route_name} backendRef must target core Service"
+        (group.is_empty() && kind == "Service")
+            || service_import
+            || (route_kind == "HTTPRoute" && inference_pool),
+        "{route_kind} {route_namespace}/{route_name} backendRef must target Service, ServiceImport, or HTTPRoute InferencePool"
     );
     let service_name = backend
         .get("name")
@@ -7771,14 +9404,92 @@ fn compile_backend_ref(
     validate_kubernetes_name("Gateway Route backend namespace", backend_namespace)?;
     if backend_namespace != route_namespace {
         anyhow::ensure!(
-            grants.permits(
+            grants.permits_group_reference(
                 route_namespace,
                 route_kind,
                 backend_namespace,
+                group,
+                kind,
                 service_name
             )?,
             "{route_kind} {route_namespace}/{route_name} backendRef to {backend_namespace}/{service_name} is not permitted by ReferenceGrant"
         );
+    }
+    let weight = backend.get("weight").and_then(Value::as_u64).unwrap_or(1);
+    let weight = u32::try_from(weight).context("Gateway Route backend weight exceeds u32")?;
+    anyhow::ensure!(
+        weight <= 1_000_000,
+        "Gateway Route backend weight exceeds 1000000"
+    );
+    if inference_pool {
+        let pools = inference_pools
+            .context("HTTPRoute InferencePool backend requires inference_gateway_enabled=true")?;
+        let pool = pools
+            .pools
+            .get(&(backend_namespace.to_owned(), service_name.to_owned()))
+            .with_context(|| {
+                format!(
+                    "HTTPRoute {route_namespace}/{route_name} InferencePool {backend_namespace}/{service_name} does not exist or is unresolved"
+                )
+            })?;
+        anyhow::ensure!(
+            pool.resolved,
+            "HTTPRoute {route_namespace}/{route_name} InferencePool {backend_namespace}/{service_name} has an unresolved EPP Service"
+        );
+        // InferencePool 的 HTTPRoute port 按固定合同不参与后端选择；EPP 返回的 IP 或
+        // IP:port 仍会与池的 targetPorts 实例目录求交，不能借此越出声明端口。
+        if let Some(port) = backend.get("port") {
+            anyhow::ensure!(
+                port.as_u64()
+                    .and_then(|value| u16::try_from(value).ok())
+                    .is_some_and(|value| value > 0),
+                "HTTPRoute InferencePool backendRef port must be a valid number when present"
+            );
+        }
+        for (logical, value) in [
+            (&pool.pool_logical, &pool.pool_service),
+            (&pool.epp_logical, &pool.epp_service),
+        ] {
+            match services.get(logical) {
+                Some(existing) => anyhow::ensure!(
+                    existing == value,
+                    "generated Kubernetes service id collision for `{logical}`"
+                ),
+                None => {
+                    services.insert(logical.clone(), value.clone());
+                }
+            }
+        }
+        let ext_proc = json!({
+            "target": format!("lb://{}", pool.epp_logical),
+            "fail_open": pool.fail_open,
+            "request_headers": true,
+            "response_headers": true,
+            "request_body": "buffered",
+            "response_body": "none",
+            "message_timeout_ms": 2000,
+            "total_timeout_ms": 900000,
+            "max_message_bytes": 16777216,
+            "max_total_bytes": 67108864,
+            "max_body_bytes": 16777216,
+            "max_in_flight": 4096,
+            "failure_threshold": 5,
+            "reset_timeout_ms": 1000,
+            "mutation_headers": [
+                "x-gateway-destination-endpoint",
+                "traceparent",
+                "tracestate",
+                "baggage"
+            ],
+            "writable_metadata_namespaces": ["envoy.lb"]
+        });
+        return Ok(BackendTarget {
+            logical: pool.pool_logical.clone(),
+            weight,
+            filters: backend_filters,
+            inference_pool: Some(json!({"max_selected_endpoints": 256})),
+            ext_proc: Some(ext_proc),
+        });
     }
     let port = backend
         .get("port")
@@ -7786,12 +9497,15 @@ fn compile_backend_ref(
         .and_then(|port| u16::try_from(port).ok())
         .filter(|port| *port > 0)
         .context("Gateway Route Service backendRef requires a valid numeric port")?;
-    let ports = service_catalog
-        .ports
+    let ports = if service_import {
+        &service_import_catalog.ports
+    } else {
+        &service_catalog.ports
+    }
         .get(&(backend_namespace.to_owned(), service_name.to_owned()))
         .with_context(|| {
             format!(
-                "{route_kind} {route_namespace}/{route_name} backend Service {backend_namespace}/{service_name} does not exist"
+                "{route_kind} {route_namespace}/{route_name} backend {kind} {backend_namespace}/{service_name} does not exist"
             )
         })?;
     let service_protocol = if route_kind == "UDPRoute" {
@@ -7802,28 +9516,36 @@ fn compile_backend_ref(
     let port_key = (port, service_protocol.to_owned());
     anyhow::ensure!(
         ports.contains_key(&port_key),
-        "{route_kind} {route_namespace}/{route_name} backend Service {backend_namespace}/{service_name} has no {service_protocol} port {port}"
-    );
-    let weight = backend.get("weight").and_then(Value::as_u64).unwrap_or(1);
-    let weight = u32::try_from(weight).context("Gateway Route backend weight exceeds u32")?;
-    anyhow::ensure!(
-        weight <= 1_000_000,
-        "Gateway Route backend weight exceeds 1000000"
+        "{route_kind} {route_namespace}/{route_name} backend {kind} {backend_namespace}/{service_name} has no {service_protocol} port {port}"
     );
     let app_protocol = ports.get(&port_key).and_then(Option::as_deref);
     let (scheme, protocol) = backend_transport(route_kind, scheme, protocol, app_protocol)?;
-    let logical = insert_generated_service_with_protocol(
+    let target_key = BackendTrafficTargetKey {
+        group: group.to_owned(),
+        kind: kind.to_owned(),
+        namespace: backend_namespace.to_owned(),
+        name: service_name.to_owned(),
+    };
+    let traffic_policy = backend_traffic
+        .selected
+        .get(&target_key)
+        .and_then(|index| backend_traffic.policies[*index].config.as_ref());
+    let logical = insert_generated_service_with_protocol_and_kind(
         services,
         backend_namespace,
         service_name,
         &BackendPort::Number(port),
         scheme,
         protocol,
+        service_import,
+        traffic_policy,
     )?;
     Ok(BackendTarget {
         logical,
         weight,
         filters: backend_filters,
+        inference_pool: None,
+        ext_proc: None,
     })
 }
 
@@ -7869,27 +9591,6 @@ fn backend_transport<'a>(
 }
 
 impl ReferenceGrantCatalog<'_> {
-    /// 业务作用：执行 Gateway API ReferenceGrant 的双边 namespace 授权，防跨租户 Service 引用。
-    ///
-    /// 参数说明：`from_namespace`/`from_kind` 描述 Route；`to_namespace`/`service_name` 描述目标。
-    ///
-    /// 返回：至少一个目标 namespace 内的 grant 同时匹配 from/to 时为 true；坏 grant 结构返回错误。
-    fn permits(
-        &self,
-        from_namespace: &str,
-        from_kind: &str,
-        to_namespace: &str,
-        service_name: &str,
-    ) -> anyhow::Result<bool> {
-        self.permits_reference(
-            from_namespace,
-            from_kind,
-            to_namespace,
-            "Service",
-            service_name,
-        )
-    }
-
     /// 业务作用：执行通用 Gateway API ReferenceGrant 双边授权，使 Gateway 引用 Secret
     /// 与 Route 引用 Service 共用同一个跨 namespace 安全不变量。
     ///
@@ -7903,6 +9604,32 @@ impl ReferenceGrantCatalog<'_> {
         from_namespace: &str,
         from_kind: &str,
         to_namespace: &str,
+        to_kind: &str,
+        to_name: &str,
+    ) -> anyhow::Result<bool> {
+        self.permits_group_reference(
+            from_namespace,
+            from_kind,
+            to_namespace,
+            "",
+            to_kind,
+            to_name,
+        )
+    }
+
+    /// 业务作用：执行带显式 API group 的 ReferenceGrant 双边授权，使 ServiceImport
+    /// 与 core Service 采用相同的跨 namespace 最小权限门禁。
+    ///
+    /// 参数说明：from 身份描述引用者；to 身份完整描述目标 group、kind 和 name。
+    ///
+    /// 返回：目标 namespace 内存在精确匹配的授权时返回 true；结构异常返回错误。
+    #[allow(clippy::too_many_arguments)]
+    fn permits_group_reference(
+        &self,
+        from_namespace: &str,
+        from_kind: &str,
+        to_namespace: &str,
+        to_group: &str,
         to_kind: &str,
         to_name: &str,
     ) -> anyhow::Result<bool> {
@@ -7930,10 +9657,7 @@ impl ReferenceGrantCatalog<'_> {
                 .context("ReferenceGrant missing spec.to")?
                 .iter()
                 .any(|to| {
-                    to.get("group")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .is_empty()
+                    to.get("group").and_then(Value::as_str).unwrap_or("") == to_group
                         && to.get("kind").and_then(Value::as_str) == Some(to_kind)
                         && to
                             .get("name")
@@ -8084,6 +9808,8 @@ fn compile_grpc_routes(
     gateways: &GatewayCatalog,
     namespaces: &NamespaceCatalog,
     service_catalog: &ServiceCatalog,
+    service_import_catalog: &ServiceImportCatalog,
+    backend_traffic: &BackendTrafficCatalog,
     grants: &ReferenceGrantCatalog<'_>,
     listener_routes: &mut BTreeMap<HttpListenerKey, Vec<Value>>,
     services: &mut BTreeMap<String, Value>,
@@ -8167,6 +9893,8 @@ fn compile_grpc_routes(
                             "/",
                             "PathPrefix",
                             service_catalog,
+                            service_import_catalog,
+                            backend_traffic,
                             grants,
                             &mut object_services,
                         )?;
@@ -8183,7 +9911,7 @@ fn compile_grpc_routes(
                         } else {
                             "http"
                         };
-                        let backends = compile_backend_refs(
+                        let mut backends = compile_backend_refs(
                             rule,
                             namespace,
                             name,
@@ -8191,7 +9919,20 @@ fn compile_grpc_routes(
                             scheme,
                             Some(cfg.grpc_backend_protocol.as_str()),
                             service_catalog,
+                            service_import_catalog,
+                            None,
+                            backend_traffic,
                             grants,
+                            &mut object_services,
+                        )?;
+                        apply_inline_session_persistence(
+                            rule,
+                            namespace,
+                            name,
+                            "GRPCRoute",
+                            rule_index,
+                            "/",
+                            &mut backends,
                             &mut object_services,
                         )?;
                         let matches = rule
@@ -8244,7 +9985,16 @@ fn compile_grpc_routes(
                             }
                         }
                     }
-                    scope_routes_to_gateway_listener(&mut object_routes, &listener_id)?;
+                    if is_mesh_listener(&attached_listener.listener) {
+                        scope_routes_to_mesh_parent(
+                            &mut object_routes,
+                            &attached_listener.listener,
+                            namespace,
+                            &gateways.mesh_source_namespace_header,
+                        )?;
+                    } else {
+                        scope_routes_to_gateway_listener(&mut object_routes, &listener_id)?;
+                    }
                     socket_routes.extend(object_routes);
                 }
             }
@@ -8384,6 +10134,8 @@ fn compile_l4_routes(
     gateways: &GatewayCatalog,
     namespaces: &NamespaceCatalog,
     service_catalog: &ServiceCatalog,
+    service_import_catalog: &ServiceImportCatalog,
+    backend_traffic: &BackendTrafficCatalog,
     grants: &ReferenceGrantCatalog<'_>,
     services: &mut BTreeMap<String, Value>,
     listeners: &mut BTreeMap<String, L4ListenerPlan>,
@@ -8508,6 +10260,9 @@ fn compile_l4_routes(
                 "http",
                 None,
                 service_catalog,
+                service_import_catalog,
+                None,
+                backend_traffic,
                 grants,
                 &mut object_services,
             )?;
@@ -8707,166 +10462,6 @@ fn merge_l4_listeners(
     Ok(())
 }
 
-#[cfg(test)]
-fn compile_gateway_api(
-    classes_value: &Value,
-    gateways_value: &Value,
-    routes_value: &Value,
-    cfg: &KubernetesRouteSourceCfg,
-    routes: &mut Vec<Value>,
-    services: &mut BTreeMap<String, Value>,
-) -> anyhow::Result<()> {
-    let classes = resource_items(classes_value, cfg.max_objects, "GatewayClass")?;
-    let selected_classes = classes
-        .iter()
-        .filter(|class| {
-            class
-                .pointer("/spec/controllerName")
-                .and_then(Value::as_str)
-                == Some(cfg.gateway_controller_name.as_str())
-        })
-        .filter_map(|class| class.pointer("/metadata/name").and_then(Value::as_str))
-        .collect::<HashSet<_>>();
-    let gateways = resource_items(gateways_value, cfg.max_objects, "Gateway")?;
-    let mut selected_gateways = HashSet::new();
-    for gateway in gateways {
-        let (namespace, name) = object_identity(gateway, "Gateway")?;
-        if !namespace_allowed(cfg, namespace) {
-            continue;
-        }
-        let class = gateway
-            .pointer("/spec/gatewayClassName")
-            .and_then(Value::as_str)
-            .context("Gateway missing spec.gatewayClassName")?;
-        if selected_classes.contains(class) {
-            selected_gateways.insert((namespace.to_owned(), name.to_owned()));
-        }
-    }
-    let http_routes = resource_items(routes_value, cfg.max_objects, "HTTPRoute")?;
-    for http_route in http_routes {
-        let (namespace, name) = object_identity(http_route, "HTTPRoute")?;
-        if !namespace_allowed(cfg, namespace)
-            || !http_route_attaches(http_route, namespace, &selected_gateways)?
-        {
-            continue;
-        }
-        let hostnames = http_route
-            .pointer("/spec/hostnames")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .map(|value| {
-                        value
-                            .as_str()
-                            .context("HTTPRoute hostname must be a string")
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let rules = http_route
-            .pointer("/spec/rules")
-            .and_then(Value::as_array)
-            .context("selected HTTPRoute missing spec.rules")?;
-        for (rule_index, rule) in rules.iter().enumerate() {
-            anyhow::ensure!(
-                rule.get("filters")
-                    .and_then(Value::as_array)
-                    .is_none_or(Vec::is_empty),
-                "HTTPRoute {namespace}/{name} filters are not supported; refusing to broaden semantics"
-            );
-            let backends = rule
-                .get("backendRefs")
-                .and_then(Value::as_array)
-                .context("HTTPRoute rule missing backendRefs")?;
-            anyhow::ensure!(
-                backends.len() == 1,
-                "HTTPRoute {namespace}/{name} requires exactly one backendRef"
-            );
-            let backend = &backends[0];
-            let group = backend.get("group").and_then(Value::as_str).unwrap_or("");
-            let kind = backend
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("Service");
-            anyhow::ensure!(
-                group.is_empty() && kind == "Service",
-                "HTTPRoute backendRef must target a core Service"
-            );
-            let service_name = backend
-                .get("name")
-                .and_then(Value::as_str)
-                .context("HTTPRoute backendRef missing name")?;
-            let backend_namespace = backend
-                .get("namespace")
-                .and_then(Value::as_str)
-                .unwrap_or(namespace);
-            anyhow::ensure!(
-                backend_namespace == namespace,
-                "cross-namespace HTTPRoute backendRef requires ReferenceGrant support"
-            );
-            let port = backend
-                .get("port")
-                .and_then(Value::as_u64)
-                .and_then(|value| u16::try_from(value).ok())
-                .filter(|value| *value > 0)
-                .context("HTTPRoute Service backendRef requires a valid numeric port")?;
-            let logical = insert_generated_service(
-                services,
-                namespace,
-                service_name,
-                &BackendPort::Number(port),
-                "http",
-            )?;
-            let matches = rule
-                .get("matches")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_else(|| vec![json!({})]);
-            for (match_index, route_match) in matches.iter().enumerate() {
-                let path = route_match
-                    .pointer("/path/value")
-                    .and_then(Value::as_str)
-                    .unwrap_or("/");
-                let path_type = route_match
-                    .pointer("/path/type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("PathPrefix");
-                validate_http_path(path)?;
-                let mut predicates = vec![path_predicate(path, path_type)?];
-                if !hostnames.is_empty() {
-                    predicates.push(format!("Host={}", hostnames.join(",")));
-                }
-                if let Some(method) = route_match.get("method").and_then(Value::as_str) {
-                    predicates.push(format!("Method={method}"));
-                }
-                append_http_route_header_matches(route_match, namespace, name, &mut predicates)?;
-                append_http_route_query_matches(route_match, namespace, name, &mut predicates)?;
-                let id = stable_id(
-                    "k8s-httproute",
-                    &[
-                        namespace,
-                        name,
-                        &rule_index.to_string(),
-                        &match_index.to_string(),
-                        path,
-                        &logical,
-                    ],
-                );
-                routes.push(json!({
-                    "id": id,
-                    "uri": format!("lb://{logical}"),
-                    "preserve_host": true,
-                    "predicates": predicates,
-                    "order": 0
-                }));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// 业务作用：把 Gateway API HTTPHeaderMatch 无损映射为 Naway Header predicate。
 ///
 /// 参数说明：`route_match` 是单个 HTTPRoute match；`namespace`/`route_name` 用于诊断；
@@ -8948,42 +10543,6 @@ fn append_http_route_query_matches(
     Ok(())
 }
 
-#[cfg(test)]
-fn http_route_attaches(
-    route: &Value,
-    route_namespace: &str,
-    gateways: &HashSet<(String, String)>,
-) -> anyhow::Result<bool> {
-    let parents = route
-        .pointer("/spec/parentRefs")
-        .and_then(Value::as_array)
-        .context("HTTPRoute missing spec.parentRefs")?;
-    for parent in parents {
-        let group = parent
-            .get("group")
-            .and_then(Value::as_str)
-            .unwrap_or("gateway.networking.k8s.io");
-        let kind = parent
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("Gateway");
-        if group != "gateway.networking.k8s.io" || kind != "Gateway" {
-            continue;
-        }
-        let Some(name) = parent.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let namespace = parent
-            .get("namespace")
-            .and_then(Value::as_str)
-            .unwrap_or(route_namespace);
-        if gateways.contains(&(namespace.to_owned(), name.to_owned())) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 #[derive(Clone)]
 enum BackendPort {
     Name(String),
@@ -9030,6 +10589,36 @@ fn insert_generated_service_with_protocol(
     scheme: &str,
     protocol: Option<&str>,
 ) -> anyhow::Result<String> {
+    insert_generated_service_with_protocol_and_kind(
+        services,
+        namespace,
+        service_name,
+        port,
+        scheme,
+        protocol,
+        false,
+        None,
+    )
+}
+
+/// 业务作用：生成 Service 或 ServiceImport 的统一发现定义，并在对象落表前应用
+/// BackendTrafficPolicy 的唯一冲突赢家。
+///
+/// 参数说明：后端身份、端口与 transport 已完成引用校验；`service_import` 选择 MCS
+/// EndpointSlice 语义；`traffic_policy` 是同轮确定的原生策略。
+///
+/// 返回：无碰撞时返回稳定逻辑名；相同逻辑身份出现不同定义时拒绝整个候选。
+#[allow(clippy::too_many_arguments)]
+fn insert_generated_service_with_protocol_and_kind(
+    services: &mut BTreeMap<String, Value>,
+    namespace: &str,
+    service_name: &str,
+    port: &BackendPort,
+    scheme: &str,
+    protocol: Option<&str>,
+    service_import: bool,
+    traffic_policy: Option<&BackendTrafficPolicyConfig>,
+) -> anyhow::Result<String> {
     validate_kubernetes_name("backend namespace", namespace)?;
     validate_kubernetes_name("backend service", service_name)?;
     let port_key = match port {
@@ -9037,7 +10626,7 @@ fn insert_generated_service_with_protocol(
         BackendPort::Number(number) => format!("port-{number}"),
     };
     let logical = stable_id(
-        "k8s-svc",
+        if service_import { "k8s-mcs" } else { "k8s-svc" },
         &[
             namespace,
             service_name,
@@ -9058,6 +10647,17 @@ fn insert_generated_service_with_protocol(
     }
     if let Some(protocol) = protocol {
         value["protocol"] = json!(protocol);
+    }
+    if service_import {
+        value["registry_service_import"] = json!(true);
+    }
+    if let Some(policy) = traffic_policy {
+        if let Some(retry_budget) = &policy.retry_budget {
+            value["retry_budget"] = retry_budget.clone();
+        }
+        if let Some(session_affinity) = &policy.session_affinity {
+            value["session_affinity"] = session_affinity.clone();
+        }
     }
     match services.get(&logical) {
         Some(existing) => anyhow::ensure!(
@@ -9356,6 +10956,7 @@ fn source_fingerprint(
         cfg.materialized_file.as_str(),
         cfg.gateway_controller_name.as_str(),
         cfg.gateway_api_version.as_str(),
+        cfg.inference_extension_version.as_str(),
         cfg.gateway_bind_address.as_str(),
         cfg.gateway_stream_bind_address.as_str(),
         cfg.grpc_backend_protocol.as_str(),
@@ -9380,6 +10981,7 @@ fn source_fingerprint(
     hasher.update([
         u8::from(cfg.ingress_enabled),
         u8::from(cfg.gateway_api_enabled),
+        u8::from(cfg.inference_gateway_enabled),
         u8::from(cfg.status_updates_enabled),
         u8::from(cfg.finalizers_enabled),
     ]);

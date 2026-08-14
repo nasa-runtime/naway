@@ -27,9 +27,9 @@ log-kafka = ["nasa/kafka"]
 # mTLS、SessionDirectory、interest auto 与 Redis 两类入口；未编此 feature 时，配置 edge
 # route/relay 会在快照构建期 fail-fast，普通 L7 路径不受影响。
 grpc-edge = []
-# V9 HTTP/3/QUIC 独立制品门；关闭时不编译 QUIC/H3 transport，也不在 TCP/H2 热路径
+# HTTP/3/QUIC 独立制品门；关闭时不编译 QUIC/H3 transport，也不在 TCP/H2 热路径
 # 创建 UDP task。配置启用但制品未带本 feature 时必须在快照构建期 fail-fast。
-http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn"]
+http3 = ["dep:h3", "dep:h3-datagram", "dep:h3-quinn", "dep:h3-webtransport", "dep:quinn", "dep:wtransport"]
 # V10 xDS v3 client 独立制品门；Envoy protobuf、ADS gRPC transport 与状态机只在该
 # feature 中编译。默认 core 仍只解析并拒绝越权 xDS 配置，不携带 tonic/prost 代码。
 xds-client = ["dep:prost", "dep:prost-types", "dep:tonic", "dep:tonic-prost", "dep:tokio-stream"]
@@ -48,17 +48,31 @@ enterprise-jwe = ["dep:josekit"]
 enterprise-saml = ["dep:saml-rs"]
 enterprise-ldap = ["dep:ldap3"]
 enterprise-identity = ["enterprise-jwe", "enterprise-saml", "enterprise-ldap"]
+# PKCS#11 只进入需要直连 HSM 的制品；默认构建继续使用 HTTPS keyless provider。
+pkcs11 = ["dep:cryptoki"]
+# SPIRE Workload API 只进入需要本地 UDS 身份订阅的制品；默认构建不携带 protobuf/gRPC client。
+spire-workload = ["dep:prost", "dep:tonic", "dep:tonic-prost", "dep:tower"]
+# Envoy External Processing 协议只进入显式扩展制品；默认数据面不携带 protobuf 状态机。
+ext-proc = ["dep:prost", "dep:prost-types"]
+# Gateway API Experimental Channel 的 MCS、Mesh 与 BackendTrafficPolicy；默认只保留 Standard surface。
+gateway-api-experimental = []
+# Gateway API Inference Extension 通过标准 External Processing 协议调用 EPP；两个能力必须同制品交付。
+inference-gateway = ["ext-proc"]
 
 [dependencies]
 # —— 数据面(hyper 反向代理)——
 anyhow = "1"
+aes-gcm = "0.10"                     # 共享 TLS session ticket key 的 AES-256-GCM 认证加密
 arc-swap = "1"                        # 单快照原子换版(无感热更)
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2"] } # V5 admin server；路由声明/类型优先走 nasa::web 门面
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] } # V5 gzip/br 流式编解码；不聚合响应 body
 base64 = "0.22"                       # gRPC-Web text 与 Connect status details 的标准 Base64 envelope
 bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] } # OCSP freshness 使用带时区的验证时刻
 casbin = { version = "2.20.0", default-features = false, features = ["glob", "ip", "runtime-tokio"] } # V7 内嵌 RBAC/ABAC；模型/策略构建后只读
 crossbeam-utils = "0.8"                # 热指标 CachePadded 条带计数，避免 Tokio worker 争用同一 cache line
+crossbeam-channel = "0.5"              # keyless TLS 使用可克隆 receiver 驱动固定 worker 池与有界排队
+cryptoki = { version = "0.12.0", optional = true } # 安全 PKCS#11 wrapper；动态 module 和 token 由部署显式选择
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"                         # 长流连接表分片并发；避免 gRPC 短流注册/注销争用单全局锁
 ed25519-dalek = "2.2"                 # OPA bundle detached Ed25519 签名；激活前验证原始压缩字节
@@ -72,12 +86,15 @@ hmac = "0.12"                           # RFC2136 DNS-01 的 HMAC-SHA256 TSIG �
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio", "webpki-roots"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "tokio", "http1", "http2"] }
-h3 = { version = "0.0.8", optional = true, features = ["tracing"] } # V9 HTTP/3 frame/QPACK 状态机；只由 http3 feature 引入
-h3-quinn = { version = "0.0.10", optional = true, features = ["tracing"] } # V9 把 Quinn stream 适配到 h3 traits
+h3 = { version = "0.0.8", optional = true, features = ["tracing"] } # HTTP/3 frame/QPACK 状态机；只由 http3 feature 引入
+h3-datagram = { version = "0.0.2", optional = true } # 自定义 Quinn 入站适配继续满足 WebTransport DATAGRAM transport 契约
+h3-quinn = { version = "0.0.10", optional = true, features = ["tracing", "datagram"] } # 把 Quinn stream 与 DATAGRAM 适配到 h3 traits
+h3-webtransport = { version = "0.1.2", optional = true } # WebTransport 下游 session 与 stream 编解码
 mimalloc = { version = "0.1.52", default-features = false }
 instant-acme = { version = "0.8.5", features = ["rcgen"] } # RFC 8555 HTTP-01/DNS-01 签发与续期
 jsonschema = { version = "0.48.1", default-features = false } # V5 build-time JSON Schema validator；关闭网络/文件 resolver，拒绝外部 $ref
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto", "use_pem"] } # RS256/ES256、PEM/JWKS 严格验签；远端 URL 只取 route 固定配置
+maxminddb = "0.30"                    # route GeoIP/ASN/匿名网络只读本地 MMDB 快照；候选构建期校验类型、大小与 freshness
 josekit = { version = "0.10.3", optional = true } # JWE compact RSA-OAEP-256 + A256GCM；只用于嵌套签名 JWT 解密
 ldap3 = { version = "0.12.1", optional = true, default-features = false, features = ["tls-rustls-aws-lc-rs"] } # LDAPv3/LDAPS/StartTLS 企业目录认证
 libc = "0.2"                          # `-s reload` 向运行进程发 SIGHUP
@@ -88,7 +105,7 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] } # V5 OTLP/HTTP protobuf exporter
 parking_lot = "0.12"                  # 上游 client cache 共享读快路径；短临界区不占 Tokio 异步锁
 percent-encoding = "2"                # OpenAPI path parameter percent-decode；不同于 query，不把 `+` 错当空格
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2", "form", "json", "query"] } # 后台 HTTP、受控 callout 与有界表单/响应读取
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "blocking", "http2", "form", "json", "query"] } # 后台 HTTP、受控 callout 与有界表单/响应读取
 quinn = { version = "0.11.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] } # V9 QUIC/TLS 1.3 transport；与现有 aws-lc rustls provider 对齐
 prost = { version = "0.14.4", optional = true } # V10 只编码显式声明的 xDS v3 message surface
 prost-types = { version = "0.14.4", optional = true } # V10 DiscoveryResponse Any 与基础 wrapper
@@ -100,6 +117,7 @@ saml-rs = { version = "0.3.0", optional = true } # 纯 Rust SAML SP、严格 XML
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"                      # 配置 tree 与管理 API 的 serde_json::Value
 serde_yml = "0.0.12"                  # Console 语义编辑与三文档 dry-run 工作区
+sha1 = "0.10"                          # OCSP CertID 按 RFC 6960 使用 SHA-1 标识 issuer
 sha2 = "0.10"                         # V5 cache key 增量摘要；避免把 Vary/header 原值写进 L1/Redis key
 tar = "0.4"                           # 标准 OPA bundle archive；拒绝链接与路径穿越 entry
 socket2 = { version = "0.6", features = ["all"] } # V7 SO_REUSEPORT 两阶段 listener 热切换
@@ -111,14 +129,19 @@ tokio-rustls = "0.26"                 # TLS 监听 + ALPN
 tonic = { version = "0.14.6", optional = true, default-features = false, features = ["channel", "codegen", "tls-aws-lc"] } # V10 ADS bidi gRPC client；不编 router/server
 tonic-prost = { version = "0.14.6", optional = true } # V10 手写选择性 proto 的 Prost codec
 tower-service = "0.3"
+tower = { version = "0.5", optional = true, features = ["util"] } # SPIRE Workload API Unix socket connector
 tracing = "0.1"                       # 日志宏(info!/warn!/...);全局订阅初始化用 nasa::log
 tracing-opentelemetry = { version = "0.33", default-features = false } # V5 tracing/OTel 同栈桥接；与 opentelemetry 0.32 配套
+tsp-ltv = { version = "0.3.1", default-features = false, features = ["ltv"] } # OCSP 签名、证书绑定和 freshness 校验
 form_urlencoded = "1"                 # V5 schema 慢路径 query percent-decoding；Cow 复用无转义片段
 regex = "1"                           # Gateway API HTTPRoute header/query RegularExpression 构建期编译
+quick-xml = "0.41"                    # route 显式 WAF XML 慢路径；禁用 DTD/外部实体并执行节点预算
 regorus = { version = "0.10.1", optional = true, default-features = false, features = ["full-opa", "arc"] } # 显式 embedded OPA profile 的 Rego 解释器
 futures = "0.3"                       # 仅用于快照构建期驱动 Casbin 的字符串 adapter future
+x509-cert = { version = "0.2", features = ["pem"] } # OCSP 目标和 issuer 的严格 DER 解析
 x509-parser = "0.18"                  # 控制面解析证书 notAfter，避免无条件重复下单
 wasmtime = { version = "46.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] } # V7 Proxy-Wasm 沙箱；无 WASI/文件/网络权限
+wtransport = { version = "0.7.1", optional = true, default-features = false, features = ["aws-lc-rs", "quinn"] } # WebTransport 真上游 client；关闭 http3 时不进入制品
 
 # —— 复用 nasa-runtime-rust 生态（YAML 直接使用 naml，日志走 nasa::log）——
 # 当前 path 用于联调尚未发布的 Nacos 首次 bundle API，version 仍锁定兼容基线。
@@ -135,6 +158,9 @@ nabase = { path = "../nasa-runtime-rust/nabase" }
 macro-support = { path = "../nasa-runtime-rust/macro-support" }
 
 [dev-dependencies]
+maxminddb-writer = "0.1.2"
 rcgen = "0.12"
 tokio = { version = "1", features = ["full", "test-util"] } # start_paused 时钟仅测试形态启用
+tonic = { version = "0.14.6", default-features = false, features = ["server", "channel", "codegen", "router"] }
+tonic-prost = "0.14.6"
 wat = "1"                            # V7 进程级 Proxy-Wasm 回归测试动态生成最小标准模块

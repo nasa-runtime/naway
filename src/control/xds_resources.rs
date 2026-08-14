@@ -368,27 +368,6 @@ impl XdsPolicyCache {
             .retain(|cluster| retain.contains(cluster));
     }
 
-    /// 业务作用：读取最近完整发布的 CDS/RDS LKG，供 warming 或坏版本期间继续服务。
-    ///
-    /// 参数说明：无。
-    ///
-    /// 返回：至少完成过一次依赖闭包时返回 active snapshot，否则返回 None。
-    #[cfg(test)]
-    pub(crate) fn active(&self) -> Option<&XdsPolicySnapshot> {
-        self.active.as_ref()
-    }
-
-    /// 业务作用：判断当前 accepted 候选是否已经超过 bootstrap warming timeout。
-    ///
-    /// 参数说明：`now` 是同一单调时钟；`timeout` 是有界 bootstrap 值。
-    ///
-    /// 返回：存在未闭合候选且持续时间达到门限时返回 true。
-    #[cfg(test)]
-    pub(crate) fn warming_expired(&self, now: Instant, timeout: Duration) -> bool {
-        self.warming_since
-            .is_some_and(|started| now.saturating_duration_since(started) >= timeout)
-    }
-
     /// 业务作用：给 ADS 接收循环提供当前 warming 周期的一次性超时唤醒点，避免无新 response 时永远不告警。
     ///
     /// 参数说明：`timeout` 是 bootstrap 已校验的 warming 上限。
@@ -654,9 +633,13 @@ fn materialize_listener_tls(
         listen: listener.listen.clone(),
         cert_file: std::path::PathBuf::new(),
         key_file: std::path::PathBuf::new(),
+        private_key_provider: None,
+        spire: None,
         keypair_manifest_file: None,
         certs: Vec::new(),
         client_auth: None,
+        ocsp_stapling: None,
+        session_tickets: None,
         acme: None,
         in_memory: Some(Arc::new(InMemoryTlsMaterial {
             certificate_chain,

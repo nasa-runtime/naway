@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 
+use crate::bot::BotDecision;
+use crate::csrf::CsrfDecision;
+use crate::geoip::GeoIpDecision;
 use crate::graphql::GraphqlGuardResult;
 
 const REQUEST_DURATION_BUCKET_MS: [u64; 12] =
@@ -111,6 +114,57 @@ pub(crate) enum LlmModerationMetric {
     Blocked,
     FailOpen,
     Error,
+}
+
+/// WAF 的固定数据面结果；规则、target 与 route 只进入低敏日志，不进入 label。
+#[derive(Clone, Copy)]
+pub(crate) enum WafMetric {
+    /// monitor 模式命中后继续转发。
+    Monitored,
+    /// enforce 模式命中并拒绝。
+    Blocked,
+    /// body 超过显式聚合预算。
+    TooLarge,
+    /// 下游 body transport 读取失败。
+    BodyReadError,
+}
+
+/// DLP 的固定数据面结果；规则、方向、字段名与命中原值不进入 label。
+#[derive(Clone, Copy)]
+pub(crate) enum DlpMetric {
+    /// monitor 命中后原字节继续传输。
+    Monitored,
+    /// redact 命中且敏感字段已替换。
+    Redacted,
+    /// block 命中且当前方向停止。
+    Blocked,
+    /// body 超过显式聚合预算。
+    TooLarge,
+    /// body transport 读取失败。
+    BodyReadError,
+    /// media type、Content-Encoding 或结构无法安全检查。
+    Invalid,
+}
+
+/// 响应契约的固定终态；operation、status、schema path 与 route 不进入 label。
+#[derive(Clone, Copy)]
+pub(crate) enum ResponseContractMetric {
+    Valid = 0,
+    Invalid = 1,
+    Blocked = 2,
+    Replaced = 3,
+    TooLarge = 4,
+    ReadError = 5,
+    Unsupported = 6,
+}
+
+/// 声明式 body 转换的固定终态；字段路径、输入值与 route 不进入 label。
+#[derive(Clone, Copy)]
+pub(crate) enum BodyTransformMetric {
+    Transformed = 0,
+    Invalid = 1,
+    TooLarge = 2,
+    ReadError = 3,
 }
 
 /// V7 Usage Plan 的固定数据面结果；consumer、plan、route 均不进入 label。
@@ -235,6 +289,10 @@ pub struct Metrics {
     request_schema_invalid_total: AtomicU64,
     request_schema_too_large_total: AtomicU64,
     request_schema_body_read_error_total: AtomicU64,
+    /// 响应契约只按固定结果计数，不暴露 schema、operation 或字段信息。
+    response_contract_total: [AtomicU64; 7],
+    /// 请求和响应实体转换共用固定终态，方向通过独立日志上下文定位。
+    body_transform_total: [AtomicU64; 4],
     /// V7 GraphQL 守卫固定结果；不使用 operation/field/route 等高基数 label。
     graphql_allowed_total: AtomicU64,
     graphql_invalid_total: AtomicU64,
@@ -243,6 +301,19 @@ pub struct Metrics {
     graphql_too_complex_total: AtomicU64,
     graphql_introspection_denied_total: AtomicU64,
     graphql_body_read_error_total: AtomicU64,
+    /// WAF 固定终态；不把规则、target 或 route 写入指标 label。
+    waf_monitored_total: AtomicU64,
+    waf_blocked_total: AtomicU64,
+    waf_too_large_total: AtomicU64,
+    waf_body_read_error_total: AtomicU64,
+    /// GeoIP 固定决策集合；不把 IP、国家、ASN、数据库或 route 写入 label。
+    geoip_decisions_total: [AtomicU64; 10],
+    /// Bot 固定决策与 enforce/monitor 终态；不把 IP、User-Agent、指纹或 route 写入 label。
+    bot_decisions_total: [AtomicU64; 12],
+    /// CSRF 固定决策与 enforce/monitor 终态；不把 Origin、Referer、cookie、token 或 route 写入 label。
+    csrf_decisions_total: [AtomicU64; 8],
+    /// DLP 固定处置集合；不把规则、方向、字段名、命中值或 route 写入 label。
+    dlp_decisions_total: [AtomicU64; 6],
     /// V7 OPA 固定结果；不使用 policy、consumer、route 或 header 等高基数 label。
     opa_decision_allow_total: AtomicU64,
     opa_decision_deny_total: AtomicU64,
@@ -360,6 +431,37 @@ pub struct Metrics {
     http3_requests_error_total: AtomicU64,
     #[cfg(feature = "http3")]
     http3_streams_active: AtomicU64,
+    /// 0-RTT 只记录固定放行/拒绝终态，不把 nonce、ticket、route 或客户端写入 label。
+    early_data_decisions_total: [AtomicU64; 10],
+    /// CONNECT-UDP 只使用固定方向与丢弃终态，不把 route、目标或客户端写入 label。
+    #[cfg(feature = "http3")]
+    connect_udp_downstream_datagrams_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    connect_udp_upstream_datagrams_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    connect_udp_dropped_datagrams_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    http3_dropped_datagrams_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    webtransport_sessions_active: AtomicU64,
+    #[cfg(feature = "http3")]
+    webtransport_sessions_success_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    webtransport_sessions_error_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    webtransport_bidi_streams_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    webtransport_uni_streams_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    webtransport_bidi_streams_rejected_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    webtransport_uni_streams_rejected_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    webtransport_downstream_datagrams_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    webtransport_upstream_datagrams_total: AtomicU64,
+    #[cfg(feature = "http3")]
+    webtransport_dropped_datagrams_total: AtomicU64,
     #[cfg(feature = "http3")]
     upstream_http3_connections_active: AtomicU64,
     #[cfg(feature = "http3")]
@@ -475,6 +577,8 @@ impl Default for Metrics {
             request_schema_invalid_total: AtomicU64::new(0),
             request_schema_too_large_total: AtomicU64::new(0),
             request_schema_body_read_error_total: AtomicU64::new(0),
+            response_contract_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            body_transform_total: std::array::from_fn(|_| AtomicU64::new(0)),
             graphql_allowed_total: AtomicU64::new(0),
             graphql_invalid_total: AtomicU64::new(0),
             graphql_too_large_total: AtomicU64::new(0),
@@ -482,6 +586,14 @@ impl Default for Metrics {
             graphql_too_complex_total: AtomicU64::new(0),
             graphql_introspection_denied_total: AtomicU64::new(0),
             graphql_body_read_error_total: AtomicU64::new(0),
+            waf_monitored_total: AtomicU64::new(0),
+            waf_blocked_total: AtomicU64::new(0),
+            waf_too_large_total: AtomicU64::new(0),
+            waf_body_read_error_total: AtomicU64::new(0),
+            geoip_decisions_total: Default::default(),
+            bot_decisions_total: Default::default(),
+            csrf_decisions_total: Default::default(),
+            dlp_decisions_total: Default::default(),
             opa_decision_allow_total: AtomicU64::new(0),
             opa_decision_deny_total: AtomicU64::new(0),
             opa_decision_fail_open_total: AtomicU64::new(0),
@@ -578,6 +690,35 @@ impl Default for Metrics {
             http3_requests_error_total: AtomicU64::new(0),
             #[cfg(feature = "http3")]
             http3_streams_active: AtomicU64::new(0),
+            early_data_decisions_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            #[cfg(feature = "http3")]
+            connect_udp_downstream_datagrams_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            connect_udp_upstream_datagrams_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            connect_udp_dropped_datagrams_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            http3_dropped_datagrams_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            webtransport_sessions_active: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            webtransport_sessions_success_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            webtransport_sessions_error_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            webtransport_bidi_streams_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            webtransport_uni_streams_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            webtransport_bidi_streams_rejected_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            webtransport_uni_streams_rejected_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            webtransport_downstream_datagrams_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            webtransport_upstream_datagrams_total: AtomicU64::new(0),
+            #[cfg(feature = "http3")]
+            webtransport_dropped_datagrams_total: AtomicU64::new(0),
             #[cfg(feature = "http3")]
             upstream_http3_connections_active: AtomicU64::new(0),
             #[cfg(feature = "http3")]
@@ -949,6 +1090,24 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 业务作用：记录响应契约的固定终态，同时避免 schema、operation 和字段进入指标 label。
+    ///
+    /// 参数说明：`result` 是编译期固定的契约结果。
+    ///
+    /// 返回：无；对应计数器增加一次。
+    pub(crate) fn inc_response_contract(&self, result: ResponseContractMetric) {
+        self.response_contract_total[result as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录声明式 request/response body 转换的固定终态。
+    ///
+    /// 参数说明：`result` 是不携带字段名或实体值的转换结果。
+    ///
+    /// 返回：无；对应计数器增加一次。
+    pub(crate) fn inc_body_transform(&self, result: BodyTransformMetric) {
+        self.body_transform_total[result as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// 记录 V7 GraphQL 守卫的一个固定结果。
     pub(crate) fn inc_graphql_guard(&self, result: GraphqlGuardResult) {
         let counter = match result {
@@ -961,6 +1120,101 @@ impl Metrics {
             GraphqlGuardResult::BodyReadError => &self.graphql_body_read_error_total,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一次 WAF monitor、拦截或 body 安全门禁终态。
+    ///
+    /// 参数说明：`result` 是编译期固定的低基数结果，不携带请求值。
+    ///
+    /// 返回：无；对应固定计数器增加一次。
+    pub(crate) fn inc_waf(&self, result: WafMetric) {
+        let counter = match result {
+            WafMetric::Monitored => &self.waf_monitored_total,
+            WafMetric::Blocked => &self.waf_blocked_total,
+            WafMetric::TooLarge => &self.waf_too_large_total,
+            WafMetric::BodyReadError => &self.waf_body_read_error_total,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一次 route GeoIP/ASN/匿名网络固定决策。
+    ///
+    /// 参数说明：`decision` 不携带客户端 IP、国家、ASN 或数据库动态值。
+    ///
+    /// 返回：无；对应固定结果计数增加一次。
+    pub(crate) fn inc_geoip(&self, decision: GeoIpDecision) {
+        let index = match decision {
+            GeoIpDecision::Allowed => 0,
+            GeoIpDecision::CountryDenied => 1,
+            GeoIpDecision::AsnDenied => 2,
+            GeoIpDecision::AnonymousDenied => 3,
+            GeoIpDecision::NotFoundAllowed => 4,
+            GeoIpDecision::NotFoundDenied => 5,
+            GeoIpDecision::LookupErrorAllowed => 6,
+            GeoIpDecision::LookupErrorDenied => 7,
+            GeoIpDecision::StaleAllowed => 8,
+            GeoIpDecision::StaleDenied => 9,
+        };
+        self.geoip_decisions_total[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一次 route Bot 固定决策，并区分真正挑战与 monitor 观察。
+    ///
+    /// 参数说明：`decision` 不携带客户端输入；`monitored` 表示拒绝原因是否仅观察。
+    ///
+    /// 返回：无；对应固定结果计数增加一次。
+    pub(crate) fn inc_bot(&self, decision: BotDecision, monitored: bool) {
+        let index = match (decision, monitored) {
+            (BotDecision::Allowed, _) => 0,
+            (BotDecision::Trusted, _) => 1,
+            (BotDecision::UserAgentDenied, false) => 2,
+            (BotDecision::UserAgentDenied, true) => 3,
+            (BotDecision::FingerprintDenied, false) => 4,
+            (BotDecision::FingerprintDenied, true) => 5,
+            (BotDecision::BehaviorDenied, false) => 6,
+            (BotDecision::BehaviorDenied, true) => 7,
+            (BotDecision::TrustedClaimInvalid, false) => 8,
+            (BotDecision::TrustedClaimInvalid, true) => 9,
+            (BotDecision::RateDenied, false) => 10,
+            (BotDecision::RateDenied, true) => 11,
+        };
+        self.bot_decisions_total[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一次 route CSRF 固定决策，并区分真正阻断与 monitor 观察。
+    ///
+    /// 参数说明：`decision` 不携带请求输入；`monitored` 表示拒绝原因是否仅观察。
+    ///
+    /// 返回：无；对应固定结果计数增加一次。
+    pub(crate) fn inc_csrf(&self, decision: CsrfDecision, monitored: bool) {
+        let index = match (decision, monitored) {
+            (CsrfDecision::SafeMethod, _) => 0,
+            (CsrfDecision::Allowed, _) => 1,
+            (CsrfDecision::OriginDenied, false) => 2,
+            (CsrfDecision::OriginDenied, true) => 3,
+            (CsrfDecision::TokenMissing, false) => 4,
+            (CsrfDecision::TokenMissing, true) => 5,
+            (CsrfDecision::TokenInvalid, false) => 6,
+            (CsrfDecision::TokenInvalid, true) => 7,
+        };
+        self.csrf_decisions_total[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一次 DLP 固定处置，不接收规则、target 或命中原值。
+    ///
+    /// 参数说明：`result` 是固定 monitor/redact/block/资源或解析终态。
+    ///
+    /// 返回：无；对应固定结果计数增加一次。
+    pub(crate) fn inc_dlp(&self, result: DlpMetric) {
+        let index = match result {
+            DlpMetric::Monitored => 0,
+            DlpMetric::Redacted => 1,
+            DlpMetric::Blocked => 2,
+            DlpMetric::TooLarge => 3,
+            DlpMetric::BodyReadError => 4,
+            DlpMetric::Invalid => 5,
+        };
+        self.dlp_decisions_total[index].fetch_add(1, Ordering::Relaxed);
     }
 
     /// 记录一个 OPA 最终数据面决策。
@@ -1320,16 +1574,25 @@ impl Metrics {
         self.stream_kafka_rejections_total[index].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 业务作用：记录一条已完成握手、正在服务的下游 QUIC connection。
+    /// 业务作用：记录一条已经进入服务态的下游 QUIC connection。
     ///
     /// 参数说明：无。
     ///
-    /// 返回：无；同时增加握手成功累计与活跃连接 gauge。
+    /// 返回：无；增加活跃连接 gauge，握手终态由独立方法记录。
     #[cfg(feature = "http3")]
     pub fn inc_quic_connection(&self) {
+        self.quic_connections_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：在 QUIC TLS 握手确认后记录成功终态，与可提前处理的 0-RTT stream 解耦。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：无；固定 `result=success` 计数增加。
+    #[cfg(feature = "http3")]
+    pub fn inc_quic_handshake_success(&self) {
         self.quic_handshake_success_total
             .fetch_add(1, Ordering::Relaxed);
-        self.quic_connections_active.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 业务作用：在 QUIC connection 完整退出时归还活跃 gauge。
@@ -1409,6 +1672,148 @@ impl Metrics {
             &self.http3_requests_error_total
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一次 transport 已确认的 early-data 放行或固定拒绝终态。
+    ///
+    /// 参数说明：`denial` 为空表示通过全部门禁，非空表示拒绝原因。
+    ///
+    /// 返回：无；对应固定计数器增加一次，不记录请求输入。
+    pub(crate) fn inc_early_data(&self, denial: Option<crate::masque::EarlyDataDenial>) {
+        let index = match denial {
+            None => 0,
+            Some(crate::masque::EarlyDataDenial::NotEnabled) => 1,
+            Some(crate::masque::EarlyDataDenial::NonIdempotentMethod) => 2,
+            Some(crate::masque::EarlyDataDenial::SensitiveCredential) => 3,
+            Some(crate::masque::EarlyDataDenial::Replayed) => 4,
+            Some(crate::masque::EarlyDataDenial::MissingNonce) => 5,
+            Some(crate::masque::EarlyDataDenial::MissingIndicator) => 6,
+            Some(crate::masque::EarlyDataDenial::InvalidIndicator) => 7,
+            Some(crate::masque::EarlyDataDenial::InvalidNonce) => 8,
+            Some(crate::masque::EarlyDataDenial::RequestBody) => 9,
+        };
+        self.early_data_decisions_total[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一枚成功穿过 CONNECT-UDP 的数据报，不暴露 route、目标或客户端身份。
+    ///
+    /// 参数说明：`downstream` 为 true 表示客户端到 UDP 目标，false 表示反向。
+    ///
+    /// 返回：无；对应固定方向计数器增加一。
+    #[cfg(feature = "http3")]
+    pub fn inc_connect_udp_datagram(&self, downstream: bool) {
+        let counter = if downstream {
+            &self.connect_udp_downstream_datagrams_total
+        } else {
+            &self.connect_udp_upstream_datagrams_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录因畸形、未知 session、队列满、payload 或累计预算触发的 DATAGRAM 丢弃。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；固定丢弃计数器增加一。
+    #[cfg(feature = "http3")]
+    pub fn inc_connect_udp_datagram_drop(&self) {
+        self.connect_udp_dropped_datagrams_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录无法归属到活动扩展会话的 HTTP/3 DATAGRAM，暴露畸形、迟到与未知流量。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；固定协议级丢弃计数器增加一。
+    #[cfg(feature = "http3")]
+    pub fn inc_http3_datagram_drop(&self) {
+        self.http3_dropped_datagrams_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：登记一条已完成上下游握手的 WebTransport session。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；活跃 session gauge 增加一，终态由 [`Self::finish_webtransport_session`] 归还。
+    #[cfg(feature = "http3")]
+    pub fn inc_webtransport_session(&self) {
+        self.webtransport_sessions_active
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：在 WebTransport session 退出时归还活跃量并记录固定成功或错误终态。
+    ///
+    /// 参数说明：`success` 表示会话按关闭、超时、撤权或停机路径完整收口。
+    ///
+    /// 返回：无；只更新固定结果计数器，不记录 route、目标或客户端身份。
+    #[cfg(feature = "http3")]
+    pub fn finish_webtransport_session(&self, success: bool) {
+        self.webtransport_sessions_active
+            .fetch_sub(1, Ordering::Relaxed);
+        let counter = if success {
+            &self.webtransport_sessions_success_total
+        } else {
+            &self.webtransport_sessions_error_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一条已取得会话准入的 WebTransport stream。
+    ///
+    /// 参数说明：`bidirectional` 区分双向与单向 stream。
+    ///
+    /// 返回：无；对应固定类型计数器增加一。
+    #[cfg(feature = "http3")]
+    pub fn inc_webtransport_stream(&self, bidirectional: bool) {
+        let counter = if bidirectional {
+            &self.webtransport_bidi_streams_total
+        } else {
+            &self.webtransport_uni_streams_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录因 session 身份或并发硬门而被明确终止的 WebTransport stream。
+    ///
+    /// 参数说明：`bidirectional` 区分双向与单向 stream。
+    ///
+    /// 返回：无；对应固定类型拒绝计数器增加一。
+    #[cfg(feature = "http3")]
+    pub fn inc_webtransport_stream_rejected(&self, bidirectional: bool) {
+        let counter = if bidirectional {
+            &self.webtransport_bidi_streams_rejected_total
+        } else {
+            &self.webtransport_uni_streams_rejected_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录一枚成功穿过 WebTransport session 的 DATAGRAM。
+    ///
+    /// 参数说明：`downstream` 为 true 表示客户端到上游，false 表示上游到客户端。
+    ///
+    /// 返回：无；对应固定方向计数器增加一。
+    #[cfg(feature = "http3")]
+    pub fn inc_webtransport_datagram(&self, downstream: bool) {
+        let counter = if downstream {
+            &self.webtransport_downstream_datagrams_total
+        } else {
+            &self.webtransport_upstream_datagrams_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 业务作用：记录因畸形、session 不匹配、队列、payload、累计预算或拥塞而丢弃的数据报。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；固定 WebTransport 丢弃计数器增加一。
+    #[cfg(feature = "http3")]
+    pub fn inc_webtransport_datagram_drop(&self) {
+        self.webtransport_dropped_datagrams_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// 业务作用：记录一条新建且可多路复用的上游 H3 connection。
@@ -1783,6 +2188,118 @@ impl Metrics {
                 "gw_http3_requests_total{{result=\"error\"}} {}\n",
                 self.http3_requests_error_total.load(Ordering::Relaxed)
             ));
+            out.push_str("# HELP gw_http3_early_data_total HTTP/3 early data by fixed decision.\n");
+            out.push_str("# TYPE gw_http3_early_data_total counter\n");
+            for (index, decision) in [
+                "accepted",
+                "not_enabled",
+                "non_idempotent_method",
+                "sensitive_credential",
+                "replayed",
+                "missing_nonce",
+                "missing_indicator",
+                "invalid_indicator",
+                "invalid_nonce",
+                "request_body",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                out.push_str(&format!(
+                    "gw_http3_early_data_total{{decision=\"{decision}\"}} {}\n",
+                    self.early_data_decisions_total[index].load(Ordering::Relaxed)
+                ));
+            }
+            out.push_str(
+                "# HELP gw_connect_udp_datagrams_total CONNECT-UDP datagrams by fixed direction.\n",
+            );
+            out.push_str("# TYPE gw_connect_udp_datagrams_total counter\n");
+            out.push_str(&format!(
+                "gw_connect_udp_datagrams_total{{direction=\"downstream_to_upstream\"}} {}\n",
+                self.connect_udp_downstream_datagrams_total
+                    .load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!(
+                "gw_connect_udp_datagrams_total{{direction=\"upstream_to_downstream\"}} {}\n",
+                self.connect_udp_upstream_datagrams_total
+                    .load(Ordering::Relaxed)
+            ));
+            render_counter(
+                &mut out,
+                "gw_connect_udp_dropped_datagrams_total",
+                self.connect_udp_dropped_datagrams_total
+                    .load(Ordering::Relaxed),
+            );
+            render_counter(
+                &mut out,
+                "gw_http3_dropped_datagrams_total",
+                self.http3_dropped_datagrams_total.load(Ordering::Relaxed),
+            );
+            render_gauge(
+                &mut out,
+                "gw_webtransport_sessions_active",
+                self.webtransport_sessions_active.load(Ordering::Relaxed),
+            );
+            out.push_str(
+                "# HELP gw_webtransport_sessions_total WebTransport sessions by fixed result.\n",
+            );
+            out.push_str("# TYPE gw_webtransport_sessions_total counter\n");
+            out.push_str(&format!(
+                "gw_webtransport_sessions_total{{result=\"success\"}} {}\n",
+                self.webtransport_sessions_success_total
+                    .load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!(
+                "gw_webtransport_sessions_total{{result=\"error\"}} {}\n",
+                self.webtransport_sessions_error_total
+                    .load(Ordering::Relaxed)
+            ));
+            out.push_str(
+                "# HELP gw_webtransport_streams_total WebTransport streams admitted by fixed type.\n",
+            );
+            out.push_str("# TYPE gw_webtransport_streams_total counter\n");
+            out.push_str(&format!(
+                "gw_webtransport_streams_total{{type=\"bidirectional\"}} {}\n",
+                self.webtransport_bidi_streams_total.load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!(
+                "gw_webtransport_streams_total{{type=\"unidirectional\"}} {}\n",
+                self.webtransport_uni_streams_total.load(Ordering::Relaxed)
+            ));
+            out.push_str(
+                "# HELP gw_webtransport_stream_rejections_total WebTransport streams rejected by fixed type.\n",
+            );
+            out.push_str("# TYPE gw_webtransport_stream_rejections_total counter\n");
+            out.push_str(&format!(
+                "gw_webtransport_stream_rejections_total{{type=\"bidirectional\"}} {}\n",
+                self.webtransport_bidi_streams_rejected_total
+                    .load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!(
+                "gw_webtransport_stream_rejections_total{{type=\"unidirectional\"}} {}\n",
+                self.webtransport_uni_streams_rejected_total
+                    .load(Ordering::Relaxed)
+            ));
+            out.push_str(
+                "# HELP gw_webtransport_datagrams_total WebTransport datagrams by fixed direction.\n",
+            );
+            out.push_str("# TYPE gw_webtransport_datagrams_total counter\n");
+            out.push_str(&format!(
+                "gw_webtransport_datagrams_total{{direction=\"downstream_to_upstream\"}} {}\n",
+                self.webtransport_downstream_datagrams_total
+                    .load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!(
+                "gw_webtransport_datagrams_total{{direction=\"upstream_to_downstream\"}} {}\n",
+                self.webtransport_upstream_datagrams_total
+                    .load(Ordering::Relaxed)
+            ));
+            render_counter(
+                &mut out,
+                "gw_webtransport_dropped_datagrams_total",
+                self.webtransport_dropped_datagrams_total
+                    .load(Ordering::Relaxed),
+            );
             render_gauge(
                 &mut out,
                 "gw_upstream_http3_connections_active",
@@ -1880,6 +2397,36 @@ impl Metrics {
                 "gw_request_schema_total{{result=\"{result}\"}} {value}\n"
             ));
         }
+        out.push_str("# HELP gw_response_contract_total Responses by OpenAPI contract result.\n");
+        out.push_str("# TYPE gw_response_contract_total counter\n");
+        for (index, result) in [
+            "valid",
+            "invalid",
+            "blocked",
+            "replaced",
+            "too_large",
+            "body_read_error",
+            "unsupported",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.push_str(&format!(
+                "gw_response_contract_total{{result=\"{result}\"}} {}\n",
+                self.response_contract_total[index].load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str("# HELP gw_body_transform_total Body transformations by result.\n");
+        out.push_str("# TYPE gw_body_transform_total counter\n");
+        for (index, result) in ["transformed", "invalid", "too_large", "body_read_error"]
+            .into_iter()
+            .enumerate()
+        {
+            out.push_str(&format!(
+                "gw_body_transform_total{{result=\"{result}\"}} {}\n",
+                self.body_transform_total[index].load(Ordering::Relaxed)
+            ));
+        }
         out.push_str("# HELP gw_graphql_guard_total GraphQL requests by bounded guard result.\n");
         out.push_str("# TYPE gw_graphql_guard_total counter\n");
         for (result, value) in [
@@ -1915,6 +2462,119 @@ impl Metrics {
         ] {
             out.push_str(&format!(
                 "gw_graphql_guard_total{{result=\"{result}\"}} {value}\n"
+            ));
+        }
+        out.push_str("# HELP gw_waf_requests_total WAF interventions by fixed outcome.\n");
+        out.push_str("# TYPE gw_waf_requests_total counter\n");
+        for (result, value) in [
+            (
+                "monitored",
+                self.waf_monitored_total.load(Ordering::Relaxed),
+            ),
+            ("blocked", self.waf_blocked_total.load(Ordering::Relaxed)),
+            (
+                "too_large",
+                self.waf_too_large_total.load(Ordering::Relaxed),
+            ),
+            (
+                "body_read_error",
+                self.waf_body_read_error_total.load(Ordering::Relaxed),
+            ),
+        ] {
+            out.push_str(&format!(
+                "gw_waf_requests_total{{result=\"{result}\"}} {value}\n"
+            ));
+        }
+        out.push_str(
+            "# HELP gw_geoip_decisions_total GeoIP decisions by fixed low-cardinality result.\n",
+        );
+        out.push_str("# TYPE gw_geoip_decisions_total counter\n");
+        for (index, result) in [
+            "allowed",
+            "country_denied",
+            "asn_denied",
+            "anonymous_denied",
+            "not_found_allowed",
+            "not_found_denied",
+            "lookup_error_allowed",
+            "lookup_error_denied",
+            "stale_allowed",
+            "stale_denied",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.push_str(&format!(
+                "gw_geoip_decisions_total{{result=\"{result}\"}} {}\n",
+                self.geoip_decisions_total[index].load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str(
+            "# HELP gw_bot_decisions_total Bot decisions by fixed low-cardinality result.\n",
+        );
+        out.push_str("# TYPE gw_bot_decisions_total counter\n");
+        for (index, result) in [
+            "allowed",
+            "trusted",
+            "user_agent_blocked",
+            "user_agent_monitored",
+            "fingerprint_blocked",
+            "fingerprint_monitored",
+            "behavior_blocked",
+            "behavior_monitored",
+            "trusted_claim_invalid_blocked",
+            "trusted_claim_invalid_monitored",
+            "rate_blocked",
+            "rate_monitored",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.push_str(&format!(
+                "gw_bot_decisions_total{{result=\"{result}\"}} {}\n",
+                self.bot_decisions_total[index].load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str(
+            "# HELP gw_csrf_decisions_total CSRF decisions by fixed low-cardinality result.\n",
+        );
+        out.push_str("# TYPE gw_csrf_decisions_total counter\n");
+        for (index, result) in [
+            "safe_method",
+            "allowed",
+            "origin_blocked",
+            "origin_monitored",
+            "token_missing_blocked",
+            "token_missing_monitored",
+            "token_invalid_blocked",
+            "token_invalid_monitored",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.push_str(&format!(
+                "gw_csrf_decisions_total{{result=\"{result}\"}} {}\n",
+                self.csrf_decisions_total[index].load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str(
+            "# HELP gw_dlp_decisions_total DLP actions by fixed low-cardinality result.\n",
+        );
+        out.push_str("# TYPE gw_dlp_decisions_total counter\n");
+        for (index, result) in [
+            "monitored",
+            "redacted",
+            "blocked",
+            "too_large",
+            "body_read_error",
+            "invalid",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.push_str(&format!(
+                "gw_dlp_decisions_total{{result=\"{result}\"}} {}\n",
+                self.dlp_decisions_total[index].load(Ordering::Relaxed)
             ));
         }
         out.push_str("# HELP gw_opa_decisions_total Final OPA authorization decisions.\n");

@@ -131,7 +131,7 @@ struct CompileCtx {
 impl VariablePlan {
     /// 从配置构建变量计划。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `cfg`: 顶层 `variables` 配置,包含 set/map 定义和 header/query allowlist。
     pub fn build(cfg: &VariablesCfg) -> Result<Arc<Self>> {
         let allow_any_header = cfg.allow_headers.iter().any(|h| h == "*");
@@ -220,7 +220,7 @@ impl VariablePlan {
 
     /// 编译一个可引用本计划变量的字符串模板。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `raw`: 原始模板字符串,例如 `"${remote_addr}-${map.tenant}"`。
     pub fn compile_template(&self, raw: &str) -> Result<ValueTemplate> {
         self.compile_template_for_phase(raw, VariablePhase::Request)
@@ -247,6 +247,22 @@ impl VariablePlan {
             phase,
         };
         compile_template(raw, &ctx)
+    }
+
+    /// 业务作用：按名求值一个已在构建期声明的 `variables.set` 变量,让一致性哈希键
+    /// 复用同一套受控变量域,而不是让 LB 另开一条直读请求字段的旁路。
+    ///
+    /// 只接受构建期已声明的名字:未声明即返回 `None`,请求期不动态编译模板,
+    /// 因此不存在「任意字段都能当哈希键」的高基数与信任面问题。
+    ///
+    /// 参数说明：
+    /// - `name`: `variables.set` 中声明的变量名。
+    /// - `ctx`: 当前请求求值上下文。
+    ///
+    /// 返回：变量已声明时返回其求值结果；未声明时返回 `None`。
+    pub fn eval_named(&self, name: &str, ctx: &EvalContext<'_>) -> Option<String> {
+        let template = self.sets.get(name)?;
+        Some(template.render(ctx, self))
     }
 }
 

@@ -1,9 +1,8 @@
-//! V6 AI/LLM 统一协议与模型路由。
+//! AI/LLM 独立 API 契约、provider 身份与模型路由。
 //!
-//! 下游固定使用 OpenAI Chat Completions JSON 契约；模型列表在快照构建期编译为有序计划。
-//! 请求 JSON 是显式慢路径：只有配置了 `routes[].llm` 的 route 才读取 body，并且先执行硬上限。
-//! 单 frame 直接保留 Hyper 交付的 [`Bytes`]；OpenAI 模型名已经匹配时，上游请求继续复用同一
-//! allocation。只有 provider/模型字段确实需要转换时才重新序列化一次。
+//! Chat Completions 只在声明无损 adapter 的 provider 间转换；Responses、embedding、rerank、
+//! image/audio/video、batch/file 与 Realtime 保持各自原生 wire 契约。所有请求先受 route 字节、
+//! 时长和费用预算约束，模型目录与凭据在快照构建期冻结，客户端不能选择 provider path 或身份。
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -12,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use http::header::{HeaderValue, AUTHORIZATION, CONTENT_LENGTH, COOKIE, TRANSFER_ENCODING};
 use http::request::Parts;
 use nasa::cache::local_cache::BoundedLocalCache;
@@ -21,9 +22,9 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::config::model::{
-    LlmCacheScopeCfg, LlmEmbeddingCfg, LlmModelCfg, LlmModerationCfg, LlmModerationFailModeCfg,
-    LlmProviderCfg, LlmQuotaDimensionCfg, LlmRouteCfg, LlmSelectionStrategyCfg,
-    LlmSemanticCacheCfg, LlmTokenQuotaCfg,
+    LlmApiTypeCfg, LlmCacheScopeCfg, LlmEmbeddingCfg, LlmModelCfg, LlmModerationCfg,
+    LlmModerationFailModeCfg, LlmProviderCfg, LlmQuotaDimensionCfg, LlmRouteCfg,
+    LlmSelectionStrategyCfg, LlmSemanticCacheCfg, LlmTokenQuotaCfg,
 };
 
 /// 单 route 最多允许的 fallback 模型数，限制一次请求最坏尝试次数与配置内存。
@@ -40,12 +41,22 @@ const LLM_CACHE_RESPONSE_VERSION: u8 = 1;
 
 /// 已编译的 LLM route 计划。
 pub struct LlmRoutePolicy {
+    /// 独立 API 契约；非 Chat 类型不进入 Chat adapter。
+    pub(crate) api_type: LlmApiType,
     /// 请求体聚合硬上限。
     pub(crate) max_body_bytes: usize,
     /// Prompt 估算硬上限。
     pub(crate) max_prompt_tokens: u64,
     /// Completion 预留/注入硬上限。
     pub(crate) max_completion_tokens: u64,
+    /// provider 响应累计字节门。
+    pub(crate) max_response_bytes: usize,
+    /// 流协议单 frame 字节门。
+    pub(crate) max_stream_frame_bytes: usize,
+    /// 单次调用或长连接持续时间门。
+    pub(crate) max_duration: Duration,
+    /// 路由允许的单请求估算费用上限。
+    pub(crate) max_cost_microusd: u64,
     /// 可选 token bucket 配额。
     pub(crate) token_quota: Option<LlmTokenQuota>,
     /// 构建期校验后的注入/越权短语。
@@ -60,6 +71,14 @@ pub struct LlmRoutePolicy {
     pub(crate) semantic_cache: Option<Arc<LlmSemanticCache>>,
     /// 构建期编译的模型首选策略。
     pub(crate) selection: LlmSelectionStrategy,
+    /// joint 策略软偏好能力。
+    pub(crate) preferred_capabilities: Arc<[Arc<str>]>,
+    /// joint 策略首 token SLO；None 表示不按声明延迟淘汰。
+    pub(crate) max_first_token_latency: Option<Duration>,
+    /// 可选 shadow 模型下标及采样万分比。
+    pub(crate) shadow: Option<(usize, u16)>,
+    /// 可选灰度模型下标及采样万分比。
+    pub(crate) rollout: Option<(usize, u16)>,
     /// 影响响应语义的 route 配置摘要；进入 cache scope，热更 system/model 后不会命中旧 L2。
     pub(crate) cache_salt: [u8; 32],
     /// 主模型在前、fallback 在后的不可变模型 slice。
@@ -138,6 +157,8 @@ pub struct LlmModel {
     pub(crate) id: Arc<str>,
     /// Wire provider。
     pub(crate) provider: LlmProvider,
+    /// 此模型参与的 route API 类型。
+    pub(crate) api_type: LlmApiType,
     /// `http(s)://` 或 `lb://` 上游。
     pub(crate) upstream: Arc<str>,
     /// Provider 模型名。
@@ -150,10 +171,26 @@ pub struct LlmModel {
     api_key: Option<HeaderValue>,
     /// Anthropic 强制版本 header。
     anthropic_version: Option<HeaderValue>,
+    /// 云 provider 固定 region。
+    region: Option<Arc<str>>,
+    /// Bedrock SigV4 access key id。
+    aws_access_key_id: Option<Arc<str>>,
+    /// Bedrock SigV4 secret access key，只驻留不可变快照内存。
+    aws_secret_access_key: Option<Arc<[u8]>>,
+    /// Bedrock 临时 session token。
+    aws_session_token: Option<HeaderValue>,
+    /// 是否保持 provider 原生 request/response。
+    pub(crate) native_passthrough: bool,
     /// 每百万 prompt token 的微美元价格。
     pub(crate) input_cost_microusd_per_million: u64,
     /// 每百万 completion token 的微美元价格。
     pub(crate) output_cost_microusd_per_million: u64,
+    /// 非 token 请求的固定估算费用。
+    pub(crate) fixed_cost_microusd: u64,
+    /// 构建期冻结的能力集合。
+    pub(crate) capabilities: Arc<[Arc<str>]>,
+    /// catalog 声明的首 token 延迟。
+    pub(crate) expected_first_token_latency: Option<Duration>,
     /// weighted 首选权重；0 只作为 fallback。
     pub(crate) weight: u32,
 }
@@ -183,6 +220,32 @@ pub enum LlmProvider {
     Anthropic,
     /// Google Gemini Developer API。
     Google,
+    AzureOpenai,
+    Bedrock,
+    VertexAi,
+    Cohere,
+    Mistral,
+    HuggingFace,
+    Xai,
+    Dashscope,
+    Deepseek,
+    Ollama,
+    Vllm,
+}
+
+/// 与 Chat adapter 解耦的 AI API 类型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LlmApiType {
+    ChatCompletions,
+    Responses,
+    Embeddings,
+    Rerank,
+    Image,
+    Audio,
+    Video,
+    Batch,
+    File,
+    Realtime,
 }
 
 /// 与 serde 配置解耦的模型首选策略。
@@ -196,6 +259,8 @@ pub enum LlmSelectionStrategy {
     Latency,
     /// 请求稳定哈希按权重选择首模型。
     Weighted,
+    /// 能力、SLO、费用与运行延迟联合排序。
+    Joint,
 }
 
 /// Provider 回传的真实 token 计数。
@@ -234,8 +299,47 @@ pub struct ParsedLlmRequest {
 impl LlmRoutePolicy {
     /// 在 build-then-swap 阶段编译并校验模型列表与 SecretSource。
     pub fn build(cfg: &LlmRouteCfg, config_dir: &Path, route_id: &str) -> Result<Self> {
+        let api_type = match cfg.api_type {
+            LlmApiTypeCfg::ChatCompletions => LlmApiType::ChatCompletions,
+            LlmApiTypeCfg::Responses => LlmApiType::Responses,
+            LlmApiTypeCfg::Embeddings => LlmApiType::Embeddings,
+            LlmApiTypeCfg::Rerank => LlmApiType::Rerank,
+            LlmApiTypeCfg::Image => LlmApiType::Image,
+            LlmApiTypeCfg::Audio => LlmApiType::Audio,
+            LlmApiTypeCfg::Video => LlmApiType::Video,
+            LlmApiTypeCfg::Batch => LlmApiType::Batch,
+            LlmApiTypeCfg::File => LlmApiType::File,
+            LlmApiTypeCfg::Realtime => LlmApiType::Realtime,
+        };
         if !(1..=MAX_LLM_BODY_BYTES).contains(&cfg.max_body_bytes) {
             bail!("route `{route_id}` llm.max_body_bytes must be within 1..={MAX_LLM_BODY_BYTES}");
+        }
+        if !(1..=MAX_LLM_RESPONSE_BYTES as u64).contains(&cfg.max_response_bytes) {
+            bail!(
+                "route `{route_id}` llm.max_response_bytes must be within 1..={MAX_LLM_RESPONSE_BYTES}"
+            );
+        }
+        if cfg.max_stream_frame_bytes == 0
+            || cfg.max_stream_frame_bytes > cfg.max_response_bytes
+            || cfg.max_stream_frame_bytes > 4 * 1024 * 1024
+        {
+            bail!("route `{route_id}` llm.max_stream_frame_bytes must be positive, no larger than max_response_bytes, and <=4194304");
+        }
+        if !(1..=86_400_000).contains(&cfg.max_duration_ms) {
+            bail!("route `{route_id}` llm.max_duration_ms must be within 1..=86400000");
+        }
+        if cfg.max_cost_microusd == 0 {
+            bail!("route `{route_id}` llm.max_cost_microusd must be positive");
+        }
+        if api_type != LlmApiType::ChatCompletions
+            && (cfg.moderation.is_some()
+                || cfg.semantic_cache.is_some()
+                || cfg.token_quota.is_some()
+                || !cfg.guardrails.system_prompt.is_empty()
+                || !cfg.guardrails.blocked_substrings.is_empty()
+                || !cfg.guardrails.blocked_response_substrings.is_empty())
+        {
+            bail!("route `{route_id}` non-Chat API cannot enable Chat-only moderation, semantic_cache, token_quota, or prompt guardrails");
         }
         if cfg.models.is_empty() || cfg.models.len() > MAX_LLM_MODELS {
             bail!("route `{route_id}` llm.models must contain 1..={MAX_LLM_MODELS} entries");
@@ -255,7 +359,33 @@ impl LlmRoutePolicy {
             LlmSelectionStrategyCfg::Cost => LlmSelectionStrategy::Cost,
             LlmSelectionStrategyCfg::Latency => LlmSelectionStrategy::Latency,
             LlmSelectionStrategyCfg::Weighted => LlmSelectionStrategy::Weighted,
+            LlmSelectionStrategyCfg::Joint => LlmSelectionStrategy::Joint,
         };
+        if cfg.selection.preferred_capabilities.len() > 16 {
+            bail!("route `{route_id}` llm.selection supports at most 16 preferred_capabilities");
+        }
+        let mut preferred = HashSet::with_capacity(cfg.selection.preferred_capabilities.len());
+        for capability in &cfg.selection.preferred_capabilities {
+            validate_capability(capability, route_id)?;
+            if !preferred.insert(capability.as_str()) {
+                bail!("route `{route_id}` has duplicate preferred LLM capability `{capability}`");
+            }
+        }
+        if cfg.selection.shadow_basis_points > 10_000 || cfg.selection.rollout_basis_points > 10_000
+        {
+            bail!("route `{route_id}` LLM shadow/rollout basis points must be <=10000");
+        }
+        if cfg.selection.shadow_model.is_empty() != (cfg.selection.shadow_basis_points == 0) {
+            bail!("route `{route_id}` LLM shadow_model and positive shadow_basis_points must be configured together");
+        }
+        if cfg.selection.rollout_model.is_empty() != (cfg.selection.rollout_basis_points == 0) {
+            bail!("route `{route_id}` LLM rollout_model and positive rollout_basis_points must be configured together");
+        }
+        if !cfg.selection.shadow_model.is_empty()
+            && cfg.selection.shadow_model == cfg.selection.rollout_model
+        {
+            bail!("route `{route_id}` LLM shadow and rollout models must be distinct");
+        }
         let mut ids = HashSet::with_capacity(cfg.models.len());
         let mut models = Vec::with_capacity(cfg.models.len());
         for model in &cfg.models {
@@ -282,7 +412,7 @@ impl LlmRoutePolicy {
                     );
                 }
             }
-            let built = LlmModel::build(model, config_dir, route_id)?;
+            let built = LlmModel::build(model, config_dir, route_id, api_type)?;
             if required
                 .iter()
                 .all(|capability| capabilities.contains(capability))
@@ -306,6 +436,30 @@ impl LlmRoutePolicy {
                     .saturating_add(model.output_cost_microusd_per_million);
                 (total == 0, total)
             });
+        }
+        let model_index = |id: &str, field: &str| -> Result<Option<usize>> {
+            if id.is_empty() {
+                return Ok(None);
+            }
+            models
+                .iter()
+                .position(|model| model.id.as_ref() == id)
+                .map(Some)
+                .with_context(|| {
+                    format!(
+                        "route `{route_id}` llm.selection.{field} references an unavailable model"
+                    )
+                })
+        };
+        let shadow = model_index(cfg.selection.shadow_model.as_str(), "shadow_model")?
+            .map(|index| (index, cfg.selection.shadow_basis_points));
+        let rollout = model_index(cfg.selection.rollout_model.as_str(), "rollout_model")?
+            .map(|index| (index, cfg.selection.rollout_basis_points));
+        if shadow.is_some() && models.len() < 2 {
+            bail!("route `{route_id}` LLM shadow evaluation requires a distinct main model");
+        }
+        if api_type == LlmApiType::Realtime && shadow.is_some() {
+            bail!("route `{route_id}` realtime API cannot duplicate a bidirectional upgrade as shadow traffic");
         }
         if cfg.max_prompt_tokens == 0 || cfg.max_prompt_tokens > 16 * 1024 * 1024 {
             bail!("route `{route_id}` llm.max_prompt_tokens must be within 1..=16777216");
@@ -375,9 +529,14 @@ impl LlmRoutePolicy {
             cache_salt.update([model.provider as u8]);
         }
         Ok(Self {
+            api_type,
             max_body_bytes: cfg.max_body_bytes as usize,
             max_prompt_tokens: cfg.max_prompt_tokens,
             max_completion_tokens: cfg.max_completion_tokens,
+            max_response_bytes: cfg.max_response_bytes as usize,
+            max_stream_frame_bytes: cfg.max_stream_frame_bytes as usize,
+            max_duration: Duration::from_millis(cfg.max_duration_ms),
+            max_cost_microusd: cfg.max_cost_microusd,
             token_quota,
             blocked_substrings: blocked.into(),
             system_prompt,
@@ -385,6 +544,17 @@ impl LlmRoutePolicy {
             moderation,
             semantic_cache,
             selection,
+            preferred_capabilities: cfg
+                .selection
+                .preferred_capabilities
+                .iter()
+                .map(|value| Arc::from(value.as_str()))
+                .collect::<Vec<_>>()
+                .into(),
+            max_first_token_latency: (cfg.selection.max_first_token_latency_ms > 0)
+                .then(|| Duration::from_millis(cfg.selection.max_first_token_latency_ms)),
+            shadow,
+            rollout,
             cache_salt: cache_salt.finalize().into(),
             models: models.into(),
         })
@@ -713,6 +883,7 @@ impl LlmModerationPolicy {
         parts.headers.remove(COOKIE);
         parts.headers.remove("x-api-key");
         parts.headers.remove("x-goog-api-key");
+        parts.headers.remove("api-key");
         parts.headers.remove("anthropic-version");
         parts.headers.remove(CONTENT_LENGTH);
         parts.headers.remove(TRANSFER_ENCODING);
@@ -778,10 +949,16 @@ impl LlmTokenQuota {
 impl LlmModel {
     /// 业务作用：在候选快照构建阶段把 provider 配置编译成不含未解析 SecretSource 的固定模型计划。
     ///
-    /// 参数说明：`cfg` 是单模型配置，`config_dir` 是 SecretSource 相对目录，`route_id` 用于错误定位。
+    /// 参数说明：`cfg` 是单模型配置，`config_dir` 是 SecretSource 相对目录，`route_id` 用于错误定位，
+    /// `api_type` 是 route 冻结的独立 wire 契约。
     ///
     /// 返回：配置、路径、模型名和凭据都合法时返回可发布模型；任一信任边界不满足时拒绝候选快照。
-    fn build(cfg: &LlmModelCfg, config_dir: &Path, route_id: &str) -> Result<Self> {
+    fn build(
+        cfg: &LlmModelCfg,
+        config_dir: &Path,
+        route_id: &str,
+        api_type: LlmApiType,
+    ) -> Result<Self> {
         if cfg.model.trim().is_empty() || cfg.model.len() > 256 {
             bail!(
                 "route `{route_id}` llm model `{}` model name must be 1..=256 bytes",
@@ -799,25 +976,55 @@ impl LlmModel {
             LlmProviderCfg::Openai => LlmProvider::Openai,
             LlmProviderCfg::Anthropic => LlmProvider::Anthropic,
             LlmProviderCfg::Google => LlmProvider::Google,
+            LlmProviderCfg::AzureOpenai => LlmProvider::AzureOpenai,
+            LlmProviderCfg::Bedrock => LlmProvider::Bedrock,
+            LlmProviderCfg::VertexAi => LlmProvider::VertexAi,
+            LlmProviderCfg::Cohere => LlmProvider::Cohere,
+            LlmProviderCfg::Mistral => LlmProvider::Mistral,
+            LlmProviderCfg::HuggingFace => LlmProvider::HuggingFace,
+            LlmProviderCfg::Xai => LlmProvider::Xai,
+            LlmProviderCfg::Dashscope => LlmProvider::Dashscope,
+            LlmProviderCfg::Deepseek => LlmProvider::Deepseek,
+            LlmProviderCfg::Ollama => LlmProvider::Ollama,
+            LlmProviderCfg::Vllm => LlmProvider::Vllm,
         };
-        if provider == LlmProvider::Google {
+        if !provider_supports_api(provider, api_type, cfg.native_passthrough) {
+            bail!(
+                "route `{route_id}` llm model `{}` provider does not support the selected api_type without lossy conversion",
+                cfg.id
+            );
+        }
+        if matches!(provider, LlmProvider::Google | LlmProvider::VertexAi) {
             validate_google_model_name(cfg.model.as_str(), route_id, cfg.id.as_str())?;
         }
-        let default_path = match provider {
-            LlmProvider::Openai => "/v1/chat/completions".to_string(),
-            LlmProvider::Anthropic => "/v1/messages".to_string(),
-            LlmProvider::Google => {
-                format!("/v1beta/models/{}:generateContent", cfg.model)
-            }
-        };
-        let path = if cfg.path.is_empty() {
+        validate_cloud_scope(cfg, provider, route_id)?;
+        let default_path = default_provider_path(cfg, provider, api_type, route_id)?;
+        let mut path = if cfg.path.is_empty() {
             default_path
         } else {
             cfg.path.clone()
         };
-        validate_provider_path(path.as_str(), route_id, cfg.id.as_str())?;
-        let stream_path = match provider {
-            LlmProvider::Google => {
+        if api_type == LlmApiType::Realtime {
+            validate_realtime_path(path.as_str(), route_id, cfg.id.as_str())?;
+        } else {
+            validate_provider_path(path.as_str(), route_id, cfg.id.as_str())?;
+        }
+        if provider == LlmProvider::AzureOpenai && !cfg.api_version.is_empty() {
+            // API 版本只从快照中的安全 scope 生成，客户端不能借 query 改写 endpoint 契约。
+            let separator = if path.contains('?') { '&' } else { '?' };
+            let added_len = "api-version=".len() + cfg.api_version.len() + separator.len_utf8();
+            if path.len().saturating_add(added_len) > 2048 {
+                bail!(
+                    "route `{route_id}` Azure OpenAI model `{}` path and api_version exceed 2048 bytes",
+                    cfg.id
+                );
+            }
+            path.push(separator);
+            path.push_str("api-version=");
+            path.push_str(cfg.api_version.as_str());
+        }
+        let stream_path = match (provider, api_type) {
+            (LlmProvider::Google, LlmApiType::ChatCompletions) => {
                 let stream_path = if cfg.stream_path.is_empty() {
                     format!("/v1beta/models/{}:streamGenerateContent?alt=sse", cfg.model)
                 } else {
@@ -826,27 +1033,30 @@ impl LlmModel {
                 validate_google_stream_path(stream_path.as_str(), route_id, cfg.id.as_str())?;
                 Some(Arc::from(stream_path))
             }
-            LlmProvider::Openai | LlmProvider::Anthropic => {
+            (LlmProvider::VertexAi, LlmApiType::ChatCompletions) => {
+                let stream_path = if cfg.stream_path.is_empty() {
+                    format!(
+                        "/v1/projects/{}/locations/{}/publishers/google/models/{}:streamGenerateContent?alt=sse",
+                        cfg.project, cfg.region, cfg.model
+                    )
+                } else {
+                    cfg.stream_path.clone()
+                };
+                validate_google_stream_path(stream_path.as_str(), route_id, cfg.id.as_str())?;
+                Some(Arc::from(stream_path))
+            }
+            _ => {
                 if !cfg.stream_path.is_empty() {
                     bail!(
-                        "route `{route_id}` non-Google LLM model `{}` cannot set stream_path",
+                        "route `{route_id}` LLM model `{}` cannot set stream_path for this provider/api_type",
                         cfg.id
                     );
                 }
                 None
             }
         };
-        let api_key = resolve_api_key(cfg.api_key.as_str(), config_dir, route_id, cfg.id.as_str())?;
+        let api_key = resolve_model_api_key(cfg, config_dir, route_id)?;
         let anthropic_version = match provider {
-            LlmProvider::Openai | LlmProvider::Google => {
-                if !cfg.anthropic_version.is_empty() {
-                    bail!(
-                        "route `{route_id}` non-Anthropic model `{}` cannot set anthropic_version",
-                        cfg.id
-                    );
-                }
-                None
-            }
             LlmProvider::Anthropic => {
                 let raw = if cfg.anthropic_version.is_empty() {
                     "2023-06-01"
@@ -860,18 +1070,96 @@ impl LlmModel {
                     )
                 })?)
             }
+            _ => {
+                if !cfg.anthropic_version.is_empty() {
+                    bail!(
+                        "route `{route_id}` non-Anthropic model `{}` cannot set anthropic_version",
+                        cfg.id
+                    );
+                }
+                None
+            }
         };
+        let aws_access_key_id = resolve_optional_secret(
+            cfg.resolved_aws_access_key_id.as_deref(),
+            cfg.aws_access_key_id.as_str(),
+            config_dir,
+            route_id,
+            cfg.id.as_str(),
+            "aws_access_key_id",
+        )?
+        .map(Arc::from);
+        let aws_secret_access_key = resolve_optional_secret(
+            cfg.resolved_aws_secret_access_key.as_deref(),
+            cfg.aws_secret_access_key.as_str(),
+            config_dir,
+            route_id,
+            cfg.id.as_str(),
+            "aws_secret_access_key",
+        )?
+        .map(|value| Arc::from(value.into_bytes()));
+        let aws_session_token = resolve_optional_secret(
+            cfg.resolved_aws_session_token.as_deref(),
+            cfg.aws_session_token.as_str(),
+            config_dir,
+            route_id,
+            cfg.id.as_str(),
+            "aws_session_token",
+        )?
+        .map(|value| {
+            let mut value = HeaderValue::from_str(value.as_str())
+                .context("Bedrock session token is not a valid header value")?;
+            value.set_sensitive(true);
+            Ok::<_, anyhow::Error>(value)
+        })
+        .transpose()?;
+        if aws_access_key_id.is_some() != aws_secret_access_key.is_some() {
+            bail!(
+                "route `{route_id}` Bedrock model `{}` requires both AWS access and secret keys",
+                cfg.id
+            );
+        }
+        if provider == LlmProvider::Bedrock && api_key.is_some() && aws_access_key_id.is_some() {
+            bail!(
+                "route `{route_id}` Bedrock model `{}` cannot combine bearer API key and SigV4 credentials",
+                cfg.id
+            );
+        }
+        if provider == LlmProvider::Bedrock
+            && aws_access_key_id.is_some()
+            && !cfg.uri.starts_with("https://")
+        {
+            bail!(
+                "route `{route_id}` Bedrock model `{}` SigV4 requires a fixed https origin",
+                cfg.id
+            );
+        }
         Ok(Self {
             id: Arc::from(cfg.id.as_str()),
             provider,
+            api_type,
             upstream: Arc::from(cfg.uri.as_str()),
             model: Arc::from(cfg.model.as_str()),
             path: Arc::from(path),
             stream_path,
             api_key,
             anthropic_version,
+            region: (!cfg.region.is_empty()).then(|| Arc::from(cfg.region.as_str())),
+            aws_access_key_id,
+            aws_secret_access_key,
+            aws_session_token,
+            native_passthrough: cfg.native_passthrough || api_type != LlmApiType::ChatCompletions,
             input_cost_microusd_per_million: cfg.input_cost_microusd_per_million,
             output_cost_microusd_per_million: cfg.output_cost_microusd_per_million,
+            fixed_cost_microusd: cfg.fixed_cost_microusd,
+            capabilities: cfg
+                .capabilities
+                .iter()
+                .map(|value| Arc::from(value.as_str()))
+                .collect::<Vec<_>>()
+                .into(),
+            expected_first_token_latency: (cfg.expected_first_token_latency_ms > 0)
+                .then(|| Duration::from_millis(cfg.expected_first_token_latency_ms)),
             weight: cfg.weight,
         })
     }
@@ -887,15 +1175,36 @@ impl LlmModel {
         parts.headers.remove("x-api-key");
         parts.headers.remove("x-goog-api-key");
         parts.headers.remove("anthropic-version");
+        parts.headers.remove("x-amz-date");
+        parts.headers.remove("x-amz-content-sha256");
+        parts.headers.remove("x-amz-security-token");
         parts.headers.remove(CONTENT_LENGTH);
         parts.headers.remove(TRANSFER_ENCODING);
         parts.headers.remove(http::header::ACCEPT_ENCODING);
-        parts.headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
+        if !matches!(self.api_type, LlmApiType::File | LlmApiType::Realtime)
+            && !parts
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.to_ascii_lowercase().starts_with("multipart/"))
+        {
+            parts.headers.insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+        }
         match self.provider {
-            LlmProvider::Openai => {
+            LlmProvider::Openai
+            | LlmProvider::Bedrock
+            | LlmProvider::VertexAi
+            | LlmProvider::Cohere
+            | LlmProvider::Mistral
+            | LlmProvider::HuggingFace
+            | LlmProvider::Xai
+            | LlmProvider::Dashscope
+            | LlmProvider::Deepseek
+            | LlmProvider::Ollama
+            | LlmProvider::Vllm => {
                 if let Some(key) = &self.api_key {
                     let mut value = Vec::with_capacity("Bearer ".len() + key.as_bytes().len());
                     value.extend_from_slice(b"Bearer ");
@@ -904,6 +1213,11 @@ impl LlmModel {
                         value.set_sensitive(true);
                         parts.headers.insert(AUTHORIZATION, value);
                     }
+                }
+            }
+            LlmProvider::AzureOpenai => {
+                if let Some(key) = &self.api_key {
+                    parts.headers.insert("api-key", key.clone());
                 }
             }
             LlmProvider::Anthropic => {
@@ -928,6 +1242,122 @@ impl LlmModel {
         }
     }
 
+    /// 业务作用：把 Bedrock 请求的固定 origin、region、path 与精确实体绑定进 SigV4，阻止客户端
+    /// 替换签名 scope、临时令牌或 payload 后仍复用授权。
+    ///
+    /// 参数说明：`parts` 是已完成 provider header 清洗的上游请求头；`body` 是最终 provider 实体；
+    /// `path` 是快照冻结的 path/query；`now` 是本次签名时刻。
+    ///
+    /// 返回：非 Bedrock 或 bearer API key 模式不改变请求；SigV4 材料完整时注入签名，否则失败。
+    pub(crate) fn sign_bedrock_request(
+        &self,
+        parts: &mut Parts,
+        body: &[u8],
+        path: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        if self.provider != LlmProvider::Bedrock || self.aws_access_key_id.is_none() {
+            return Ok(());
+        }
+        let access_key = self
+            .aws_access_key_id
+            .as_deref()
+            .context("Bedrock SigV4 access key is missing")?;
+        let secret_key = self
+            .aws_secret_access_key
+            .as_deref()
+            .context("Bedrock SigV4 secret key is missing")?;
+        let region = self
+            .region
+            .as_deref()
+            .context("Bedrock SigV4 region is missing")?;
+        let origin: http::Uri = self
+            .upstream
+            .parse()
+            .context("Bedrock SigV4 origin is invalid")?;
+        let authority = origin
+            .authority()
+            .context("Bedrock SigV4 origin has no authority")?
+            .as_str();
+        parts.headers.insert(
+            http::header::HOST,
+            HeaderValue::from_str(authority).context("Bedrock authority is not a header value")?,
+        );
+        let payload_hash = sha256_hex(body);
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let date = now.format("%Y%m%d").to_string();
+        parts.headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_str(payload_hash.as_str())?,
+        );
+        parts
+            .headers
+            .insert("x-amz-date", HeaderValue::from_str(amz_date.as_str())?);
+        if let Some(token) = &self.aws_session_token {
+            parts.headers.insert("x-amz-security-token", token.clone());
+        }
+
+        let target: http::Uri = path
+            .parse()
+            .context("Bedrock SigV4 path/query is invalid")?;
+        let canonical_uri = aws_percent_encode_path(target.path());
+        let canonical_query = canonical_aws_query(target.query().unwrap_or_default())?;
+        let mut signed_names = vec!["content-type", "host", "x-amz-content-sha256", "x-amz-date"];
+        if self.aws_session_token.is_some() {
+            signed_names.push("x-amz-security-token");
+        }
+        if parts
+            .headers
+            .contains_key("x-amzn-bedrock-request-metadata")
+        {
+            signed_names.push("x-amzn-bedrock-request-metadata");
+        }
+        signed_names.sort_unstable();
+        let signed_headers = signed_names.join(";");
+        let mut canonical_headers = String::new();
+        for name in &signed_names {
+            let value = parts
+                .headers
+                .get(*name)
+                .context("Bedrock signed header is missing")?
+                .to_str()
+                .context("Bedrock signed header is not ASCII")?;
+            canonical_headers.push_str(name);
+            canonical_headers.push(':');
+            canonical_headers.push_str(normalize_aws_header_value(value).as_str());
+            canonical_headers.push('\n');
+        }
+        let canonical_request = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            parts.method.as_str(),
+            canonical_uri,
+            canonical_query,
+            canonical_headers,
+            signed_headers,
+            payload_hash
+        );
+        let scope = format!("{date}/{region}/bedrock/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            sha256_hex(canonical_request.as_bytes())
+        );
+        let mut prefixed_secret = Vec::with_capacity(4 + secret_key.len());
+        prefixed_secret.extend_from_slice(b"AWS4");
+        prefixed_secret.extend_from_slice(secret_key);
+        let date_key = hmac_sha256(&prefixed_secret, date.as_bytes());
+        let region_key = hmac_sha256(&date_key, region.as_bytes());
+        let service_key = hmac_sha256(&region_key, b"bedrock");
+        let signing_key = hmac_sha256(&service_key, b"aws4_request");
+        let signature = hex_bytes(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+        );
+        let mut authorization = HeaderValue::from_str(authorization.as_str())?;
+        authorization.set_sensitive(true);
+        parts.headers.insert(AUTHORIZATION, authorization);
+        Ok(())
+    }
+
     /// 业务作用：为当前请求选择 provider 固定的 unary 或 SSE path，避免运行期拼接不可信模型名。
     ///
     /// 参数说明：`stream` 表示下游是否请求 SSE。
@@ -940,6 +1370,155 @@ impl LlmModel {
             }
         }
         self.path.as_ref()
+    }
+
+    /// 业务作用：复验模型 catalog 是否覆盖本次请求实际使用的 tool、structured output 与多模态能力。
+    ///
+    /// 参数说明：`required` 是从已验证请求 DOM 推导的能力 token 集合。
+    ///
+    /// 返回：全部能力都在快照冻结 catalog 中时为 true；缺少任一项时为 false。
+    pub(crate) fn supports_capabilities(&self, required: &[&'static str]) -> bool {
+        required.iter().all(|required| {
+            self.capabilities
+                .iter()
+                .any(|capability| capability.as_ref() == *required)
+        })
+    }
+
+    /// 业务作用：用冻结价格计算请求的保守费用，供 provider I/O 前执行 route cost admission。
+    ///
+    /// 参数说明：`prompt_tokens` 与 `completion_tokens` 是网关保守预留；非 token API 使用固定费用。
+    ///
+    /// 返回：价格完整时返回向上取整的微美元；任一所需价格未知时返回 None。
+    pub(crate) fn estimated_cost_microusd(
+        &self,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> Option<u64> {
+        if self.fixed_cost_microusd > 0 {
+            return Some(self.fixed_cost_microusd);
+        }
+        if self.input_cost_microusd_per_million == 0 || self.output_cost_microusd_per_million == 0 {
+            return None;
+        }
+        let input = prompt_tokens
+            .saturating_mul(self.input_cost_microusd_per_million)
+            .saturating_add(999_999)
+            / 1_000_000;
+        let output = completion_tokens
+            .saturating_mul(self.output_cost_microusd_per_million)
+            .saturating_add(999_999)
+            / 1_000_000;
+        Some(input.saturating_add(output))
+    }
+
+    /// 业务作用：为独立 JSON API 固定 provider 模型，不执行 Chat 字段映射或丢弃未知原生字段。
+    ///
+    /// 参数说明：`document` 是已验证 JSON object；`raw` 是原始实体，可在模型已匹配时零复制复用。
+    ///
+    /// 返回：Batch/File 原样返回；其它 API 只覆盖顶层 `model`，序列化超限由 route 外层复验。
+    pub(crate) fn native_json_body(&self, document: &Value, raw: &Bytes) -> Result<Bytes> {
+        if matches!(self.api_type, LlmApiType::Batch | LlmApiType::File) {
+            return Ok(raw.clone());
+        }
+        let object = document
+            .as_object()
+            .context("native AI JSON body must be an object")?;
+        if object
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| model == self.model.as_ref())
+        {
+            return Ok(raw.clone());
+        }
+        let mut document = document.clone();
+        document
+            .as_object_mut()
+            .expect("object validated above")
+            .insert("model".to_string(), Value::String(self.model.to_string()));
+        serde_json::to_vec(&document)
+            .map(Bytes::from)
+            .context("serialize provider-native AI request")
+    }
+}
+
+/// 业务作用：从 provider 原生 JSON 推导实际 tools、structured output 与多模态能力门，
+/// 防止客户端用未声明字段绕过冻结 catalog。
+///
+/// 参数说明：`document` 是已通过 JSON object 与字节上限校验的请求。
+///
+/// 返回：返回去重的固定能力 token，供所有模型在 provider I/O 前过滤。
+pub(crate) fn native_required_capabilities(document: &Value) -> Vec<&'static str> {
+    let mut required = Vec::with_capacity(3);
+    let object = document.as_object();
+    if object
+        .and_then(|value| value.get("tools"))
+        .is_some_and(|value| {
+            !value.is_null() && value.as_array().is_none_or(|items| !items.is_empty())
+        })
+    {
+        required.push("tools");
+    }
+    if object.is_some_and(|value| {
+        value.contains_key("response_format") || value.contains_key("json_schema")
+    }) || document.pointer("/text/format").is_some()
+    {
+        required.push("structured_output");
+    }
+    if native_value_is_multimodal(document) {
+        required.push("multimodal");
+    }
+    required
+}
+
+/// 业务作用：从原生请求中读取声明的输出 token 上限，供冻结价格在调用 provider 前保守估算。
+///
+/// 参数说明：`document` 是独立 API 的 JSON object。
+///
+/// 返回：返回常见 provider 字段中的最大非负值；未声明时返回 0。
+pub(crate) fn native_completion_tokens(document: &Value) -> u64 {
+    [
+        "max_tokens",
+        "max_output_tokens",
+        "max_completion_tokens",
+        "max_tokens_to_sample",
+    ]
+    .into_iter()
+    .filter_map(|field| document.get(field).and_then(Value::as_u64))
+    .max()
+    .unwrap_or_default()
+}
+
+/// 业务作用：递归识别原生 content block 或媒体输入键，不解释或改写 provider payload。
+///
+/// 参数说明：`value` 是当前 JSON 节点。
+///
+/// 返回：出现 image/audio/video/input_file 等媒体语义时返回 true。
+fn native_value_is_multimodal(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(native_value_is_multimodal),
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            matches!(
+                key.as_str(),
+                "image"
+                    | "image_url"
+                    | "input_image"
+                    | "audio"
+                    | "input_audio"
+                    | "video"
+                    | "input_video"
+                    | "file"
+                    | "input_file"
+            ) || (key == "type"
+                && value.as_str().is_some_and(|kind| {
+                    kind.contains("image")
+                        || kind.contains("audio")
+                        || kind.contains("video")
+                        || kind.contains("file")
+                }))
+                || native_value_is_multimodal(value)
+        }),
+        _ => false,
     }
 }
 
@@ -994,8 +1573,27 @@ impl ParsedLlmRequest {
     ///
     /// 返回：字段可无损映射时返回 JSON `Bytes`；存在 provider 不支持的角色、内容或参数时失败闭合。
     pub(crate) fn body_for(&mut self, model: &LlmModel) -> Result<Bytes> {
+        if model.native_passthrough {
+            self.document
+                .as_object_mut()
+                .expect("LLM object validated at parse")
+                .insert("model".to_string(), Value::String(model.model.to_string()));
+            self.pristine = false;
+            return serde_json::to_vec(&self.document)
+                .map(Bytes::from)
+                .context("encode provider native request");
+        }
         match model.provider {
-            LlmProvider::Openai => {
+            LlmProvider::Openai
+            | LlmProvider::AzureOpenai
+            | LlmProvider::Bedrock
+            | LlmProvider::Mistral
+            | LlmProvider::HuggingFace
+            | LlmProvider::Xai
+            | LlmProvider::Dashscope
+            | LlmProvider::Deepseek
+            | LlmProvider::Ollama
+            | LlmProvider::Vllm => {
                 let current_matches = self
                     .document
                     .get("model")
@@ -1025,7 +1623,57 @@ impl ParsedLlmRequest {
                     .map(Bytes::from)
                     .context("encode Google model request")
             }
+            LlmProvider::VertexAi => {
+                let body = openai_to_google(&self.document, self.stream)?;
+                serde_json::to_vec(&body)
+                    .map(Bytes::from)
+                    .context("encode Vertex AI model request")
+            }
+            LlmProvider::Cohere => unreachable!("Cohere Chat requires native passthrough"),
         }
+    }
+
+    /// 业务作用：从请求实际字段推导跨 provider 必须无损保持的能力，避免 catalog 只按 route 静态标签放行。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回去重的小型静态能力列表，供每个 fallback 模型在调用前复验。
+    pub(crate) fn required_capabilities(&self) -> Vec<&'static str> {
+        let mut required = Vec::with_capacity(4);
+        if self.document.get("tools").is_some()
+            || self.document.get("tool_choice").is_some()
+            || self.document.get("parallel_tool_calls").is_some()
+        {
+            required.push("tools");
+        }
+        if self.document.get("response_format").is_some()
+            || self.document.get("json_schema").is_some()
+        {
+            required.push("structured_output");
+        }
+        if self
+            .document
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|blocks| {
+                            blocks.iter().any(|block| {
+                                !matches!(
+                                    block.get("type").and_then(Value::as_str),
+                                    Some("text" | "input_text" | "output_text")
+                                )
+                            })
+                        })
+                })
+            })
+        {
+            required.push("multimodal");
+        }
+        required
     }
 
     /// 校验 completion 上限；请求未声明时把安全默认值写入 DOM。返回本次配额预留成本。
@@ -1314,16 +1962,19 @@ pub(crate) fn anthropic_response_to_openai(body: &[u8]) -> Result<(Bytes, LlmUsa
     let object = source
         .as_object()
         .context("Anthropic response must be a JSON object")?;
-    let content = object
+    let blocks = object
         .get("content")
         .and_then(Value::as_array)
-        .context("Anthropic response requires content array")?
+        .context("Anthropic response requires content array")?;
+    if blocks.iter().any(|block| {
+        block.get("type").and_then(Value::as_str) != Some("text")
+            || block.get("text").and_then(Value::as_str).is_none()
+    }) {
+        bail!("Anthropic adapter cannot losslessly represent non-text response blocks");
+    }
+    let content = blocks
         .iter()
-        .filter_map(|block| {
-            (block.get("type").and_then(Value::as_str) == Some("text"))
-                .then(|| block.get("text").and_then(Value::as_str))
-                .flatten()
-        })
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
         .collect::<String>();
     let input_tokens = source
         .pointer("/usage/input_tokens")
@@ -1335,7 +1986,9 @@ pub(crate) fn anthropic_response_to_openai(body: &[u8]) -> Result<(Bytes, LlmUsa
         .unwrap_or(0);
     let finish_reason = match object.get("stop_reason").and_then(Value::as_str) {
         Some("max_tokens") => "length",
-        Some("tool_use") => "tool_calls",
+        Some("tool_use") => {
+            bail!("Anthropic adapter cannot losslessly represent tool_use response")
+        }
         _ => "stop",
     };
     let converted = json!({
@@ -1526,6 +2179,22 @@ fn openai_to_anthropic(source: &Value, model: &str) -> Result<Value> {
     let object = source
         .as_object()
         .context("LLM request must be an object")?;
+    const ALLOWED_KEYS: &[&str] = &[
+        "messages",
+        "model",
+        "stream",
+        "max_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "top_p",
+        "stop",
+    ];
+    if let Some(field) = object
+        .keys()
+        .find(|field| !ALLOWED_KEYS.contains(&field.as_str()))
+    {
+        bail!("Anthropic adapter does not support request field `{field}`");
+    }
     let messages = object
         .get("messages")
         .and_then(Value::as_array)
@@ -1536,22 +2205,27 @@ fn openai_to_anthropic(source: &Value, model: &str) -> Result<Value> {
         let message = message
             .as_object()
             .context("LLM message must be an object")?;
+        if message
+            .keys()
+            .any(|key| !matches!(key.as_str(), "role" | "content"))
+        {
+            bail!("Anthropic adapter only supports message role and content fields");
+        }
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .context("LLM message requires string role")?;
         let content = message
             .get("content")
-            .cloned()
             .context("LLM message requires content")?;
         if role == "system" {
-            system.push(content_text(&content)?);
+            system.push(strict_content_text(content)?);
             continue;
         }
         if !matches!(role, "user" | "assistant") {
             bail!("Anthropic adapter only supports system/user/assistant roles");
         }
-        converted.push(json!({ "role": role, "content": content }));
+        converted.push(json!({ "role": role, "content": strict_content_text(content)? }));
     }
     if converted.is_empty() {
         bail!("Anthropic adapter requires at least one user/assistant message");
@@ -1781,26 +2455,6 @@ fn prompt_text_bytes(messages: &[Value]) -> Result<usize> {
     Ok(bytes)
 }
 
-fn content_text(content: &Value) -> Result<String> {
-    if let Some(text) = content.as_str() {
-        return Ok(text.to_string());
-    }
-    let blocks = content
-        .as_array()
-        .context("LLM message content must be string or array")?;
-    let mut text = String::new();
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) == Some("text") {
-            let value = block
-                .get("text")
-                .and_then(Value::as_str)
-                .context("LLM text content block requires text")?;
-            text.push_str(value);
-        }
-    }
-    Ok(text)
-}
-
 /// 把 message 的文字片段追加到已有 prompt buffer；调用方统一控制分隔符和总 allocation。
 fn append_content_text(target: &mut String, content: &Value) -> Result<()> {
     if let Some(text) = content.as_str() {
@@ -1941,6 +2595,341 @@ fn hash_digest_part(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
+/// 业务作用：冻结 provider/API 兼容矩阵，避免运行期用 Chat adapter 猜测其它协议。
+///
+/// 参数说明：`provider` 与 `api_type` 是候选模型声明；`native_passthrough` 表示 Chat 是否保持原生 wire。
+///
+/// 返回：存在明确、无损的 wire 契约时为 true；未知组合为 false 并在构建期拒绝。
+fn provider_supports_api(
+    provider: LlmProvider,
+    api_type: LlmApiType,
+    native_passthrough: bool,
+) -> bool {
+    match api_type {
+        LlmApiType::ChatCompletions => provider != LlmProvider::Cohere || native_passthrough,
+        LlmApiType::Responses => matches!(
+            provider,
+            LlmProvider::Openai
+                | LlmProvider::AzureOpenai
+                | LlmProvider::Bedrock
+                | LlmProvider::Xai
+        ),
+        LlmApiType::Embeddings => matches!(
+            provider,
+            LlmProvider::Openai
+                | LlmProvider::AzureOpenai
+                | LlmProvider::Bedrock
+                | LlmProvider::VertexAi
+                | LlmProvider::Cohere
+                | LlmProvider::Mistral
+                | LlmProvider::HuggingFace
+                | LlmProvider::Dashscope
+                | LlmProvider::Ollama
+                | LlmProvider::Vllm
+        ),
+        LlmApiType::Rerank => matches!(
+            provider,
+            LlmProvider::Cohere
+                | LlmProvider::Mistral
+                | LlmProvider::HuggingFace
+                | LlmProvider::Dashscope
+        ),
+        LlmApiType::Image => matches!(
+            provider,
+            LlmProvider::Openai
+                | LlmProvider::AzureOpenai
+                | LlmProvider::Bedrock
+                | LlmProvider::VertexAi
+                | LlmProvider::HuggingFace
+                | LlmProvider::Xai
+                | LlmProvider::Dashscope
+        ),
+        LlmApiType::Audio => matches!(
+            provider,
+            LlmProvider::Openai
+                | LlmProvider::AzureOpenai
+                | LlmProvider::Mistral
+                | LlmProvider::HuggingFace
+                | LlmProvider::Dashscope
+        ),
+        LlmApiType::Video => matches!(
+            provider,
+            LlmProvider::Openai
+                | LlmProvider::AzureOpenai
+                | LlmProvider::VertexAi
+                | LlmProvider::Dashscope
+        ),
+        LlmApiType::Batch | LlmApiType::File => matches!(
+            provider,
+            LlmProvider::Openai
+                | LlmProvider::AzureOpenai
+                | LlmProvider::Mistral
+                | LlmProvider::Xai
+                | LlmProvider::Dashscope
+        ),
+        LlmApiType::Realtime => {
+            matches!(provider, LlmProvider::Openai | LlmProvider::AzureOpenai)
+        }
+    }
+}
+
+/// 业务作用：验证区域、project 与云签名材料只进入对应 provider，并确保 endpoint scope 不由请求决定。
+///
+/// 参数说明：`cfg` 是模型声明；`provider` 是已编译 provider；`route_id` 用于低敏错误定位。
+///
+/// 返回：云身份字段闭合且字符安全时成功；缺失 scope、半套签名材料或跨 provider 字段污染时失败。
+fn validate_cloud_scope(cfg: &LlmModelCfg, provider: LlmProvider, route_id: &str) -> Result<()> {
+    let safe_scope = |value: &str| {
+        value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    };
+    if !cfg.region.is_empty() && !safe_scope(cfg.region.as_str()) {
+        bail!(
+            "route `{route_id}` llm model `{}` has invalid region",
+            cfg.id
+        );
+    }
+    if !cfg.project.is_empty() && !safe_scope(cfg.project.as_str()) {
+        bail!(
+            "route `{route_id}` llm model `{}` has invalid project",
+            cfg.id
+        );
+    }
+    if !cfg.api_version.is_empty() && !safe_scope(cfg.api_version.as_str()) {
+        bail!(
+            "route `{route_id}` llm model `{}` has invalid api_version",
+            cfg.id
+        );
+    }
+    match provider {
+        LlmProvider::Bedrock => {
+            if cfg.region.is_empty() {
+                bail!(
+                    "route `{route_id}` Bedrock model `{}` requires region",
+                    cfg.id
+                );
+            }
+            if !cfg.project.is_empty() || !cfg.api_version.is_empty() {
+                bail!(
+                    "route `{route_id}` Bedrock model `{}` cannot set project/api_version",
+                    cfg.id
+                );
+            }
+        }
+        LlmProvider::VertexAi => {
+            if cfg.region.is_empty() || cfg.project.is_empty() {
+                bail!(
+                    "route `{route_id}` Vertex AI model `{}` requires region and project",
+                    cfg.id
+                );
+            }
+            if !cfg.api_version.is_empty()
+                || !cfg.aws_access_key_id.is_empty()
+                || !cfg.aws_secret_access_key.is_empty()
+                || !cfg.aws_session_token.is_empty()
+            {
+                bail!("route `{route_id}` Vertex AI model `{}` has incompatible cloud identity fields", cfg.id);
+            }
+        }
+        LlmProvider::AzureOpenai => {
+            if !cfg.region.is_empty()
+                || !cfg.project.is_empty()
+                || !cfg.aws_access_key_id.is_empty()
+                || !cfg.aws_secret_access_key.is_empty()
+                || !cfg.aws_session_token.is_empty()
+            {
+                bail!("route `{route_id}` Azure OpenAI model `{}` has incompatible cloud identity fields", cfg.id);
+            }
+        }
+        _ => {
+            if !cfg.api_version.is_empty()
+                || !cfg.region.is_empty()
+                || !cfg.project.is_empty()
+                || !cfg.aws_access_key_id.is_empty()
+                || !cfg.aws_secret_access_key.is_empty()
+                || !cfg.aws_session_token.is_empty()
+            {
+                bail!(
+                    "route `{route_id}` llm model `{}` sets cloud fields for a non-cloud provider",
+                    cfg.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 业务作用：按 provider 与独立 API 类型生成可信默认 path，模型、region 与 project 只来自当前快照。
+///
+/// 参数说明：`cfg` 提供已校验模型 scope；`provider`/`api_type` 是兼容矩阵已接受的组合；
+/// `route_id` 仅用于配置错误定位。
+///
+/// 返回：返回固定绝对 path；需要用户选择具体原生 operation 而未提供 path 时拒绝候选。
+fn default_provider_path(
+    cfg: &LlmModelCfg,
+    provider: LlmProvider,
+    api_type: LlmApiType,
+    route_id: &str,
+) -> Result<String> {
+    if provider == LlmProvider::Google {
+        return Ok(format!("/v1beta/models/{}:generateContent", cfg.model));
+    }
+    if provider == LlmProvider::VertexAi && api_type == LlmApiType::ChatCompletions {
+        return Ok(format!(
+            "/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
+            cfg.project, cfg.region, cfg.model
+        ));
+    }
+    if provider == LlmProvider::Anthropic {
+        return Ok("/v1/messages".to_string());
+    }
+    if provider == LlmProvider::Cohere {
+        return Ok(match api_type {
+            LlmApiType::ChatCompletions => "/v2/chat",
+            LlmApiType::Embeddings => "/v2/embed",
+            LlmApiType::Rerank => "/v2/rerank",
+            _ => unreachable!("Cohere compatibility checked before default path"),
+        }
+        .to_string());
+    }
+    if provider == LlmProvider::Ollama && cfg.native_passthrough {
+        return Ok(match api_type {
+            LlmApiType::ChatCompletions => "/api/chat",
+            LlmApiType::Embeddings => "/api/embed",
+            _ => unreachable!("Ollama compatibility checked before default path"),
+        }
+        .to_string());
+    }
+    if provider == LlmProvider::Mistral && api_type == LlmApiType::Batch {
+        return Ok("/v1/batch/jobs".to_string());
+    }
+    if matches!(provider, LlmProvider::Bedrock | LlmProvider::VertexAi)
+        && !matches!(
+            api_type,
+            LlmApiType::ChatCompletions | LlmApiType::Responses
+        )
+    {
+        bail!(
+            "route `{route_id}` llm model `{}` requires an explicit native path for this cloud API",
+            cfg.id
+        );
+    }
+    let openai_path = match api_type {
+        LlmApiType::ChatCompletions => "/v1/chat/completions".to_string(),
+        LlmApiType::Responses => "/v1/responses".to_string(),
+        LlmApiType::Embeddings => "/v1/embeddings".to_string(),
+        LlmApiType::Rerank => "/v1/rerank".to_string(),
+        LlmApiType::Image => "/v1/images/generations".to_string(),
+        LlmApiType::Audio => "/v1/audio/speech".to_string(),
+        LlmApiType::Video => "/v1/videos".to_string(),
+        LlmApiType::Batch => "/v1/batches".to_string(),
+        LlmApiType::File => "/v1/files".to_string(),
+        LlmApiType::Realtime => {
+            let model = percent_encoding::utf8_percent_encode(
+                cfg.model.as_str(),
+                percent_encoding::NON_ALPHANUMERIC,
+            );
+            format!("/v1/realtime?model={model}")
+        }
+    };
+    if provider == LlmProvider::AzureOpenai {
+        return Ok(format!("/openai{openai_path}"));
+    }
+    Ok(openai_path)
+}
+
+/// 业务作用：校验 Realtime 固定升级 path，允许模型 query 但拒绝 fragment、控制字节与相对目标。
+///
+/// 参数说明：`path` 是候选升级目标；`route_id` 与 `model_id` 只用于错误定位。
+///
+/// 返回：合法绝对 URI path/query 时成功，否则拒绝候选快照。
+fn validate_realtime_path(path: &str, route_id: &str, model_id: &str) -> Result<()> {
+    let uri: http::Uri = path.parse().with_context(|| {
+        format!("route `{route_id}` realtime model `{model_id}` path is invalid")
+    })?;
+    if !uri.path().starts_with('/')
+        || uri.path().len() > 2048
+        || path.contains('#')
+        || path.bytes().any(|byte| byte.is_ascii_control())
+    {
+        bail!("route `{route_id}` realtime model `{model_id}` path must be a bounded absolute path without fragment/control bytes");
+    }
+    Ok(())
+}
+
+/// 业务作用：在候选构建阶段解析可选云凭据 SecretSource，禁止请求路径访问外部事实源。
+///
+/// 参数说明：`source` 是 SecretSource；`config_dir` 是相对路径根；`route_id`、`model_id` 与 `field`
+/// 只用于不含 secret 的错误上下文。
+///
+/// 返回：空来源返回 None；合法来源返回已物化文本，读取或语法失败时拒绝候选。
+fn resolve_optional_secret(
+    resolved: Option<&str>,
+    source: &str,
+    config_dir: &Path,
+    route_id: &str,
+    model_id: &str,
+    field: &str,
+) -> Result<Option<String>> {
+    if let Some(value) = resolved {
+        return Ok(Some(value.to_owned()));
+    }
+    if source.is_empty() {
+        return Ok(None);
+    }
+    if crate::remote_secret::is_remote_reference(source) {
+        bail!("route `{route_id}` llm model `{model_id}` {field} remote value was not prepared");
+    }
+    crate::secret::resolve_text(
+        source,
+        config_dir,
+        &format!("route `{route_id}` llm model `{model_id}` {field}"),
+    )
+    .map(Some)
+}
+
+/// 业务作用：读取模型 API key，优先使用本轮远程 Secret provider 的内存结果，并冻结为敏感 header。
+///
+/// 参数说明：`cfg` 是当前模型声明；`config_dir` 是本地 SecretSource 根；`route_id` 仅用于错误定位。
+///
+/// 返回：空来源返回 None；远程或本地来源有效时返回敏感值，未物化远程引用与非法 header 失败。
+fn resolve_model_api_key(
+    cfg: &LlmModelCfg,
+    config_dir: &Path,
+    route_id: &str,
+) -> Result<Option<HeaderValue>> {
+    let value = if let Some(value) = cfg.resolved_api_key.as_deref() {
+        Some(value.to_owned())
+    } else if cfg.api_key.is_empty() {
+        None
+    } else {
+        if crate::remote_secret::is_remote_reference(cfg.api_key.as_str()) {
+            bail!(
+                "route `{route_id}` llm model `{}` api_key remote value was not prepared",
+                cfg.id
+            );
+        }
+        Some(crate::secret::resolve_text(
+            cfg.api_key.as_str(),
+            config_dir,
+            &format!("route `{route_id}` llm model `{}` api_key", cfg.id),
+        )?)
+    };
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let mut value = HeaderValue::from_str(value.as_str()).with_context(|| {
+        format!(
+            "route `{route_id}` llm model `{}` api_key is not a header value",
+            cfg.id
+        )
+    })?;
+    value.set_sensitive(true);
+    Ok(Some(value))
+}
+
 fn validate_provider_path(path: &str, route_id: &str, model_id: &str) -> Result<()> {
     if !path.starts_with('/')
         || path.len() > 2048
@@ -2011,6 +3000,110 @@ fn resolve_api_key(
     })?;
     value.set_sensitive(true);
     Ok(Some(value))
+}
+
+/// 业务作用：计算 SigV4 所需 SHA-256 小写十六进制摘要，不保留原始实体副本。
+///
+/// 参数说明：`input` 是 canonical request 或最终 provider 实体。
+///
+/// 返回：返回固定 64 字符摘要。
+fn sha256_hex(input: &[u8]) -> String {
+    let digest: [u8; 32] = Sha256::digest(input).into();
+    hex_bytes(&digest)
+}
+
+/// 业务作用：执行 SigV4 密钥派生和最终签名使用的 HMAC-SHA256。
+///
+/// 参数说明：`key` 是当前派生级密钥；`message` 是下一层 scope 或待签名文本。
+///
+/// 返回：返回固定 32 字节 MAC；HMAC-SHA256 接受任意长度密钥。
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(message);
+    mac.finalize().into_bytes().into()
+}
+
+/// 业务作用：把二进制签名编码为 canonical 小写十六进制，避免日志或错误路径接触原始密钥。
+///
+/// 参数说明：`input` 是摘要或 MAC 字节。
+///
+/// 返回：返回两倍输入长度的 ASCII 字符串。
+fn hex_bytes(input: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(input.len() * 2);
+    for byte in input {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+/// 业务作用：按 AWS unreserved 规则编码 canonical URI path，并保留层级分隔符。
+///
+/// 参数说明：`path` 是快照冻结的绝对 URI path。
+///
+/// 返回：返回可进入 SigV4 canonical request 的 ASCII path。
+fn aws_percent_encode_path(path: &str) -> String {
+    aws_percent_encode(path.as_bytes(), true)
+}
+
+/// 业务作用：规范化固定 query 的编码和排序，使签名绑定的参数顺序不依赖配置书写顺序。
+///
+/// 参数说明：`query` 是不含问号的原始 query。
+///
+/// 返回：参数可按百分号语法解码时返回 key/value 分别编码并排序的 canonical query。
+fn canonical_aws_query(query: &str) -> Result<String> {
+    if query.is_empty() {
+        return Ok(String::new());
+    }
+    let mut pairs = Vec::new();
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_encoding::percent_decode_str(key).collect::<Vec<_>>();
+        let value = percent_encoding::percent_decode_str(value).collect::<Vec<_>>();
+        pairs.push((
+            aws_percent_encode(key.as_slice(), false),
+            aws_percent_encode(value.as_slice(), false),
+        ));
+    }
+    pairs.sort_unstable();
+    Ok(pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&"))
+}
+
+/// 业务作用：执行 AWS URI 编码，路径模式仅保留 `/`，其余非 unreserved 字节使用大写十六进制。
+///
+/// 参数说明：`input` 是 UTF-8 或已解码 query 字节；`preserve_slash` 仅供 canonical path 使用。
+///
+/// 返回：返回不含歧义空格、加号或小写 escape 的 ASCII 字符串。
+fn aws_percent_encode(input: &[u8], preserve_slash: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut output = String::with_capacity(input.len());
+    for byte in input {
+        if byte.is_ascii_alphanumeric()
+            || matches!(*byte, b'-' | b'.' | b'_' | b'~')
+            || (preserve_slash && *byte == b'/')
+        {
+            output.push(*byte as char);
+        } else {
+            output.push('%');
+            output.push(HEX[(byte >> 4) as usize] as char);
+            output.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    output
+}
+
+/// 业务作用：折叠 SigV4 header 值的首尾与连续空白，确保签名与 HTTP 语义规范值一致。
+///
+/// 参数说明：`value` 是已验证 ASCII header 值。
+///
+/// 返回：返回单空格连接的 canonical 值。
+fn normalize_aws_header_value(value: &str) -> String {
+    value.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn validate_upstream(uri: &str, route_id: &str, model_id: &str) -> Result<()> {

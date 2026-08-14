@@ -45,6 +45,8 @@ enum ReloadEvent {
     Dependency,
     /// 运维通过进程信号请求重新读取本地配置。
     Sighup,
+    /// 活动快照要求从同一主配置来源重新拉取远程 Secret provider，不能被文件指纹去重。
+    RemoteSecret { cfg_path: PathBuf },
     /// Nacos 已把完整配置 bundle 物化到私有候选路径。
     Nacos { cfg_path: PathBuf },
 }
@@ -145,7 +147,7 @@ impl ReloadEvent {
     ///
     /// 参数说明：无。
     ///
-    /// 返回：文件、依赖和 SIGHUP 返回 `true`；Nacos 物化候选返回 `false`。
+    /// 返回：文件、依赖和 SIGHUP 返回 `true`；远程刷新与 Nacos 候选不重配本地 watcher。
     fn uses_local_watch(&self) -> bool {
         matches!(self, Self::File | Self::Dependency | Self::Sighup)
     }
@@ -160,6 +162,7 @@ impl ReloadEvent {
             Self::File => "file",
             Self::Dependency => "dependency-file",
             Self::Sighup => "SIGHUP",
+            Self::RemoteSecret { .. } => "remote-secret-refresh",
             Self::Nacos { .. } => "nacos-config",
         }
     }
@@ -172,7 +175,7 @@ impl ReloadEvent {
     fn cfg_path(&self, local_cfg_path: &Path) -> PathBuf {
         match self {
             Self::File | Self::Dependency | Self::Sighup => local_cfg_path.to_path_buf(),
-            Self::Nacos { cfg_path } => cfg_path.clone(),
+            Self::RemoteSecret { cfg_path } | Self::Nacos { cfg_path } => cfg_path.clone(),
         }
     }
 }
@@ -1154,7 +1157,30 @@ async fn reload_worker(
         last_hashes.insert(cfg_path.clone(), hash);
     }
 
-    while let Some(first) = rx.recv().await {
+    loop {
+        let (refresh_ms, refresh_cfg_path) = {
+            let active = snap.load();
+            (
+                active.remote_secret_refresh_ms,
+                active.source_config_path.as_ref().clone(),
+            )
+        };
+        let first = if let Some(refresh_ms) = refresh_ms {
+            tokio::select! {
+                event = rx.recv() => {
+                    let Some(event) = event else { break; };
+                    event
+                }
+                _ = tokio::time::sleep(Duration::from_millis(refresh_ms)) => {
+                    ReloadEvent::RemoteSecret { cfg_path: refresh_cfg_path }
+                }
+            }
+        } else {
+            let Some(event) = rx.recv().await else {
+                break;
+            };
+            event
+        };
         if !debounce.is_zero() {
             tokio::time::sleep(debounce).await;
         }
@@ -1162,7 +1188,10 @@ async fn reload_worker(
         let source_cfg_path = trigger.cfg_path(&cfg_path);
 
         match config_fingerprint(&source_cfg_path) {
-            Ok(hash) if last_hashes.get(&source_cfg_path) == Some(&hash) => {
+            Ok(hash)
+                if !matches!(trigger, ReloadEvent::RemoteSecret { .. })
+                    && last_hashes.get(&source_cfg_path) == Some(&hash) =>
+            {
                 tracing::debug!(
                     trigger = trigger.as_str(),
                     cfg = %source_cfg_path.display(),
@@ -1218,19 +1247,28 @@ fn drain_reload_events(first: ReloadEvent, rx: &mut mpsc::Receiver<ReloadEvent>)
 ///
 /// 参数说明：`current` 是当前聚合结果；`next` 是随后到达的事件。
 ///
-/// 返回：Nacos 候选优先，其次主配置、附加依赖和 SIGHUP；保留被选事件携带的路径。
+/// 返回：Nacos 候选优先，其次主配置、附加依赖、SIGHUP 和远程刷新；保留被选事件路径。
 fn merge_reload_events(current: ReloadEvent, next: ReloadEvent) -> ReloadEvent {
     match next {
         ReloadEvent::Nacos { .. } => next,
         ReloadEvent::File => match current {
             ReloadEvent::Nacos { .. } => current,
-            ReloadEvent::File | ReloadEvent::Dependency | ReloadEvent::Sighup => ReloadEvent::File,
+            ReloadEvent::File
+            | ReloadEvent::Dependency
+            | ReloadEvent::Sighup
+            | ReloadEvent::RemoteSecret { .. } => ReloadEvent::File,
         },
         ReloadEvent::Dependency => match current {
             ReloadEvent::Nacos { .. } | ReloadEvent::File => current,
-            ReloadEvent::Dependency | ReloadEvent::Sighup => ReloadEvent::Dependency,
+            ReloadEvent::Dependency | ReloadEvent::Sighup | ReloadEvent::RemoteSecret { .. } => {
+                ReloadEvent::Dependency
+            }
         },
-        ReloadEvent::Sighup => current,
+        ReloadEvent::Sighup => match current {
+            ReloadEvent::Nacos { .. } | ReloadEvent::File | ReloadEvent::Dependency => current,
+            ReloadEvent::Sighup | ReloadEvent::RemoteSecret { .. } => ReloadEvent::Sighup,
+        },
+        ReloadEvent::RemoteSecret { .. } => current,
     }
 }
 

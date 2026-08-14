@@ -8,6 +8,7 @@ mod grpc_browser;
 #[cfg(feature = "http3")]
 mod http3_upstream;
 pub(crate) mod request_validation;
+pub(crate) mod response_contract;
 
 // V8 回执字段号别名:对外 wire 契约的一部分,禁止在调用点写裸数字
 // (见 `edge_hub::summary_field` 与 proto/naway/edge/v1/edge.proto)。
@@ -27,10 +28,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use arc_swap::{ArcSwap, ArcSwapOption};
+use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt as FuturesStreamExt};
-use http::header::{HeaderName, HeaderValue};
+use http::header::{
+    HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, RETRY_AFTER, WWW_AUTHENTICATE,
+};
 use http::request::Parts;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
@@ -41,19 +45,23 @@ use sha2::{Digest, Sha256};
 
 use crate::access_log::{AccessLogger, AccessMethod, AccessPath, AccessRecord};
 use crate::blacklist::BlacklistCache;
+use crate::bot::BotDecision;
 use crate::casbin_auth::{CasbinDecision, CasbinInputError};
 use crate::compression::{apply_response_compression, AcceptedEncodings};
 use crate::config::{GatewayListenerRuntime, GatewaySnapshot};
 use crate::conn_registry::{CloseNotified, ConnGuard, ConnectionRegistry, LongProto};
+use crate::dlp::{DlpBodyOutcome, DlpHeadOutcome};
+#[cfg(feature = "ext-proc")]
+use crate::ext_proc::{ExtProcAction, ExtProcError, ExtProcPhase, SharedExtProcSession};
 use crate::graphql::{GraphqlGuardResult, GraphqlOutcome};
 use crate::guard::DynamicInterfaceGuardCache;
 use crate::http_cache::{
     CacheLookup, CacheMiss, HttpCacheFill, HttpCacheHit, SwappableHttpCacheRuntime,
 };
 use crate::metrics::{
-    CasbinDecisionMetric, DegraphqlMetric, DubboMetric, ExternalPluginMetric, LlmModerationMetric,
-    Metrics, OpaCacheMetric, OpaDecisionMetric, OpaRequestMetric, UsagePlanMetric,
-    WasmExecutionMetric,
+    CasbinDecisionMetric, DegraphqlMetric, DlpMetric, DubboMetric, ExternalPluginMetric,
+    LlmModerationMetric, Metrics, OpaCacheMetric, OpaDecisionMetric, OpaRequestMetric,
+    UsagePlanMetric, WafMetric, WasmExecutionMetric,
 };
 use crate::opa::{OpaDecision, OpaFlightRole, OpaInputError, OpaObligations, OpaRequestContext};
 use crate::proxy::request_validation::ValidationOutcome;
@@ -69,11 +77,14 @@ use crate::runtime_state::{
 };
 use crate::upstream::{PassiveHealthPolicy, UpstreamProtocol};
 use crate::variable::EvalContext;
+use crate::waf::WafBodyOutcome;
 use crate::{full_body, text_status, BoxBody};
 use tokio::time::Sleep;
 
 const MAX_INTERNAL_REROUTES: usize = 3;
 const GATEWAY_LISTENER_HEADER: HeaderName = HeaderName::from_static("x-naway-gateway-listener");
+const MESH_SOURCE_NAMESPACE_HEADER: HeaderName =
+    HeaderName::from_static("x-naway-mesh-source-namespace");
 const LIMIT_CONN_TTL: Duration = Duration::from_secs(120);
 const LIMIT_CONN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// auto-ban 计数表的硬上限。到达上限时先清理过期项；若仍满，则不再为新 IP 分配状态。
@@ -466,6 +477,23 @@ pub struct GatewayProxy {
     request_ids: RequestIdGenerator,
     /// 实例 health_key -> 在途请求数。TLS profile 属于实例身份的一部分,同 URI 不得串计数。
     upstream_inflight: DashMap<Arc<str>, Arc<AtomicU64>>,
+    /// 服务名 -> retry budget 运行态。常驻 proxy,不随配置换版重置:
+    /// 换版瞬间清零预算会让正在发生的故障恰好失去全部重试保护。
+    upstream_retry_budget: DashMap<String, Arc<crate::admission::RetryBudgetState>>,
+    /// 服务名 -> 自适应并发运行态。同样常驻:重置会把已经学到的 minRTT 与
+    /// 收敛好的上限一起丢掉,reload 后必然出现一段过冲。
+    upstream_admission: DashMap<String, Arc<crate::admission::AdaptiveConcurrencyState>>,
+    /// route+维度 -> 共享带宽桶注册表。带宽必须跨并发流共享,
+    /// 否则同一调用方多开几条流就能成倍突破配额。
+    traffic_bandwidth: crate::traffic_limit::BandwidthRegistry,
+    /// route+维度 -> 多窗口限额运行态。常驻 proxy:换版清零等于给超额流量开一次免费窗口。
+    traffic_quota: DashMap<String, Arc<crate::traffic_limit::QuotaState>>,
+    /// 实例 health_key -> 负载反馈状态(EWMA 延迟 / ORCA 利用率)。
+    ///
+    /// 条目在选择成功时创建并由该请求固定持有。目录换代后 `retain` 撤下旧身份；
+    /// 迟到响应只更新已脱离权威表的旧 `Arc`，不会按同名 key 重建条目，也不会污染
+    /// 后续目录为同名实例创建的新对象。
+    upstream_load: DashMap<Arc<str>, Arc<crate::lb_load::InstanceLoad>>,
     /// 实例 health_key -> 受 `limits.upstream_pending_limit` 约束的在途上游请求数。
     /// 与 least_conn 分表，避免 LB 统计和过载保护相互污染。
     upstream_pending: DashMap<Arc<str>, Arc<AtomicU64>>,
@@ -653,6 +681,8 @@ struct LlmForwardRequest<'a> {
     downstream_proto: &'static str,
     request_id: &'a str,
     trace: &'a crate::telemetry::ServerTrace,
+    downstream_upgrade: DownstreamUpgrade,
+    limit_conn_guards: Vec<LimitConnGuard>,
 }
 
 /// BFF fan-out 只借用当前不可变快照和请求 head；原下游 body 不进入子请求，也不会被聚合。
@@ -763,6 +793,11 @@ impl GatewayProxy {
             ws_activity_clock: forward::start_ws_activity_clock(),
             request_ids,
             upstream_inflight: DashMap::new(),
+            traffic_bandwidth: crate::traffic_limit::BandwidthRegistry::default(),
+            traffic_quota: DashMap::new(),
+            upstream_load: DashMap::new(),
+            upstream_retry_budget: DashMap::new(),
+            upstream_admission: DashMap::new(),
             upstream_pending: DashMap::new(),
             upstream_pending_hot: ArcSwapOption::empty(),
             upstream_rr: DashMap::new(),
@@ -818,6 +853,16 @@ impl GatewayProxy {
             });
             self.upstream_pending.len()
         };
+        // 负载反馈随实例身份一起退场:实例不在当前目录就不该再有调度参考量,
+        // 否则同名实例重新出现时会继承上一代的延迟/利用率历史。
+        self.upstream_load
+            .retain(|identity, _| active_identities.contains(identity.as_ref()));
+        // 准入状态按**服务**保留:服务还在就继承既有预算与已收敛的并发上限,
+        // 服务被删除才回收。这正是「reload 保守继承」的落点。
+        self.upstream_retry_budget
+            .retain(|service, _| active_services.contains(service));
+        self.upstream_admission
+            .retain(|service, _| active_services.contains(service));
         let rr_len = {
             self.upstream_rr
                 .retain(|service, _| active_services.contains(service));
@@ -958,7 +1003,28 @@ impl GatewayProxy {
         let downstream_version = req.version();
         let websocket_upgrade = is_h1_websocket_upgrade(&req);
         let sse_request = accepts_event_stream(req.headers());
-        let mut downstream_upgrade = if websocket_upgrade {
+        let connect_udp_request = req
+            .extensions()
+            .get::<crate::masque::ConnectUdpRequest>()
+            .is_some();
+        let webtransport_request = req
+            .extensions()
+            .get::<crate::masque::WebTransportRequest>()
+            .is_some();
+        let early_data_request = req
+            .extensions()
+            .get::<crate::masque::EarlyDataRequest>()
+            .is_some();
+        let early_data_request_body = req
+            .extensions()
+            .get::<crate::masque::EarlyDataRequestBody>()
+            .is_some();
+        // CONNECT 与 WebSocket 一样需要在响应后接管裸 socket,因此同样要在这里取走升级权。
+        // 取升级权本身不放行任何目标:allowlist 与 SSRF 判定全部在隧道建立前执行。
+        let connect_request = req.method() == Method::CONNECT;
+        let mut downstream_upgrade = if websocket_upgrade
+            || (connect_request && !connect_udp_request && !webtransport_request)
+        {
             // OnUpgrade 把真实 socket 移交给独立隧道 task；连接预算 lease 必须一起移动，否则
             // Hyper HTTP future 在 101 后结束会提前归还 max_connections 名额并把指标减为 0。
             let connection_lease = req.extensions_mut().remove::<DownstreamConnectionLease>();
@@ -986,7 +1052,7 @@ impl GatewayProxy {
         let access_log_enabled = snap.access_log.enabled();
         // 只在日志 producer 确实启用时保留原始 method/URI。clone 只共享 http crate 内部存储，
         // 但关闭态连引用计数/enum 构造也无需支付；body 仍在下方直接 move，不发生复制或聚合。
-        let access_log_head = access_log_enabled.then(|| {
+        let mut access_log_head = access_log_enabled.then(|| {
             (
                 AccessMethod::Http(req.method().clone()),
                 AccessPath::Http(req.uri().clone()),
@@ -1120,11 +1186,21 @@ impl GatewayProxy {
         let mut wasm_response_request = None;
         // 外部响应插件只快照其 request-header allowlist 并集，不 clone 整份请求 head/body。
         let mut external_response_request = None;
+        // 每个显式 ext_proc route 只建立一条双向流，request/response phase 共用同一协议状态。
+        let mut ext_proc_session: Option<crate::ext_proc::SharedExtProcSession> = None;
+        // EPP 子集只在处理器完成完整请求裁决后生成，并借用到同一次上游转发结束。
+        let mut inference_selection: Option<forward::InferenceEndpointSelection> = None;
         // OPA response obligations 只有 allow 且整组通过白名单/资源复验后才写入；在响应插件完成后应用。
         let mut opa_response_obligations: Option<OpaObligations> = None;
         let mut internal_reroute_parts = None;
         let mut long_connection_consumer = None;
         let mut limit_conn_guards = Vec::new();
+        // 响应方向整形器在准入期就取好共享桶:此时才有 route 与维度,
+        // 而响应阶段拿不到原始请求头,晚了就算不出维度键。
+        let mut response_bandwidth_shaper: Option<crate::traffic_limit::FrameShaper> = None;
+        // 成本型限额的预留凭据必须跟随响应 body 生命周期；只有实际交付的数据帧
+        // 才能形成可信事实，客户端中途取消时由 Drop 以已交付量完成结算。
+        let mut response_cost_settlement: Option<TrafficSettlement> = None;
         let mut circuit_permits = Vec::new();
         // 只在安全可缓存 GET 的 L1 miss 上持有；hit/绕过保持 None，默认快路径零分配。
         let mut response_cache_key = None;
@@ -1180,7 +1256,20 @@ impl GatewayProxy {
                 Some(r) => r,
                 None => {
                     self.metrics.inc_no_route();
-                    let mut resp = text_status(404, "no matching route");
+                    let mut resp = if early_data_request {
+                        // 早期请求没有显式授权 route 时必须要求客户端在握手后重试；普通 404
+                        // 会让客户端误以为重放安全门已经完成，并掩盖实际拒绝原因。
+                        self.metrics
+                            .inc_early_data(Some(crate::masque::EarlyDataDenial::NotEnabled));
+                        let mut response = text_status(StatusCode::TOO_EARLY.as_u16(), "too early");
+                        response.headers_mut().insert(
+                            http::header::CACHE_CONTROL,
+                            HeaderValue::from_static("no-store"),
+                        );
+                        response
+                    } else {
+                        text_status(404, "no matching route")
+                    };
                     server_trace.finish(resp.status().as_u16(), None, None, 0);
                     self.finish_access(access_log_enabled, || {
                         let (method, path) =
@@ -1214,6 +1303,14 @@ impl GatewayProxy {
             // 内部 listener 标记的唯一职责是 Router 匹配；在任何认证、插件、缓存或上游
             // 处理前移除，避免内部拓扑身份越过网关边界或被业务策略误用。
             parts.headers.remove(&GATEWAY_LISTENER_HEADER);
+            // 源 namespace 只由受保护的 Mesh listener 用于 consumer Route 选择；命中后立即
+            // 清除，避免该控制身份被转发给后端或被后续业务插件当作普通用户输入。
+            parts.headers.remove(&MESH_SOURCE_NAMESPACE_HEADER);
+            if route.inference_pool.is_some() {
+                // 客户端不得预置 EPP 控制头；先清除再进入授权 ext_proc，相同名称只有处理器
+                // mutation 才能重新产生，避免用户输入取得 endpoint 选择权威。
+                parts.headers.remove("x-gateway-destination-endpoint");
+            }
             route_id = Some(route.id_shared.clone());
             matched_route = Some(route.clone());
             let mut authorization_identity = AuthorizationIdentity::default();
@@ -1227,12 +1324,52 @@ impl GatewayProxy {
             {
                 response_filter_parts = Some(Box::new(parts.clone()));
             }
+            if let Some(uri) = route
+                .dlp
+                .as_ref()
+                .and_then(|policy| policy.sanitized_log_uri(&parts.uri))
+            {
+                // access log path 在任何 DLP 命中日志之前替换，后续拒绝、插件或上游分支都只能
+                // 看到固定占位路径，不能因早退把敏感 path 原值写回审计。
+                if let Some((_, path)) = access_log_head.as_mut() {
+                    *path = AccessPath::Http(uri);
+                }
+            }
 
-            if !route.permits_ip(client_ip) || !route.permits_referer(&parts) {
+            if let Some(response) = self
+                .enforce_early_data(
+                    &route,
+                    &mut parts,
+                    early_data_request,
+                    early_data_request_body,
+                    proxy_runtime.id.as_str(),
+                )
+                .await
+            {
+                response
+            } else if !route.permits_ip(client_ip) || !route.permits_referer(&parts) {
                 self.metrics.inc_acl_denied();
                 text_status(403, "forbidden")
             } else if !route.permits_method(&parts) {
                 text_status(405, "method not allowed")
+            } else if let Some(resp) = enforce_waf_head(&route, &parts, self.metrics.as_ref()) {
+                resp
+            } else if let Some(resp) = enforce_geoip(&route, client_ip, self.metrics.as_ref()) {
+                resp
+            } else if let Some(resp) = self.enforce_bot(&parts, &route, client_ip).await {
+                resp
+            } else if let Some(resp) =
+                enforce_csrf(&route, &parts, downstream_proto, self.metrics.as_ref())
+            {
+                resp
+            } else if let Some(resp) = enforce_dlp_request_head(
+                &route,
+                &mut parts,
+                &mut internal_reroute_parts,
+                &mut response_filter_parts,
+                self.metrics.as_ref(),
+            ) {
+                resp
             } else if let Some(resp) = self
                 .enforce_auth_chain(
                     &snap,
@@ -1246,7 +1383,7 @@ impl GatewayProxy {
                     &request_id,
                     &server_trace,
                     &mut authorization_identity,
-                    (websocket_upgrade || grpc_request || sse_request)
+                    (websocket_upgrade || grpc_request || sse_request || connect_request)
                         .then_some(&mut long_connection_consumer),
                 )
                 .await
@@ -1280,6 +1417,19 @@ impl GatewayProxy {
                 downstream_proto,
                 self.metrics.as_ref(),
             ) {
+                resp
+            } else if let Some(resp) =
+                enforce_waf_body(&route, &parts, &mut forward_body, self.metrics.as_ref()).await
+            {
+                resp
+            } else if let Some(resp) = enforce_dlp_request_body(
+                &route,
+                &mut parts,
+                &mut forward_body,
+                self.metrics.as_ref(),
+            )
+            .await
+            {
                 resp
             } else if let Some(resp) = enforce_wasm_request_headers(
                 &route,
@@ -1317,6 +1467,32 @@ impl GatewayProxy {
                 .await
             {
                 resp
+            } else if let Some(resp) = self
+                .enforce_ext_proc_request(
+                    &snap,
+                    proxy_runtime,
+                    &route,
+                    &mut parts,
+                    &mut forward_body,
+                    request_end_of_stream,
+                    downstream_proto,
+                    &request_id,
+                    &server_trace,
+                    &mut ext_proc_session,
+                )
+                .await
+            {
+                resp
+            } else if let Some(resp) = self
+                .enforce_inference_pool_request(
+                    &route,
+                    &mut parts,
+                    &ext_proc_session,
+                    &mut inference_selection,
+                )
+                .await
+            {
+                resp
             } else if let Some(resp) = transform_degraphql(
                 &route,
                 &mut parts,
@@ -1335,6 +1511,15 @@ impl GatewayProxy {
                     .await
             {
                 resp
+            } else if let Some(resp) = transform_route_request(
+                &route,
+                &mut parts,
+                &mut forward_body,
+                self.metrics.as_ref(),
+            )
+            .await
+            {
+                resp
             } else if let Some(direct) =
                 route.conditional_return(&parts, client_ip, downstream_proto, &request_id)
             {
@@ -1351,6 +1536,44 @@ impl GatewayProxy {
                 .await
             {
                 resp
+            } else if let Some(resp) = self
+                .enforce_traffic_limit(
+                    &parts,
+                    &route,
+                    client_ip,
+                    &mut forward_body,
+                    &mut response_bandwidth_shaper,
+                    &mut response_cost_settlement,
+                )
+                .await
+            {
+                resp
+            } else if webtransport_request {
+                // session 只有在普通 route 的认证、授权、WAF 与配额全部通过后才取得执行计划；
+                // HTTP/3 adapter 还必须先连通固定上游，才能向客户端发送成功响应。
+                self.prepare_webtransport(
+                    &parts,
+                    &route,
+                    client_ip,
+                    long_connection_consumer.clone(),
+                    snap.version,
+                )
+            } else if connect_udp_request {
+                // extended CONNECT 先完整经过与普通请求相同的安全管线，只有这里才把已匹配
+                // route 的正向代理策略与逐次 DNS 结果交回 QUIC adapter。2xx 之前不创建 UDP socket。
+                self.prepare_connect_udp(
+                    &parts,
+                    &route,
+                    client_ip,
+                    long_connection_consumer.clone(),
+                    snap.version,
+                )
+                .await
+            } else if connect_request {
+                // CONNECT 是终端语义:它不进反代/缓存/上游选择,而是自成一条隧道路径。
+                // 放在认证与限流之后,保证正向代理同样受身份与配额治理。
+                self.handle_connect(&parts, &route, client_ip, &mut downstream_upgrade)
+                    .await
             } else if let Some(resp) = lookup_route_cache(
                 &route,
                 &parts,
@@ -1550,6 +1773,20 @@ impl GatewayProxy {
                         downstream_proto,
                         request_id: &request_id,
                         trace: &server_trace,
+                        downstream_upgrade: if route.llm.as_ref().is_some_and(|policy| {
+                            policy.api_type == crate::llm::LlmApiType::Realtime
+                        }) {
+                            downstream_upgrade.take()
+                        } else {
+                            None
+                        },
+                        limit_conn_guards: if route.llm.as_ref().is_some_and(|policy| {
+                            policy.api_type == crate::llm::LlmApiType::Realtime
+                        }) {
+                            std::mem::take(&mut limit_conn_guards)
+                        } else {
+                            Vec::new()
+                        },
                     }),
                 )
                 .await
@@ -1586,6 +1823,7 @@ impl GatewayProxy {
                             .expect("request body remains available before forward"),
                         upstream_override: None,
                         path_override: None,
+                        inference_endpoints: inference_selection.as_ref(),
                         client_ip,
                         client_ip_header: connection_client_ip_header,
                         trusted_inbound,
@@ -1595,6 +1833,8 @@ impl GatewayProxy {
                         consumer: long_connection_consumer.clone(),
                         downstream_upgrade,
                         limit_conn_guards: limit_conn_guards_for_forward,
+                        websocket_max_lifetime_ms: None,
+                        websocket_frame_limits: None,
                         trace: Some(&server_trace),
                     })
                     .await
@@ -1763,6 +2003,16 @@ impl GatewayProxy {
                     }
                 }
             }
+            if let Some(matched) = matched_route.as_ref() {
+                resp = self
+                    .enforce_ext_proc_response(
+                        matched,
+                        resp,
+                        &mut ext_proc_session,
+                        &response_method,
+                    )
+                    .await;
+            }
             if let (Some(matched), Some(request_head)) =
                 (matched_route.as_ref(), wasm_response_request.take())
             {
@@ -1879,6 +2129,63 @@ impl GatewayProxy {
                 // 又必须早于压缩以免任何 framing header 有机会参与（framing 名称本身也永久禁用）。
                 obligations.apply_response(resp.headers_mut());
             }
+            let mut contract_eligible = true;
+            if let Some(transform) = &route.response_transform {
+                match transform.transform_response(resp).await {
+                    Ok(transformed) => {
+                        self.metrics
+                            .inc_body_transform(crate::metrics::BodyTransformMetric::Transformed);
+                        resp = transformed;
+                    }
+                    Err(outcome) => {
+                        crate::proxy::response_contract::record_transform_failure(
+                            self.metrics.as_ref(),
+                            &outcome,
+                        );
+                        let message = match outcome {
+                            crate::proxy::response_contract::TransformOutcome::TooLarge => {
+                                "upstream response transform exceeds limit"
+                            }
+                            crate::proxy::response_contract::TransformOutcome::ReadFailed => {
+                                "upstream response transform read failed"
+                            }
+                            crate::proxy::response_contract::TransformOutcome::Invalid(message) => {
+                                tracing::warn!(route = %route.id, reason = message, "response body transform rejected input");
+                                "upstream response transform failed"
+                            }
+                            crate::proxy::response_contract::TransformOutcome::Transformed {
+                                ..
+                            } => unreachable!("successful response transform is handled above"),
+                        };
+                        // 原实体已经被消费或判定不安全，契约不能再检查本地替代错误并覆盖失败原因。
+                        contract_eligible = false;
+                        resp = text_status(502, message);
+                    }
+                }
+            }
+            if contract_eligible {
+                if let Some(contract) = &route.response_contract {
+                    resp = contract
+                        .enforce(resp, &response_method, self.metrics.clone())
+                        .await;
+                }
+            }
+            resp = enforce_dlp_response(route, resp, self.metrics.as_ref()).await;
+            if let Some((route, policy)) = matched_route
+                .as_ref()
+                .and_then(|route| route.csrf.as_ref().map(|policy| (route, policy)))
+            {
+                if policy.should_issue(&response_method, resp.status()) {
+                    // token 必须在响应插件和缓存包装之后签发，防止插件覆盖安全 header，也避免
+                    // 每客户端 token 被写入共享缓存；签发失败不能返回一个假装可继续的成功响应。
+                    if let Err(error) =
+                        policy.issue_response_token(resp.headers_mut(), route.id.as_str())
+                    {
+                        tracing::error!(route = %route.id, %error, "issue CSRF token failed");
+                        resp = text_status(500, "CSRF token issuance failed");
+                    }
+                }
+            }
             if let Some(policy) = &route.compression {
                 resp = apply_response_compression(
                     resp,
@@ -1890,6 +2197,27 @@ impl GatewayProxy {
             }
             if let Some(policy) = route.limit_rate {
                 resp = wrap_limit_rate_response(resp, policy);
+            }
+            if let Some(shaper) = response_bandwidth_shaper.take() {
+                resp = resp.map(|body| {
+                    ShapedBody {
+                        inner: Box::pin(body),
+                        shaper,
+                        pending: None,
+                        sleep: None,
+                    }
+                    .boxed()
+                });
+            }
+            if let Some(mut settlement) = response_cost_settlement.take() {
+                settlement.validate_response_headers(resp.headers());
+                resp = resp.map(|body| {
+                    SettledTrafficBody {
+                        inner: Box::pin(body),
+                        settlement: Some(settlement),
+                    }
+                    .boxed()
+                });
             }
         }
         if !circuit_permits.is_empty() {
@@ -1955,6 +2283,11 @@ impl GatewayProxy {
             downstream_version,
         );
         let upstream_trace = resp.extensions().get::<forward::UpstreamTrace>().cloned();
+        // 会话保持载体在全部 post filter 之后、写下游之前下发:此时最终实例已确定,
+        // 且不会被后续 header 规则覆盖。未配置会话保持的服务不产生任何额外 header。
+        if let Some(trace) = upstream_trace.as_ref() {
+            forward::apply_session_affinity(&mut resp, &snap, trace);
+        }
         let status = resp.status();
         let upstream_attempts = upstream_trace
             .as_ref()
@@ -1990,6 +2323,168 @@ impl GatewayProxy {
             }
         });
         Ok(resp)
+    }
+
+    /// 业务作用：在任何认证、插件、配额或上游副作用前裁决真实 QUIC early data，并用
+    /// 一次性 nonce 账本阻止同一请求在有效窗口内再次执行。
+    ///
+    /// 参数说明：`route` 是当前快照命中的路由；`parts` 是待转发请求头；`transport_early`
+    /// 只来自 Quinn 接收流；`transport_body` 表示 adapter 已看到 DATA 或 trailers；`proxy_id`
+    /// 隔离不同 listener 下可能同名的 route。
+    ///
+    /// 返回：普通 1-RTT 或全部门禁通过时返回 `None` 并继续管线；early data 不满足条件时
+    /// 返回不可缓存的 425 响应，且不会读取请求 body 或触发任何外部调用。
+    async fn enforce_early_data(
+        &self,
+        route: &Route,
+        parts: &mut Parts,
+        transport_early: bool,
+        transport_body: bool,
+        proxy_id: &str,
+    ) -> Option<Response<BoxBody>> {
+        const EARLY_DATA_HEADER: &str = "early-data";
+        const NONCE_HEADER: &str = "x-naway-early-data-nonce";
+
+        let indicator = {
+            let mut values = parts.headers.get_all(EARLY_DATA_HEADER).iter();
+            let first = values.next().cloned();
+            let repeated = values.next().is_some();
+            (first, repeated)
+        };
+        let nonce = {
+            let mut values = parts.headers.get_all(NONCE_HEADER).iter();
+            let first = values.next().cloned();
+            let repeated = values.next().is_some();
+            (first, repeated)
+        };
+        // 两个字段只用于本 listener 的 transport 门禁；无论是否为 early stream 都必须在
+        // 进入插件和上游前删除，防止客户端伪造内部证据或让上游误判请求安全级别。
+        parts.headers.remove(EARLY_DATA_HEADER);
+        parts.headers.remove(NONCE_HEADER);
+        if !transport_early {
+            return None;
+        }
+
+        let denial = if route.early_data.is_none() {
+            Some(crate::masque::EarlyDataDenial::NotEnabled)
+        } else if !matches!(
+            parts.method,
+            Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+        ) {
+            Some(crate::masque::EarlyDataDenial::NonIdempotentMethod)
+        } else if [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "x-api-key",
+            "x-auth-token",
+            "x-amz-security-token",
+            "x-goog-api-key",
+        ]
+        .iter()
+        .any(|name| parts.headers.contains_key(*name))
+        {
+            Some(crate::masque::EarlyDataDenial::SensitiveCredential)
+        } else if transport_body || parts.headers.contains_key(http::header::TRANSFER_ENCODING) || {
+            let mut lengths = parts.headers.get_all(http::header::CONTENT_LENGTH).iter();
+            match (lengths.next(), lengths.next()) {
+                (None, None) => false,
+                (Some(value), None) => {
+                    value.to_str().ok().and_then(|raw| raw.parse::<u64>().ok()) != Some(0)
+                }
+                _ => true,
+            }
+        } {
+            Some(crate::masque::EarlyDataDenial::RequestBody)
+        } else if indicator.0.is_none() {
+            Some(crate::masque::EarlyDataDenial::MissingIndicator)
+        } else if indicator.1
+            || indicator
+                .0
+                .as_ref()
+                .is_none_or(|value| value.as_bytes() != b"1")
+        {
+            Some(crate::masque::EarlyDataDenial::InvalidIndicator)
+        } else if nonce.0.is_none() {
+            Some(crate::masque::EarlyDataDenial::MissingNonce)
+        } else if nonce.1 {
+            Some(crate::masque::EarlyDataDenial::InvalidNonce)
+        } else {
+            None
+        };
+
+        let decoded_nonce = if denial.is_none() {
+            nonce.0.as_ref().and_then(|value| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(value.as_bytes())
+                    .ok()
+                    .filter(|decoded| decoded.len() == 32)
+            })
+        } else {
+            None
+        };
+        let mut denial = denial.or_else(|| {
+            decoded_nonce
+                .is_none()
+                .then_some(crate::masque::EarlyDataDenial::InvalidNonce)
+        });
+
+        if denial.is_none() {
+            let mut hasher = Sha256::new();
+            for field in [
+                proxy_id.as_bytes(),
+                route.id.as_bytes(),
+                parts.method.as_str().as_bytes(),
+                parts
+                    .headers
+                    .get(http::header::HOST)
+                    .map(HeaderValue::as_bytes)
+                    .unwrap_or_default(),
+                parts
+                    .uri
+                    .path_and_query()
+                    .map(|value| value.as_str().as_bytes())
+                    .unwrap_or_else(|| parts.uri.path().as_bytes()),
+                decoded_nonce
+                    .as_deref()
+                    .expect("nonce presence checked before replay lookup"),
+            ] {
+                hasher.update((field.len() as u64).to_be_bytes());
+                hasher.update(field);
+            }
+            let digest = hasher.finalize();
+            let mut replay_key = String::with_capacity(64);
+            use std::fmt::Write as _;
+            for byte in digest {
+                write!(&mut replay_key, "{byte:02x}")
+                    .expect("writing SHA-256 hex to String cannot fail");
+            }
+            let replay_window = route
+                .early_data
+                .as_ref()
+                .expect("early-data route checked before replay lookup")
+                .replay_window();
+            // 去重占位必须在任何业务副作用前提交；账本不可用时配置层要求失败闭合，不能以
+            // 可用性为由执行一份没有重放证据的请求。
+            if !self
+                .replay_guard
+                .check_and_set(&replay_key, replay_window)
+                .await
+            {
+                denial = Some(crate::masque::EarlyDataDenial::Replayed);
+            }
+        }
+
+        self.metrics.inc_early_data(denial);
+        if denial.is_none() {
+            return None;
+        }
+        let mut response = text_status(StatusCode::TOO_EARLY.as_u16(), "too early");
+        response.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+        Some(response)
     }
 
     /// 执行 V6 多模型统一入口：一次有界读取/解析，下游凭据隔离，然后按配置顺序 fallback。
@@ -2029,6 +2524,7 @@ impl GatewayProxy {
                         body: full_body(Bytes::new()),
                         upstream_override: Some(target.uri.as_ref()),
                         path_override: Some(target.path.as_ref()),
+                        inference_endpoints: None,
                         client_ip: ctx.client_ip,
                         client_ip_header: None,
                         trusted_inbound: ctx.trusted_inbound,
@@ -2038,6 +2534,8 @@ impl GatewayProxy {
                         consumer: None,
                         downstream_upgrade: None,
                         limit_conn_guards: Vec::new(),
+                        websocket_max_lifetime_ms: None,
+                        websocket_frame_limits: None,
                         trace: Some(ctx.trace),
                     })
                     .await
@@ -2118,6 +2616,9 @@ impl GatewayProxy {
             .llm
             .as_ref()
             .expect("forward_llm is called only for an LLM route");
+        if policy.api_type != crate::llm::LlmApiType::ChatCompletions {
+            return self.forward_native_ai(ctx, policy).await;
+        }
         if content_length_exceeds(&ctx.parts, policy.max_body_bytes) {
             return LlmForwardOutcome::Local(text_status(413, "LLM request body too large"));
         }
@@ -2456,7 +2957,75 @@ impl GatewayProxy {
 
         let mut attempted_upstream = false;
         let consumer_metric = llm_consumer_metric_label(ctx.route, &ctx.parts);
-        let model_order = self.llm_model_order(ctx.route.id.as_str(), policy, ctx.request_id);
+        let request_capabilities = request.required_capabilities();
+        let completion_tokens = request.max_completion_tokens.unwrap_or_default();
+        let mut model_order = self.llm_model_order(ctx.route.id.as_str(), policy, ctx.request_id);
+        model_order.retain(|index| {
+            let model = &policy.models()[*index];
+            model.supports_capabilities(request_capabilities.as_slice())
+                && (policy.max_cost_microusd == u64::MAX
+                    || model
+                        .estimated_cost_microusd(request.prompt_tokens, completion_tokens)
+                        .is_some_and(|cost| cost <= policy.max_cost_microusd))
+        });
+        if model_order.is_empty() {
+            refund_llm_reservation(&mut quota_reservation).await;
+            return LlmForwardOutcome::Local(text_status(
+                400,
+                "LLM request has no model satisfying capability, SLO, and cost policy",
+            ));
+        }
+        if let Some((shadow_index, basis_points)) = policy.shadow {
+            let shadow = &policy.models()[shadow_index];
+            let sample_key = format!("{}:shadow:{}", ctx.request_id, shadow.id);
+            let sampled = stable_hash64(sample_key.as_bytes()) % 10_000 < u64::from(basis_points);
+            let cost_allowed = policy.max_cost_microusd == u64::MAX
+                || shadow
+                    .estimated_cost_microusd(request.prompt_tokens, completion_tokens)
+                    .is_some_and(|cost| cost <= policy.max_cost_microusd);
+            if sampled
+                && cost_allowed
+                && shadow.supports_capabilities(request_capabilities.as_slice())
+            {
+                match request.body_for(shadow) {
+                    Ok(body) => {
+                        let mut parts = ctx.parts.clone();
+                        shadow.prepare_headers(&mut parts, request.stream);
+                        let signed = shadow.sign_bedrock_request(
+                            &mut parts,
+                            body.as_ref(),
+                            shadow.path_for(request.stream),
+                            chrono::Utc::now(),
+                        );
+                        if let Err(error) = signed.and_then(|()| {
+                            self.spawn_llm_shadow_request(
+                                ctx.snap,
+                                ctx.proxy,
+                                ctx.route,
+                                parts,
+                                body,
+                                shadow.upstream.as_ref(),
+                                shadow.path_for(request.stream),
+                                ctx.client_ip,
+                                ctx.trusted_inbound,
+                                ctx.client_cert_verified,
+                                ctx.downstream_proto,
+                                ctx.request_id,
+                                ctx.trace,
+                                policy.max_duration,
+                                shadow.id.clone(),
+                            )
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))
+                        }) {
+                            tracing::debug!(route = %ctx.route.id, model = %shadow.id, %error, "LLM shadow evaluation was skipped");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(route = %ctx.route.id, model = %shadow.id, %error, "LLM shadow request cannot be represented");
+                    }
+                }
+            }
+        }
         let model_count = model_order.len();
         for (attempt, model_index) in model_order.into_iter().enumerate() {
             let model = &policy.models()[model_index];
@@ -2473,6 +3042,19 @@ impl GatewayProxy {
             };
             let mut parts = ctx.parts.clone();
             model.prepare_headers(&mut parts, request.stream);
+            if let Err(error) = model.sign_bedrock_request(
+                &mut parts,
+                body.as_ref(),
+                model.path_for(request.stream),
+                chrono::Utc::now(),
+            ) {
+                tracing::warn!(route = %ctx.route.id, model = %model.id, %error, "LLM provider signing failed");
+                refund_llm_reservation(&mut quota_reservation).await;
+                return LlmForwardOutcome::Local(text_status(
+                    500,
+                    "LLM provider authentication failed",
+                ));
+            }
             attempted_upstream = true;
             let model_started = Instant::now();
             let response = self
@@ -2484,6 +3066,7 @@ impl GatewayProxy {
                     body: full_body(body),
                     upstream_override: Some(model.upstream.as_ref()),
                     path_override: Some(model.path_for(request.stream)),
+                    inference_endpoints: None,
                     client_ip: ctx.client_ip,
                     client_ip_header: None,
                     trusted_inbound: ctx.trusted_inbound,
@@ -2493,6 +3076,8 @@ impl GatewayProxy {
                     consumer: None,
                     downstream_upgrade: None,
                     limit_conn_guards: Vec::new(),
+                    websocket_max_lifetime_ms: None,
+                    websocket_frame_limits: None,
                     trace: Some(ctx.trace),
                 })
                 .await;
@@ -2536,12 +3121,32 @@ impl GatewayProxy {
                 refund_llm_reservation(&mut quota_reservation).await;
             }
             let (usage, response_body) = if !request.stream && response.status().is_success() {
-                let converted = match model.provider {
-                    crate::llm::LlmProvider::Anthropic => {
-                        convert_anthropic_response(response).await
+                let converted = if model.native_passthrough {
+                    inspect_native_llm_response(response, policy.max_response_bytes).await
+                } else {
+                    match model.provider {
+                        crate::llm::LlmProvider::Anthropic => {
+                            convert_anthropic_response(response, policy.max_response_bytes).await
+                        }
+                        crate::llm::LlmProvider::Google | crate::llm::LlmProvider::VertexAi => {
+                            convert_google_response(response, policy.max_response_bytes).await
+                        }
+                        crate::llm::LlmProvider::Openai
+                        | crate::llm::LlmProvider::AzureOpenai
+                        | crate::llm::LlmProvider::Bedrock
+                        | crate::llm::LlmProvider::Mistral
+                        | crate::llm::LlmProvider::HuggingFace
+                        | crate::llm::LlmProvider::Xai
+                        | crate::llm::LlmProvider::Dashscope
+                        | crate::llm::LlmProvider::Deepseek
+                        | crate::llm::LlmProvider::Ollama
+                        | crate::llm::LlmProvider::Vllm => {
+                            inspect_openai_response(response, policy.max_response_bytes).await
+                        }
+                        crate::llm::LlmProvider::Cohere => {
+                            unreachable!("Cohere Chat requires native passthrough")
+                        }
                     }
-                    crate::llm::LlmProvider::Openai => inspect_openai_response(response).await,
-                    crate::llm::LlmProvider::Google => convert_google_response(response).await,
                 };
                 match converted {
                     Ok((converted, usage, body)) => {
@@ -2610,15 +3215,37 @@ impl GatewayProxy {
                     output_cost_microusd_per_million: model.output_cost_microusd_per_million,
                     reservation: quota_reservation.take(),
                 };
-                response = match model.provider {
-                    crate::llm::LlmProvider::Anthropic => {
-                        wrap_anthropic_sse_response(response, accounting)
-                    }
-                    crate::llm::LlmProvider::Openai => {
-                        wrap_openai_sse_usage_response(response, accounting)
-                    }
-                    crate::llm::LlmProvider::Google => {
-                        wrap_google_sse_response(response, accounting)
+                response = if model.native_passthrough {
+                    wrap_native_llm_stream_response(
+                        response,
+                        accounting,
+                        policy.max_response_bytes,
+                        policy.max_stream_frame_bytes,
+                        policy.max_duration,
+                    )
+                } else {
+                    match model.provider {
+                        crate::llm::LlmProvider::Anthropic => {
+                            wrap_anthropic_sse_response(response, accounting)
+                        }
+                        crate::llm::LlmProvider::Google | crate::llm::LlmProvider::VertexAi => {
+                            wrap_google_sse_response(response, accounting)
+                        }
+                        crate::llm::LlmProvider::Openai
+                        | crate::llm::LlmProvider::AzureOpenai
+                        | crate::llm::LlmProvider::Bedrock
+                        | crate::llm::LlmProvider::Mistral
+                        | crate::llm::LlmProvider::HuggingFace
+                        | crate::llm::LlmProvider::Xai
+                        | crate::llm::LlmProvider::Dashscope
+                        | crate::llm::LlmProvider::Deepseek
+                        | crate::llm::LlmProvider::Ollama
+                        | crate::llm::LlmProvider::Vllm => {
+                            wrap_openai_sse_usage_response(response, accounting)
+                        }
+                        crate::llm::LlmProvider::Cohere => {
+                            unreachable!("Cohere Chat requires native passthrough")
+                        }
                     }
                 };
             }
@@ -2694,6 +3321,393 @@ impl GatewayProxy {
         }
     }
 
+    /// 业务作用：转发非 Chat 的独立 AI API，保持 provider 原生字段与响应不变，同时在任何
+    /// provider I/O 前执行 content-type、能力、费用和资源预算门。
+    ///
+    /// 参数说明：`ctx` 持有已认证请求、升级权与不可变快照；`policy` 是 route 冻结的 API/model 计划。
+    ///
+    /// 返回：本地契约拒绝返回 Local；已经尝试 provider 后返回 Upstream，并仅对 transport、超时或
+    /// 5xx 使用剩余模型 fallback。
+    async fn forward_native_ai(
+        &self,
+        mut ctx: LlmForwardRequest<'_>,
+        policy: &crate::llm::LlmRoutePolicy,
+    ) -> LlmForwardOutcome {
+        if policy.api_type == crate::llm::LlmApiType::Realtime {
+            return self.forward_realtime_ai(ctx, policy).await;
+        }
+        if ctx.downstream_upgrade.is_some() {
+            return LlmForwardOutcome::Local(text_status(
+                400,
+                "WebSocket upgrade is only valid for realtime AI routes",
+            ));
+        }
+        if content_length_exceeds(&ctx.parts, policy.max_body_bytes) {
+            return LlmForwardOutcome::Local(text_status(413, "AI request body too large"));
+        }
+        let media_type = ctx
+            .parts
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .map(str::to_ascii_lowercase);
+        let multipart = media_type
+            .as_deref()
+            .is_some_and(|value| value.starts_with("multipart/"));
+        let json = media_type
+            .as_deref()
+            .is_some_and(|value| value == "application/json" || value.ends_with("+json"));
+        let content_type_allowed = match policy.api_type {
+            crate::llm::LlmApiType::Responses
+            | crate::llm::LlmApiType::Embeddings
+            | crate::llm::LlmApiType::Rerank
+            | crate::llm::LlmApiType::Batch => json,
+            crate::llm::LlmApiType::Image
+            | crate::llm::LlmApiType::Audio
+            | crate::llm::LlmApiType::Video
+            | crate::llm::LlmApiType::File => json || multipart,
+            crate::llm::LlmApiType::ChatCompletions | crate::llm::LlmApiType::Realtime => false,
+        };
+        if !content_type_allowed {
+            return LlmForwardOutcome::Local(text_status(
+                415,
+                "content type is not valid for this AI API",
+            ));
+        }
+        let body = std::mem::replace(&mut ctx.body, full_body(Bytes::new()));
+        let raw = match collect_llm_body(body, policy.max_body_bytes).await {
+            Ok(raw) => raw,
+            Err(LlmBodyError::TooLarge) => {
+                return LlmForwardOutcome::Local(text_status(413, "AI request body too large"));
+            }
+            Err(LlmBodyError::Invalid(error)) => {
+                tracing::debug!(route = %ctx.route.id, %error, "invalid native AI request body");
+                return LlmForwardOutcome::Local(text_status(400, "invalid AI request body"));
+            }
+        };
+        let document = if json {
+            match serde_json::from_slice::<serde_json::Value>(raw.as_ref()) {
+                Ok(value) if value.is_object() => Some(value),
+                Ok(_) => {
+                    return LlmForwardOutcome::Local(text_status(
+                        400,
+                        "AI JSON request must be an object",
+                    ));
+                }
+                Err(error) => {
+                    tracing::debug!(route = %ctx.route.id, %error, "native AI request is not JSON");
+                    return LlmForwardOutcome::Local(text_status(400, "invalid AI JSON request"));
+                }
+            }
+        } else {
+            None
+        };
+        let stream = document
+            .as_ref()
+            .and_then(|value| value.get("stream"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mut capabilities = document
+            .as_ref()
+            .map(crate::llm::native_required_capabilities)
+            .unwrap_or_else(|| vec!["multimodal"]);
+        capabilities.sort_unstable();
+        capabilities.dedup();
+        let prompt_tokens = ((raw.len() as u64).saturating_add(3) / 4).max(1);
+        let completion_tokens = document
+            .as_ref()
+            .map(crate::llm::native_completion_tokens)
+            .unwrap_or_default();
+        let mut order = self.llm_model_order(ctx.route.id.as_str(), policy, ctx.request_id);
+        order.retain(|index| {
+            let model = &policy.models()[*index];
+            model.supports_capabilities(capabilities.as_slice())
+                && (policy.max_cost_microusd == u64::MAX
+                    || model
+                        .estimated_cost_microusd(prompt_tokens, completion_tokens)
+                        .is_some_and(|cost| cost <= policy.max_cost_microusd))
+        });
+        if order.is_empty() {
+            return LlmForwardOutcome::Local(text_status(
+                400,
+                "AI request has no model satisfying capability, SLO, and cost policy",
+            ));
+        }
+        if let Some((shadow_index, basis_points)) = policy.shadow {
+            let shadow = &policy.models()[shadow_index];
+            let sample_key = format!("{}:shadow:{}", ctx.request_id, shadow.id);
+            let sampled = stable_hash64(sample_key.as_bytes()) % 10_000 < u64::from(basis_points);
+            let cost_allowed = policy.max_cost_microusd == u64::MAX
+                || shadow
+                    .estimated_cost_microusd(prompt_tokens, completion_tokens)
+                    .is_some_and(|cost| cost <= policy.max_cost_microusd);
+            if sampled && cost_allowed && shadow.supports_capabilities(capabilities.as_slice()) {
+                let shadow_body = match document.as_ref() {
+                    Some(document) => shadow.native_json_body(document, &raw),
+                    None => Ok(raw.clone()),
+                };
+                match shadow_body {
+                    Ok(body) if body.len() <= policy.max_body_bytes => {
+                        let mut parts = ctx.parts.clone();
+                        shadow.prepare_headers(&mut parts, stream);
+                        let signed = shadow.sign_bedrock_request(
+                            &mut parts,
+                            body.as_ref(),
+                            shadow.path_for(stream),
+                            chrono::Utc::now(),
+                        );
+                        if let Err(error) = signed.and_then(|()| {
+                            self.spawn_llm_shadow_request(
+                                ctx.snap,
+                                ctx.proxy,
+                                ctx.route,
+                                parts,
+                                body,
+                                shadow.upstream.as_ref(),
+                                shadow.path_for(stream),
+                                ctx.client_ip,
+                                ctx.trusted_inbound,
+                                ctx.client_cert_verified,
+                                ctx.downstream_proto,
+                                ctx.request_id,
+                                ctx.trace,
+                                policy.max_duration,
+                                shadow.id.clone(),
+                            )
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))
+                        }) {
+                            tracing::debug!(route = %ctx.route.id, model = %shadow.id, %error, "AI shadow evaluation was skipped");
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::debug!(route = %ctx.route.id, model = %shadow.id, "AI shadow request exceeds route body budget");
+                    }
+                    Err(error) => {
+                        tracing::debug!(route = %ctx.route.id, model = %shadow.id, %error, "AI shadow request cannot be represented");
+                    }
+                }
+            }
+        }
+        let model_count = order.len();
+        for (attempt, model_index) in order.into_iter().enumerate() {
+            let model = &policy.models()[model_index];
+            let body = match document.as_ref() {
+                Some(document) => match model.native_json_body(document, &raw) {
+                    Ok(body) if body.len() <= policy.max_body_bytes => body,
+                    Ok(_) => {
+                        return LlmForwardOutcome::Local(text_status(
+                            413,
+                            "provider AI request body too large",
+                        ));
+                    }
+                    Err(error) => {
+                        tracing::debug!(route = %ctx.route.id, model = %model.id, %error, "native AI request cannot be represented");
+                        return LlmForwardOutcome::Local(text_status(
+                            400,
+                            "AI request is unsupported by selected provider",
+                        ));
+                    }
+                },
+                None => raw.clone(),
+            };
+            let mut parts = ctx.parts.clone();
+            model.prepare_headers(&mut parts, stream);
+            if let Err(error) = model.sign_bedrock_request(
+                &mut parts,
+                body.as_ref(),
+                model.path_for(stream),
+                chrono::Utc::now(),
+            ) {
+                tracing::warn!(route = %ctx.route.id, model = %model.id, %error, "AI provider signing failed");
+                return LlmForwardOutcome::Local(text_status(
+                    500,
+                    "AI provider authentication failed",
+                ));
+            }
+            let started = Instant::now();
+            let future = self.forward(forward::ForwardRequest {
+                snap: ctx.snap,
+                proxy: ctx.proxy,
+                route: ctx.route,
+                parts,
+                body: full_body(body),
+                upstream_override: Some(model.upstream.as_ref()),
+                path_override: Some(model.path_for(stream)),
+                inference_endpoints: None,
+                client_ip: ctx.client_ip,
+                client_ip_header: None,
+                trusted_inbound: ctx.trusted_inbound,
+                client_cert_verified: ctx.client_cert_verified,
+                downstream_proto: ctx.downstream_proto,
+                request_id: ctx.request_id,
+                consumer: None,
+                downstream_upgrade: None,
+                limit_conn_guards: Vec::new(),
+                websocket_max_lifetime_ms: None,
+                websocket_frame_limits: None,
+                trace: Some(ctx.trace),
+            });
+            let mut response = match tokio::time::timeout(policy.max_duration, future).await {
+                Err(_) if attempt + 1 < model_count => continue,
+                Err(_) => {
+                    return LlmForwardOutcome::Upstream(text_status(
+                        504,
+                        "AI provider request timed out",
+                    ));
+                }
+                Ok(Err(error)) if attempt + 1 < model_count => {
+                    tracing::warn!(route = %ctx.route.id, model = %model.id, %error, "AI provider transport failed; trying fallback");
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    self.metrics.inc_upstream_error();
+                    return LlmForwardOutcome::Upstream(text_status(
+                        error.status().as_u16(),
+                        error.message(),
+                    ));
+                }
+                Ok(Ok(response)) => response,
+            };
+            if response.status().is_server_error() && attempt + 1 < model_count {
+                drain_llm_fallback_response(response).await;
+                continue;
+            }
+            if response.status().is_success() {
+                self.observe_llm_model_latency(
+                    ctx.route.id.as_str(),
+                    model.id.clone(),
+                    started.elapsed(),
+                );
+                if stream {
+                    response = wrap_native_llm_stream_response(
+                        response,
+                        LlmStreamAccounting {
+                            metrics: self.metrics.clone(),
+                            route: Arc::from(ctx.route.id.as_str()),
+                            model: model.id.clone(),
+                            consumer: Arc::from(llm_consumer_metric_label(ctx.route, &ctx.parts)),
+                            input_cost_microusd_per_million: model.input_cost_microusd_per_million,
+                            output_cost_microusd_per_million: model
+                                .output_cost_microusd_per_million,
+                            reservation: None,
+                        },
+                        policy.max_response_bytes,
+                        policy.max_stream_frame_bytes,
+                        policy.max_duration.saturating_sub(started.elapsed()),
+                    );
+                } else {
+                    response = match inspect_native_llm_response(
+                        response,
+                        policy.max_response_bytes,
+                    )
+                    .await
+                    {
+                        Ok((response, _, _)) => response,
+                        Err(error) => {
+                            tracing::warn!(route = %ctx.route.id, model = %model.id, %error, "invalid native AI provider response");
+                            return LlmForwardOutcome::Upstream(text_status(
+                                502,
+                                "invalid AI provider response",
+                            ));
+                        }
+                    };
+                }
+            }
+            response.headers_mut().insert(
+                "x-gateway-llm-model",
+                HeaderValue::from_str(model.id.as_ref())
+                    .expect("AI model id is a validated HTTP-safe token"),
+            );
+            return LlmForwardOutcome::Upstream(response);
+        }
+        LlmForwardOutcome::Local(text_status(503, "no compatible AI model available"))
+    }
+
+    /// 业务作用：把 Realtime WebSocket 升级权只交给经能力、费用与 rollout 选择的固定 provider，
+    /// 不允许请求体、query 或客户端认证材料改写模型身份。
+    ///
+    /// 参数说明：`ctx` 持有唯一升级 future 与连接 guard；`policy` 是 Realtime 专属 route 计划。
+    ///
+    /// 返回：握手契约或 admission 不满足时返回 Local；已尝试固定 provider 后返回 Upstream。
+    async fn forward_realtime_ai(
+        &self,
+        mut ctx: LlmForwardRequest<'_>,
+        policy: &crate::llm::LlmRoutePolicy,
+    ) -> LlmForwardOutcome {
+        if ctx.parts.method != Method::GET || ctx.downstream_upgrade.is_none() {
+            return LlmForwardOutcome::Local(text_status(
+                426,
+                "realtime AI route requires WebSocket upgrade",
+            ));
+        }
+        let Some(model_index) = self
+            .llm_model_order(ctx.route.id.as_str(), policy, ctx.request_id)
+            .into_iter()
+            .find(|index| {
+                let model = &policy.models()[*index];
+                policy.max_cost_microusd == u64::MAX
+                    || model
+                        .estimated_cost_microusd(0, 0)
+                        .is_some_and(|cost| cost <= policy.max_cost_microusd)
+            })
+        else {
+            return LlmForwardOutcome::Local(text_status(
+                400,
+                "realtime AI request exceeds cost policy",
+            ));
+        };
+        let model = &policy.models()[model_index];
+        let mut parts = ctx.parts;
+        model.prepare_headers(&mut parts, true);
+        let consumer = ctx.route.authenticated_consumer(&parts);
+        let future = self.forward(forward::ForwardRequest {
+            snap: ctx.snap,
+            proxy: ctx.proxy,
+            route: ctx.route,
+            parts,
+            body: ctx.body,
+            upstream_override: Some(model.upstream.as_ref()),
+            path_override: Some(model.path_for(true)),
+            inference_endpoints: None,
+            client_ip: ctx.client_ip,
+            client_ip_header: None,
+            trusted_inbound: ctx.trusted_inbound,
+            client_cert_verified: ctx.client_cert_verified,
+            downstream_proto: ctx.downstream_proto,
+            request_id: ctx.request_id,
+            consumer,
+            downstream_upgrade: ctx.downstream_upgrade.take(),
+            limit_conn_guards: std::mem::take(&mut ctx.limit_conn_guards),
+            websocket_max_lifetime_ms: Some(
+                policy.max_duration.as_millis().min(u128::from(u64::MAX)) as u64,
+            ),
+            websocket_frame_limits: Some((
+                policy.max_stream_frame_bytes as u64,
+                policy.max_response_bytes as u64,
+            )),
+            trace: Some(ctx.trace),
+        });
+        match tokio::time::timeout(policy.max_duration, future).await {
+            Ok(Ok(mut response)) => {
+                response.headers_mut().insert(
+                    "x-gateway-llm-model",
+                    HeaderValue::from_str(model.id.as_ref())
+                        .expect("AI model id is a validated HTTP-safe token"),
+                );
+                LlmForwardOutcome::Upstream(response)
+            }
+            Ok(Err(error)) => {
+                LlmForwardOutcome::Upstream(text_status(error.status().as_u16(), error.message()))
+            }
+            Err(_) => LlmForwardOutcome::Upstream(text_status(
+                504,
+                "realtime AI provider handshake timed out",
+            )),
+        }
+    }
+
     /// 业务作用：在模型、缓存与配额 admission 前调用 external moderation，并把响应收敛为单一 flagged 判定。
     ///
     /// 参数说明：`ctx` 提供当前不可变快照和安全网络上下文，`policy` 是已编译 moderation 计划，`body` 是有界 text-only JSON。
@@ -2715,6 +3729,7 @@ impl GatewayProxy {
             body: full_body(body),
             upstream_override: Some(policy.upstream.as_ref()),
             path_override: Some(policy.path.as_ref()),
+            inference_endpoints: None,
             client_ip: ctx.client_ip,
             client_ip_header: None,
             trusted_inbound: ctx.trusted_inbound,
@@ -2724,6 +3739,8 @@ impl GatewayProxy {
             consumer: None,
             downstream_upgrade: None,
             limit_conn_guards: Vec::new(),
+            websocket_max_lifetime_ms: None,
+            websocket_frame_limits: None,
             trace: Some(ctx.trace),
         });
         let response = tokio::time::timeout(policy.timeout, future)
@@ -2782,6 +3799,56 @@ impl GatewayProxy {
                     order.insert(0, selected);
                 }
             }
+            crate::llm::LlmSelectionStrategy::Joint => {
+                let latencies = self.llm_model_latency.lock();
+                let route = latencies.get(route_id);
+                order.sort_by_key(|index| {
+                    let model = &models[*index];
+                    let observed_us = route
+                        .and_then(|values| values.get(model.id.as_ref()))
+                        .copied();
+                    let declared_us = model
+                        .expected_first_token_latency
+                        .map(|value| value.as_micros().min(u128::from(u64::MAX)) as u64);
+                    let latency_us = observed_us.or(declared_us);
+                    let outside_slo = policy.max_first_token_latency.is_some_and(|slo| {
+                        latency_us.is_some_and(|latency| latency > slo.as_micros() as u64)
+                    });
+                    let missing_preferred = policy
+                        .preferred_capabilities
+                        .iter()
+                        .filter(|required| {
+                            !model
+                                .capabilities
+                                .iter()
+                                .any(|value| value.as_ref() == required.as_ref())
+                        })
+                        .count();
+                    let price = model
+                        .input_cost_microusd_per_million
+                        .saturating_add(model.output_cost_microusd_per_million);
+                    (
+                        outside_slo,
+                        missing_preferred,
+                        price == 0,
+                        price,
+                        latency_us.is_none(),
+                        latency_us.unwrap_or(0),
+                    )
+                });
+            }
+        }
+        if let Some((shadow, _)) = policy.shadow {
+            // Shadow 模型只有独立后台评估权，永远不能因主模型失败进入 fallback 或成为 rollout。
+            order.retain(|index| *index != shadow);
+        }
+        if let Some((rollout, basis_points)) = policy.rollout {
+            if stable_hash64(request_id.as_bytes()) % 10_000 < u64::from(basis_points) {
+                if let Some(position) = order.iter().position(|index| *index == rollout) {
+                    order.remove(position);
+                    order.insert(0, rollout);
+                }
+            }
         }
         order
     }
@@ -2831,6 +3898,7 @@ impl GatewayProxy {
                 body: full_body(body),
                 upstream_override: Some(cache.embedding.upstream.as_ref()),
                 path_override: Some(cache.embedding.path.as_ref()),
+                inference_endpoints: None,
                 client_ip: ctx.client_ip,
                 client_ip_header: None,
                 trusted_inbound: ctx.trusted_inbound,
@@ -2840,6 +3908,8 @@ impl GatewayProxy {
                 consumer: None,
                 downstream_upgrade: None,
                 limit_conn_guards: Vec::new(),
+                websocket_max_lifetime_ms: None,
+                websocket_frame_limits: None,
                 trace: Some(ctx.trace),
             })
             .await
@@ -2967,6 +4037,7 @@ impl GatewayProxy {
                     body: full_body(Bytes::new()),
                     upstream_override: None,
                     path_override: None,
+                    inference_endpoints: None,
                     client_ip,
                     client_ip_header: None,
                     trusted_inbound,
@@ -2976,6 +4047,8 @@ impl GatewayProxy {
                     consumer: None,
                     downstream_upgrade: None,
                     limit_conn_guards: Vec::new(),
+                    websocket_max_lifetime_ms: None,
+                    websocket_frame_limits: None,
                     trace: Some(&refresh_trace),
                 })
                 .await;
@@ -3357,6 +4430,645 @@ impl GatewayProxy {
             }
         }
         None
+    }
+
+    /// 业务作用：为 route 建立一条 External Processing 双向流，并按声明顺序处理 request
+    /// headers/body/trailers；任何 mutation 都在完整权限复验后才原子写入请求。
+    ///
+    /// 参数说明：快照与 route 固定扩展目标；`parts`/`body` 是当前请求唯一所有权；
+    /// `session_out` 把同一协议流交给响应阶段继续使用。
+    ///
+    /// 返回：继续代理返回 None；即时响应、输入越界或 fail-closed 错误返回本地响应。
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "ext-proc")]
+    async fn enforce_ext_proc_request(
+        &self,
+        snap: &GatewaySnapshot,
+        proxy: &crate::config::ProxyRuntime,
+        route: &Route,
+        parts: &mut Parts,
+        body: &mut Option<forward::ForwardBody>,
+        request_end_of_stream: bool,
+        downstream_proto: &'static str,
+        request_id: &str,
+        trace: &crate::telemetry::ServerTrace,
+        session_out: &mut Option<SharedExtProcSession>,
+    ) -> Option<Response<BoxBody>> {
+        let Some(plan) = &route.ext_proc else {
+            return None;
+        };
+        let mut permit = match plan.acquire() {
+            Ok(permit) => permit,
+            Err(error) if plan.fail_open() && error.may_fail_open() => {
+                tracing::warn!(route = %route.id, %error, "ext_proc admission failed open");
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(route = %route.id, %error, "ext_proc admission failed closed");
+                return Some(text_status(503, "external processor unavailable"));
+            }
+        };
+        let wire = match self.open_ext_proc_stream(snap, proxy, route, plan, request_id, trace) {
+            Ok(wire) => wire,
+            Err(error) => {
+                if error.may_fail_open() {
+                    permit.record_dependency_failure();
+                }
+                if plan.fail_open() && error.may_fail_open() {
+                    tracing::warn!(route = %route.id, %error, "ext_proc stream creation failed open");
+                    return None;
+                }
+                tracing::warn!(route = %route.id, %error, "ext_proc stream creation failed closed");
+                return Some(text_status(503, "external processor unavailable"));
+            }
+        };
+        let session = plan.start_session(wire, permit);
+        *session_out = Some(session.clone());
+        let (
+            request_headers,
+            request_body,
+            request_trailers,
+            response_headers,
+            response_body,
+            response_trailers,
+        ) = plan.phases();
+        let has_response_phase = response_headers
+            || response_body != crate::config::model::ExtProcBodyModeCfg::None
+            || response_trailers;
+        if plan.pipelines_buffered_request_body() {
+            let current = body
+                .take()
+                .expect("request body is owned exactly once by the filter pipeline");
+            let collected = match collect_wasm_box_body(current, plan.max_body_bytes()).await {
+                Ok(collected) => collected,
+                Err(WasmBodyError::TooLarge) => {
+                    return Some(text_status(
+                        413,
+                        "external processor request body exceeds limit",
+                    ));
+                }
+                Err(WasmBodyError::Read(error)) => {
+                    tracing::warn!(route = %route.id, %error, "read inference EPP request body failed");
+                    return Some(text_status(400, "invalid request body"));
+                }
+            };
+            let mut bytes = collected.bytes;
+            let head_uri = ext_proc_request_uri(parts, downstream_proto);
+            let actions = {
+                let mut state = session.lock().await;
+                state
+                    .process_pipelined_request(
+                        (
+                            &parts.method,
+                            &head_uri,
+                            &parts.headers,
+                            request_end_of_stream,
+                        ),
+                        &bytes,
+                    )
+                    .await
+            };
+            let (header_action, body_action) = match actions {
+                Ok(actions) => actions,
+                Err(error) => {
+                    let mut state = session.lock().await;
+                    if state.apply_failure(&error) {
+                        // 依赖故障放行仍必须重建已经有界读取的原请求体，不能把空实体交给池后端。
+                        normalize_content_length(&mut parts.headers, bytes.len());
+                        *body = Some(replay_wasm_body(bytes, collected.trailers));
+                        tracing::warn!(route = %route.id, %error, "inference EPP request failed open");
+                        return None;
+                    }
+                    tracing::warn!(route = %route.id, %error, "inference EPP request failed closed");
+                    return Some(text_status(500, "external processor rejected request"));
+                }
+            };
+            match header_action {
+                ExtProcAction::Continue(changes) => {
+                    changes.apply_headers(&mut parts.headers);
+                    bytes = changes.apply_body(bytes);
+                }
+                ExtProcAction::Immediate(response) => {
+                    session.lock().await.finish_after_immediate();
+                    return Some(response);
+                }
+            }
+            if let Some(action) = body_action {
+                match action {
+                    ExtProcAction::Continue(changes) => {
+                        changes.apply_headers(&mut parts.headers);
+                        bytes = changes.apply_body(bytes);
+                    }
+                    ExtProcAction::Immediate(response) => {
+                        session.lock().await.finish_after_immediate();
+                        return Some(response);
+                    }
+                }
+            }
+            normalize_content_length(&mut parts.headers, bytes.len());
+            *body = Some(replay_wasm_body(bytes, collected.trailers));
+            if !has_response_phase {
+                session.lock().await.finish();
+            }
+            return None;
+        }
+        let mut replaced_tail = false;
+        if request_headers {
+            let head_uri = ext_proc_request_uri(parts, downstream_proto);
+            let action = {
+                let mut session = session.lock().await;
+                session
+                    .process(
+                        ExtProcPhase::RequestHeaders,
+                        Some((
+                            &parts.method,
+                            &head_uri,
+                            &parts.headers,
+                            request_end_of_stream
+                                && request_body == crate::config::model::ExtProcBodyModeCfg::None
+                                && !request_trailers,
+                        )),
+                        None,
+                        None,
+                    )
+                    .await
+            };
+            match action {
+                Ok(ExtProcAction::Continue(changes)) => {
+                    changes.apply_headers(&mut parts.headers);
+                    if changes.replaces_body() {
+                        let bytes = changes.apply_body(Bytes::new());
+                        normalize_content_length(&mut parts.headers, bytes.len());
+                        *body = Some(full_body(bytes));
+                        replaced_tail = true;
+                    }
+                }
+                Ok(ExtProcAction::Immediate(response)) => {
+                    session.lock().await.finish_after_immediate();
+                    return Some(response);
+                }
+                Err(error) => {
+                    let mut session = session.lock().await;
+                    if session.apply_failure(&error) {
+                        tracing::warn!(route = %route.id, %error, "ext_proc request headers failed open");
+                        return None;
+                    }
+                    tracing::warn!(route = %route.id, %error, "ext_proc request headers failed closed");
+                    return Some(text_status(500, "external processor rejected request"));
+                }
+            }
+        }
+        if replaced_tail {
+            if !has_response_phase {
+                session.lock().await.finish();
+            }
+            return None;
+        }
+        match request_body {
+            crate::config::model::ExtProcBodyModeCfg::Streamed => {
+                let current = body
+                    .take()
+                    .expect("request body is owned exactly once by the filter pipeline");
+                parts.headers.remove(http::header::CONTENT_LENGTH);
+                *body = Some(wrap_ext_proc_body(
+                    current,
+                    session,
+                    ExtProcPhase::RequestBody,
+                    request_trailers,
+                    plan.max_body_bytes(),
+                    !has_response_phase,
+                ));
+            }
+            crate::config::model::ExtProcBodyModeCfg::Buffered
+            | crate::config::model::ExtProcBodyModeCfg::None
+                if request_body == crate::config::model::ExtProcBodyModeCfg::Buffered
+                    || request_trailers =>
+            {
+                let current = body
+                    .take()
+                    .expect("request body is owned exactly once by the filter pipeline");
+                let collected = match collect_wasm_box_body(current, plan.max_body_bytes()).await {
+                    Ok(collected) => collected,
+                    Err(WasmBodyError::TooLarge) => {
+                        return Some(text_status(
+                            413,
+                            "external processor request body exceeds limit",
+                        ));
+                    }
+                    Err(WasmBodyError::Read(error)) => {
+                        tracing::warn!(route = %route.id, %error, "read ext_proc request body failed");
+                        return Some(text_status(400, "invalid request body"));
+                    }
+                };
+                let mut bytes = collected.bytes;
+                if request_body == crate::config::model::ExtProcBodyModeCfg::Buffered {
+                    let action = {
+                        let mut session = session.lock().await;
+                        session
+                            .process(
+                                ExtProcPhase::RequestBody,
+                                None,
+                                Some((&bytes, collected.trailers.is_none() || !request_trailers)),
+                                None,
+                            )
+                            .await
+                    };
+                    match action {
+                        Ok(ExtProcAction::Continue(changes)) => {
+                            changes.apply_headers(&mut parts.headers);
+                            bytes = changes.apply_body(bytes);
+                        }
+                        Ok(ExtProcAction::Immediate(response)) => {
+                            session.lock().await.finish_after_immediate();
+                            return Some(response);
+                        }
+                        Err(error) => {
+                            let mut session = session.lock().await;
+                            if !session.apply_failure(&error) {
+                                tracing::warn!(route = %route.id, %error, "ext_proc request body failed closed");
+                                return Some(text_status(
+                                    500,
+                                    "external processor rejected request",
+                                ));
+                            }
+                        }
+                    }
+                }
+                let mut trailers = collected.trailers;
+                if request_trailers {
+                    if let Some(current) = trailers.as_mut() {
+                        let action = {
+                            let mut session = session.lock().await;
+                            session
+                                .process(ExtProcPhase::RequestTrailers, None, None, Some(current))
+                                .await
+                        };
+                        match action {
+                            Ok(ExtProcAction::Continue(changes)) => {
+                                changes.apply_headers(current);
+                            }
+                            Ok(ExtProcAction::Immediate(response)) => {
+                                session.lock().await.finish_after_immediate();
+                                return Some(response);
+                            }
+                            Err(error) => {
+                                let mut session = session.lock().await;
+                                if !session.apply_failure(&error) {
+                                    tracing::warn!(route = %route.id, %error, "ext_proc request trailers failed closed");
+                                    return Some(text_status(
+                                        500,
+                                        "external processor rejected request",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                normalize_content_length(&mut parts.headers, bytes.len());
+                *body = Some(replay_wasm_body(bytes, trailers));
+                if !has_response_phase {
+                    session.lock().await.finish();
+                }
+            }
+            crate::config::model::ExtProcBodyModeCfg::None => {
+                if !has_response_phase {
+                    session.lock().await.finish();
+                }
+            }
+            crate::config::model::ExtProcBodyModeCfg::Buffered => unreachable!(),
+        }
+        None
+    }
+
+    /// 业务作用：为未携带 `ext-proc` feature 的制品保留统一请求管线；配置层已经拒绝启用。
+    ///
+    /// 参数说明：参数只用于保持跨 feature 签名一致。
+    ///
+    /// 返回：始终继续普通代理。
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(not(feature = "ext-proc"))]
+    async fn enforce_ext_proc_request(
+        &self,
+        _snap: &GatewaySnapshot,
+        _proxy: &crate::config::ProxyRuntime,
+        _route: &Route,
+        _parts: &mut Parts,
+        _body: &mut Option<forward::ForwardBody>,
+        _request_end_of_stream: bool,
+        _downstream_proto: &'static str,
+        _request_id: &str,
+        _trace: &crate::telemetry::ServerTrace,
+        _session_out: &mut Option<crate::ext_proc::SharedExtProcSession>,
+    ) -> Option<Response<BoxBody>> {
+        None
+    }
+
+    /// 业务作用：把 EPP 的 header 或动态 metadata 决策收敛为数据面可执行的 endpoint
+    /// 子集；正常协议流缺少决策时停止请求，只有依赖故障进入 `FailOpen` 才退回普通 LB。
+    ///
+    /// 参数说明：`route` 提供数量硬门；`parts` 持有 EPP mutation；`session` 表明正常或
+    /// 放行状态；`selection_out` 接收仅供本次 forward 使用的不可变子集。
+    ///
+    /// 返回：决策合法或允许退回普通 LB 时返回 None；缺失、冲突或非法目标返回本地 500。
+    #[cfg(feature = "inference-gateway")]
+    async fn enforce_inference_pool_request(
+        &self,
+        route: &Route,
+        parts: &mut Parts,
+        session: &Option<SharedExtProcSession>,
+        selection_out: &mut Option<forward::InferenceEndpointSelection>,
+    ) -> Option<Response<BoxBody>> {
+        let policy = route.inference_pool?;
+        let header_values = parts
+            .headers
+            .get_all("x-gateway-destination-endpoint")
+            .iter()
+            .map(|value| value.to_str().map(str::to_owned))
+            .collect::<std::result::Result<Vec<_>, _>>();
+        parts.headers.remove("x-gateway-destination-endpoint");
+        let header_value = match header_values {
+            Ok(values) if values.len() <= 1 => values.into_iter().next(),
+            Ok(_) | Err(_) => {
+                return Some(text_status(
+                    500,
+                    "endpoint picker returned invalid selection",
+                ));
+            }
+        };
+        let Some(session) = session else {
+            // 请求阶段没有建立会话只可能来自 ext_proc 已批准的依赖故障放行；此时按池目录
+            // 自行选择，不能把任何残留控制头交给上游。
+            return None;
+        };
+        let state = session.lock().await;
+        if state.bypassed() {
+            return None;
+        }
+        let metadata = state.metadata();
+        drop(state);
+        let metadata_value = metadata
+            .string("envoy.lb", "x-gateway-destination-endpoint")
+            .map(str::to_owned);
+        let raw = match (header_value, metadata_value) {
+            (Some(header), Some(metadata)) if header != metadata => {
+                return Some(text_status(
+                    500,
+                    "endpoint picker returned conflicting selection",
+                ));
+            }
+            (Some(header), _) => header,
+            (_, Some(metadata)) => metadata,
+            (None, None) => {
+                return Some(text_status(500, "endpoint picker returned no selection"));
+            }
+        };
+        match forward::InferenceEndpointSelection::parse(
+            raw.as_str(),
+            policy.max_selected_endpoints,
+        ) {
+            Ok(selection) => {
+                *selection_out = Some(selection);
+                None
+            }
+            Err(error) => {
+                tracing::warn!(route = %route.id, %error, "endpoint picker returned invalid selection");
+                Some(text_status(
+                    500,
+                    "endpoint picker returned invalid selection",
+                ))
+            }
+        }
+    }
+
+    /// 业务作用：在未携带 Inference Gateway 能力的制品中保留统一调用形态；配置构建期会
+    /// 拒绝任何 InferencePool route。
+    ///
+    /// 参数说明：所有参数只用于保持 feature 间签名一致。
+    ///
+    /// 返回：始终继续普通请求管线。
+    #[cfg(not(feature = "inference-gateway"))]
+    async fn enforce_inference_pool_request(
+        &self,
+        _route: &Route,
+        _parts: &mut Parts,
+        _session: &Option<crate::ext_proc::SharedExtProcSession>,
+        _selection_out: &mut Option<forward::InferenceEndpointSelection>,
+    ) -> Option<Response<BoxBody>> {
+        None
+    }
+
+    /// 业务作用：在上游响应进入其它可变换 filter 前继续同一 External Processing 流，处理
+    /// response headers/body/trailers 并在最终相位半关闭发送方向。
+    ///
+    /// 参数说明：`route` 固定处理计划；`response` 是当前响应唯一所有权；`session` 来自请求阶段；
+    /// `request_method` 只用于构造标准响应 phase 输入占位。
+    ///
+    /// 返回：成功或依赖 fail-open 返回处理后的响应；协议、越权或资源错误返回 500。
+    #[cfg(feature = "ext-proc")]
+    async fn enforce_ext_proc_response(
+        &self,
+        route: &Route,
+        mut response: Response<BoxBody>,
+        session: &mut Option<SharedExtProcSession>,
+        request_method: &Method,
+    ) -> Response<BoxBody> {
+        let Some(plan) = &route.ext_proc else {
+            return response;
+        };
+        let Some(shared) = session.as_ref().cloned() else {
+            return response;
+        };
+        if let Some(immediate) = shared.lock().await.take_pending_immediate() {
+            return immediate;
+        }
+        if shared.lock().await.bypassed() {
+            return response;
+        }
+        if route.inference_pool.is_some() {
+            let served = response
+                .extensions()
+                .get::<forward::UpstreamTrace>()
+                .and_then(|trace| trace.final_upstream.parse::<http::Uri>().ok())
+                .and_then(|uri| uri.authority().map(ToString::to_string));
+            let Some(served) = served else {
+                // 正常 EPP 响应相位必须绑定到真实上游 reservation；缺少该事实时停止扩展
+                // 交互，避免把请求阶段建议伪装成实际承载 endpoint。
+                return text_status(500, "served endpoint is unavailable");
+            };
+            if let Err(error) = shared
+                .lock()
+                .await
+                .set_destination_endpoint_served(served.as_str())
+            {
+                tracing::warn!(route = %route.id, %error, "record served endpoint failed");
+                return text_status(500, "served endpoint is unavailable");
+            }
+        }
+        let (_, _, _, response_headers, response_body, response_trailers) = plan.phases();
+        let mut replaced_tail = false;
+        if response_headers {
+            let placeholder = http::Uri::from_static("/");
+            let end = response.body().is_end_stream()
+                && response_body == crate::config::model::ExtProcBodyModeCfg::None
+                && !response_trailers;
+            let action = {
+                let mut state = shared.lock().await;
+                state
+                    .process(
+                        ExtProcPhase::ResponseHeaders,
+                        Some((request_method, &placeholder, response.headers(), end)),
+                        None,
+                        None,
+                    )
+                    .await
+            };
+            match action {
+                Ok(ExtProcAction::Continue(changes)) => {
+                    changes.apply_headers(response.headers_mut());
+                    if changes.replaces_body() {
+                        let bytes = changes.apply_body(Bytes::new());
+                        normalize_content_length(response.headers_mut(), bytes.len());
+                        *response.body_mut() = full_body(bytes);
+                        replaced_tail = true;
+                    }
+                }
+                Ok(ExtProcAction::Immediate(_)) => {
+                    unreachable!("response phases cannot return immediate response")
+                }
+                Err(error) => {
+                    let mut state = shared.lock().await;
+                    if state.apply_failure(&error) {
+                        tracing::warn!(route = %route.id, %error, "ext_proc response headers failed open");
+                        return response;
+                    }
+                    tracing::warn!(route = %route.id, %error, "ext_proc response headers failed closed");
+                    return text_status(500, "external processor rejected response");
+                }
+            }
+        }
+        if replaced_tail {
+            shared.lock().await.finish();
+            return response;
+        }
+        match response_body {
+            crate::config::model::ExtProcBodyModeCfg::Streamed => {
+                response.headers_mut().remove(http::header::CONTENT_LENGTH);
+                let (parts, body) = response.into_parts();
+                Response::from_parts(
+                    parts,
+                    wrap_ext_proc_body(
+                        body,
+                        shared,
+                        ExtProcPhase::ResponseBody,
+                        response_trailers,
+                        plan.max_body_bytes(),
+                        true,
+                    ),
+                )
+            }
+            crate::config::model::ExtProcBodyModeCfg::Buffered
+            | crate::config::model::ExtProcBodyModeCfg::None
+                if response_body == crate::config::model::ExtProcBodyModeCfg::Buffered
+                    || response_trailers =>
+            {
+                let (mut parts, body) = response.into_parts();
+                let collected = match collect_wasm_box_body(body, plan.max_body_bytes()).await {
+                    Ok(collected) => collected,
+                    Err(WasmBodyError::TooLarge) => {
+                        return text_status(500, "external processor response body exceeds limit");
+                    }
+                    Err(WasmBodyError::Read(error)) => {
+                        tracing::warn!(route = %route.id, %error, "read ext_proc response body failed");
+                        return text_status(500, "external processor response body read failed");
+                    }
+                };
+                let mut bytes = collected.bytes;
+                if response_body == crate::config::model::ExtProcBodyModeCfg::Buffered {
+                    let action = {
+                        let mut state = shared.lock().await;
+                        state
+                            .process(
+                                ExtProcPhase::ResponseBody,
+                                None,
+                                Some((&bytes, collected.trailers.is_none() || !response_trailers)),
+                                None,
+                            )
+                            .await
+                    };
+                    match action {
+                        Ok(ExtProcAction::Continue(changes)) => {
+                            changes.apply_headers(&mut parts.headers);
+                            bytes = changes.apply_body(bytes);
+                        }
+                        Ok(ExtProcAction::Immediate(_)) => {
+                            unreachable!("response phases cannot return immediate response")
+                        }
+                        Err(error) => {
+                            let mut state = shared.lock().await;
+                            if !state.apply_failure(&error) {
+                                tracing::warn!(route = %route.id, %error, "ext_proc response body failed closed");
+                                return text_status(500, "external processor rejected response");
+                            }
+                        }
+                    }
+                }
+                let mut trailers = collected.trailers;
+                if response_trailers {
+                    if let Some(current) = trailers.as_mut() {
+                        let action = {
+                            let mut state = shared.lock().await;
+                            state
+                                .process(ExtProcPhase::ResponseTrailers, None, None, Some(current))
+                                .await
+                        };
+                        match action {
+                            Ok(ExtProcAction::Continue(changes)) => changes.apply_headers(current),
+                            Ok(ExtProcAction::Immediate(_)) => {
+                                unreachable!("response phases cannot return immediate response")
+                            }
+                            Err(error) => {
+                                let mut state = shared.lock().await;
+                                if !state.apply_failure(&error) {
+                                    tracing::warn!(route = %route.id, %error, "ext_proc response trailers failed closed");
+                                    return text_status(
+                                        500,
+                                        "external processor rejected response",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                normalize_content_length(&mut parts.headers, bytes.len());
+                let metadata = shared.lock().await.metadata();
+                parts.extensions.insert(metadata);
+                shared.lock().await.finish();
+                Response::from_parts(parts, replay_wasm_body(bytes, trailers))
+            }
+            crate::config::model::ExtProcBodyModeCfg::None => {
+                let metadata = shared.lock().await.metadata();
+                response.extensions_mut().insert(metadata);
+                shared.lock().await.finish();
+                response
+            }
+            crate::config::model::ExtProcBodyModeCfg::Buffered => unreachable!(),
+        }
+    }
+
+    /// 业务作用：为未携带 `ext-proc` feature 的制品保留统一响应管线。
+    ///
+    /// 参数说明：`response` 原样返回，其余参数只保持跨 feature 签名一致。
+    ///
+    /// 返回：未修改响应。
+    #[cfg(not(feature = "ext-proc"))]
+    async fn enforce_ext_proc_response(
+        &self,
+        _route: &Route,
+        response: Response<BoxBody>,
+        _session: &mut Option<crate::ext_proc::SharedExtProcSession>,
+        _request_method: &Method,
+    ) -> Response<BoxBody> {
+        response
     }
 
     /// 业务作用：向启动接线与管理面暴露进程唯一 EdgeHub，使数据面与 metrics 读取同一份事实。
@@ -4860,6 +6572,135 @@ impl GatewayProxy {
             .collect()
     }
 
+    /// 业务作用：取得服务的 retry budget 运行态,首次访问时创建。
+    ///
+    /// 参数说明：`service` 是逻辑服务名。
+    ///
+    /// 返回：该服务的共享预算状态。
+    pub(super) fn retry_budget_state(
+        &self,
+        service: &str,
+    ) -> Arc<crate::admission::RetryBudgetState> {
+        if let Some(state) = self.upstream_retry_budget.get(service) {
+            return state.clone();
+        }
+        self.upstream_retry_budget
+            .entry(service.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// 业务作用：取得 route+维度 的共享带宽桶。
+    ///
+    /// 参数说明：
+    /// - `scope`: route 作用域标识。
+    /// - `dimension`: 限额维度值。
+    ///
+    /// 返回：共享桶;维度表已满时返回 `None`,由调用方按 fail-open 放行。
+    pub(super) fn traffic_bandwidth_bucket(
+        &self,
+        scope: &str,
+        dimension: &str,
+    ) -> Option<Arc<crate::traffic_limit::BandwidthBucket>> {
+        self.traffic_bandwidth.bucket(scope, dimension)
+    }
+
+    /// 业务作用：取得 route+维度 的多窗口限额运行态。
+    ///
+    /// 参数说明：
+    /// - `key`: 已包含 route 与维度的复合键。
+    ///
+    /// 返回：共享限额状态;维度表已达上限时返回 `None`,避免高基数 key 打爆内存。
+    pub(super) fn traffic_quota_state(
+        &self,
+        key: &str,
+    ) -> Option<Arc<crate::traffic_limit::QuotaState>> {
+        if let Some(state) = self.traffic_quota.get(key) {
+            return Some(state.clone());
+        }
+        if self.traffic_quota.len() >= crate::traffic_limit::MAX_ACTIVE_KEYS {
+            // 只有超过最长窗口影响周期的账本才可回收；按 `Arc` 引用数清理会让攻击者
+            // 填满维度表后重置仍有效的额度，形成可重复绕过。
+            let now_ms = crate::lb_load::monotonic_ms();
+            self.traffic_quota
+                .retain(|_, state| !state.evictable(now_ms));
+            if self.traffic_quota.len() >= crate::traffic_limit::MAX_ACTIVE_KEYS {
+                return None;
+            }
+        }
+        Some(
+            self.traffic_quota
+                .entry(key.to_string())
+                .or_default()
+                .clone(),
+        )
+    }
+
+    /// 业务作用：取得服务的自适应并发运行态,首次访问时按策略下界初始化。
+    ///
+    /// 参数说明：`service` 是逻辑服务名;`policy` 提供初始上下界。
+    ///
+    /// 返回：该服务的共享并发状态。
+    pub(super) fn admission_state(
+        &self,
+        service: &str,
+        policy: &crate::admission::AdaptiveConcurrencyPolicy,
+    ) -> Arc<crate::admission::AdaptiveConcurrencyState> {
+        if let Some(state) = self.upstream_admission.get(service) {
+            state.reconcile_policy(policy);
+            return state.clone();
+        }
+        let state = self
+            .upstream_admission
+            .entry(service.to_string())
+            .or_insert_with(|| Arc::new(crate::admission::AdaptiveConcurrencyState::new(policy)))
+            .clone();
+        state.reconcile_policy(policy);
+        state
+    }
+
+    /// 业务作用：为当前目录中的实例准备反馈条目,并返回它。
+    ///
+    /// 只在选择成功后调用:此刻实例必定属于当前目录,因此条目创建是安全的。
+    /// 表容量有硬上限,超限后不再新建条目(既有条目继续工作),防止发现抖动撑爆状态表。
+    ///
+    /// 参数说明：`health_key` 是实例稳定身份。
+    ///
+    /// 返回：反馈条目;表已满且该实例尚无条目时返回 `None`。
+    pub(super) fn upstream_load_entry(
+        &self,
+        health_key: &Arc<str>,
+    ) -> Option<Arc<crate::lb_load::InstanceLoad>> {
+        if let Some(entry) = self.upstream_load.get(health_key.as_ref()) {
+            return Some(entry.clone());
+        }
+        if self.upstream_load.len() >= crate::lb_load::MAX_TRACKED_INSTANCES {
+            return None;
+        }
+        Some(
+            self.upstream_load
+                .entry(health_key.clone())
+                .or_default()
+                .clone(),
+        )
+    }
+
+    /// 业务作用：只读方式取得实例当前反馈分数,供 P2C 比较与 panic 判定。
+    ///
+    /// 参数说明：`health_key` 是实例身份；`policy` 是服务反馈策略；`now_ms` 是本轮统一时刻。
+    ///
+    /// 返回：反馈新鲜且样本足够时返回分数,否则返回 `None`。
+    pub(super) fn upstream_load_score(
+        &self,
+        health_key: &str,
+        policy: &crate::lb_load::LoadFeedbackPolicy,
+        now_ms: u64,
+    ) -> Option<u64> {
+        self.upstream_load
+            .get(health_key)
+            .and_then(|entry| entry.score(policy, now_ms))
+    }
+
     pub(super) fn record_upstream_success(&self, health_key: &str) {
         // 从未失败是绝对常态；一个 relaxed read 足以作为性能 hint。若它与刚插入的失败并发
         // 而短暂读到 0，本次成功至多晚清一次，下一请求会观察到 Release 发布后的非零值。
@@ -4913,6 +6754,88 @@ impl GatewayProxy {
         }
     }
 
+    /// 业务作用：在身份与上游副作用前组合 Bot head 判断和共享有界速率信号。
+    ///
+    /// 参数说明：`parts` 是请求 head；`route` 是已匹配路由；`client_ip` 是权威客户端地址。
+    ///
+    /// 返回：enforce 拒绝时返回固定挑战响应；允许、可信、monitor 或未配置时返回 `None`。
+    async fn enforce_bot(
+        &self,
+        parts: &Parts,
+        route: &Route,
+        client_ip: IpAddr,
+    ) -> Option<Response<BoxBody>> {
+        let policy = route.bot.as_ref()?;
+        let mut decision = policy.evaluate_head(parts, client_ip);
+        if decision != BotDecision::Trusted && (!decision.denied() || policy.monitor()) {
+            if let Some(rate) = policy.rate.as_ref() {
+                let scope = format!("bot:{}", route.id);
+                let dimension = policy.rate_key(parts, client_ip);
+                let key = format!("{scope}:{dimension}");
+                let rate_decision = self
+                    .rate_limiter
+                    .allow(RateLimitRequest {
+                        scope: &scope,
+                        key: &key,
+                        cost: 1,
+                        limit: rate.limit,
+                        window: rate.window,
+                        burst: rate.burst,
+                        max_active_keys: rate.max_active_keys,
+                        active_keys_fail_open: rate.active_keys_fail_open,
+                    })
+                    .await;
+                if !rate_decision.allowed && !decision.denied() {
+                    decision = BotDecision::RateDenied;
+                }
+            }
+        }
+
+        let monitored = decision.denied() && policy.monitor();
+        self.metrics.inc_bot(decision, monitored);
+        if !decision.denied() {
+            return None;
+        }
+        if monitored {
+            tracing::warn!(
+                route = %route.id,
+                reason = decision.reason(),
+                "request matched Bot monitor policy"
+            );
+            return None;
+        }
+
+        // Bot 挑战必须发生在认证、插件和上游副作用之前；响应只携带固定 scheme/realm，
+        // 不回显 User-Agent、指纹、IP 或命中字段。
+        tracing::warn!(
+            route = %route.id,
+            reason = decision.reason(),
+            "request challenged by Bot policy"
+        );
+        let status = if decision == BotDecision::RateDenied {
+            self.metrics.inc_rate_limited();
+            429
+        } else {
+            policy.challenge_status
+        };
+        let mut response = text_status(status, "request requires bot verification");
+        response
+            .headers_mut()
+            .insert(WWW_AUTHENTICATE, policy.challenge_header.clone());
+        if decision == BotDecision::RateDenied {
+            if let Ok(value) = HeaderValue::from_str(policy.retry_after_secs().to_string().as_str())
+            {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+        Some(response)
+    }
+
+    /// 业务作用：按 route 声明的每条请求限流规则执行共享后端准入，并在首个拒绝处停止业务处理。
+    ///
+    /// 参数说明：`parts` 是请求 head；`route` 是已匹配路由；`client_ip` 是权威客户端地址。
+    ///
+    /// 返回：任一规则拒绝时返回 429；全部允许或未配置规则时返回 `None`。
     async fn enforce_limit_req(
         &self,
         parts: &Parts,
@@ -5077,6 +7000,424 @@ impl GatewayProxy {
                 return Some(conn_limited_response(policy.limit));
             };
             acquired.push(guard);
+        }
+        None
+    }
+
+    /// 业务作用：处理 HTTP CONNECT,在通过全部目标校验后建立受控正向代理隧道。
+    ///
+    /// 校验顺序是安全要求而非风格问题:
+    /// 1. route 未显式声明 `forward_proxy` 一律 405——**没有默认放行的正向代理**;
+    /// 2. authority 语法 → 端口/域名 allowlist(无 I/O),挡住绝大多数尝试;
+    /// 3. 每次连接重新解析 DNS,逐个校验解析结果;
+    /// 4. **按已校验的 IP 直连**,而不是把主机名再交给系统解析一次。
+    ///
+    /// 第 4 步是 DNS rebinding 防御的闭合点:按主机名连接会触发第二次解析,
+    /// 攻击者只要让两次解析给出不同答案,前面所有校验都白做。
+    ///
+    /// 参数说明：
+    /// - `parts`: 请求 head,authority 取自请求行。
+    /// - `route`: 已匹配 route。
+    /// - `client_ip`: 真实客户端 IP,用于审计。
+    /// - `downstream_upgrade`: 下游升级权;成功后移交隧道 task。
+    ///
+    /// 返回：允许时返回 200(CONNECT 成功语义,不是 101);任何一步不通过都返回
+    /// 明确的 4xx 并记录低基数拒绝原因,隧道建立前始终 fail-closed。
+    async fn handle_connect(
+        &self,
+        parts: &Parts,
+        route: &Route,
+        client_ip: IpAddr,
+        downstream_upgrade: &mut Option<(
+            hyper::upgrade::OnUpgrade,
+            Option<DownstreamConnectionLease>,
+        )>,
+    ) -> Response<BoxBody> {
+        use crate::forward_proxy::{ConnectTarget, DenyReason};
+
+        let Some(policy) = route.forward_proxy.as_ref() else {
+            // 未声明正向代理的 route 收到 CONNECT:这不是配置疏漏就是探测,
+            // 一律拒绝,绝不退化成"当作普通请求处理"。
+            tracing::debug!(route = %route.id, %client_ip, "CONNECT rejected: route has no forward_proxy");
+            return text_status(405, "CONNECT not allowed on this route");
+        };
+
+        let deny = |reason: DenyReason, route_id: &str| -> Response<BoxBody> {
+            tracing::warn!(
+                route = %route_id,
+                %client_ip,
+                reason = reason.as_str(),
+                "CONNECT target rejected"
+            );
+            match reason {
+                DenyReason::MalformedAuthority => text_status(400, "malformed CONNECT authority"),
+                _ => text_status(403, "CONNECT target not allowed"),
+            }
+        };
+
+        // CONNECT 的目标在请求行的 authority 里,不在 Host 头。用 Host 会让客户端
+        // 有两个可控来源去指定目标,校验哪个都可能被另一个绕开。
+        let authority = match parts.uri.authority() {
+            Some(authority) => authority.as_str().to_string(),
+            None => return deny(DenyReason::MalformedAuthority, &route.id),
+        };
+        let target = match ConnectTarget::parse(&authority) {
+            Ok(target) => target,
+            Err(reason) => return deny(reason, &route.id),
+        };
+        if let Err(reason) = policy.check_authority(&target) {
+            return deny(reason, &route.id);
+        }
+        let addrs = match policy.resolve_checked(&target).await {
+            Ok(addrs) => addrs,
+            Err(reason) => return deny(reason, &route.id),
+        };
+
+        // 只连已校验的 IP。这里刻意不使用 (host, port) 形式的连接接口。
+        let mut upstream = None;
+        for addr in &addrs {
+            match tokio::time::timeout(
+                policy.connect_timeout(),
+                tokio::net::TcpStream::connect(*addr),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => {
+                    upstream = Some(stream);
+                    break;
+                }
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+        let Some(upstream) = upstream else {
+            tracing::warn!(route = %route.id, %client_ip, host = %target.host, "CONNECT upstream unreachable");
+            return text_status(502, "CONNECT upstream unreachable");
+        };
+
+        let Some((upgrade, connection_lease)) = downstream_upgrade.take() else {
+            return text_status(500, "CONNECT upgrade unavailable");
+        };
+
+        let route_id: Arc<str> = Arc::from(route.id.as_str());
+        let registry = self.conn_registry.clone();
+        let activity_clock = self.ws_activity_clock.clone();
+        let idle_timeout_ms = policy.idle_timeout_ms;
+        let max_lifetime_ms = policy.max_lifetime_ms;
+        let max_bytes = policy.max_bytes;
+        let host = target.host.clone();
+        let port = target.port;
+        tokio::spawn(async move {
+            // 200 之后 Hyper 的 HTTP future 就结束了,连接预算必须由隧道 task 持有到收尾,
+            // 否则 max_connections 名额会被提前归还,指标也会与真实 socket 数脱节。
+            let _connection_lease = connection_lease;
+            let downstream = match upgrade.await {
+                Ok(downstream) => downstream,
+                Err(error) => {
+                    tracing::debug!(route = %route_id, %error, "CONNECT downstream upgrade failed");
+                    return;
+                }
+            };
+            let activity = forward::WsActivity::new(activity_clock);
+            // 字节预算由两个方向共享:限制的是这条隧道的总搬运量。
+            let budget = Arc::new(AtomicU64::new(0));
+            let mut downstream = forward::ActivityIo::new(
+                forward::BudgetIo::new(
+                    hyper_util::rt::TokioIo::new(downstream),
+                    budget.clone(),
+                    max_bytes,
+                ),
+                activity.clone(),
+            );
+            let mut upstream = forward::ActivityIo::new(
+                forward::BudgetIo::new(upstream, budget, max_bytes),
+                activity.clone(),
+            );
+            // 隧道纳入统一长连接治理:撤权、drain 与 shutdown 走与 WebSocket 相同的通道。
+            let guard = registry.register(
+                route_id.clone(),
+                client_ip,
+                None,
+                0,
+                crate::conn_registry::LongProto::Ws,
+            );
+            let close = guard.closed();
+            tokio::pin!(close);
+            tokio::select! {
+                result = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {
+                    match result {
+                        Ok((to_upstream, to_downstream)) => tracing::debug!(
+                            route = %route_id, %host, port, to_upstream, to_downstream,
+                            "CONNECT tunnel closed"
+                        ),
+                        Err(error) => tracing::debug!(route = %route_id, %error, "CONNECT tunnel error"),
+                    }
+                }
+                _ = &mut close => {
+                    tracing::debug!(route = %route_id, "CONNECT tunnel closed by registry");
+                }
+                _ = forward::wait_for_ws_inactivity(activity, idle_timeout_ms), if idle_timeout_ms > 0 => {
+                    tracing::debug!(route = %route_id, idle_timeout_ms, "CONNECT tunnel idle timeout");
+                }
+                _ = tokio::time::sleep(Duration::from_millis(max_lifetime_ms)), if max_lifetime_ms > 0 => {
+                    tracing::debug!(route = %route_id, max_lifetime_ms, "CONNECT tunnel max lifetime reached");
+                }
+            }
+        });
+
+        // CONNECT 成功用 200,不是 101:101 是 Upgrade 语义,CONNECT 不走 Upgrade 协商。
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(forward::empty_body())
+            .expect("build CONNECT response")
+    }
+
+    /// 业务作用：为 HTTP/3 CONNECT-UDP 生成已授权、已复验 DNS 的不可变隧道计划。
+    ///
+    /// 参数说明：`parts` 是已完成路径规范化与安全治理的请求 head；`route` 是本请求唯一快照
+    /// 命中的终端 route；`client_ip` 只用于低敏拒绝日志；`consumer` 与 `snapshot_version`
+    /// 用于既有长连接治理，不进入公开日志。
+    ///
+    /// 返回：允许时返回携带 [`crate::masque::ConnectUdpPlan`] 的 200 响应；路径、allowlist、
+    /// SSRF 或解析门失败时返回明确 4xx，且不创建 socket、不产生目标流量。
+    async fn prepare_connect_udp(
+        &self,
+        parts: &Parts,
+        route: &Route,
+        client_ip: IpAddr,
+        consumer: Option<Arc<str>>,
+        snapshot_version: u64,
+    ) -> Response<BoxBody> {
+        use crate::forward_proxy::DenyReason;
+
+        let Some(policy) = route.forward_proxy.as_ref() else {
+            return text_status(405, "CONNECT-UDP not allowed on this route");
+        };
+        let deny = |reason: DenyReason| {
+            tracing::warn!(
+                route = %route.id,
+                %client_ip,
+                reason = reason.as_str(),
+                "CONNECT-UDP target rejected"
+            );
+            match reason {
+                DenyReason::MalformedAuthority => text_status(400, "malformed CONNECT-UDP target"),
+                _ => text_status(403, "CONNECT-UDP target not allowed"),
+            }
+        };
+        let target = match crate::masque::parse_connect_udp_path(parts.uri.path()) {
+            Ok(target) => target,
+            Err(reason) => return deny(reason),
+        };
+        let addresses = match crate::masque::resolve_connect_udp(policy, &target).await {
+            Ok(addresses) => addresses,
+            Err(reason) => return deny(reason),
+        };
+        let plan = crate::masque::ConnectUdpPlan {
+            route_id: route.id_shared.clone(),
+            target,
+            addresses: addresses.into(),
+            policy: policy.clone(),
+            guard: Arc::new(self.conn_registry.register(
+                route.id_shared.clone(),
+                client_ip,
+                consumer,
+                snapshot_version,
+                crate::conn_registry::LongProto::ConnectUdp,
+            )),
+        };
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header("capsule-protocol", "?1")
+            .body(full_body(Bytes::new()))
+            .expect("fixed CONNECT-UDP response");
+        response.extensions_mut().insert(plan);
+        response
+    }
+
+    /// 业务作用：为 HTTP/3 WebTransport 生成已授权、Origin 复验后的不可变 session 计划。
+    ///
+    /// 参数说明：`parts` 是已完成公共安全管线的 CONNECT head；`route` 是本请求唯一快照命中的
+    /// 终端 route；`client_ip`、`consumer` 与 `snapshot_version` 用于长连接撤权与 drain。
+    ///
+    /// 返回：允许时返回携带 [`crate::masque::WebTransportPlan`] 的内部 200 响应；route 类型或
+    /// Origin 不合法时返回 4xx，且不建立上游 QUIC、不向客户端确认 session。
+    fn prepare_webtransport(
+        &self,
+        parts: &Parts,
+        route: &Route,
+        client_ip: IpAddr,
+        consumer: Option<Arc<str>>,
+        snapshot_version: u64,
+    ) -> Response<BoxBody> {
+        let Some(policy) = route.webtransport.as_ref() else {
+            return text_status(405, "WebTransport not allowed on this route");
+        };
+        let origin = match policy.authorize_origin(&parts.headers) {
+            Ok(origin) => origin,
+            Err(error) => {
+                tracing::warn!(
+                    route = %route.id,
+                    %client_ip,
+                    error = %error,
+                    "WebTransport Origin rejected"
+                );
+                return text_status(403, "WebTransport Origin not allowed");
+            }
+        };
+        let plan = crate::masque::WebTransportPlan {
+            route_id: route.id_shared.clone(),
+            origin,
+            policy: policy.clone(),
+            guard: Arc::new(self.conn_registry.register(
+                route.id_shared.clone(),
+                client_ip,
+                consumer,
+                snapshot_version,
+                crate::conn_registry::LongProto::WebTransport,
+            )),
+        };
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(full_body(Bytes::new()))
+            .expect("fixed WebTransport plan response");
+        response.extensions_mut().insert(plan);
+        response
+    }
+
+    /// 业务作用：执行 route 级双向带宽整形与多窗口成本型限额。
+    ///
+    /// 三件事在同一处完成,因为它们共享同一个维度键——分开算会出现"限额按 consumer、
+    /// 带宽按 IP"这类错配,同一个调用方被当成两个主体治理。
+    ///
+    /// 参数说明：
+    /// - `parts`: 请求头,用于解析维度键。
+    /// - `route`: 已匹配 route。
+    /// - `client_ip`: 经可信代理链与连接元数据判定的真实客户端 IP。
+    /// - `forward_body`: 待转发的请求体;命中请求方向带宽策略时就地包上整形器。
+    /// - `response_shaper`: 输出参数,命中响应方向策略时写入整形器。
+    /// - `response_settlement`: 输出参数，命中事实成本策略时写入随响应生命周期结算的凭据。
+    ///
+    /// 返回：需要短路时返回 429 响应(携带标准限额头);放行返回 `None`。
+    async fn enforce_traffic_limit(
+        &self,
+        parts: &Parts,
+        route: &Route,
+        client_ip: IpAddr,
+        forward_body: &mut Option<BoxBody>,
+        response_shaper: &mut Option<crate::traffic_limit::FrameShaper>,
+        response_settlement: &mut Option<TrafficSettlement>,
+    ) -> Option<Response<BoxBody>> {
+        use crate::traffic_limit::{FrameShaper, OverflowAction, QuotaFailMode};
+
+        let policy = route.traffic_limit.as_ref()?;
+        let dimension = limit_dimension(parts, route, client_ip, &policy.key);
+        let scope = format!("traffic:{}", route.id);
+
+        // —— 限额判定必须早于带宽整形 ——
+        // 反过来会先为一个即将被拒的请求占用带宽额度,超额流量照样消耗了配额。
+        if let Some(quota) = policy.quota.as_ref() {
+            let key = format!(
+                "{scope}:{:016x}:{:016x}",
+                policy.state_key,
+                stable_hash64(dimension.as_bytes())
+            );
+            let Some(state) = self.traffic_quota_state(&key) else {
+                // 维度表已满 = 计数不可用。这里不猜,按策略显式声明的模式处理。
+                return match policy.fail_mode {
+                    QuotaFailMode::FailOpen => None,
+                    QuotaFailMode::FailClosed => {
+                        self.metrics.inc_rate_limited();
+                        Some(quota_limited_response(
+                            &crate::traffic_limit::QuotaDecision {
+                                allowed: false,
+                                remaining: 0,
+                                limit: 0,
+                                reset_after: Duration::from_secs(1),
+                                retry_after: Duration::from_secs(1),
+                            },
+                        ))
+                    }
+                };
+            };
+            let cost = policy.cost_source.admission_cost();
+            let (mut decision, mut reservation) = state.check_with_reservation(quota, cost);
+            if !decision.allowed {
+                match quota.overflow {
+                    OverflowAction::Reject => {
+                        self.metrics.inc_rate_limited();
+                        return Some(quota_limited_response(&decision));
+                    }
+                    OverflowAction::Delay {
+                        max_queue,
+                        max_wait_ms,
+                    } => {
+                        // 排队名额本身有界:拿不到就立刻拒绝。无界排队会把过载从
+                        // "快速失败"变成"内存耗尽",后者在生产上不可恢复。
+                        let Some(_slot) = state.enqueue(max_queue) else {
+                            self.metrics.inc_rate_limited();
+                            return Some(quota_limited_response(&decision));
+                        };
+                        let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
+                        loop {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                self.metrics.inc_rate_limited();
+                                return Some(quota_limited_response(&decision));
+                            }
+                            // 轮询步长取"建议等待"与剩余时间的较小值,并设 1ms 下界,
+                            // 避免 retry_after 为 0 时退化成忙等把 CPU 打满。
+                            let step = decision
+                                .retry_after
+                                .max(Duration::from_millis(1))
+                                .min(remaining)
+                                .min(Duration::from_millis(50));
+                            tokio::time::sleep(step).await;
+                            let (next_decision, next_reservation) =
+                                state.check_with_reservation(quota, cost);
+                            decision = next_decision;
+                            reservation = next_reservation;
+                            if decision.allowed {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(reservation) = reservation {
+                *response_settlement = TrafficSettlement::new(
+                    state,
+                    quota.clone(),
+                    policy.cost_source.clone(),
+                    reservation,
+                );
+            }
+        }
+
+        // —— 带宽整形 ——
+        // 取桶失败(维度表满)时按 fail-open 放行:带宽整形短暂失效的代价,
+        // 远小于因为记不下一个计数器就拒绝正常流量。
+        if let Some(bandwidth) = policy.request_bandwidth.as_ref() {
+            if let Some(bucket) = self.traffic_bandwidth_bucket(&format!("{scope}:req"), &dimension)
+            {
+                if let Some(body) = forward_body.take() {
+                    *forward_body = Some(
+                        ShapedBody {
+                            inner: Box::pin(body),
+                            shaper: FrameShaper::new(bucket, *bandwidth),
+                            pending: None,
+                            sleep: None,
+                        }
+                        .boxed(),
+                    );
+                }
+            }
+        }
+        if let Some(bandwidth) = policy.response_bandwidth.as_ref() {
+            if let Some(bucket) =
+                self.traffic_bandwidth_bucket(&format!("{scope}:resp"), &dimension)
+            {
+                *response_shaper = Some(FrameShaper::new(bucket, *bandwidth));
+            }
         }
         None
     }
@@ -5251,6 +7592,21 @@ fn rate_limited_response(remaining: u64) -> Response<BoxBody> {
         .header("x-ratelimit-remaining", remaining.to_string())
         .body(full_body(Bytes::from_static(b"rate limited")))
         .expect("build rate limit response")
+}
+
+/// 业务作用：构造带标准限额响应头的 429。
+///
+/// 参数说明：`decision` 为限额判定结果,决定 `RateLimit-*` 与 `Retry-After` 的取值。
+///
+/// 返回：429 响应。
+fn quota_limited_response(decision: &crate::traffic_limit::QuotaDecision) -> Response<BoxBody> {
+    let mut resp = Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(full_body(Bytes::from_static(b"rate limited")))
+        .expect("build quota limit response");
+    crate::traffic_limit::write_rate_limit_headers(resp.headers_mut(), decision);
+    resp
 }
 
 fn conn_limited_response(limit: u64) -> Response<BoxBody> {
@@ -5692,6 +8048,338 @@ impl Body for LimitRateBody {
         self.inner.is_end_stream() && self.pending.is_none()
     }
 
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// 受共享带宽桶整形的 body。请求与响应两个方向共用同一实现。
+/// 逐帧延迟响应数据且不聚合实体的带宽整形 body。
+struct ShapedBody {
+    /// 原始流式响应体。
+    inner: Pin<Box<BoxBody>>,
+    /// 当前 route+维度共享桶的帧级调度器。
+    shaper: crate::traffic_limit::FrameShaper,
+    /// 已扣带宽额度、等待发送时刻的数据帧。
+    pending: Option<Frame<Bytes>>,
+    /// pending frame 对应的单次等待计时器。
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+/// 响应事实成本的计量方式。
+enum TrafficObservation {
+    /// 统计实际交付的响应 data frame 字节。
+    ResponseBytes(u64),
+    /// 统计完整交付的 gRPC message。
+    GrpcMessages(GrpcMessageCounter),
+}
+
+/// gRPC 五字节 envelope 的跨 frame 增量计数器。
+#[derive(Default)]
+struct GrpcMessageCounter {
+    /// 跨 data frame 暂存的不完整五字节 gRPC envelope header。
+    header: [u8; 5],
+    /// `header` 中当前有效字节数。
+    header_len: usize,
+    /// 当前消息尚未交付的 payload 字节数；None 表示正在读取下一个 header。
+    payload_remaining: Option<u32>,
+    /// 已完整交付给下游的 gRPC message 数。
+    completed: u64,
+    /// envelope 非法后停止信任后续字节，避免错误返还账本额度。
+    invalid: bool,
+}
+
+impl GrpcMessageCounter {
+    /// 业务作用：消费一个响应 data frame，并只在完整 gRPC message 已交付时增加事实计数。
+    ///
+    /// 参数说明：`data` 是即将交给下游的响应字节。
+    ///
+    /// 返回：无；畸形 envelope 后停止计数，避免把任意字节误当成 usage。
+    fn observe(&mut self, mut data: &[u8]) {
+        if self.invalid {
+            return;
+        }
+        while !data.is_empty() {
+            if let Some(remaining) = self.payload_remaining {
+                let consumed = data.len().min(remaining as usize);
+                data = &data[consumed..];
+                let remaining = remaining - consumed as u32;
+                if remaining == 0 {
+                    self.completed = self.completed.saturating_add(1);
+                    self.payload_remaining = None;
+                } else {
+                    self.payload_remaining = Some(remaining);
+                }
+                continue;
+            }
+            let needed = 5usize.saturating_sub(self.header_len);
+            let consumed = data.len().min(needed);
+            self.header[self.header_len..self.header_len + consumed]
+                .copy_from_slice(&data[..consumed]);
+            self.header_len += consumed;
+            data = &data[consumed..];
+            if self.header_len < 5 {
+                continue;
+            }
+            // 压缩标志只有 0/1。未知值说明响应不再是可安全计量的 gRPC envelope，
+            // 停止解析比继续错位计数更保守。
+            if self.header[0] > 1 {
+                self.invalid = true;
+                return;
+            }
+            let payload_len = u32::from_be_bytes([
+                self.header[1],
+                self.header[2],
+                self.header[3],
+                self.header[4],
+            ]);
+            self.header_len = 0;
+            if payload_len == 0 {
+                self.completed = self.completed.saturating_add(1);
+            } else {
+                self.payload_remaining = Some(payload_len);
+            }
+        }
+    }
+}
+
+/// 一次成本型限额的响应期结算上下文。
+struct TrafficSettlement {
+    /// route+维度共享额度账本。
+    state: Arc<crate::traffic_limit::QuotaState>,
+    /// 准入和结算必须共用的不可变额度策略。
+    policy: crate::traffic_limit::QuotaPolicy,
+    /// 响应事实到额度单位的换算口径。
+    source: crate::traffic_limit::CostSource,
+    /// 尚未完成最终结算的准入预留凭据。
+    reservation: Option<crate::traffic_limit::QuotaReservation>,
+    /// 已从实际交付帧累计的可信事实。
+    observation: TrafficObservation,
+    /// 响应协议与成本来源一致时为 true；不一致时只保留准入预留。
+    trustworthy_response: bool,
+}
+
+impl TrafficSettlement {
+    /// 业务作用：把准入预留与支持的可信响应计量方式绑定，供 body 生命周期完成最终结算。
+    ///
+    /// 参数说明：`state` 是共享账本；`policy` 是准入策略；`source` 是成本来源；
+    /// `reservation` 是本次成功扣账凭据。
+    ///
+    /// 返回：需要响应期事实的来源返回结算上下文；固定请求成本返回 `None`。
+    fn new(
+        state: Arc<crate::traffic_limit::QuotaState>,
+        policy: crate::traffic_limit::QuotaPolicy,
+        source: crate::traffic_limit::CostSource,
+        reservation: crate::traffic_limit::QuotaReservation,
+    ) -> Option<Self> {
+        let observation = match &source {
+            crate::traffic_limit::CostSource::PerRequest(_) => return None,
+            crate::traffic_limit::CostSource::ResponseBytes { .. } => {
+                TrafficObservation::ResponseBytes(0)
+            }
+            crate::traffic_limit::CostSource::GrpcMessages { .. } => {
+                TrafficObservation::GrpcMessages(GrpcMessageCounter::default())
+            }
+            // 这两种来源在构建期已拒绝，保留失败闭合分支防止后续新增调用旁路门禁。
+            crate::traffic_limit::CostSource::GraphqlCost { .. }
+            | crate::traffic_limit::CostSource::TrustedUsage { .. } => return None,
+        };
+        Some(Self {
+            state,
+            policy,
+            source,
+            reservation: Some(reservation),
+            observation,
+            trustworthy_response: true,
+        })
+    }
+
+    /// 业务作用：复验响应协议是否与声明的事实计量来源一致，防止把普通 HTTP body
+    /// 按 gRPC envelope 误解析后返还配额。
+    ///
+    /// 参数说明：`headers` 是最终响应头。
+    ///
+    /// 返回：无；协议不匹配时保留准入预留，不做事实返还。
+    fn validate_response_headers(&mut self, headers: &HeaderMap) {
+        if matches!(&self.observation, TrafficObservation::GrpcMessages(_)) {
+            self.trustworthy_response = headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .is_some_and(|mime| mime.trim().starts_with("application/grpc"))
+                });
+        }
+    }
+
+    /// 业务作用：登记一个即将交付给下游的数据帧，形成响应字节或完整 gRPC message 事实。
+    ///
+    /// 参数说明：`data` 是响应 body 的 data frame。
+    ///
+    /// 返回：无；计数使用饱和运算。
+    fn observe(&mut self, data: &[u8]) {
+        match &mut self.observation {
+            TrafficObservation::ResponseBytes(bytes) => {
+                *bytes = bytes.saturating_add(data.len() as u64);
+            }
+            TrafficObservation::GrpcMessages(counter) => counter.observe(data),
+        }
+    }
+
+    /// 业务作用：以已观测事实完成一次且仅一次账本结算。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；重复调用不产生副作用。
+    fn finish(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let observed = match &self.observation {
+            TrafficObservation::ResponseBytes(bytes) => *bytes,
+            TrafficObservation::GrpcMessages(counter) => counter.completed,
+        };
+        let actual = if self.trustworthy_response {
+            self.source.settle_cost(observed)
+        } else {
+            self.source.admission_cost()
+        };
+        self.state.settle(&self.policy, reservation, actual);
+    }
+}
+
+impl Drop for TrafficSettlement {
+    /// 业务作用：在客户端取消、响应错误或包装体提前销毁时结算已实际交付的成本，避免预留泄漏。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；已结算凭据不会重复扣账。
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// 在不缓冲响应的前提下计量事实成本，并在 EOF、错误或取消时结算已交付部分。
+struct SettledTrafficBody {
+    /// 原始流式响应体。
+    inner: Pin<Box<BoxBody>>,
+    /// 尚未完成的成本结算上下文；EOF、错误或 Drop 后取空。
+    settlement: Option<TrafficSettlement>,
+}
+
+impl Body for SettledTrafficBody {
+    type Data = Bytes;
+    type Error = crate::BoxError;
+
+    /// 业务作用：透传响应帧并在交付 data frame 前登记事实成本，终止路径立即结算。
+    ///
+    /// 参数说明：`cx` 是异步 body 轮询上下文。
+    ///
+    /// 返回：底层 body 的下一帧；EOF 或错误时结算当前已交付事实。
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let polled = self.inner.as_mut().poll_frame(cx);
+        match polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let (Some(settlement), Some(data)) = (self.settlement.as_mut(), frame.data_ref())
+                {
+                    settlement.observe(data);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                if let Some(mut settlement) = self.settlement.take() {
+                    settlement.finish();
+                }
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                if let Some(mut settlement) = self.settlement.take() {
+                    settlement.finish();
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// 业务作用：报告底层响应是否已结束，同时确保结算包装不改变流结束语义。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：底层已结束时返回 `true`。
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    /// 业务作用：透传底层响应体大小提示，不因计量包装改变 framing 决策。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：底层 body 的大小提示。
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Body for ShapedBody {
+    type Data = Bytes;
+    type Error = crate::BoxError;
+
+    /// 业务作用：逐帧执行共享响应带宽整形，同时保留底层 body 的流式背压与 trailer 顺序。
+    ///
+    /// 参数说明：`cx` 是异步 body 轮询上下文。
+    ///
+    /// 返回：额度就绪时返回下一帧；需要等待时返回 Pending；底层错误与结束原样传播。
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.pending.is_some() {
+            let sleep = self.sleep.as_mut().expect("shaped body pending sleep");
+            if sleep.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.sleep = None;
+            return Poll::Ready(self.pending.take().map(Ok));
+        }
+        match self.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                // 只有 data frame 计入带宽;trailer 参与计费会让限速随协议细节漂移。
+                let len = frame.data_ref().map(|data| data.len() as u64).unwrap_or(0);
+                let delay = self.shaper.delay_for(len);
+                if delay.is_zero() {
+                    return Poll::Ready(Some(Ok(frame)));
+                }
+                // 帧先扣配额再延后投递:桶已在 delay_for 里推进,
+                // 这一帧的额度不会被并发流重复取走。
+                self.pending = Some(frame);
+                self.sleep = Some(Box::pin(tokio::time::sleep(delay)));
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            other => other,
+        }
+    }
+
+    /// 业务作用：报告整形 body 是否已无底层帧和待发送帧，避免过早结束丢失已扣额度的数据。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：底层结束且没有 pending frame 时返回 true。
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream() && self.pending.is_none()
+    }
+
+    /// 业务作用：透传响应实体大小提示，整形只改变时序而不改变字节数量。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回底层 body 的大小提示。
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
     }
@@ -7507,9 +10195,10 @@ async fn refund_llm_reservation(reservation: &mut Option<RateLimitReservation>) 
 /// 聚合有显式 16MiB 上限的 Anthropic 非流式 JSON，并保留原响应状态/version/extensions。
 async fn convert_anthropic_response(
     response: Response<BoxBody>,
+    max_response_bytes: usize,
 ) -> anyhow::Result<(Response<BoxBody>, Option<crate::llm::LlmUsage>, Bytes)> {
     let (mut parts, body) = response.into_parts();
-    let body = collect_llm_boxed_body(body, crate::llm::MAX_LLM_RESPONSE_BYTES)
+    let body = collect_llm_boxed_body(body, max_response_bytes)
         .await
         .map_err(|error| match error {
             LlmBodyError::TooLarge => anyhow::anyhow!("Anthropic response exceeds limit"),
@@ -7536,9 +10225,10 @@ async fn convert_anthropic_response(
 /// 返回：合法 text-only `GenerateContentResponse` 返回重建后的响应、可选 usage 与统一 body；超限或协议畸形返回错误且不向下游泄漏原 body。
 async fn convert_google_response(
     response: Response<BoxBody>,
+    max_response_bytes: usize,
 ) -> anyhow::Result<(Response<BoxBody>, Option<crate::llm::LlmUsage>, Bytes)> {
     let (mut parts, body) = response.into_parts();
-    let body = collect_llm_boxed_body(body, crate::llm::MAX_LLM_RESPONSE_BYTES)
+    let body = collect_llm_boxed_body(body, max_response_bytes)
         .await
         .map_err(|error| match error {
             LlmBodyError::TooLarge => anyhow::anyhow!("Google response exceeds limit"),
@@ -7562,9 +10252,10 @@ async fn convert_google_response(
 /// 情况不复制 payload。这样可观测与低拷贝边界同时成立。
 async fn inspect_openai_response(
     response: Response<BoxBody>,
+    max_response_bytes: usize,
 ) -> anyhow::Result<(Response<BoxBody>, Option<crate::llm::LlmUsage>, Bytes)> {
     let (mut parts, body) = response.into_parts();
-    let body = collect_llm_boxed_body(body, crate::llm::MAX_LLM_RESPONSE_BYTES)
+    let body = collect_llm_boxed_body(body, max_response_bytes)
         .await
         .map_err(|error| match error {
             LlmBodyError::TooLarge => anyhow::anyhow!("OpenAI response exceeds limit"),
@@ -7575,6 +10266,30 @@ async fn inspect_openai_response(
     Ok((
         Response::from_parts(parts, full_body(body.clone())),
         usage,
+        body,
+    ))
+}
+
+/// 业务作用：有界聚合 provider 原生非流式响应而不改写其 usage、finish、tool 或多模态字段。
+///
+/// 参数说明：`response` 是成功的 provider 响应；`max_response_bytes` 是 route 冻结的累计字节门。
+///
+/// 返回：在预算内时原样重建响应并返回 body；超限或读取失败时返回错误且不泄漏部分实体。
+async fn inspect_native_llm_response(
+    response: Response<BoxBody>,
+    max_response_bytes: usize,
+) -> anyhow::Result<(Response<BoxBody>, Option<crate::llm::LlmUsage>, Bytes)> {
+    let (mut parts, body) = response.into_parts();
+    let body = collect_llm_boxed_body(body, max_response_bytes)
+        .await
+        .map_err(|error| match error {
+            LlmBodyError::TooLarge => anyhow::anyhow!("native provider response exceeds limit"),
+            LlmBodyError::Invalid(error) => error,
+        })?;
+    parts.headers.remove(http::header::CONTENT_LENGTH);
+    Ok((
+        Response::from_parts(parts, full_body(body.clone())),
+        None,
         body,
     ))
 }
@@ -7630,6 +10345,117 @@ struct LlmStreamAccounting {
     input_cost_microusd_per_million: u64,
     output_cost_microusd_per_million: u64,
     reservation: Option<RateLimitReservation>,
+}
+
+/// 业务作用：为 provider 原生流附加累计字节、单帧与持续时间门，同时完全保留 frame 内容和顺序。
+///
+/// 参数说明：`response` 是已成功建立的原生流；`accounting` 持有保守配额预留；其余参数是 route
+/// 构建期冻结的资源预算。
+///
+/// 返回：返回透明流式响应；任一预算越界时 body 产生错误并停止读取上游。
+fn wrap_native_llm_stream_response(
+    response: Response<BoxBody>,
+    accounting: LlmStreamAccounting,
+    max_response_bytes: usize,
+    max_frame_bytes: usize,
+    max_duration: Duration,
+) -> Response<BoxBody> {
+    response.map(|body| {
+        NativeLlmStreamBody {
+            inner: body,
+            remaining: max_response_bytes,
+            max_frame_bytes,
+            deadline: Box::pin(tokio::time::sleep(max_duration)),
+            done: false,
+            _accounting: accounting,
+        }
+        .boxed()
+    })
+}
+
+struct NativeLlmStreamBody {
+    inner: BoxBody,
+    remaining: usize,
+    max_frame_bytes: usize,
+    deadline: Pin<Box<Sleep>>,
+    done: bool,
+    _accounting: LlmStreamAccounting,
+}
+
+impl Body for NativeLlmStreamBody {
+    type Data = Bytes;
+    type Error = crate::BoxError;
+
+    /// 业务作用：逐帧保持 provider 原生 payload，同时在交付下游前执行三重流预算门。
+    ///
+    /// 参数说明：`cx` 是下游背压驱动的任务上下文。
+    ///
+    /// 返回：预算内原样返回 frame；超时、单帧或累计超限返回一次错误并终止流。
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            self.done = true;
+            return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "native LLM stream duration limit exceeded",
+            )))));
+        }
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    if data.len() > self.max_frame_bytes || data.len() > self.remaining {
+                        self.done = true;
+                        return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                            "native LLM stream byte limit exceeded",
+                        )))));
+                    }
+                    self.remaining -= data.len();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.done = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// 业务作用：向下游暴露当前原生流是否已经终止，保持 Hyper 对 trailer 与连接复用的判断。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：本地预算门结束或内层 body 结束时为 true。
+    fn is_end_stream(&self) -> bool {
+        self.done || self.inner.is_end_stream()
+    }
+
+    /// 业务作用：透传上游大小提示并用 route 剩余预算收紧上界。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回不超过剩余累计字节预算的 SizeHint。
+    fn size_hint(&self) -> SizeHint {
+        let inner = self.inner.size_hint();
+        let mut hint = SizeHint::new();
+        hint.set_lower(inner.lower().min(self.remaining as u64));
+        hint.set_upper(
+            inner
+                .upper()
+                .unwrap_or(self.remaining as u64)
+                .min(self.remaining as u64),
+        );
+        hint
+    }
 }
 
 /// 业务作用：透明转发 OpenAI SSE，同时在有界窗口解析最终 usage 并结算绑定原后端的 reservation。
@@ -8219,7 +11045,28 @@ impl AnthropicSseBody {
                     serde_json::Value::Null,
                 )?))
             }
+            "content_block_start" => {
+                if value
+                    .pointer("/content_block/type")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("text")
+                {
+                    anyhow::bail!(
+                        "Anthropic SSE adapter cannot losslessly represent non-text content block"
+                    );
+                }
+                Ok(None)
+            }
             "content_block_delta" => {
+                if value
+                    .pointer("/delta/type")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("text_delta")
+                {
+                    anyhow::bail!(
+                        "Anthropic SSE adapter cannot losslessly represent non-text delta"
+                    );
+                }
                 let Some(text) = value
                     .pointer("/delta/text")
                     .and_then(serde_json::Value::as_str)
@@ -8243,7 +11090,9 @@ impl AnthropicSseBody {
                     .and_then(serde_json::Value::as_str)
                 {
                     Some("max_tokens") => "length",
-                    Some("tool_use") => "tool_calls",
+                    Some("tool_use") => {
+                        anyhow::bail!("Anthropic SSE adapter cannot losslessly represent tool_use")
+                    }
                     _ => "stop",
                 };
                 Ok(Some(openai_sse_chunk(
@@ -8259,8 +11108,8 @@ impl AnthropicSseBody {
                 Ok(Some(Bytes::from_static(b"data: [DONE]\n\n")))
             }
             "error" => anyhow::bail!("Anthropic SSE provider emitted error event"),
-            // ping/content_block_start/content_block_stop 不对应 OpenAI chunk，低成本跳过。
-            _ => Ok(None),
+            "ping" | "content_block_stop" => Ok(None),
+            _ => anyhow::bail!("Anthropic SSE provider emitted unsupported event"),
         }
     }
 
@@ -8770,6 +11619,270 @@ async fn collect_wasm_box_body(
     })
 }
 
+#[cfg(feature = "ext-proc")]
+/// 业务作用：为 External Processing request_headers 补齐下游 scheme/authority，使标准处理器收到
+/// 完整伪头，同时不信任任何处理器返回的目标重写。
+///
+/// 参数说明：`parts` 是当前请求 head；`scheme` 来自已建立的 listener transport。
+///
+/// 返回：Host 合法时返回 absolute URI；缺失或非法时保留原 URI，由普通请求校验继续裁决。
+fn ext_proc_request_uri(parts: &Parts, scheme: &'static str) -> http::Uri {
+    if parts.uri.scheme().is_some() && parts.uri.authority().is_some() {
+        return parts.uri.clone();
+    }
+    let Some(authority) = parts
+        .headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return parts.uri.clone();
+    };
+    let path = parts
+        .uri
+        .path_and_query()
+        .map_or(parts.uri.path(), |value| value.as_str());
+    format!("{scheme}://{authority}{path}")
+        .parse()
+        .unwrap_or_else(|_| parts.uri.clone())
+}
+
+#[cfg(feature = "ext-proc")]
+/// 业务作用：把 STREAMED body 逐 DATA frame 送入同一 External Processing 流，并用容量为一的
+/// channel 把处理器响应背压传回 HTTP 管线；trailers 保持末尾顺序且可独立变更。
+///
+/// 参数说明：`body` 是当前方向唯一所有权；`session` 共享双向协议状态；`phase` 固定方向；
+/// `send_trailers` 控制 trailer phase；`max_body_bytes` 限制输入和处理后输出；`finish` 表示流末关闭。
+///
+/// 返回：可继续流式消费的 BoxBody；协议、越权和 fail-closed 依赖错误通过 body error 终止连接。
+fn wrap_ext_proc_body(
+    mut body: BoxBody,
+    session: SharedExtProcSession,
+    phase: ExtProcPhase,
+    send_trailers: bool,
+    max_body_bytes: usize,
+    finish: bool,
+) -> BoxBody {
+    let (mut sender, output) = http_body_util::channel::Channel::<Bytes, crate::BoxError>::new(1);
+    tokio::spawn(async move {
+        let mut input_total = 0usize;
+        let mut output_total = 0usize;
+        let mut pending: Option<Bytes> = None;
+        let mut saw_trailers = false;
+        while let Some(frame) = body.frame().await {
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(error) => {
+                    sender.abort(error);
+                    return;
+                }
+            };
+            if frame.is_data() {
+                if saw_trailers {
+                    sender.abort(Box::new(std::io::Error::other(
+                        "body data appeared after trailers",
+                    )));
+                    return;
+                }
+                let data = frame
+                    .into_data()
+                    .expect("is_data guarantees data conversion");
+                input_total = match input_total.checked_add(data.len()) {
+                    Some(total) if total <= max_body_bytes => total,
+                    _ => {
+                        sender.abort(Box::new(std::io::Error::other(
+                            "external processor streamed body exceeds limit",
+                        )));
+                        return;
+                    }
+                };
+                if let Some(previous) = pending.replace(data) {
+                    match process_ext_proc_stream_data(&session, phase, previous, false).await {
+                        Ok(Some(processed)) => {
+                            output_total = match output_total.checked_add(processed.len()) {
+                                Some(total) if total <= max_body_bytes => total,
+                                _ => {
+                                    sender.abort(Box::new(std::io::Error::other(
+                                        "external processor streamed output exceeds limit",
+                                    )));
+                                    return;
+                                }
+                            };
+                            if sender.send_data(processed).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => {
+                            sender.abort(Box::new(std::io::Error::other(
+                                "external processor selected an immediate response",
+                            )));
+                            return;
+                        }
+                        Err(error) => {
+                            sender.abort(Box::new(error));
+                            return;
+                        }
+                    }
+                }
+            } else if frame.is_trailers() {
+                if saw_trailers {
+                    sender.abort(Box::new(std::io::Error::other(
+                        "multiple trailer frames are not allowed",
+                    )));
+                    return;
+                }
+                saw_trailers = true;
+                let mut trailers = frame
+                    .into_trailers()
+                    .expect("is_trailers guarantees trailer conversion");
+                if let Some(previous) = pending.take() {
+                    match process_ext_proc_stream_data(&session, phase, previous, false).await {
+                        Ok(Some(processed)) => {
+                            output_total = match output_total.checked_add(processed.len()) {
+                                Some(total) if total <= max_body_bytes => total,
+                                _ => {
+                                    sender.abort(Box::new(std::io::Error::other(
+                                        "external processor streamed output exceeds limit",
+                                    )));
+                                    return;
+                                }
+                            };
+                            if sender.send_data(processed).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => {
+                            sender.abort(Box::new(std::io::Error::other(
+                                "external processor selected an immediate response",
+                            )));
+                            return;
+                        }
+                        Err(error) => {
+                            sender.abort(Box::new(error));
+                            return;
+                        }
+                    }
+                }
+                if send_trailers {
+                    let trailer_phase = match phase {
+                        ExtProcPhase::RequestBody => ExtProcPhase::RequestTrailers,
+                        ExtProcPhase::ResponseBody => ExtProcPhase::ResponseTrailers,
+                        _ => {
+                            sender.abort(Box::new(std::io::Error::other(
+                                "invalid external processor streamed phase",
+                            )));
+                            return;
+                        }
+                    };
+                    if let Err(error) =
+                        process_ext_proc_stream_trailers(&session, trailer_phase, &mut trailers)
+                            .await
+                    {
+                        sender.abort(Box::new(error));
+                        return;
+                    }
+                }
+                if sender.send_trailers(trailers).await.is_err() {
+                    return;
+                }
+            }
+        }
+        if !saw_trailers {
+            let final_chunk = pending.take().unwrap_or_default();
+            match process_ext_proc_stream_data(&session, phase, final_chunk, true).await {
+                Ok(Some(processed)) => {
+                    if output_total
+                        .checked_add(processed.len())
+                        .is_none_or(|total| total > max_body_bytes)
+                    {
+                        sender.abort(Box::new(std::io::Error::other(
+                            "external processor streamed output exceeds limit",
+                        )));
+                        return;
+                    }
+                    if !processed.is_empty() && sender.send_data(processed).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    sender.abort(Box::new(std::io::Error::other(
+                        "external processor selected an immediate response",
+                    )));
+                    return;
+                }
+                Err(error) => {
+                    sender.abort(Box::new(error));
+                    return;
+                }
+            }
+        }
+        if finish {
+            session.lock().await.finish();
+        }
+    });
+    output.boxed()
+}
+
+#[cfg(feature = "ext-proc")]
+/// 业务作用：处理一个 streamed DATA chunk，并把依赖 fail-open 精确降级为原 chunk 透传。
+///
+/// 参数说明：共享会话、body phase、原始 chunk 与 end_of_stream 标志均来自 wrapper 的有序状态机。
+///
+/// 返回：Some 为应发送 chunk；None 表示已登记即时响应；fail-closed 错误终止 body。
+async fn process_ext_proc_stream_data(
+    session: &SharedExtProcSession,
+    phase: ExtProcPhase,
+    original: Bytes,
+    end_of_stream: bool,
+) -> Result<Option<Bytes>, ExtProcError> {
+    let mut state = session.lock().await;
+    if state.bypassed() {
+        return Ok(Some(original));
+    }
+    match state
+        .process(phase, None, Some((&original, end_of_stream)), None)
+        .await
+    {
+        Ok(ExtProcAction::Continue(changes)) => Ok(Some(changes.apply_body(original))),
+        Ok(ExtProcAction::Immediate(response)) => {
+            state.set_pending_immediate(response)?;
+            Ok(None)
+        }
+        Err(error) if state.apply_failure(&error) => Ok(Some(original)),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "ext-proc")]
+/// 业务作用：处理 streamed body 末尾 trailers，并保证依赖 fail-open 时原 trailers 不变。
+///
+/// 参数说明：`session` 是同一协议流；`phase` 固定 trailer 方向；`trailers` 原子承接已验证 delta。
+///
+/// 返回：成功或允许绕过返回 Ok；即时响应、协议错序和 fail-closed 依赖返回错误。
+async fn process_ext_proc_stream_trailers(
+    session: &SharedExtProcSession,
+    phase: ExtProcPhase,
+    trailers: &mut HeaderMap,
+) -> Result<(), ExtProcError> {
+    let mut state = session.lock().await;
+    if state.bypassed() {
+        return Ok(());
+    }
+    match state.process(phase, None, None, Some(trailers)).await {
+        Ok(ExtProcAction::Continue(changes)) => {
+            changes.apply_headers(trailers);
+            Ok(())
+        }
+        Ok(ExtProcAction::Immediate(response)) => {
+            state.set_pending_immediate(response)?;
+            Err(ExtProcError::protocol(anyhow::anyhow!(
+                "ext_proc immediate response stopped streamed trailers"
+            )))
+        }
+        Err(error) if state.apply_failure(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// 业务作用：把插件处理后的完整 data 与原 trailers 重建成有界下游/上游 body。
 ///
 /// 参数说明：`bytes` 是最终 data，`trailers` 是收集时保留的单份 trailers。
@@ -8796,6 +11909,389 @@ fn normalize_content_length(headers: &mut http::HeaderMap, length: usize) {
         headers.insert(http::header::CONTENT_LENGTH, value);
     } else {
         headers.remove(http::header::CONTENT_LENGTH);
+    }
+}
+
+/// 业务作用：body 被遮蔽后删除已不再对应最终实体的摘要、validator 与 range header。
+///
+/// 参数说明：`headers` 是请求或响应 head。
+///
+/// 返回：无；只移除固定 body 完整性与范围字段，调用方随后写入新的 Content-Length。
+fn strip_body_integrity_headers(headers: &mut http::HeaderMap) {
+    for name in [
+        "content-md5",
+        "digest",
+        "content-digest",
+        "repr-digest",
+        "etag",
+        "content-range",
+        "accept-ranges",
+    ] {
+        headers.remove(name);
+    }
+}
+
+/// 业务作用：执行 route WAF 的请求行/header 门禁，在昂贵认证与外部调用前短路确定攻击输入。
+///
+/// 参数说明：
+/// - `route`：当前已匹配 route。
+/// - `parts`：尚未交给插件改写的原始请求 head。
+/// - `metrics`：共享低基数指标。
+///
+/// 返回：enforce 模式命中时返回 403；monitor 或未命中返回 `None` 并继续主管线。
+fn enforce_waf_head(route: &Route, parts: &Parts, metrics: &Metrics) -> Option<Response<BoxBody>> {
+    let policy = route.waf.as_ref()?;
+    let matched = policy.inspect_head(parts)?;
+    if policy.enforces() {
+        // WAF 拒绝必须发生在任何上游、插件和缓存副作用之前，避免恶意输入穿过部分管线。
+        metrics.inc_waf(WafMetric::Blocked);
+        tracing::warn!(
+            route = %route.id,
+            rule = %matched.rule,
+            target = %matched.target,
+            "request blocked by WAF"
+        );
+        Some(text_status(403, "request blocked by WAF"))
+    } else {
+        metrics.inc_waf(WafMetric::Monitored);
+        tracing::warn!(
+            route = %route.id,
+            rule = %matched.rule,
+            target = %matched.target,
+            "request matched WAF monitor rule"
+        );
+        None
+    }
+}
+
+/// 业务作用：用 listener 已验证的客户端 IP 执行 route 国家、ASN 与匿名网络门禁。
+///
+/// 参数说明：
+/// - `route`：当前已匹配 route。
+/// - `client_ip`：经 trusted-proxy 规则确定的权威客户端地址。
+/// - `metrics`：共享低基数指标。
+///
+/// 返回：策略拒绝时返回 403；允许或未配置时返回 `None`，且日志不包含 IP、国家或 ASN。
+fn enforce_geoip(route: &Route, client_ip: IpAddr, metrics: &Metrics) -> Option<Response<BoxBody>> {
+    let policy = route.geoip.as_ref()?;
+    let decision = policy.evaluate(client_ip);
+    metrics.inc_geoip(decision);
+    if decision.allowed() {
+        if decision.reason() != "allowed" {
+            tracing::warn!(
+                route = %route.id,
+                reason = decision.reason(),
+                "GeoIP policy explicitly allowed an incomplete lookup"
+            );
+        }
+        None
+    } else {
+        // GeoIP 拒绝发生在认证、插件和上游副作用之前，且不得用客户端自报位置覆盖。
+        tracing::warn!(
+            route = %route.id,
+            reason = decision.reason(),
+            "request denied by GeoIP policy"
+        );
+        Some(text_status(403, "request denied by GeoIP policy"))
+    }
+}
+
+/// 业务作用：在认证、插件和上游副作用前执行浏览器来源与 CSRF token 双门禁。
+///
+/// 参数说明：`route` 是已匹配路由；`parts` 是请求 head；`downstream_scheme` 来自 listener；
+/// `metrics` 是共享低基数指标。
+///
+/// 返回：enforce 拒绝时返回 403；安全方法、验证通过、monitor 或未配置时返回 `None`。
+fn enforce_csrf(
+    route: &Route,
+    parts: &Parts,
+    downstream_scheme: &str,
+    metrics: &Metrics,
+) -> Option<Response<BoxBody>> {
+    let policy = route.csrf.as_ref()?;
+    let decision = policy.evaluate(parts, downstream_scheme, route.id.as_str());
+    let monitored = decision.denied() && policy.monitor();
+    metrics.inc_csrf(decision, monitored);
+    if !decision.denied() {
+        return None;
+    }
+    if monitored {
+        tracing::warn!(
+            route = %route.id,
+            reason = decision.reason(),
+            "request matched CSRF monitor policy"
+        );
+        return None;
+    }
+
+    // CSRF 拒绝不得回显 Origin、Referer、cookie 或 token，也不能进入认证/插件/上游阶段。
+    tracing::warn!(
+        route = %route.id,
+        reason = decision.reason(),
+        "request denied by CSRF policy"
+    );
+    Some(text_status(403, "request denied by CSRF policy"))
+}
+
+/// 业务作用：在认证、插件和上游副作用前检查或遮蔽请求 header/query。
+///
+/// 参数说明：`route` 是已匹配路由；`parts` 是可按显式 redact 策略修改的请求 head；
+/// `internal_reroute_parts` 与 `response_filter_parts` 是早期冻结的可选请求快照；`metrics` 是共享指标。
+///
+/// 返回：block 命中返回 403；允许、monitor、redact 或未配置时返回 `None`。
+fn enforce_dlp_request_head(
+    route: &Route,
+    parts: &mut Parts,
+    internal_reroute_parts: &mut Option<Box<Parts>>,
+    response_filter_parts: &mut Option<Box<Parts>>,
+    metrics: &Metrics,
+) -> Option<Response<BoxBody>> {
+    let policy = route.dlp.as_ref()?;
+    match policy.inspect_request_head(parts) {
+        DlpHeadOutcome::Allowed => None,
+        DlpHeadOutcome::Monitored(matched) => {
+            metrics.inc_dlp(DlpMetric::Monitored);
+            log_dlp_match(route, matched, "request DLP monitor match");
+            None
+        }
+        DlpHeadOutcome::Redacted(matched) => {
+            // error_page/reroute 与响应过滤器不得继续持有遮蔽前的 URI/header，否则原值可能
+            // 在后续内部请求或插件阶段重新出现。只更新原本已需要的快照，不扩大 clone 热路径。
+            if internal_reroute_parts.is_some() {
+                *internal_reroute_parts = Some(Box::new(parts.clone()));
+            }
+            if response_filter_parts.is_some() {
+                *response_filter_parts = Some(Box::new(parts.clone()));
+            }
+            metrics.inc_dlp(DlpMetric::Redacted);
+            log_dlp_match(route, matched, "request DLP field redacted");
+            None
+        }
+        DlpHeadOutcome::Blocked(matched) => {
+            // 原 head 不得进入认证、插件或上游；日志只使用固定 rule/target。
+            metrics.inc_dlp(DlpMetric::Blocked);
+            log_dlp_match(route, matched, "request blocked by DLP");
+            Some(text_status(403, "request blocked by DLP"))
+        }
+    }
+}
+
+/// 业务作用：在身份授权后、插件和上游前执行显式有界请求 body DLP 慢路径。
+///
+/// 参数说明：`route` 是已匹配路由；`parts` 接收 redact 后的实体长度；`body` 是请求体唯一槽；
+/// `metrics` 是共享低基数指标。
+///
+/// 返回：block/资源/解析失败返回本地响应；允许、monitor、redact 或未配置时归还 body 并返回 `None`。
+async fn enforce_dlp_request_body(
+    route: &Route,
+    parts: &mut Parts,
+    body: &mut Option<forward::ForwardBody>,
+    metrics: &Metrics,
+) -> Option<Response<BoxBody>> {
+    let Some(policy) = &route.dlp else {
+        return None;
+    };
+    if !policy.inspects_request_body() {
+        return None;
+    }
+    let current = body
+        .take()
+        .expect("request body is owned exactly once by DLP/forward pipeline");
+    match policy.inspect_request_body(parts, current).await {
+        DlpBodyOutcome::Allowed(allowed) => {
+            *body = Some(allowed);
+            None
+        }
+        DlpBodyOutcome::Monitored(allowed, matched) => {
+            *body = Some(allowed);
+            metrics.inc_dlp(DlpMetric::Monitored);
+            log_dlp_match(route, matched, "request body DLP monitor match");
+            None
+        }
+        DlpBodyOutcome::Redacted(redacted, matched) => {
+            strip_body_integrity_headers(&mut parts.headers);
+            if let Some(length) = redacted.size_hint().exact() {
+                normalize_content_length(&mut parts.headers, length as usize);
+            }
+            *body = Some(redacted);
+            metrics.inc_dlp(DlpMetric::Redacted);
+            log_dlp_match(route, matched, "request body redacted by DLP");
+            None
+        }
+        DlpBodyOutcome::Blocked(matched) => {
+            // 已消费的敏感实体不可交回后续插件或上游，避免半遮蔽或旁路发送。
+            metrics.inc_dlp(DlpMetric::Blocked);
+            log_dlp_match(route, matched, "request body blocked by DLP");
+            Some(text_status(403, "request blocked by DLP"))
+        }
+        DlpBodyOutcome::TooLarge => {
+            metrics.inc_dlp(DlpMetric::TooLarge);
+            Some(text_status(413, "DLP request body is too large"))
+        }
+        DlpBodyOutcome::ReadFailed => {
+            metrics.inc_dlp(DlpMetric::BodyReadError);
+            Some(text_status(400, "DLP request body read failed"))
+        }
+        DlpBodyOutcome::Invalid => {
+            metrics.inc_dlp(DlpMetric::Invalid);
+            Some(text_status(400, "DLP request body cannot be inspected"))
+        }
+    }
+}
+
+/// 业务作用：在响应插件后、压缩与下游发送前检查或遮蔽响应 header/body。
+///
+/// 参数说明：`route` 是最终响应 route；`response` 是尚未写下游的完整响应；
+/// `metrics` 是共享低基数指标。
+///
+/// 返回：允许、monitor 或 redact 返回可发送响应；block/资源/解析失败返回不含原实体的 502。
+async fn enforce_dlp_response(
+    route: &Route,
+    mut response: Response<BoxBody>,
+    metrics: &Metrics,
+) -> Response<BoxBody> {
+    let Some(policy) = &route.dlp else {
+        return response;
+    };
+    match policy.inspect_response_head(response.headers_mut()) {
+        DlpHeadOutcome::Allowed => {}
+        DlpHeadOutcome::Monitored(matched) => {
+            metrics.inc_dlp(DlpMetric::Monitored);
+            log_dlp_match(route, matched, "response DLP monitor match");
+        }
+        DlpHeadOutcome::Redacted(matched) => {
+            metrics.inc_dlp(DlpMetric::Redacted);
+            log_dlp_match(route, matched, "response DLP field redacted");
+        }
+        DlpHeadOutcome::Blocked(matched) => {
+            // 响应尚未写下游，立即丢弃原 body，不能发送部分敏感数据后再改错。
+            metrics.inc_dlp(DlpMetric::Blocked);
+            log_dlp_match(route, matched, "response blocked by DLP");
+            return text_status(502, "upstream response blocked by DLP");
+        }
+    }
+    if !policy.inspects_response_body() {
+        return response;
+    }
+    if response.status() == StatusCode::PARTIAL_CONTENT
+        || response.headers().contains_key(http::header::CONTENT_RANGE)
+    {
+        // 局部实体无法在不知道完整表示的情况下安全遮蔽并重建 range/validator 语义。
+        metrics.inc_dlp(DlpMetric::Invalid);
+        return text_status(502, "partial upstream response cannot be inspected by DLP");
+    }
+    let (mut parts, body) = response.into_parts();
+    match policy.inspect_response_body(&parts.headers, body).await {
+        DlpBodyOutcome::Allowed(allowed) => Response::from_parts(parts, allowed),
+        DlpBodyOutcome::Monitored(allowed, matched) => {
+            metrics.inc_dlp(DlpMetric::Monitored);
+            log_dlp_match(route, matched, "response body DLP monitor match");
+            Response::from_parts(parts, allowed)
+        }
+        DlpBodyOutcome::Redacted(redacted, matched) => {
+            strip_body_integrity_headers(&mut parts.headers);
+            if let Some(length) = redacted.size_hint().exact() {
+                normalize_content_length(&mut parts.headers, length as usize);
+            }
+            metrics.inc_dlp(DlpMetric::Redacted);
+            log_dlp_match(route, matched, "response body redacted by DLP");
+            Response::from_parts(parts, redacted)
+        }
+        DlpBodyOutcome::Blocked(matched) => {
+            metrics.inc_dlp(DlpMetric::Blocked);
+            log_dlp_match(route, matched, "response body blocked by DLP");
+            text_status(502, "upstream response blocked by DLP")
+        }
+        DlpBodyOutcome::TooLarge => {
+            metrics.inc_dlp(DlpMetric::TooLarge);
+            text_status(502, "upstream response exceeds DLP limit")
+        }
+        DlpBodyOutcome::ReadFailed => {
+            metrics.inc_dlp(DlpMetric::BodyReadError);
+            text_status(502, "upstream response DLP read failed")
+        }
+        DlpBodyOutcome::Invalid => {
+            metrics.inc_dlp(DlpMetric::Invalid);
+            text_status(502, "upstream response cannot be inspected by DLP")
+        }
+    }
+}
+
+/// 业务作用：记录 DLP 固定 rule/target，不接收或格式化命中原值与字段名。
+///
+/// 参数说明：`route` 提供低基数路由标识；`matched` 只含固定枚举文本；`message` 是编译期事件名。
+///
+/// 返回：无；写入一条低敏 warn 日志。
+fn log_dlp_match(route: &Route, matched: crate::dlp::DlpMatch, message: &'static str) {
+    tracing::warn!(
+        route = %route.id,
+        rule = matched.rule,
+        target = matched.target,
+        event = message,
+        "DLP policy match"
+    );
+}
+
+/// 业务作用：在身份授权后执行显式 JSON/XML WAF 慢路径，并把通过检查的同一份 body 放回主管线。
+///
+/// 参数说明：
+/// - `route`：当前已匹配 route。
+/// - `parts`：用于 media type 与声明长度判断的请求 head。
+/// - `body`：请求体唯一所有权槽。
+/// - `metrics`：共享低基数指标。
+///
+/// 返回：通过或 monitor 时归还 body 并返回 `None`；enforce、超限或读取失败时返回本地错误响应。
+async fn enforce_waf_body(
+    route: &Route,
+    parts: &Parts,
+    body: &mut Option<forward::ForwardBody>,
+    metrics: &Metrics,
+) -> Option<Response<BoxBody>> {
+    let Some(policy) = &route.waf else {
+        return None;
+    };
+    if !policy.inspects_body() {
+        return None;
+    }
+    let current = body
+        .take()
+        .expect("request body is owned exactly once by WAF/forward pipeline");
+    match policy.inspect_body(parts, current).await {
+        WafBodyOutcome::Allowed(allowed) => {
+            *body = Some(allowed);
+            None
+        }
+        WafBodyOutcome::Monitored(allowed, matched) => {
+            *body = Some(allowed);
+            metrics.inc_waf(WafMetric::Monitored);
+            tracing::warn!(
+                route = %route.id,
+                rule = %matched.rule,
+                target = %matched.target,
+                "request body matched WAF monitor rule"
+            );
+            None
+        }
+        WafBodyOutcome::Blocked(matched) => {
+            // 已消费且判定违规的 body 不得重放给后续插件或上游，避免形成半拦截状态。
+            metrics.inc_waf(WafMetric::Blocked);
+            tracing::warn!(
+                route = %route.id,
+                rule = %matched.rule,
+                target = %matched.target,
+                "request body blocked by WAF"
+            );
+            Some(text_status(403, "request blocked by WAF"))
+        }
+        WafBodyOutcome::TooLarge => {
+            // 聚合预算是独立资源门禁；monitor 也不能绕过，否则 chunked body 可制造无界内存。
+            metrics.inc_waf(WafMetric::TooLarge);
+            Some(text_status(413, "WAF request body is too large"))
+        }
+        WafBodyOutcome::ReadFailed => {
+            metrics.inc_waf(WafMetric::BodyReadError);
+            Some(text_status(400, "WAF request body read failed"))
+        }
     }
 }
 
@@ -8832,6 +12328,51 @@ async fn validate_route_request(
         ValidationOutcome::BodyReadFailed => {
             metrics.inc_request_schema_body_read_error();
             Some(text_status(400, "request body read failed"))
+        }
+    }
+}
+
+/// 业务作用：在入站契约和安全插件通过后执行显式请求实体转换，并把唯一新实体交给上游管线。
+///
+/// 参数说明：`route` 提供转换计划；`parts` 是待同步 representation header；`body` 是请求体
+/// 唯一所有权槽；`metrics` 记录固定低基数终态。
+///
+/// 返回：未配置或转换成功返回 None 并归还 body；超限、读取或结构错误返回本地 413/400。
+async fn transform_route_request(
+    route: &Route,
+    parts: &mut Parts,
+    body: &mut Option<forward::ForwardBody>,
+    metrics: &Metrics,
+) -> Option<Response<BoxBody>> {
+    let Some(transform) = &route.request_transform else {
+        return None;
+    };
+    let current = body
+        .take()
+        .expect("request body is owned exactly once by transform/forward pipeline");
+    match transform.transform_request(parts, current).await {
+        crate::proxy::response_contract::TransformOutcome::Transformed { body: output, .. } => {
+            *body = Some(output);
+            metrics.inc_body_transform(crate::metrics::BodyTransformMetric::Transformed);
+            None
+        }
+        failure => {
+            crate::proxy::response_contract::record_transform_failure(metrics, &failure);
+            match failure {
+                crate::proxy::response_contract::TransformOutcome::TooLarge => {
+                    Some(text_status(413, "request body transform exceeds limit"))
+                }
+                crate::proxy::response_contract::TransformOutcome::ReadFailed => {
+                    Some(text_status(400, "request body transform read failed"))
+                }
+                crate::proxy::response_contract::TransformOutcome::Invalid(message) => {
+                    tracing::debug!(route = %route.id, reason = message, "request body transform rejected input");
+                    Some(text_status(400, "request body transform failed"))
+                }
+                crate::proxy::response_contract::TransformOutcome::Transformed { .. } => {
+                    unreachable!("successful request transform is handled above")
+                }
+            }
         }
     }
 }

@@ -565,7 +565,7 @@ upstreams:
 #       max_argument_bytes: 4096
 #       max_input_bytes: 16384
 #       fail_open: false
-#   # V7 Proxy-Wasm ABI v0.2.1 HTTP 插件。替换 module_file 会触发 build-then-swap，
+#   # Proxy-Wasm ABI v0.2.1 HTTP 插件。替换 module_file 会触发 build-then-swap，
 #   # 无需重编/重启 gateway；旧 snapshot 继续服务在途请求。沙箱不挂 WASI，
 #   # 不提供文件或网络。request_body/response_body 是显式有界聚合慢路径；
 #   # PAUSE 必须注册 timer，并在统一 timeout 内由 proxy_on_tick 调用 continue_stream。
@@ -588,7 +588,15 @@ upstreams:
 #         max_body_bytes: 1048576
 #         max_local_response_body_bytes: 65536
 #       - id: response-policy
-#         module_file: plugins/response-policy.wasm
+#         module_source:
+#           reference: oci://registry.example.com/gateway/response-policy:stable
+#           sha256: "<Wasm layer 的 64 位十六进制 SHA-256>"
+#           manifest_sha256: "<OCI manifest 的 64 位十六进制 SHA-256>"
+#           authorization: file://secrets/registry-authorization
+#           ca_certificate: file://secrets/registry-ca.pem
+#           cache_dir: state/wasm-cache
+#           signature: file://secrets/response-policy.wasm.sig.b64
+#           public_key: file://secrets/wasm-signer.pub.b64
 #         phase: response_headers
 #         config: { add_security_headers: true }
 #         fail_open: false

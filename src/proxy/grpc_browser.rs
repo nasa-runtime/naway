@@ -168,7 +168,7 @@ impl BrowserGrpc {
     /// 参数说明：`method` 与 `headers` 来自已完成通用请求头校验的下游请求。
     ///
     /// 返回：支持的 protobuf 模式返回计划；普通 HTTP 返回 None；已声明但不支持的 JSON/方法返回 4xx。
-    #[cfg(any(test, not(feature = "grpc-descriptor")))]
+    #[cfg(not(feature = "grpc-descriptor"))]
     pub(super) fn detect(
         method: &Method,
         headers: &HeaderMap,

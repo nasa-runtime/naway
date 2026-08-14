@@ -1,6 +1,6 @@
 //! IP 网段(CIDR)解析与匹配。
 //!
-//! 供多处复用:PROXY protocol 的 `accept_from`、数据面 `trusted_proxies`(§12 / review L6)。
+//! 供多处复用：PROXY protocol 的 `accept_from` 与数据面 `trusted_proxies`。
 //! **在【构建期】解析并校验成 [`Cidr`],运行期只做无分配的位比较**——避免每条连接/每个请求重复解析字符串
 //! (原 `proxy_protocol::is_trusted` 每连接都 `parse` 一次 CIDR,现收敛到构建期一次)。
 

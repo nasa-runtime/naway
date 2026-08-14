@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -79,7 +79,7 @@ impl DynamicUpstreamStore {
 
     /// 获取一个服务当前的不可变实例切片。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `service`: 配置中的逻辑服务名，而不是 Nacos 的物理 dataId。
     ///
     /// 返回：服务存在时只 clone 一次 `Arc`；不存在时返回 `None`。不会按请求深拷贝实例列表。
@@ -212,7 +212,7 @@ impl DynamicUpstreamStore {
     /// ——即「距 watch 上次确认存活的时长」,而非「距上次数据变更的时长」。触活把二者对齐:watch 活着就保持 fresh,
     /// watch 一旦断(任务退出、停止触活),stale_ttl 到点才降级。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `service`: 逻辑服务名(`lb://<service>` 抽出的名)。仅当该服务已存在且非空时触活
     ///   (空服务本就不该 fresh,触活它会掩盖「实例全没了」)。
     pub fn touch_service(&self, service: &str) {
@@ -255,6 +255,12 @@ pub struct UpstreamDirectory {
     services: HashMap<String, ServiceSnapshot>,
     dynamic: Arc<DynamicUpstreamStore>,
     prewarm_scan_interval_ms: u64,
+    /// 一致性哈希表缓存:服务名 → 与某一份实例切片绑定的环/表。
+    ///
+    /// 表的构建是 O(实例数 × 副本数),绝不能每请求重建;缓存条目持有构建时那份
+    /// `Arc` 切片,既保证指针比较不会 ABA 误判,也保证实例目录换代后自动重建。
+    /// 用 `Mutex` 而非 `ArcSwap`:重建只发生在实例集合变化时,常态是读命中。
+    hash_tables: Arc<Mutex<HashMap<String, Arc<crate::lb_hash::ConsistentHashTable>>>>,
 }
 
 impl Default for UpstreamDirectory {
@@ -263,6 +269,7 @@ impl Default for UpstreamDirectory {
             services: HashMap::new(),
             dynamic: DynamicUpstreamStore::new(),
             prewarm_scan_interval_ms: 1_000,
+            hash_tables: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -437,6 +444,18 @@ impl UpstreamDirectory {
                             .unwrap_or("round_robin"),
                     )
                     .with_context(|| format!("service `{name}` lb_policy"))?,
+                    hash: build_hash_policy(svc)
+                        .with_context(|| format!("service `{name}` hash_on"))?,
+                    session_affinity: build_session_affinity(svc.session_affinity.as_ref())
+                        .with_context(|| format!("service `{name}` session_affinity"))?,
+                    load_feedback: build_load_feedback(svc.load_feedback.as_ref())
+                        .with_context(|| format!("service `{name}` load_feedback"))?,
+                    retry_budget: crate::admission::build_retry_budget(svc.retry_budget.as_ref())
+                        .with_context(|| format!("service `{name}` retry_budget"))?,
+                    adaptive_concurrency: crate::admission::build_adaptive_concurrency(
+                        svc.adaptive_concurrency.as_ref(),
+                    )
+                    .with_context(|| format!("service `{name}` adaptive_concurrency"))?,
                     next_upstream: NextUpstreamPolicy::parse(
                         svc.next_upstream.as_deref(),
                         svc.next_upstream_tries,
@@ -455,6 +474,7 @@ impl UpstreamDirectory {
                     tls_profile,
                     nacos_service: svc.nacos_service.clone().unwrap_or_else(|| name.clone()),
                     registry_service: svc.registry_service.clone().unwrap_or_else(|| name.clone()),
+                    registry_service_import: svc.registry_service_import,
                     registry_namespace: svc.registry_namespace.clone(),
                     registry_port: svc.registry_port,
                     registry_port_name: svc.registry_port_name.clone(),
@@ -484,12 +504,54 @@ impl UpstreamDirectory {
             services,
             dynamic,
             prewarm_scan_interval_ms: cfg.prewarm_scan_interval_ms,
+            hash_tables: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// 业务作用：取得与当前实例切片匹配的一致性哈希表,必要时重建并缓存。
+    ///
+    /// 只有实例切片换代(静态换版或发现刷新)才会重建;常态是一次指针比较后的读命中。
+    /// 锁只覆盖缓存查改,表构建本身在锁外完成,避免大服务重建阻塞其它服务的选择。
+    ///
+    /// 参数说明：
+    /// - `service`: 逻辑服务名。
+    /// - `policy`: 服务级 LB 策略,决定建环还是建 Maglev 表。
+    /// - `hash`: 服务级哈希参数。
+    /// - `instances`: 本次请求读到的实例切片。
+    ///
+    /// 返回：可用表;无任何可入表实例时返回 `None`,调用方回落常规 LB。
+    fn hash_table_for(
+        &self,
+        service: &str,
+        policy: LbPolicy,
+        hash: &LbHashPolicy,
+        instances: &Arc<[Arc<UpstreamInstance>]>,
+    ) -> Option<Arc<crate::lb_hash::ConsistentHashTable>> {
+        if let Ok(cache) = self.hash_tables.lock() {
+            if let Some(table) = cache.get(service) {
+                if table.matches(instances) {
+                    return Some(table.clone());
+                }
+            }
+        }
+        let built = match policy {
+            LbPolicy::Maglev => {
+                crate::lb_hash::ConsistentHashTable::build_maglev(instances, hash.table_size)
+            }
+            _ => {
+                crate::lb_hash::ConsistentHashTable::build_ring(instances, hash.replicas_per_weight)
+            }
+        }?;
+        let built = Arc::new(built);
+        if let Ok(mut cache) = self.hash_tables.lock() {
+            cache.insert(service.to_string(), built.clone());
+        }
+        Some(built)
     }
 
     /// 选择一个可用实例:先选 primary,primary 全不可用时才选 backup;`down` 实例永不进入候选。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `service`: `lb://service` 中的逻辑服务名。
     ///
     /// 返回：默认零负载/零游标下选中的共享实例；服务不存在或无候选时返回 `None`。
@@ -605,10 +667,85 @@ impl UpstreamDirectory {
         F: FnMut(&str) -> u64,
         R: FnOnce() -> u64,
     {
+        self.select_instance_hinted(service, LbSelectHints::default(), is_excluded, load, rr)
+    }
+
+    /// 业务作用：带请求期提示的实例选择,是一致性哈希与会话保持的唯一入口。
+    ///
+    /// 选择优先级固定为「会话亲和 → 一致性哈希 → 服务级 LB」,且每一级都必须通过同一套
+    /// 候选谓词。**亲和与哈希都只影响顺序,不影响可用性判定**:命中的实例若已不健康、
+    /// 被摘除或不在允许 locality,直接降级到下一级,健康实例存在时绝不会粘死。
+    ///
+    /// 参数说明：
+    /// - `service`: 逻辑服务名。
+    /// - `hints`: 请求期算好的哈希键与亲和令牌;两者都可缺失。
+    /// - `is_excluded`: 排除谓词,输入 URI 或 `health_key`。
+    /// - `load`: in-flight 计数读取器,仅 `least_conn`/P2C 调用。
+    /// - `rr`: 单调游标读取器,`round_robin` 与 `random`/P2C 的抽样源。
+    ///
+    /// 返回：命中时只 clone 一个 `Arc<UpstreamInstance>`。
+    pub fn select_instance_hinted<E, F, R>(
+        &self,
+        service: &str,
+        hints: LbSelectHints,
+        is_excluded: E,
+        load: F,
+        rr: R,
+    ) -> Option<Arc<UpstreamInstance>>
+    where
+        E: Fn(&str) -> bool,
+        F: FnMut(&str) -> u64,
+        R: FnOnce() -> u64,
+    {
         let svc = self.services.get(service)?;
         let instances = self.instances_for(service, svc);
+        let slice = instances.as_slice();
+        if slice.is_empty() {
+            return None;
+        }
+        // 候选谓词与常规 LB 完全同源:亲和/哈希命中后仍要过健康、排除、backup 分层
+        // 与 locality rank,不允许任何一级绕过可用性事实。
+        let layer = CandidateLayer::resolve(slice, svc.locality.as_ref(), &is_excluded)?;
+        let accept = |inst: &UpstreamInstance| layer.accepts(inst, &is_excluded);
+
+        // ① 会话亲和:客户端带回令牌且对应实例仍可选时优先复用,保证同会话落同实例。
+        if let Some(token) = hints.affinity {
+            if svc.session_affinity.is_some() {
+                if let Some(found) = slice.iter().find(|inst| {
+                    crate::lb_hash::stable_hash(inst.uri.as_bytes()) == token.endpoint_hash
+                        && accept(inst.as_ref())
+                }) {
+                    return Some(found.clone());
+                }
+            }
+        }
+
+        // ② 一致性哈希:仅在服务声明了 ring_hash/maglev 且本次请求算出键时生效。
+        if svc.lb_policy.requires_hash_key() {
+            if let (Some(hash), Some(policy)) = (hints.hash, svc.hash.as_ref()) {
+                if let Some(owned) = instances.as_arc(svc) {
+                    if let Some(table) = self.hash_table_for(service, svc.lb_policy, policy, &owned)
+                    {
+                        if let Some(found) = table.select(hash, |inst| accept(inst)) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            // 无键、无表或探测预算耗尽:退回加权轮转保证可用性,不因缺键拒绝服务。
+            return select_instance_from_slice(
+                slice,
+                LbPolicy::RoundRobin,
+                svc.locality.as_ref(),
+                is_excluded,
+                load,
+                rr,
+            );
+        }
+
+        // ③ 常规 LB。
         select_instance_from_slice(
-            instances.as_slice(),
+            slice,
             svc.lb_policy,
             svc.locality.as_ref(),
             is_excluded,
@@ -628,10 +765,113 @@ impl UpstreamDirectory {
     }
 
     /// 当前服务是否真正需要请求期 in-flight 计数。其它 LB 策略不应维护一份永不读取的计数表。
+    ///
+    /// `least_conn` 与 P2C(`weighted_least_request`)都读该计数;其余策略不读,
+    /// 避免为永不查询的表付出每请求的原子增减与 DashMap 争用。
     pub fn uses_least_conn(&self, service: &str) -> bool {
         self.services
             .get(service)
-            .is_some_and(|svc| svc.lb_policy == LbPolicy::LeastConn)
+            .is_some_and(|svc| svc.lb_policy.uses_inflight())
+    }
+
+    /// 业务作用：返回服务的 retry budget 策略。
+    ///
+    /// 参数说明：`service` 是逻辑服务名。
+    ///
+    /// 返回：已启用时返回策略,否则返回 `None`。
+    pub fn retry_budget(&self, service: &str) -> Option<&crate::admission::RetryBudgetPolicy> {
+        self.services
+            .get(service)
+            .and_then(|svc| svc.retry_budget.as_ref())
+    }
+
+    /// 业务作用：返回服务的自适应并发策略。
+    ///
+    /// 参数说明：`service` 是逻辑服务名。
+    ///
+    /// 返回：已启用时返回策略,否则返回 `None`。
+    pub fn adaptive_concurrency(
+        &self,
+        service: &str,
+    ) -> Option<&crate::admission::AdaptiveConcurrencyPolicy> {
+        self.services
+            .get(service)
+            .and_then(|svc| svc.adaptive_concurrency.as_ref())
+    }
+
+    /// 业务作用：返回服务的负载反馈策略,供数据面决定是否采集与使用反馈。
+    ///
+    /// 参数说明：`service` 是逻辑服务名。
+    ///
+    /// 返回：已声明服务返回其策略,否则返回 `None`。
+    pub fn load_feedback(&self, service: &str) -> Option<&crate::lb_load::LoadFeedbackPolicy> {
+        self.services.get(service).map(|svc| &svc.load_feedback)
+    }
+
+    /// 业务作用：统计当前候选中拥有新鲜反馈的比例,并给出 panic 判定与中性分数。
+    ///
+    /// **panic 安全阀**:只有少数实例有反馈时,按反馈调度会把全部流量压到那几个实例上,
+    /// 反而制造热点。此时整服务停用反馈、回退基础算法。没有反馈的实例使用当前均值作为
+    /// 中性分数,既不被优待也不被饿死——否则冷启动实例会永远拿不到样本、永远进不了候选。
+    ///
+    /// 参数说明：
+    /// - `service`: 逻辑服务名。
+    /// - `lookup`: 按 `health_key` 读取实例反馈分数的回调。
+    ///
+    /// 返回：反馈可用时返回 `(中性分数)`;不可用或未启用时返回 `None`。
+    pub fn load_feedback_baseline<F>(&self, service: &str, mut lookup: F) -> Option<u64>
+    where
+        F: FnMut(&str) -> Option<u64>,
+    {
+        let svc = self.services.get(service)?;
+        if !svc.load_feedback.enabled() {
+            return None;
+        }
+        let instances = self.instances_for(service, svc);
+        let slice = instances.as_slice();
+        if slice.is_empty() {
+            return None;
+        }
+        let mut fresh = 0usize;
+        let mut total = 0u128;
+        for inst in slice.iter().filter(|inst| inst.is_selectable()) {
+            if let Some(score) = lookup(inst.health_key.as_ref()) {
+                fresh += 1;
+                total += score as u128;
+            }
+        }
+        let selectable = slice.iter().filter(|inst| inst.is_selectable()).count();
+        if selectable == 0 || fresh == 0 {
+            return None;
+        }
+        let ratio_bp = (fresh as u64 * 10_000) / selectable as u64;
+        if ratio_bp < svc.load_feedback.panic_threshold_bp as u64 {
+            return None;
+        }
+        Some((total / fresh as u128) as u64)
+    }
+
+    /// 业务作用：返回服务声明的一致性哈希键来源,供请求期按受控来源求值。
+    ///
+    /// 参数说明：`service` 是逻辑服务名。
+    ///
+    /// 返回：声明了 `ring_hash`/`maglev` 时返回来源,否则返回 `None`。
+    pub fn hash_source(&self, service: &str) -> Option<&LbHashSource> {
+        self.services
+            .get(service)
+            .and_then(|svc| svc.hash.as_ref())
+            .map(|hash| &hash.source)
+    }
+
+    /// 业务作用：返回服务级会话保持策略,供请求期读取亲和令牌、响应期回写载体。
+    ///
+    /// 参数说明：`service` 是逻辑服务名。
+    ///
+    /// 返回：已配置时返回策略,否则返回 `None`。
+    pub fn session_affinity(&self, service: &str) -> Option<&SessionAffinityPolicy> {
+        self.services
+            .get(service)
+            .and_then(|svc| svc.session_affinity.as_ref())
     }
 
     /// 业务作用：返回所有未就绪的关键服务名，供 `/readyz` 与真实 locality-aware 选择保持
@@ -864,6 +1104,7 @@ impl UpstreamDirectory {
                     kind,
                     logical_service: logical_service.clone(),
                     registry_service: svc.registry_service.clone(),
+                    service_import: svc.registry_service_import,
                     namespace: svc.registry_namespace.clone(),
                     port: svc.registry_port,
                     port_name: svc.registry_port_name.clone(),
@@ -993,6 +1234,19 @@ impl UpstreamInstances<'_> {
             Self::Empty => &[],
         }
     }
+
+    /// 业务作用：取得拥有所有权的实例切片,供一致性哈希表缓存按指针身份绑定代际。
+    ///
+    /// 参数说明：`svc` 提供静态分支的原始 `Arc`。
+    ///
+    /// 返回：当前实例切片的共享句柄;无实例时返回 `None`。
+    fn as_arc(&self, svc: &ServiceSnapshot) -> Option<Arc<[Arc<UpstreamInstance>]>> {
+        match self {
+            Self::Static(_) => Some(svc.instances.clone()),
+            Self::Dynamic(instances) => Some(instances.clone()),
+            Self::Empty => None,
+        }
+    }
 }
 
 /// 一个服务在单份不可变配置快照中的路由、重试、健康与发现策略。
@@ -1006,6 +1260,16 @@ pub struct ServiceSnapshot {
     pub source: ServiceSource,
     /// primary/backup 候选内部使用的负载均衡算法。
     pub lb_policy: LbPolicy,
+    /// 一致性哈希键来源与表参数;`ring_hash`/`maglev` 必需,其它策略为 None。
+    pub hash: Option<LbHashPolicy>,
+    /// 服务级会话保持;route 级策略优先于它(Gateway API 语义)。
+    pub session_affinity: Option<SessionAffinityPolicy>,
+    /// 后端负载反馈策略;`none` 时数据面不采集也不读取任何反馈状态。
+    pub load_feedback: crate::lb_load::LoadFeedbackPolicy,
+    /// backend 级 retry budget;None 表示重试只受 `next_upstream_tries` 约束。
+    pub retry_budget: Option<crate::admission::RetryBudgetPolicy>,
+    /// 自适应并发策略;None 表示不做在途上限调节。
+    pub adaptive_concurrency: Option<crate::admission::AdaptiveConcurrencyPolicy>,
     /// 连接/超时/指定 5xx 时的跨实例重试策略。
     pub next_upstream: NextUpstreamPolicy,
     /// 连续失败阈值和临时摘除窗口。
@@ -1026,6 +1290,8 @@ pub struct ServiceSnapshot {
     pub nacos_service: String,
     /// Consul/Eureka/K8s 物理 service 名或 DNS host。
     pub registry_service: String,
+    /// 是否使用 MCS ServiceImport 的 EndpointSlice label，且不回退 legacy Endpoints。
+    pub registry_service_import: bool,
     /// K8s namespace 覆盖。
     pub registry_namespace: Option<String>,
     /// DNS 端口。
@@ -1048,7 +1314,20 @@ struct UpstreamLocalityPolicy {
     local_zone: Arc<str>,
     failover_zones: Arc<[Arc<str>]>,
     allow_unlisted: bool,
+    /// zone → 相对权重(万分比已折算为整数倍率)。未列 zone 取 `DEFAULT_ZONE_WEIGHT`。
+    zone_weights: Arc<[(Arc<str>, u32)]>,
+    /// 已声明为劣化的 zone:仍参与同一优先级,但份额按 `degraded_weight_percent` 打折。
+    degraded_zones: Arc<[Arc<str>]>,
+    /// 劣化 zone 的份额百分比(1..=100)。
+    degraded_weight_percent: u32,
+    /// true 表示 weighted 模式:全部已声明 zone 同级按份额分流。
+    weighted: bool,
 }
+
+/// 未在 `zone_weights` 中声明时的默认 zone 权重。
+const DEFAULT_ZONE_WEIGHT: u32 = 1;
+/// zone 份额的定点放大倍数,使 `degraded_weight_percent` 这类百分比可被整数表达。
+const ZONE_WEIGHT_SCALE: u32 = 100;
 
 impl UpstreamLocalityPolicy {
     /// 业务作用：把声明式 zone 顺序编译成只读策略，在快照发布前拒绝空值、
@@ -1072,11 +1351,93 @@ impl UpstreamLocalityPolicy {
             );
             failover_zones.push(Arc::<str>::from(zone));
         }
+        // zone 权重与劣化列表都必须引用已声明 zone:允许给未知 zone 配权重会让运维
+        // 以为流量已经分过去,实际那个 zone 根本不在 failover 顺序里,属于静默失效。
+        let known =
+            |zone: &str| zone == local_zone || failover_zones.iter().any(|z| z.as_ref() == zone);
+        let mut zone_weights = Vec::with_capacity(cfg.zone_weights.len());
+        for (zone, weight) in &cfg.zone_weights {
+            let zone = validate_zone(zone)
+                .with_context(|| format!("service `{service}` locality.zone_weights"))?;
+            anyhow::ensure!(
+                known(&zone),
+                "service `{service}` locality.zone_weights 引用了未声明的 zone `{zone}`"
+            );
+            anyhow::ensure!(
+                (1..=10_000).contains(weight),
+                "service `{service}` locality.zone_weights[{zone}] 必须在 1..=10000"
+            );
+            zone_weights.push((Arc::<str>::from(zone), *weight));
+        }
+        let mut degraded_zones = Vec::with_capacity(cfg.degraded_zones.len());
+        for zone in &cfg.degraded_zones {
+            let zone = validate_zone(zone)
+                .with_context(|| format!("service `{service}` locality.degraded_zones"))?;
+            anyhow::ensure!(
+                known(&zone),
+                "service `{service}` locality.degraded_zones 引用了未声明的 zone `{zone}`"
+            );
+            degraded_zones.push(Arc::<str>::from(zone));
+        }
+        let degraded_weight_percent = cfg.degraded_weight_percent.unwrap_or(20);
+        anyhow::ensure!(
+            (1..=100).contains(&degraded_weight_percent),
+            "service `{service}` locality.degraded_weight_percent 必须在 1..=100"
+        );
+        let weighted = match cfg.mode.as_deref().unwrap_or("failover").trim() {
+            "failover" => false,
+            "weighted" => true,
+            other => anyhow::bail!(
+                "service `{service}` locality.mode `{other}` 仅支持 failover/weighted"
+            ),
+        };
+        anyhow::ensure!(
+            weighted || cfg.zone_weights.is_empty(),
+            "service `{service}` locality.zone_weights 只在 mode=weighted 下生效,             failover 模式请改用 failover_zones 顺序表达优先级"
+        );
         Ok(Self {
             local_zone: Arc::from(local_zone),
             failover_zones: failover_zones.into(),
             allow_unlisted: cfg.allow_unlisted,
+            zone_weights: zone_weights.into(),
+            degraded_zones: degraded_zones.into(),
+            degraded_weight_percent,
+            weighted,
         })
+    }
+
+    /// 业务作用：给出一个实例在加权 locality 调度中的份额倍率。
+    ///
+    /// 份额同时受三件事影响:显式 zone 权重、是否被声明为劣化 zone,以及该 zone 内
+    /// 实际可用的实例数(由调用方按候选计数体现)。这样「容量、健康实例数与显式权重
+    /// 共同决定份额」不是一句口号,而是三者相乘的结果。
+    ///
+    /// 参数说明：`zone` 是实例的可信 zone。
+    ///
+    /// 返回：份额倍率;劣化 zone 已按百分比折算,最小为 1 避免被彻底饿死。
+    fn zone_multiplier(&self, zone: Option<&str>) -> u32 {
+        let base = zone
+            .and_then(|zone| {
+                self.zone_weights
+                    .iter()
+                    .find(|(name, _)| name.as_ref() == zone)
+                    .map(|(_, weight)| *weight)
+            })
+            .unwrap_or(DEFAULT_ZONE_WEIGHT);
+        let degraded = zone
+            .map(|zone| self.degraded_zones.iter().any(|name| name.as_ref() == zone))
+            .unwrap_or(false);
+        // 份额空间统一放大 `ZONE_WEIGHT_SCALE` 倍。**不放大就无法表达百分比**:
+        // 默认权重是 1,直接乘 20% 再取整仍然得到 1,劣化 zone 与健康 zone 份额完全相同,
+        // 配置看起来生效、实际毫无作用。
+        let scaled = base * ZONE_WEIGHT_SCALE;
+        if degraded {
+            // 劣化 zone 不摘除、只降份额;至少保留 1 份,使它仍能承接少量真实请求。
+            // 否则恢复后没有任何业务流量去验证,只能等主动探测,恢复会明显变慢。
+            (scaled * self.degraded_weight_percent / 100).max(1)
+        } else {
+            scaled
+        }
     }
 
     /// 业务作用：将实例 zone 映射为本区优先、指定跨区次之、未列最后的稳定等级。
@@ -1085,6 +1446,19 @@ impl UpstreamLocalityPolicy {
     ///
     /// 返回：可参与选择时返回越小越优先的 rank；未列且禁止降级时返回 None。
     fn rank(&self, zone: Option<&str>) -> Option<usize> {
+        let declared = zone == Some(self.local_zone.as_ref())
+            || self
+                .failover_zones
+                .iter()
+                .any(|candidate| zone == Some(candidate.as_ref()));
+        if self.weighted {
+            // weighted 模式:全部已声明 zone 同级,差异完全由份额倍率体现;
+            // 未声明 zone 仍排在其后,只有 allow_unlisted 才可承接。
+            if declared {
+                return Some(0);
+            }
+            return self.allow_unlisted.then_some(1);
+        }
         if zone == Some(self.local_zone.as_ref()) {
             return Some(0);
         }
@@ -1271,6 +1645,8 @@ pub struct RegistryWatchSpec {
     pub logical_service: String,
     /// 注册中心中的物理服务名或 DNS host。
     pub registry_service: String,
+    /// Kubernetes worker 是否解析 MCS ServiceImport 派生 EndpointSlice。
+    pub service_import: bool,
     /// Kubernetes namespace 覆盖。
     pub namespace: Option<String>,
     /// DNS 或 Kubernetes 数字端口。
@@ -1314,6 +1690,15 @@ pub enum LbPolicy {
     RoundRobin,
     /// 选择当前活动请求数最少的候选。
     LeastConn,
+    /// 按权重随机选择;无状态、无共享游标,适合多进程/多节点同构部署。
+    Random,
+    /// power-of-two-choices:随机取两个候选,选在途请求/权重比更低者。
+    /// 比全局 `least_conn` 少一次全候选扫描,且抗「羊群涌向同一最空实例」。
+    WeightedLeastRequest,
+    /// ketama 风格加权虚拟节点环;扩缩容只迁移该实例自身承担的 key。
+    RingHash,
+    /// Maglev 查找表;一致性与 ring 同级,份额分布更均匀,查找为 O(1)。
+    Maglev,
 }
 
 impl LbPolicy {
@@ -1324,7 +1709,29 @@ impl LbPolicy {
             Self::First => "first",
             Self::RoundRobin => "round_robin",
             Self::LeastConn => "least_conn",
+            Self::Random => "random",
+            Self::WeightedLeastRequest => "weighted_least_request",
+            Self::RingHash => "ring_hash",
+            Self::Maglev => "maglev",
         }
+    }
+
+    /// 业务作用：判断负载均衡策略是否依赖请求期哈希键，供构建期关闭无键退化路径。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：一致性哈希策略返回 true；其它策略返回 false。
+    pub fn requires_hash_key(self) -> bool {
+        matches!(self, Self::RingHash | Self::Maglev)
+    }
+
+    /// 业务作用：判断策略是否需要实例在途计数，避免无关算法维护额外热路径状态。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：`least_conn` 与 P2C 返回 true；其它策略返回 false。
+    pub fn uses_inflight(self) -> bool {
+        matches!(self, Self::LeastConn | Self::WeightedLeastRequest)
     }
 
     fn parse(raw: &str) -> Result<Self> {
@@ -1332,9 +1739,286 @@ impl LbPolicy {
             "first" => Ok(Self::First),
             "round_robin" | "round-robin" | "weighted" | "wrr" => Ok(Self::RoundRobin),
             "least_conn" | "least-conn" => Ok(Self::LeastConn),
+            "random" => Ok(Self::Random),
+            "weighted_least_request" | "weighted-least-request" | "least_request" | "p2c" => {
+                Ok(Self::WeightedLeastRequest)
+            }
+            "ring_hash" | "ring-hash" | "ketama" => Ok(Self::RingHash),
+            "maglev" => Ok(Self::Maglev),
+            // `ip_hash` 是「以 remote_addr 为 hash key 的 ring_hash」的特例,由构建期
+            // 展开成 ring_hash + hash_on=remote_addr,不在数据面另立一套选择路径。
+            "ip_hash" | "ip-hash" => Ok(Self::RingHash),
             other => anyhow::bail!("unsupported lb policy `{other}`"),
         }
     }
+}
+
+/// 一致性哈希与会话保持的哈希键来源。
+///
+/// 只允许受控来源:未经信任的任意高基数字段会把哈希环与会话表变成放大面,
+/// 也会让攻击者按需把流量钉到指定实例。header/cookie/变量名都必须在构建期声明。
+#[derive(Clone, PartialEq, Eq)]
+pub enum LbHashSource {
+    /// 已完成鉴权的 consumer 身份;未认证请求视为无键。
+    Consumer,
+    /// 可信请求头的值;名字由配置固定,不接受请求期指定。
+    Header(Arc<str>),
+    /// 指定 cookie 的值。
+    Cookie(Arc<str>),
+    /// 经可信代理链与连接元数据判定的真实客户端 IP。
+    RemoteAddr,
+    /// 已编译变量的求值结果。
+    Variable(Arc<str>),
+}
+
+impl LbHashSource {
+    /// 业务作用：把已编译哈希来源还原为管理面展示和配置回写使用的稳定名称。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回不含运行态值的配置语义字符串。
+    pub fn as_display(&self) -> String {
+        match self {
+            Self::Consumer => "consumer".to_string(),
+            Self::Header(name) => format!("header:{name}"),
+            Self::Cookie(name) => format!("cookie:{name}"),
+            Self::RemoteAddr => "remote_addr".to_string(),
+            Self::Variable(name) => format!("var:{name}"),
+        }
+    }
+
+    /// 业务作用：解析配置声明的哈希来源,把不受支持的写法在构建期挡下。
+    ///
+    /// 参数说明：`raw` 是 `hash_on` 原文。
+    ///
+    /// 返回：受支持来源;前缀未知或名字为空时返回错误。
+    pub fn parse(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("consumer") {
+            return Ok(Self::Consumer);
+        }
+        if raw.eq_ignore_ascii_case("remote_addr") || raw.eq_ignore_ascii_case("remote-addr") {
+            return Ok(Self::RemoteAddr);
+        }
+        for (prefix, build) in [
+            (
+                "header:",
+                (|name: &str| Self::Header(name.into())) as fn(&str) -> Self,
+            ),
+            ("cookie:", |name: &str| Self::Cookie(name.into())),
+            ("var:", |name: &str| Self::Variable(name.into())),
+        ] {
+            if let Some(name) = raw.strip_prefix(prefix) {
+                let name = name.trim();
+                anyhow::ensure!(!name.is_empty(), "lb hash_on `{raw}` 缺少名字");
+                anyhow::ensure!(
+                    name.len() <= 128 && name.chars().all(|c| c.is_ascii_graphic()),
+                    "lb hash_on `{raw}` 名字必须是不超过 128 字节的可见 ASCII"
+                );
+                return Ok(build(name));
+            }
+        }
+        anyhow::bail!(
+            "unsupported lb hash_on `{raw}`(仅 consumer / remote_addr / header:<name> / cookie:<name> / var:<name>)"
+        )
+    }
+}
+
+/// 一致性哈希策略的键来源与表参数。
+#[derive(Clone)]
+pub struct LbHashPolicy {
+    /// 哈希键来源。
+    pub source: LbHashSource,
+    /// ring-hash 每单位权重的虚拟节点数。
+    pub replicas_per_weight: u32,
+    /// Maglev 查找表长度(构建期归一到质数)。
+    pub table_size: usize,
+}
+
+/// 会话保持的载体形态。
+#[derive(Clone)]
+pub enum SessionAffinityMode {
+    /// 由网关生成并下发 cookie;客户端后续请求带回。
+    Cookie {
+        /// cookie 名。
+        name: Arc<str>,
+        /// 兼容原生配置的滚动有效期（秒）；0 表示不使用滚动 `Max-Age`。
+        ttl_seconds: u64,
+        /// 是否按绝对期限下发持久 cookie；开启后 `Max-Age` 只能递减。
+        permanent: bool,
+        /// 可选 `Path` 属性；backend 级策略必须省略，避免错误限制到某一条 Route。
+        path: Option<Arc<str>>,
+        /// 可选 `Domain` 属性。
+        domain: Option<Arc<str>>,
+        /// `SameSite` 属性,默认 `Lax`。
+        same_site: Arc<str>,
+        /// 是否置 `Secure`,默认开。
+        secure: bool,
+        /// 是否置 `HttpOnly`,默认开。
+        http_only: bool,
+    },
+    /// 由客户端在指定请求头携带亲和令牌;网关在响应同名头回写。
+    Header {
+        /// 请求/响应头名。
+        name: Arc<str>,
+    },
+}
+
+/// 已校验的会话保持策略。
+#[derive(Clone)]
+pub struct SessionAffinityPolicy {
+    /// 载体形态与属性。
+    pub mode: SessionAffinityMode,
+    /// 从首次建立会话起计算的绝对期限（秒）；0 表示关闭。
+    pub absolute_timeout_seconds: u64,
+    /// 从客户端最近一次有效使用令牌起计算的空闲期限（秒）；0 表示关闭。
+    pub idle_timeout_seconds: u64,
+}
+
+/// 已解析且通过期限校验的会话保持令牌。
+#[derive(Clone, Copy)]
+pub struct SessionAffinityToken {
+    /// 当前会话绑定的健康实例身份哈希。
+    pub endpoint_hash: u64,
+    /// 首次建立会话的 Unix 秒时间戳；无期限的兼容令牌为 0。
+    pub issued_at_seconds: u64,
+    /// 客户端上次获得令牌的 Unix 秒时间戳；无期限的兼容令牌为 0。
+    pub touched_at_seconds: u64,
+}
+
+impl SessionAffinityPolicy {
+    /// 业务作用：由实例身份派生**不可反推后端地址**的稳定亲和令牌。
+    ///
+    /// 采用无状态令牌而非服务端会话表：跨节点无需共享存储。启用绝对或空闲期限时，
+    /// 令牌同时携带首次建立和最近使用时间；令牌不作为认证凭据，实际目标仍必须命中
+    /// 当前服务的健康授权实例，因此客户端改写令牌不能构造任意上游地址。
+    ///
+    /// 参数说明：`uri` 是实例的规范化 URI；`previous` 是本请求通过期限校验的旧令牌；
+    /// `now_seconds` 是当前 Unix 秒。
+    ///
+    /// 返回：返回可下发文本及其结构化时间事实；无期限时文本保持十六位兼容格式。
+    pub fn token_for(
+        &self,
+        uri: &str,
+        previous: Option<SessionAffinityToken>,
+        now_seconds: u64,
+    ) -> (String, SessionAffinityToken) {
+        let endpoint_hash = crate::lb_hash::stable_hash(uri.as_bytes());
+        if self.absolute_timeout_seconds == 0 && self.idle_timeout_seconds == 0 {
+            let token = SessionAffinityToken {
+                endpoint_hash,
+                issued_at_seconds: 0,
+                touched_at_seconds: 0,
+            };
+            return (format!("{endpoint_hash:016x}"), token);
+        }
+        let issued_at_seconds = previous
+            .filter(|token| token.endpoint_hash == endpoint_hash)
+            .map(|token| token.issued_at_seconds)
+            .filter(|issued| *issued <= now_seconds)
+            .unwrap_or(now_seconds);
+        let token = SessionAffinityToken {
+            endpoint_hash,
+            issued_at_seconds,
+            touched_at_seconds: now_seconds,
+        };
+        (
+            format!("{endpoint_hash:016x}.{issued_at_seconds:016x}.{now_seconds:016x}"),
+            token,
+        )
+    }
+
+    /// 业务作用：解析客户端带回的会话令牌并执行绝对、空闲期限门禁，过期令牌不得
+    /// 继续绕过常规负载均衡。
+    ///
+    /// 参数说明：`raw` 是 cookie 或请求头中的原始值；`now_seconds` 是当前 Unix 秒。
+    ///
+    /// 返回：结构和期限均有效时返回实例及时间事实；其它情况返回 `None` 并回落常规 LB。
+    pub fn parse_token(&self, raw: &str, now_seconds: u64) -> Option<SessionAffinityToken> {
+        let raw = raw.trim();
+        if self.absolute_timeout_seconds == 0 && self.idle_timeout_seconds == 0 {
+            if raw.len() != 16 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            return u64::from_str_radix(raw, 16)
+                .ok()
+                .map(|endpoint_hash| SessionAffinityToken {
+                    endpoint_hash,
+                    issued_at_seconds: 0,
+                    touched_at_seconds: 0,
+                });
+        }
+        let mut fields = raw.split('.');
+        let endpoint_hash = parse_affinity_token_field(fields.next()?)?;
+        let issued_at_seconds = parse_affinity_token_field(fields.next()?)?;
+        let touched_at_seconds = parse_affinity_token_field(fields.next()?)?;
+        if fields.next().is_some()
+            || issued_at_seconds > now_seconds
+            || touched_at_seconds < issued_at_seconds
+            || touched_at_seconds > now_seconds
+        {
+            return None;
+        }
+        if self.absolute_timeout_seconds > 0
+            && now_seconds.saturating_sub(issued_at_seconds) >= self.absolute_timeout_seconds
+        {
+            return None;
+        }
+        if self.idle_timeout_seconds > 0
+            && now_seconds.saturating_sub(touched_at_seconds) >= self.idle_timeout_seconds
+        {
+            return None;
+        }
+        Some(SessionAffinityToken {
+            endpoint_hash,
+            issued_at_seconds,
+            touched_at_seconds,
+        })
+    }
+
+    /// 业务作用：计算持久 cookie 在当前响应时仍可暴露的剩余绝对有效期，防止重复
+    /// `Set-Cookie` 把 `absoluteTimeout` 误变成滚动期限。
+    ///
+    /// 参数说明：`token` 是即将下发的新令牌；`now_seconds` 是同一响应固定读取的 Unix 秒。
+    ///
+    /// 返回：持久 cookie 返回至少一秒且不超过绝对期限的 `Max-Age`；其它模式返回 `None`。
+    pub fn permanent_cookie_max_age(
+        &self,
+        token: SessionAffinityToken,
+        now_seconds: u64,
+    ) -> Option<u64> {
+        let SessionAffinityMode::Cookie {
+            permanent: true, ..
+        } = &self.mode
+        else {
+            return None;
+        };
+        let elapsed = now_seconds.saturating_sub(token.issued_at_seconds);
+        Some(self.absolute_timeout_seconds.saturating_sub(elapsed).max(1))
+    }
+}
+
+/// 业务作用：解析定长十六进制令牌字段，避免宽松整数解析接受符号、空白或超长输入。
+///
+/// 参数说明：`raw` 是单个 endpoint 或时间戳字段。
+///
+/// 返回：恰好十六位十六进制时返回数值，否则返回 `None`。
+fn parse_affinity_token_field(raw: &str) -> Option<u64> {
+    if raw.len() != 16 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(raw, 16).ok()
+}
+
+/// 单次选择的请求期提示:一致性哈希键与会话亲和令牌。
+///
+/// 两者都是**可选**的:缺失时选择完全退回既有 LB,不产生失败。
+#[derive(Clone, Copy, Default)]
+pub struct LbSelectHints {
+    /// 由配置来源算好的稳定哈希键。
+    pub hash: Option<u64>,
+    /// 客户端带回的会话亲和令牌。
+    pub affinity: Option<SessionAffinityToken>,
 }
 
 /// `proxy_next_upstream` 的触发条件、尝试预算和退避策略。
@@ -1712,6 +2396,327 @@ impl UpstreamInstance {
 /// - `rr`: WRR 的单调游标读取器，仅确有候选且策略为 WRR 时调用一次。
 ///
 /// 返回：选中的共享实例；没有可用 primary/backup 时返回 `None`。
+/// 业务作用：校验并构建服务级一致性哈希策略,把「策略要键但没声明键」挡在构建期。
+///
+/// `ip_hash` 是 `ring_hash` + `remote_addr` 的语法糖,在此展开,数据面不再有第二条分支。
+///
+/// 参数说明：`svc` 是静态服务配置。
+///
+/// 返回：需要哈希的策略返回已校验策略；不需要时返回 `None`；声明冲突时返回错误。
+fn build_hash_policy(svc: &StaticServiceCfg) -> Result<Option<LbHashPolicy>> {
+    let raw_policy = svc
+        .lb_policy
+        .as_deref()
+        .or(svc.lb.as_deref())
+        .unwrap_or("round_robin")
+        .trim();
+    let policy = LbPolicy::parse(raw_policy)?;
+    if !policy.requires_hash_key() {
+        anyhow::ensure!(
+            svc.hash_on.is_none(),
+            "hash_on 只能与 ring_hash/maglev/ip_hash 同用,当前 lb_policy=`{raw_policy}`"
+        );
+        return Ok(None);
+    }
+    let is_ip_hash = matches!(raw_policy, "ip_hash" | "ip-hash");
+    let source = match (svc.hash_on.as_deref(), is_ip_hash) {
+        // ip_hash 语义固定为源地址;再显式配 hash_on 只会制造两个事实源。
+        (Some(_), true) => {
+            anyhow::bail!("ip_hash 已固定按 remote_addr 哈希,不应再声明 hash_on")
+        }
+        (None, true) => LbHashSource::RemoteAddr,
+        (Some(raw), false) => LbHashSource::parse(raw)?,
+        // 没有键的一致性哈希会把全部流量钉到同一实例,必须构建期拒绝而不是运行期退化。
+        (None, false) => anyhow::bail!("lb_policy=`{raw_policy}` 必须声明 hash_on"),
+    };
+    let replicas = svc.hash_ring_replicas.unwrap_or(100);
+    anyhow::ensure!(
+        (1..=crate::lb_hash::MAX_REPLICAS_PER_UNIT_WEIGHT).contains(&replicas),
+        "hash_ring_replicas 必须在 1..={} 之间",
+        crate::lb_hash::MAX_REPLICAS_PER_UNIT_WEIGHT
+    );
+    let table_size = svc.hash_table_size.unwrap_or(65_537);
+    anyhow::ensure!(
+        (1..=crate::lb_hash::MAX_MAGLEV_TABLE).contains(&table_size),
+        "hash_table_size 必须在 1..={} 之间",
+        crate::lb_hash::MAX_MAGLEV_TABLE
+    );
+    Ok(Some(LbHashPolicy {
+        source,
+        replicas_per_weight: replicas,
+        table_size,
+    }))
+}
+
+/// 业务作用：校验并构建后端负载反馈策略。
+///
+/// 所有阈值都在构建期钳制到合法区间并拒绝明显错误的组合,避免运行期出现
+/// 「平滑系数为 0 导致 EWMA 永不更新」这类只能靠观察指标才能发现的静默失效。
+///
+/// 参数说明：`cfg` 是可选反馈配置。
+///
+/// 返回：未配置时返回关闭策略;非法阈值返回错误。
+fn build_load_feedback(
+    cfg: Option<&crate::config::model::LoadFeedbackCfg>,
+) -> Result<crate::lb_load::LoadFeedbackPolicy> {
+    let mut policy = crate::lb_load::LoadFeedbackPolicy::disabled();
+    let Some(cfg) = cfg else {
+        return Ok(policy);
+    };
+    policy.feedback = crate::lb_load::LoadFeedback::parse(cfg.mode.as_deref().unwrap_or("none"))?;
+    if let Some(freshness) = cfg.freshness_ms {
+        anyhow::ensure!(
+            (100..=3_600_000).contains(&freshness),
+            "load_feedback.freshness_ms 必须在 100..=3600000"
+        );
+        policy.freshness_ms = freshness;
+    }
+    if let Some(min_samples) = cfg.min_samples {
+        anyhow::ensure!(
+            (1..=10_000).contains(&min_samples),
+            "load_feedback.min_samples 必须在 1..=10000"
+        );
+        policy.min_samples = min_samples;
+    }
+    if let Some(smoothing) = cfg.smoothing_bp {
+        anyhow::ensure!(
+            (1..=10_000).contains(&smoothing),
+            "load_feedback.smoothing_bp 必须在 1..=10000"
+        );
+        policy.smoothing_bp = smoothing;
+    }
+    if let Some(panic_bp) = cfg.panic_threshold_bp {
+        anyhow::ensure!(
+            panic_bp <= 10_000,
+            "load_feedback.panic_threshold_bp 必须在 0..=10000"
+        );
+        policy.panic_threshold_bp = panic_bp;
+    }
+    if let Some(header) = cfg.orca_header.as_deref() {
+        let header = header.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            !header.is_empty()
+                && header.len() <= 128
+                && header
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+            "load_feedback.orca_header `{header}` 非法"
+        );
+        policy.orca_header = Arc::from(header.as_str());
+    }
+    Ok(policy)
+}
+
+/// 业务作用：校验并构建会话保持策略,确保 cookie 默认带上安全属性。
+///
+/// `SameSite=None` 在现代浏览器上必须同时 `Secure`,否则 cookie 会被直接丢弃——
+/// 与其让运维在生产上排查「亲和不生效」,不如构建期拒绝该组合。
+///
+/// 参数说明：`cfg` 是可选会话保持配置。
+///
+/// 返回：合法配置返回策略；未配置返回 `None`；非法组合返回错误。
+fn build_session_affinity(
+    cfg: Option<&crate::config::model::SessionAffinityCfg>,
+) -> Result<Option<SessionAffinityPolicy>> {
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    let mode = cfg
+        .mode
+        .as_deref()
+        .unwrap_or("cookie")
+        .trim()
+        .to_ascii_lowercase();
+    let validate_name = |name: &str, what: &str| -> Result<()> {
+        anyhow::ensure!(
+            !name.is_empty()
+                && name.len() <= 128
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+            "session_affinity {what} `{name}` 必须是不超过 128 字节的字母数字/`-`/`_`"
+        );
+        Ok(())
+    };
+    let absolute_timeout_seconds = cfg.absolute_timeout_seconds.unwrap_or(0);
+    let idle_timeout_seconds = cfg.idle_timeout_seconds.unwrap_or(0);
+    let legacy_ttl_seconds = cfg.ttl_seconds.unwrap_or(0);
+    anyhow::ensure!(
+        absolute_timeout_seconds <= 31_536_000 && idle_timeout_seconds <= 31_536_000,
+        "session_affinity absolute/idle timeout 不得超过 365 天"
+    );
+    anyhow::ensure!(
+        legacy_ttl_seconds == 0 || (absolute_timeout_seconds == 0 && idle_timeout_seconds == 0),
+        "session_affinity ttl_seconds 不能与 absolute/idle timeout 同时配置"
+    );
+    match mode.as_str() {
+        "cookie" => {
+            let name = cfg
+                .name
+                .as_deref()
+                .unwrap_or("naway_affinity")
+                .trim()
+                .to_string();
+            validate_name(&name, "cookie 名")?;
+            let same_site = cfg.same_site.as_deref().unwrap_or("Lax").trim().to_string();
+            let normalized = match same_site.to_ascii_lowercase().as_str() {
+                "lax" => "Lax",
+                "strict" => "Strict",
+                "none" => "None",
+                other => {
+                    anyhow::bail!("session_affinity same_site `{other}` 仅支持 Lax/Strict/None")
+                }
+            };
+            let secure = cfg.secure.unwrap_or(true);
+            anyhow::ensure!(
+                normalized != "None" || secure,
+                "session_affinity same_site=None 必须同时 secure=true,否则浏览器会丢弃该 cookie"
+            );
+            let path = if cfg.omit_path.unwrap_or(false) {
+                anyhow::ensure!(
+                    cfg.path.is_none(),
+                    "session_affinity omit_path=true 不能同时配置 path"
+                );
+                None
+            } else {
+                let path = cfg.path.as_deref().unwrap_or("/").trim().to_string();
+                anyhow::ensure!(
+                    path.starts_with('/')
+                        && path.len() <= 256
+                        && !path.contains(|c: char| c.is_control() || c == ';'),
+                    "session_affinity path `{path}` 必须以 / 开头且不含控制字符或 `;`"
+                );
+                Some(Arc::from(path.as_str()))
+            };
+            let domain = match cfg.domain.as_deref().map(str::trim) {
+                Some(domain) if !domain.is_empty() => {
+                    anyhow::ensure!(
+                        domain.len() <= 253
+                            && domain
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')),
+                        "session_affinity domain `{domain}` 非法"
+                    );
+                    Some(Arc::from(domain))
+                }
+                _ => None,
+            };
+            let permanent = cfg.permanent_cookie.unwrap_or(false);
+            anyhow::ensure!(
+                !permanent || absolute_timeout_seconds > 0,
+                "session_affinity permanent_cookie=true 必须配置 absolute_timeout_seconds"
+            );
+            Ok(Some(SessionAffinityPolicy {
+                mode: SessionAffinityMode::Cookie {
+                    name: Arc::from(name.as_str()),
+                    ttl_seconds: legacy_ttl_seconds,
+                    permanent,
+                    path,
+                    domain,
+                    same_site: Arc::from(normalized),
+                    secure,
+                    http_only: cfg.http_only.unwrap_or(true),
+                },
+                absolute_timeout_seconds,
+                idle_timeout_seconds,
+            }))
+        }
+        "header" => {
+            anyhow::ensure!(
+                !cfg.permanent_cookie.unwrap_or(false) && cfg.ttl_seconds.unwrap_or(0) == 0,
+                "session_affinity header 模式不能配置 cookie 有效期"
+            );
+            let name = cfg
+                .name
+                .as_deref()
+                .unwrap_or("x-naway-affinity")
+                .trim()
+                .to_string();
+            validate_name(&name, "header 名")?;
+            Ok(Some(SessionAffinityPolicy {
+                mode: SessionAffinityMode::Header {
+                    name: Arc::from(name.to_ascii_lowercase().as_str()),
+                },
+                absolute_timeout_seconds,
+                idle_timeout_seconds,
+            }))
+        }
+        other => anyhow::bail!("session_affinity mode `{other}` 仅支持 cookie/header"),
+    }
+}
+
+/// 一次选择所固定的候选层:primary/backup 分层结果与被选中的最优 locality rank。
+///
+/// 抽出来是为了让「会话亲和」「一致性哈希」「常规 LB」三条路径共用**同一套**候选判定,
+/// 不出现某条路径绕过健康、排除或 locality 事实的可能。
+struct CandidateLayer {
+    use_backup: bool,
+    locality_rank: usize,
+    locality: Option<UpstreamLocalityPolicy>,
+}
+
+impl CandidateLayer {
+    /// 业务作用：在给定实例切片上确定本次选择的候选层。
+    ///
+    /// 参数说明：`instances` 是实例切片；`locality` 是可选 zone 策略；`is_excluded` 是排除谓词。
+    ///
+    /// 返回：存在任何可用候选时返回候选层,否则返回 `None`。
+    fn resolve<E: Fn(&str) -> bool>(
+        instances: &[Arc<UpstreamInstance>],
+        locality: Option<&UpstreamLocalityPolicy>,
+        is_excluded: &E,
+    ) -> Option<Self> {
+        let base = |inst: &UpstreamInstance, backup: bool| {
+            inst.is_selectable()
+                && inst.backup == backup
+                && !is_excluded(inst.uri.as_ref())
+                && (inst.health_key.as_ref() == inst.uri.as_ref()
+                    || !is_excluded(inst.health_key.as_ref()))
+        };
+        let rank = |inst: &UpstreamInstance| {
+            locality
+                .map(|policy| policy.rank(inst.zone.as_deref()))
+                .unwrap_or(Some(0))
+        };
+        // primary 存在时绝不把流量泄漏给 backup;不在允许 locality 的 primary 不能阻塞可用 backup。
+        let use_backup = !instances
+            .iter()
+            .any(|inst| base(inst.as_ref(), false) && rank(inst.as_ref()).is_some());
+        let locality_rank = instances
+            .iter()
+            .filter(|inst| base(inst.as_ref(), use_backup))
+            .filter_map(|inst| rank(inst.as_ref()))
+            .min()?;
+        Some(Self {
+            use_backup,
+            locality_rank,
+            locality: locality.cloned(),
+        })
+    }
+
+    /// 业务作用：判断一个实例是否属于本次候选层。
+    ///
+    /// 参数说明：`inst` 是待判定实例；`is_excluded` 是排除谓词。
+    ///
+    /// 返回：健康、分层与 locality 全部满足时返回 `true`。
+    fn accepts<E: Fn(&str) -> bool>(&self, inst: &UpstreamInstance, is_excluded: &E) -> bool {
+        if !inst.is_selectable() || inst.backup != self.use_backup {
+            return false;
+        }
+        if is_excluded(inst.uri.as_ref()) {
+            return false;
+        }
+        if inst.health_key.as_ref() != inst.uri.as_ref() && is_excluded(inst.health_key.as_ref()) {
+            return false;
+        }
+        self.locality
+            .as_ref()
+            .map(|policy| policy.rank(inst.zone.as_deref()))
+            .unwrap_or(Some(0))
+            == Some(self.locality_rank)
+    }
+}
+
 fn select_instance_from_slice<E, F, R>(
     instances: &[Arc<UpstreamInstance>],
     policy: LbPolicy,
@@ -1774,6 +2779,30 @@ where
             .iter()
             .find(|inst| is_candidate(inst.as_ref(), use_backup))
     };
+    // 份额 = 实例有效权重(含 slow-start) × zone 倍率(含 weighted zone 与劣化折扣)。
+    // 三个因子相乘,使「容量、健康实例数与显式权重共同决定份额」成为实际算式:
+    // 实例数通过候选个数体现,权重与 zone 倍率通过本函数体现。
+    let raw_share = |inst: &UpstreamInstance| -> u64 {
+        let zone_multiplier = locality
+            .map(|policy| policy.zone_multiplier(inst.zone.as_deref()))
+            .unwrap_or(1) as u64;
+        inst.effective_weight() as u64 * zone_multiplier.max(1)
+    };
+    // 份额按最大公约数归一。zone 倍率被放大 100 倍以表达百分比,若不归一,
+    // 权重总和会从个位数涨到上千;而 WRR 用单调游标取模,**只有游标扫完整个权重区间
+    // 才收敛到目标比例**。总和过大时,短窗口内的请求全部落在前几个槽位,低份额 zone
+    // 在几百个请求内一次都拿不到——配置看似生效,实际长期倾斜。归一后周期回到最简比例。
+    let share_divisor = {
+        let mut divisor = 0u64;
+        for inst in instances
+            .iter()
+            .filter(|inst| is_candidate(inst.as_ref(), use_backup))
+        {
+            divisor = gcd(divisor, raw_share(inst.as_ref()));
+        }
+        divisor.max(1)
+    };
+    let share_of = |inst: &UpstreamInstance| -> u64 { (raw_share(inst) / share_divisor).max(1) };
     match policy {
         LbPolicy::First => first().cloned(),
         LbPolicy::LeastConn => {
@@ -1809,7 +2838,7 @@ where
             let total_weight = instances
                 .iter()
                 .filter(|inst| is_candidate(inst.as_ref(), use_backup))
-                .map(|inst| inst.effective_weight() as u64)
+                .map(|inst| share_of(inst.as_ref()))
                 .sum::<u64>();
             if total_weight == 0 {
                 return first().cloned();
@@ -1819,7 +2848,7 @@ where
                 .iter()
                 .filter(|inst| is_candidate(inst.as_ref(), use_backup))
             {
-                let weight = inst.effective_weight() as u64;
+                let weight = share_of(inst.as_ref());
                 if slot < weight {
                     return Some(inst.clone());
                 }
@@ -1828,7 +2857,110 @@ where
             // total_weight 与同一不可变切片计算，理论上不会走到这里；保底返回首候选避免竞态假设外泄。
             first().cloned()
         }
+        LbPolicy::Random => {
+            let total_weight = instances
+                .iter()
+                .filter(|inst| is_candidate(inst.as_ref(), use_backup))
+                .map(|inst| share_of(inst.as_ref()))
+                .sum::<u64>();
+            if total_weight == 0 {
+                return first().cloned();
+            }
+            // 熵来自单调游标经雪崩混合:不引入 RNG 依赖、无锁、无全局状态,
+            // 且相邻请求不会像裸计数那样退化成严格轮转。
+            let mut slot = mix64(rr()) % total_weight;
+            for inst in instances
+                .iter()
+                .filter(|inst| is_candidate(inst.as_ref(), use_backup))
+            {
+                let weight = share_of(inst.as_ref());
+                if slot < weight {
+                    return Some(inst.clone());
+                }
+                slot -= weight;
+            }
+            first().cloned()
+        }
+        LbPolicy::WeightedLeastRequest => {
+            // power-of-two-choices:只读两个候选的在途计数,避免全候选扫描,
+            // 也避免所有 worker 同时涌向当前最空的那一个实例。
+            let count = instances
+                .iter()
+                .filter(|inst| is_candidate(inst.as_ref(), use_backup))
+                .count();
+            if count == 0 {
+                return None;
+            }
+            if count == 1 {
+                return first().cloned();
+            }
+            let entropy = mix64(rr());
+            let pick = |offset: u64| -> Option<&Arc<UpstreamInstance>> {
+                let target = (offset % count as u64) as usize;
+                instances
+                    .iter()
+                    .filter(|inst| is_candidate(inst.as_ref(), use_backup))
+                    .nth(target)
+            };
+            let first_pick = pick(entropy)?;
+            // 第二个候选强制与第一个不同:相同则退化成单点采样,失去 P2C 的抗长尾作用。
+            let second_index = 1 + (mix64(entropy) % (count as u64 - 1));
+            let second_pick = pick((entropy % count as u64 + second_index) % count as u64)?;
+            // 比较「在途请求 / 有效权重」而非裸在途数:否则高权重大实例会被误判成更忙。
+            let score = |inst: &Arc<UpstreamInstance>, load: &mut F| -> u128 {
+                // 用份额而非裸权重归一:否则高份额 zone 的实例会因为承接更多请求
+                // 被误判成更忙,weighted locality 与 P2C 组合时会互相抵消。
+                let share = share_of(inst.as_ref()).max(1) as u128;
+                (load(inst.health_key.as_ref()) as u128 + 1) * 1_000 / share
+            };
+            let mut load = load;
+            let left = score(first_pick, &mut load);
+            let right = score(second_pick, &mut load);
+            Some(if left <= right {
+                first_pick.clone()
+            } else {
+                second_pick.clone()
+            })
+        }
+        // 一致性哈希在 `select_instance_hinted` 中已优先处理;能走到这里说明本次请求
+        // 没有可用哈希键或表,按加权轮转保证可用性。
+        LbPolicy::RingHash | LbPolicy::Maglev => select_instance_from_slice(
+            instances,
+            LbPolicy::RoundRobin,
+            locality,
+            is_excluded,
+            load,
+            rr,
+        ),
     }
+}
+
+/// 业务作用：求两个份额的最大公约数,用于把加权份额约到最简比例。
+///
+/// 参数说明：`left`/`right` 是待约分的份额;`0` 视为单位元。
+///
+/// 返回：最大公约数;两者皆为 0 时返回 0。
+fn gcd(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let next = left % right;
+        left = right;
+        right = next;
+    }
+    left
+}
+
+/// 业务作用：把单调游标混合成分布良好的伪随机数,供 `random` 与 P2C 采样。
+///
+/// 使用固定的 splitmix64 终混:无外部依赖、无锁、跨节点结果可复现,便于用例断言分布。
+///
+/// 参数说明：`value` 是单调游标当前值。
+///
+/// 返回：雪崩混合后的 64 位值。
+fn mix64(value: u64) -> u64 {
+    let mut hash = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^ (hash >> 31)
 }
 
 /// 业务作用：将 Nacos SDK 实例快照转换为排序稳定、已验证且携带可信 locality 的 gateway 实例。
@@ -1938,6 +3070,25 @@ fn build_service_tls_profile(
     let Some(tls) = &svc.tls else {
         return Ok(None);
     };
+    if tls.insecure_skip_verify {
+        anyhow::ensure!(
+            tls.ca_file.is_none()
+                && tls.ca_pem.is_none()
+                && tls.subject_alt_names.is_empty()
+                && tls.client_cert_file.is_none()
+                && tls.client_key_file.is_none()
+                && tls.client_cert_pem.is_none()
+                && tls.client_key_pem.is_none()
+                && tls.spire.is_none(),
+            "service `{name}` insecure_skip_verify cannot be combined with trust or client identity material"
+        );
+        // 关闭证书认证只保留传输加密；配置构建期必须拒绝任何看似仍会生效的信任或身份材料。
+        return crate::tls::build_encryption_only_upstream_tls_profile(tls.server_name.as_deref())
+            .map(Some)
+            .with_context(|| {
+                format!("build encryption-only upstream tls profile for service `{name}`")
+            });
+    }
     let ca_file = tls
         .ca_file
         .as_ref()
@@ -1950,18 +3101,36 @@ fn build_service_tls_profile(
         .client_key_file
         .as_ref()
         .map(|path| resolve_relative(cfg_path, path));
-    build_upstream_tls_profile_with_material(
-        tls.server_name.as_deref(),
-        ca_file.as_deref(),
-        tls.ca_pem.as_deref(),
-        &tls.subject_alt_names,
-        client_cert_file.as_deref(),
-        client_key_file.as_deref(),
-        tls.client_cert_pem.as_deref(),
-        tls.client_key_pem.as_deref(),
-    )
-    .with_context(|| format!("build upstream tls profile for service `{name}`"))
-    .map(Some)
+    let mut profile = match &tls.spire {
+        Some(spire) => {
+            let source = crate::spire::build_source(spire)
+                .with_context(|| format!("build upstream SPIRE identity for service `{name}`"))?;
+            crate::tls::build_upstream_tls_profile_with_spire(
+                tls.server_name.as_deref(),
+                ca_file.as_deref(),
+                tls.ca_pem.as_deref(),
+                &tls.subject_alt_names,
+                client_cert_file.as_deref(),
+                client_key_file.as_deref(),
+                tls.client_cert_pem.as_deref(),
+                tls.client_key_pem.as_deref(),
+                source,
+            )
+        }
+        None => build_upstream_tls_profile_with_material(
+            tls.server_name.as_deref(),
+            ca_file.as_deref(),
+            tls.ca_pem.as_deref(),
+            &tls.subject_alt_names,
+            client_cert_file.as_deref(),
+            client_key_file.as_deref(),
+            tls.client_cert_pem.as_deref(),
+            tls.client_key_pem.as_deref(),
+        ),
+    }
+    .with_context(|| format!("build upstream tls profile for service `{name}`"))?;
+    profile.client_identity_not_after = tls.client_identity_not_after;
+    Ok(Some(profile))
 }
 
 fn bracket_ipv6_host(host: &str) -> String {

@@ -22,22 +22,31 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::auth::{basic_authorization_matches, constant_time_eq, escape_header_quote};
+use crate::bot::BotPolicy;
 use crate::casbin_auth::CasbinPolicy;
 use crate::config::model::{
-    BffAggregationCfg, FaultInjectionCfg, GatewayRedirectCfg, HedgeCfg, MockResponseCfg, RouteCfg,
+    BffAggregationCfg, FaultInjectionCfg, GatewayRedirectCfg, HedgeCfg, InferencePoolRouteCfg,
+    MockResponseCfg, RouteCfg,
 };
+use crate::csrf::CsrfPolicy;
 use crate::degraphql::DegraphqlPlan;
+use crate::dlp::DlpPolicy;
 use crate::dubbo::DubboPlan;
 use crate::enterprise_identity::{EnterpriseAuthPolicy, EnterpriseAuthResult};
+use crate::ext_proc::ExtProcPlan;
 use crate::external_plugin::ExternalPluginChain;
+use crate::geoip::{GeoIpCatalog, GeoIpPolicy};
 use crate::graphql::GraphqlGuardPolicy;
 use crate::http_cache::HttpCachePolicy;
 use crate::llm::LlmRoutePolicy;
 use crate::net::Cidr;
 use crate::opa::OpaPolicy;
 use crate::proxy::request_validation::RequestValidationPlan;
+use crate::proxy::response_contract::{BodyTransformPlan, ResponseContractPlan};
 use crate::static_serve::StaticServe;
+use crate::upstream_credential::UpstreamCredentialPlan;
 use crate::variable::{ValueTemplate, VariablePhase, VariablePlan};
+use crate::waf::WafPolicy;
 use crate::wasm::WasmPluginChain;
 use predicate::{parse_predicate, parse_strip_prefix, Predicate};
 
@@ -143,6 +152,8 @@ pub struct Route {
     pub(crate) hedge: Option<HedgePolicy>,
     /// 上游请求头设置规则集合。
     pub request_headers: Vec<RequestHeaderOp>,
+    /// 当前 route/backend 专属的已解析 header/query 凭据。
+    pub(crate) upstream_credentials: Option<Arc<UpstreamCredentialPlan>>,
     /// 下游响应头过滤规则集合。
     pub response_headers: Vec<ResponseHeaderOp>,
     /// V3 `sub_filter` 响应体流式替换规则。存在时仅包当前 route 的响应 body。
@@ -153,8 +164,34 @@ pub struct Route {
     pub(crate) http_cache: Option<Arc<HttpCachePolicy>>,
     /// V5 请求 OpenAPI/JSON Schema 显式慢路径；不存在时不构造 JSON、不读取 body。
     pub(crate) request_validation: Option<RequestValidationPlan>,
+    /// 请求实体声明式转换；不存在时保持原始 body 流。
+    pub(crate) request_transform: Option<Arc<BodyTransformPlan>>,
+    /// 响应实体声明式转换；不存在时保持上游或插件产生的 body。
+    pub(crate) response_transform: Option<Arc<BodyTransformPlan>>,
+    /// 最终下游响应 OpenAPI 契约；不存在时不读取或观察响应 body。
+    pub(crate) response_contract: Option<Arc<ResponseContractPlan>>,
+    /// 内置 API WAF；不存在时请求 head 与 body 都不增加扫描成本。
+    pub(crate) waf: Option<Arc<WafPolicy>>,
+    /// 本地 MMDB 驱动的客户端国家、ASN 与匿名网络策略。
+    pub(crate) geoip: Option<Arc<GeoIpPolicy>>,
+    /// 可组合行为、指纹、速率与逐请求签名复验的 Bot 策略。
+    pub(crate) bot: Option<Arc<BotPolicy>>,
+    /// 浏览器状态变更请求的来源与 token 门禁。
+    pub(crate) csrf: Option<Arc<CsrfPolicy>>,
+    /// 请求、响应与日志 path 的 PII/secret 策略。
+    pub(crate) dlp: Option<Arc<DlpPolicy>>,
     /// V7 GraphQL query depth/complexity guard；不存在时不读取或解析普通代理 body。
     pub(crate) graphql_guard: Option<GraphqlGuardPolicy>,
+    /// 双向带宽整形与成本型限额策略。
+    pub(crate) traffic_limit: Option<Arc<TrafficLimitPolicy>>,
+    /// 受控正向代理策略;None 表示该 route 不接受 CONNECT。
+    pub(crate) forward_proxy: Option<Arc<crate::forward_proxy::ForwardProxyPolicy>>,
+    /// WebTransport 真上游策略；None 表示 extended CONNECT 不会建立 session。
+    pub(crate) webtransport: Option<Arc<crate::masque::WebTransportPolicy>>,
+    /// 显式的 0-RTT 读路由计划；None 表示任何 early request 都必须返回 425。
+    pub(crate) early_data: Option<crate::masque::EarlyDataRoutePolicy>,
+    /// WebSocket 帧级治理策略;None 表示保持透明隧道。
+    pub(crate) ws_frame: Option<Arc<crate::ws_frame::FramePolicy>>,
     /// V7 REST→GraphQL 固定文档映射；不存在时普通 route 无 variables 编码成本。
     pub(crate) degraphql: Option<Arc<DegraphqlPlan>>,
     /// V7 OPA 外部授权；不存在时普通 route 不编码 policy input、不访问 decision cache。
@@ -165,6 +202,11 @@ pub struct Route {
     pub(crate) wasm_plugins: Option<Arc<WasmPluginChain>>,
     /// V7 外部 HTTP request/response header 插件链；不存在时不编码 JSON、不发子请求。
     pub(crate) external_plugins: Option<Arc<ExternalPluginChain>>,
+    /// Envoy External Processing 双向流计划；不存在时请求路径不编码 protobuf。
+    #[cfg_attr(not(feature = "ext-proc"), allow(dead_code))]
+    pub(crate) ext_proc: Option<Arc<ExtProcPlan>>,
+    /// InferencePool 的 EPP 选择门；不存在时普通 `lb://` 路由不解析 endpoint 决策。
+    pub(crate) inference_pool: Option<InferencePoolPolicy>,
     /// V7 BFF 并发只读子请求计划；终端慢路径，普通 route 为 None。
     pub(crate) bff_aggregation: Option<Arc<BffAggregationPolicy>>,
     /// V7 HTTP→Dubbo2 generic invocation；不存在时不聚合 JSON、不建立原始 TCP RPC 连接。
@@ -246,6 +288,77 @@ pub struct Route {
     pub long_stream_max_lifetime_ms: u64,
 }
 
+/// 已编译的 InferencePool 请求期选择边界。
+#[derive(Clone, Copy)]
+pub(crate) struct InferencePoolPolicy {
+    /// 单次 EPP 决策可携带的最大 endpoint 数。
+    pub(crate) max_selected_endpoints: usize,
+}
+
+impl InferencePoolPolicy {
+    /// 业务作用：把控制器生成的 InferencePool 标记与标准 ext_proc 计划绑定，确保 EPP
+    /// 决策只能在完整请求体处理后生效，并保留响应阶段的实际 endpoint 回报能力。
+    ///
+    /// 参数说明：`cfg` 是池选择预算；`route` 提供后端与 ext_proc 原始声明；`ext_proc`
+    /// 表示标准协议计划已经通过通用构建校验。
+    ///
+    /// 返回：全部协议相位和权限满足 Inference Extension 合同时返回计划，否则拒绝候选。
+    fn build(
+        cfg: &InferencePoolRouteCfg,
+        route: &RouteCfg,
+        ext_proc: Option<&Arc<ExtProcPlan>>,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "inference-gateway"))]
+        {
+            let _ = (cfg, route, ext_proc);
+            bail!("inference_pool requires the inference-gateway feature");
+        }
+        #[cfg(feature = "inference-gateway")]
+        {
+            anyhow::ensure!(
+                (1..=256).contains(&cfg.max_selected_endpoints),
+                "inference_pool.max_selected_endpoints must be within 1..=256"
+            );
+            anyhow::ensure!(
+                route.uri.starts_with("lb://"),
+                "inference_pool requires a fixed lb:// backend"
+            );
+            let raw = route
+                .ext_proc
+                .as_ref()
+                .context("inference_pool requires ext_proc")?;
+            anyhow::ensure!(
+                ext_proc.is_some(),
+                "inference_pool ext_proc plan is unavailable"
+            );
+            anyhow::ensure!(
+                raw.request_headers
+                    && raw.request_body == crate::config::model::ExtProcBodyModeCfg::Buffered
+                    && !raw.request_trailers
+                    && raw.response_headers
+                    && raw.response_body == crate::config::model::ExtProcBodyModeCfg::None
+                    && !raw.response_trailers,
+                "inference_pool requires request headers, buffered request body, response headers, and no trailer or response body processing"
+            );
+            anyhow::ensure!(
+                raw.mutation_headers
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("x-gateway-destination-endpoint")),
+                "inference_pool ext_proc must authorize x-gateway-destination-endpoint"
+            );
+            anyhow::ensure!(
+                raw.writable_metadata_namespaces
+                    .iter()
+                    .any(|namespace| namespace == "envoy.lb"),
+                "inference_pool ext_proc must authorize envoy.lb metadata"
+            );
+            Ok(Self {
+                max_selected_endpoints: cfg.max_selected_endpoints,
+            })
+        }
+    }
+}
+
 /// 构建期已验证的 hedged request 执行计划。
 #[derive(Clone, Copy)]
 pub(crate) struct HedgePolicy {
@@ -302,12 +415,12 @@ struct WeightedRouteGroup {
 }
 
 impl Router {
-    /// 从 yml 的 RouteCfg 列表构建(顺序即优先级)。
+    /// 业务作用：从 yml 路由声明构建使用默认套餐目录的有序数据面路由表。
     ///
-    /// # 参数
-    /// - `cfgs`: 配置文件中的 route 列表。
-    /// - `variables`: 已编译的变量计划,供 route URI 与 header 模板复用。
-    /// - `config_dir`: `gateway.yml` 所在目录,用于解析静态 root 相对路径。
+    /// 参数说明：`cfgs` 是 route 列表；`variables` 是已编译变量计划；`config_dir`
+    /// 是主配置目录，用于解析公开资源的相对路径。
+    ///
+    /// 返回：所有声明通过构建期门禁时返回不可变路由表，否则拒绝候选配置。
     pub fn build(
         cfgs: &[RouteCfg],
         variables: Arc<VariablePlan>,
@@ -317,17 +430,40 @@ impl Router {
         Self::build_with_usage_plans(cfgs, variables, config_dir, usage_plans)
     }
 
-    /// 使用已编译的全局套餐目录构建路由表。
+    /// 业务作用：使用已编译的全局套餐目录构建路由表，供不拥有本地 listener 拓扑的调用方复用。
     ///
     /// 套餐目录由整个配置快照共享；route 只持有不可变 `Arc`，避免在每个请求上解析
     /// plan id、复制 consumer 映射或获取配置锁。
+    ///
+    /// 参数说明：`cfgs` 是 route 列表；`variables` 是变量计划；`config_dir` 是主配置目录；
+    /// `usage_plans` 是当前快照的套餐目录。
+    ///
+    /// 返回：构建成功返回路由表；任何 route 违反协议或安全约束时返回错误。
     pub(crate) fn build_with_usage_plans(
         cfgs: &[RouteCfg],
         variables: Arc<VariablePlan>,
         config_dir: &Path,
         usage_plans: Arc<UsagePlanCatalog>,
     ) -> Result<Router> {
+        Self::build_with_usage_plans_and_self_addrs(cfgs, variables, config_dir, usage_plans, &[])
+    }
+
+    /// 业务作用：使用完整本地 listener 拓扑构建路由表，使 CONNECT route 在放宽私网访问时
+    /// 仍不能回连数据面或管理面。
+    ///
+    /// 参数说明：`cfgs` 是 route 列表；`variables` 是变量计划；`config_dir` 是主配置目录；
+    /// `usage_plans` 是套餐目录；`self_addrs` 是当前候选快照的全部本地监听地址。
+    ///
+    /// 返回：构建成功返回带自访问门禁的路由表；配置矛盾或边界非法时返回错误。
+    pub(crate) fn build_with_usage_plans_and_self_addrs(
+        cfgs: &[RouteCfg],
+        variables: Arc<VariablePlan>,
+        config_dir: &Path,
+        usage_plans: Arc<UsagePlanCatalog>,
+        self_addrs: &[std::net::SocketAddr],
+    ) -> Result<Router> {
         let mut ordered: Vec<(i32, Arc<Route>)> = Vec::with_capacity(cfgs.len());
+        let mut geoip_catalog = GeoIpCatalog::default();
         for c in cfgs {
             if c.long_stream_idle_timeout_ms
                 .is_some_and(|value| value > MAX_LONG_STREAM_DURATION_MS)
@@ -439,17 +575,57 @@ impl Router {
                 .map(GatewayRedirectPolicy::build)
                 .transpose()
                 .with_context(|| format!("route `{}` gateway_redirect", c.id))?;
+            // CONNECT route 自成一类后端:它没有固定上游,目标由请求方指定并逐次校验。
+            // 把它并进普通反代会让"方法匹配"被误当成无约束隧道,正是必须避免的建模错误。
             let terminal_backends = usize::from(!c.uri.trim().is_empty())
                 + usize::from(static_serve.is_some())
                 + usize::from(llm.is_some())
                 + usize::from(bff_aggregation.is_some())
                 + usize::from(mock_response.is_some())
-                + usize::from(gateway_redirect.is_some());
+                + usize::from(gateway_redirect.is_some())
+                + usize::from(c.forward_proxy.is_some())
+                + usize::from(c.webtransport.is_some());
             if terminal_backends != 1 {
                 bail!(
-                    "route `{}` requires exactly one of uri/serve.static/llm/bff_aggregation/mock_response/gateway_redirect",
+                    "route `{}` requires exactly one of uri/serve.static/llm/bff_aggregation/mock_response/gateway_redirect/forward_proxy/webtransport",
                     c.id
                 );
+            }
+            if c.forward_proxy.is_some() {
+                // 正向代理 route 必须显式只匹配 CONNECT。否则一条没有上游的 route
+                // 会把普通请求也吸进来,而这些请求既无后端也不该走隧道语义。
+                let connect_only = c.predicates.iter().any(|raw| {
+                    raw.trim().strip_prefix("Method=").is_some_and(|methods| {
+                        !methods.trim().is_empty()
+                            && methods
+                                .split(',')
+                                .all(|method| method.trim().eq_ignore_ascii_case("CONNECT"))
+                    })
+                });
+                if !connect_only {
+                    bail!(
+                        "route `{}` forward_proxy 必须显式声明 `Method=CONNECT` 断言",
+                        c.id
+                    );
+                }
+            }
+            if c.webtransport.is_some() {
+                // WebTransport 是 extended CONNECT 终端；显式方法门避免普通请求落到没有 HTTP
+                // response backend 的 route，也避免宽 route 绕过 session 专属治理。
+                let connect_only = c.predicates.iter().any(|raw| {
+                    raw.trim().strip_prefix("Method=").is_some_and(|methods| {
+                        !methods.trim().is_empty()
+                            && methods
+                                .split(',')
+                                .all(|method| method.trim().eq_ignore_ascii_case("CONNECT"))
+                    })
+                });
+                if !connect_only {
+                    bail!(
+                        "route `{}` webtransport 必须显式声明 `Method=CONNECT` 断言",
+                        c.id
+                    );
+                }
             }
             if grpc_edge.is_some() && (c.uri.trim().is_empty() || dubbo.is_some()) {
                 // 边缘 route 的非 edge 消息仍要正常 L7 转发到后端(§25.2 连接模型),
@@ -745,12 +921,128 @@ impl Router {
                 .map(|cfg| RequestValidationPlan::build(cfg, config_dir, c.id.as_str()))
                 .transpose()
                 .with_context(|| format!("route `{}` request_validation", c.id))?;
+            let request_transform = c
+                .request_transform
+                .as_ref()
+                .map(|cfg| BodyTransformPlan::build(cfg, c.id.as_str(), "request"))
+                .transpose()
+                .with_context(|| format!("route `{}` request_transform", c.id))?
+                .map(Arc::new);
+            let response_transform = c
+                .response_transform
+                .as_ref()
+                .map(|cfg| BodyTransformPlan::build(cfg, c.id.as_str(), "response"))
+                .transpose()
+                .with_context(|| format!("route `{}` response_transform", c.id))?
+                .map(Arc::new);
+            let response_contract = c
+                .response_contract
+                .as_ref()
+                .map(|cfg| ResponseContractPlan::build(cfg, config_dir, c.id.as_str()))
+                .transpose()
+                .with_context(|| format!("route `{}` response_contract", c.id))?
+                .map(Arc::new);
+            let waf = c
+                .waf
+                .as_ref()
+                .map(|cfg| WafPolicy::build(cfg, config_dir))
+                .transpose()
+                .with_context(|| format!("route `{}` waf", c.id))?
+                .map(Arc::new);
+            let geoip = c
+                .geoip
+                .as_ref()
+                .map(|cfg| GeoIpPolicy::build(cfg, config_dir, &mut geoip_catalog))
+                .transpose()
+                .with_context(|| format!("route `{}` geoip", c.id))?
+                .map(Arc::new);
+            let bot = c
+                .bot
+                .as_ref()
+                .map(|cfg| BotPolicy::build(cfg, config_dir))
+                .transpose()
+                .with_context(|| format!("route `{}` bot", c.id))?
+                .map(Arc::new);
+            let csrf = c
+                .csrf
+                .as_ref()
+                .map(|cfg| CsrfPolicy::build(cfg, config_dir))
+                .transpose()
+                .with_context(|| format!("route `{}` csrf", c.id))?
+                .map(Arc::new);
+            let dlp = c
+                .dlp
+                .as_ref()
+                .map(DlpPolicy::build)
+                .transpose()
+                .with_context(|| format!("route `{}` dlp", c.id))?
+                .map(Arc::new);
             let graphql_guard = c
                 .graphql_guard
                 .as_ref()
                 .map(|cfg| GraphqlGuardPolicy::build(cfg, c.id.as_str()))
                 .transpose()
                 .with_context(|| format!("route `{}` graphql_guard", c.id))?;
+            let traffic_limit = c
+                .traffic_limit
+                .as_ref()
+                .map(build_traffic_limit)
+                .transpose()
+                .with_context(|| format!("route `{}` traffic_limit", c.id))?
+                .map(Arc::new);
+            let forward_proxy = c
+                .forward_proxy
+                .as_ref()
+                .map(|cfg| -> Result<crate::forward_proxy::ForwardProxyPolicy> {
+                    let mut policy = crate::forward_proxy::ForwardProxyPolicy::build(
+                        &cfg.allowed_ports,
+                        &cfg.allowed_hosts,
+                        &cfg.allowed_cidrs,
+                        cfg.allow_private,
+                    )?;
+                    policy.idle_timeout_ms = cfg.idle_timeout_ms;
+                    policy.max_lifetime_ms = cfg.max_lifetime_ms;
+                    policy.max_bytes = cfg.max_bytes;
+                    policy.connect_timeout_ms = cfg.connect_timeout_ms;
+                    policy.set_self_addrs(self_addrs.to_vec());
+                    Ok(policy)
+                })
+                .transpose()
+                .with_context(|| format!("route `{}` forward_proxy", c.id))?
+                .map(Arc::new);
+            let webtransport = c
+                .webtransport
+                .as_ref()
+                .map(|cfg| crate::masque::WebTransportPolicy::build(cfg, config_dir))
+                .transpose()
+                .with_context(|| format!("route `{}` webtransport", c.id))?
+                .map(Arc::new);
+            let early_data = c
+                .early_data
+                .as_ref()
+                .map(crate::masque::EarlyDataRoutePolicy::build)
+                .transpose()
+                .with_context(|| format!("route `{}` early_data", c.id))?
+                .flatten();
+            let ws_frame = c
+                .ws_frame
+                .as_ref()
+                .map(|cfg| -> Result<crate::ws_frame::FramePolicy> {
+                    let policy = crate::ws_frame::FramePolicy {
+                        max_frame_bytes: cfg.max_frame_bytes,
+                        max_message_bytes: cfg.max_message_bytes,
+                        max_fragments: cfg.max_fragments,
+                        max_plugin_payload_bytes: cfg.max_plugin_payload_bytes,
+                        plugin_timeout_ms: cfg.plugin_timeout_ms,
+                        max_decompress_ratio: cfg.max_decompress_ratio,
+                        on_violation: crate::ws_frame::MessageAction::parse(&cfg.on_violation)?,
+                    };
+                    policy.validate()?;
+                    Ok(policy)
+                })
+                .transpose()
+                .with_context(|| format!("route `{}` ws_frame", c.id))?
+                .map(Arc::new);
             let degraphql = c
                 .degraphql
                 .as_ref()
@@ -789,6 +1081,27 @@ impl Router {
                 .transpose()
                 .with_context(|| format!("route `{}` external_plugins", c.id))?
                 .map(Arc::new);
+            let ext_proc = c
+                .ext_proc
+                .as_ref()
+                .map(|cfg| {
+                    ExtProcPlan::build(
+                        cfg,
+                        config_dir,
+                        c.id.as_str(),
+                        &owned_identity_headers,
+                        c.inference_pool.is_some(),
+                    )
+                })
+                .transpose()
+                .with_context(|| format!("route `{}` ext_proc", c.id))?
+                .map(Arc::new);
+            let inference_pool = c
+                .inference_pool
+                .as_ref()
+                .map(|cfg| InferencePoolPolicy::build(cfg, c, ext_proc.as_ref()))
+                .transpose()
+                .with_context(|| format!("route `{}` inference_pool", c.id))?;
             if graphql_guard.is_some()
                 && (llm.is_some()
                     || static_serve.is_some()
@@ -804,6 +1117,7 @@ impl Router {
             }
             if degraphql.is_some()
                 && (request_validation.is_some()
+                    || request_transform.is_some()
                     || http_cache.is_some()
                     || internal
                     || llm.is_some()
@@ -824,6 +1138,9 @@ impl Router {
             }
             if grpc_transcoding.is_some()
                 && (request_validation.is_some()
+                    || request_transform.is_some()
+                    || response_transform.is_some()
+                    || response_contract.is_some()
                     || graphql_guard.is_some()
                     || degraphql.is_some()
                     || http_cache.is_some()
@@ -846,6 +1163,7 @@ impl Router {
             }
             if dubbo.is_some()
                 && (request_validation.is_some()
+                    || request_transform.is_some()
                     || graphql_guard.is_some()
                     || degraphql.is_some()
                     || http_cache.is_some()
@@ -908,6 +1226,33 @@ impl Router {
                     c.id
                 );
             }
+            if ext_proc.is_some() && internal {
+                bail!(
+                    "route `{}` internal route cannot declare ext_proc because internal reroutes do not execute the public extension pipeline",
+                    c.id
+                );
+            }
+            if ext_proc.is_some() && http_cache.is_some() {
+                bail!(
+                    "route `{}` cannot combine ext_proc with public proxy_cache until processor identity and mutations participate in cache scope",
+                    c.id
+                );
+            }
+            if inference_pool.is_some()
+                && (internal
+                    || static_serve.is_some()
+                    || bff_aggregation.is_some()
+                    || mock_response.is_some()
+                    || direct_response.is_some()
+                    || llm.is_some()
+                    || !mirrors.is_empty()
+                    || hedge.is_some())
+            {
+                bail!(
+                    "route `{}` inference_pool requires one ordinary HTTP upstream without internal, terminal, mirror, hedge, or llm modes",
+                    c.id
+                );
+            }
             if opa_authorization
                 .as_ref()
                 .is_some_and(|policy| policy.requires_identity())
@@ -947,14 +1292,20 @@ impl Router {
                     c.id
                 );
             }
-            if llm.is_some() && request_validation.is_some() {
+            if llm.is_some()
+                && (request_validation.is_some()
+                    || request_transform.is_some()
+                    || response_transform.is_some()
+                    || response_contract.is_some())
+            {
                 bail!(
-                    "route `{}` llm cannot combine request_validation; the unified LLM contract already owns the bounded JSON body",
+                    "route `{}` llm cannot combine generic validation/transform/response contract; the unified LLM contract owns its body lifecycle",
                     c.id
                 );
             }
             if bff_aggregation.is_some()
                 && (request_validation.is_some()
+                    || request_transform.is_some()
                     || graphql_guard.is_some()
                     || http_cache.is_some()
                     || !mirrors.is_empty()
@@ -969,6 +1320,7 @@ impl Router {
             }
             if mock_response.is_some()
                 && (request_validation.is_some()
+                    || request_transform.is_some()
                     || graphql_guard.is_some()
                     || http_cache.is_some()
                     || !mirrors.is_empty()
@@ -1027,9 +1379,189 @@ impl Router {
                     c.id
                 );
             }
+            if http_cache.is_some() && request_transform.is_some() {
+                bail!(
+                    "route `{}` cannot combine proxy_cache with request_transform because the transformed body is not part of the public cache key",
+                    c.id
+                );
+            }
             if request_validation.is_some() && (c.long_stream_max_lifetime_ms > 0) {
                 bail!(
                     "route `{}` request_validation cannot be combined with long_stream_max_lifetime_ms; schema buffering is a finite HTTP slow path",
+                    c.id
+                );
+            }
+            if (request_transform.is_some()
+                || response_transform.is_some()
+                || response_contract.is_some())
+                && c.long_stream_max_lifetime_ms > 0
+            {
+                bail!(
+                    "route `{}` body transformation/response contract cannot combine with long_stream_max_lifetime_ms",
+                    c.id
+                );
+            }
+            if request_transform.is_some() && (!pass_request_body || internal) {
+                bail!(
+                    "route `{}` request_transform requires a public route with proxy_pass_request_body enabled",
+                    c.id
+                );
+            }
+            if (request_transform.is_some()
+                || response_transform.is_some()
+                || response_contract.is_some())
+                && (forward_proxy.is_some() || webtransport.is_some() || ws_frame.is_some())
+            {
+                bail!(
+                    "route `{}` body transformation/response contract cannot combine with CONNECT, WebTransport, or WebSocket tunnel semantics",
+                    c.id
+                );
+            }
+            if waf.is_some() && internal {
+                bail!(
+                    "route `{}` internal route cannot declare waf because internal reroutes do not execute the public security pipeline",
+                    c.id
+                );
+            }
+            if geoip.is_some() && internal {
+                bail!(
+                    "route `{}` internal route cannot declare geoip because internal reroutes do not execute the public security pipeline",
+                    c.id
+                );
+            }
+            if bot.is_some() && internal {
+                bail!(
+                    "route `{}` internal route cannot declare bot because internal reroutes do not execute the public security pipeline",
+                    c.id
+                );
+            }
+            if csrf.is_some() && internal {
+                bail!(
+                    "route `{}` internal route cannot declare csrf because internal reroutes do not execute the public security pipeline",
+                    c.id
+                );
+            }
+            if dlp.is_some() && internal {
+                bail!(
+                    "route `{}` internal route cannot declare dlp because internal reroutes do not execute the public security pipeline",
+                    c.id
+                );
+            }
+            if dlp
+                .as_ref()
+                .is_some_and(|policy| policy.inspects_request_body())
+                && (!pass_request_body || c.long_stream_max_lifetime_ms > 0)
+            {
+                bail!(
+                    "route `{}` dlp inspect_request_body cannot combine with proxy_pass_request_body=off or long_stream_max_lifetime_ms",
+                    c.id
+                );
+            }
+            if dlp
+                .as_ref()
+                .is_some_and(|policy| policy.inspects_response_body())
+                && c.long_stream_max_lifetime_ms > 0
+            {
+                bail!(
+                    "route `{}` dlp inspect_response_body cannot combine with long_stream_max_lifetime_ms",
+                    c.id
+                );
+            }
+            if dlp
+                .as_ref()
+                .is_some_and(|policy| policy.inspects_response_body())
+                && http_cache.is_some()
+            {
+                // cache fill 包装在响应治理前建立；允许该组合会把遮蔽前字节写入共享缓存，
+                // 即使每次下游发送仍再次遮蔽，也已经违反敏感数据不得持久化的不变量。
+                bail!(
+                    "route `{}` dlp inspect_response_body cannot combine with proxy_cache",
+                    c.id
+                );
+            }
+            if waf.as_ref().is_some_and(|policy| policy.inspects_body())
+                && (!pass_request_body || c.long_stream_max_lifetime_ms > 0)
+            {
+                // body WAF 必须在有限请求上独占一次有界聚合；关闭 body 转发或声明长流时继续
+                // 接受该组合，会让检查对象与真正业务语义不一致。
+                bail!(
+                    "route `{}` waf inspect_body cannot combine with proxy_pass_request_body=off or long_stream_max_lifetime_ms",
+                    c.id
+                );
+            }
+            let upstream_credentials = UpstreamCredentialPlan::build(
+                c.resolved_upstream_credentials.as_slice(),
+                config_dir,
+                request_headers.as_slice(),
+                c.id.as_str(),
+            )
+            .with_context(|| format!("route `{}` upstream credentials", c.id))?;
+            if early_data.is_some() {
+                let method_sets = predicates
+                    .iter()
+                    .filter_map(|predicate| match predicate {
+                        Predicate::Method(methods) => Some(methods.as_slice()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    method_sets.len() == 1
+                        && !method_sets[0].is_empty()
+                        && method_sets[0].iter().all(|method| matches!(
+                            *method,
+                            Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+                        )),
+                    "route `{}` early_data requires exactly one Method predicate containing only GET, HEAD, OPTIONS, or TRACE",
+                    c.id
+                );
+                anyhow::ensure!(
+                    !c.uri.trim().is_empty() && !c.uri.contains("${") && static_serve.is_none(),
+                    "route `{}` early_data requires a fixed HTTP upstream URI",
+                    c.id
+                );
+                anyhow::ensure!(
+                    !pass_request_body,
+                    "route `{}` early_data requires `proxy_pass_request_body off` so replayable bytes cannot reach the upstream",
+                    c.id
+                );
+                anyhow::ensure!(
+                    request_headers.is_empty() && upstream_credentials.is_none(),
+                    "route `{}` early_data cannot inject request headers or upstream credentials",
+                    c.id
+                );
+                anyhow::ensure!(
+                    basic_auth.is_none()
+                        && api_keys.is_empty()
+                        && hmac_auth.is_empty()
+                        && jwt_auth.is_empty()
+                        && oidc_rp.is_none()
+                        && enterprise_auth.is_empty()
+                        && ext_authz.is_empty()
+                        && opa_authorization.is_none()
+                        && casbin_authorization.is_none()
+                        && csrf.is_none(),
+                    "route `{}` early_data cannot combine with authentication, authorization, or CSRF state",
+                    c.id
+                );
+                anyhow::ensure!(
+                    request_validation.is_none()
+                        && request_transform.is_none()
+                        && response_transform.is_none()
+                        && response_contract.is_none()
+                        && graphql_guard.is_none()
+                        && degraphql.is_none()
+                        && wasm_plugins.is_none()
+                        && external_plugins.is_none()
+                        && llm.is_none()
+                        && grpc_edge.is_none()
+                        && grpc_transcoding.is_none()
+                        && dubbo.is_none()
+                        && bff_aggregation.is_none()
+                        && forward_proxy.is_none()
+                        && webtransport.is_none()
+                        && mirrors.is_empty()
+                        && cache_invalidations.is_empty(),
+                    "route `{}` early_data cannot combine with body-owning, external-call, tunnel, mirror, or write-side-effect filters",
                     c.id
                 );
             }
@@ -1069,17 +1601,28 @@ impl Router {
                     pass_request_body,
                     hedge,
                     request_headers,
+                    upstream_credentials,
                     response_headers,
                     sub_filters,
                     compression,
                     http_cache,
                     request_validation,
+                    request_transform,
+                    response_transform,
+                    response_contract,
+                    waf,
+                    geoip,
+                    bot,
+                    csrf,
+                    dlp,
                     graphql_guard,
                     degraphql,
                     opa_authorization,
                     casbin_authorization,
                     wasm_plugins,
                     external_plugins,
+                    ext_proc,
+                    inference_pool,
                     bff_aggregation,
                     dubbo,
                     mock_response,
@@ -1106,6 +1649,11 @@ impl Router {
                     limit_req,
                     limit_conn,
                     limit_rate,
+                    traffic_limit,
+                    forward_proxy,
+                    webtransport,
+                    early_data,
+                    ws_frame,
                     circuit_breakers,
                     error_pages,
                     proxy_intercept_errors,
@@ -1298,6 +1846,35 @@ impl Router {
         })
     }
 
+    /// 业务作用：汇总本 listener 下 WebTransport route 声明的最大 stream 并发预算，
+    /// 供 QUIC transport 在发布前核对底层 `MAX_STREAMS` 硬门。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：返回所有 WebTransport route 中最大的双向与单向 stream 上限；
+    /// 未配置 WebTransport 时返回 `(0, 0)`。
+    pub(crate) fn webtransport_stream_budget(&self) -> (u64, u64) {
+        self.routes
+            .iter()
+            .filter_map(|route| route.webtransport.as_ref())
+            .fold((0, 0), |(bidi, uni), policy| {
+                (
+                    bidi.max(policy.budget.max_bidi_streams),
+                    uni.max(policy.budget.max_uni_streams),
+                )
+            })
+    }
+
+    /// 业务作用：判断 listener 的路由表是否真正消费 0-RTT，供 TLS 能力声明与
+    /// route 显式授权做双向一致性校验。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：至少一条 route 含有已启用 early-data 计划时返回 `true`。
+    pub(crate) fn uses_early_data(&self) -> bool {
+        self.routes.iter().any(|route| route.early_data.is_some())
+    }
+
     /// 返回当前路由数量,主要用于健康检查和单测断言。
     pub fn len(&self) -> usize {
         self.routes.len()
@@ -1360,6 +1937,14 @@ impl Route {
         push(!self.limit_conn.is_empty(), "limit_conn");
         push(!self.circuit_breakers.is_empty(), "circuit_breaker");
         push(self.request_validation.is_some(), "request_validation");
+        push(self.request_transform.is_some(), "request_transform");
+        push(self.response_transform.is_some(), "response_transform");
+        push(self.response_contract.is_some(), "response_contract");
+        push(self.waf.is_some(), "waf");
+        push(self.geoip.is_some(), "geoip");
+        push(self.bot.is_some(), "bot");
+        push(self.csrf.is_some(), "csrf");
+        push(self.dlp.is_some(), "dlp");
         push(self.graphql_guard.is_some(), "graphql_guard");
         push(self.usage_plan.is_some(), "usage_plan");
         push(self.wasm_plugins.is_some(), "wasm");
@@ -1369,6 +1954,8 @@ impl Route {
         push(!self.mirrors.is_empty(), "mirror");
         push(self.grpc_edge.is_some(), "grpc_edge");
         push(self.grpc_transcoding.is_some(), "grpc_transcoding");
+        push(self.webtransport.is_some(), "webtransport");
+        push(self.early_data.is_some(), "early_data");
         filters
     }
 
@@ -4463,7 +5050,7 @@ impl ErrorPagePolicy {
 pub enum LimitReqKey {
     /// 所有请求共享同一桶,用于全局保护后端。
     Global,
-    /// 按 §12 计算出的真实客户端 IP 分桶。
+    /// 按可信代理链与连接元数据计算出的真实客户端 IP 分桶。
     Ip,
     /// 按当前 route id 分桶。
     Route,
@@ -4759,7 +5346,7 @@ fn parse_filter(spec: &str, variables: &VariablePlan, config_dir: &Path) -> Resu
 
 /// 解析 nginx `on|off` 风格开关指令。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串。
 /// - `cmd`: 指令名,用于截取参数和错误上下文。
 fn parse_on_off_directive(spec: &str, cmd: &str) -> Result<bool> {
@@ -5123,7 +5710,7 @@ fn parse_response_header_set(
 
 /// 解析 nginx `mirror` 基础规则。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串,如 `mirror lb://shadow` 或 `mirror uri=lb://shadow body=off`。
 fn parse_mirror(spec: &str) -> Result<MirrorPolicy> {
     let rest = filter_args(spec, "mirror").trim();
@@ -8235,4 +8822,125 @@ pub fn strip_n_segments(path: &str, n: usize) -> Cow<'_, str> {
     } else {
         Cow::Owned(format!("/{}", rest.join("/")))
     }
+}
+
+/// route 级双向带宽与成本型限额的编译产物。
+///
+/// 全部在快照构建期完成解析与校验:数据面拿到的是可直接使用的策略对象,
+/// 请求路径上不再做任何字符串解析,配置错误也不会拖到运行期才暴露。
+pub struct TrafficLimitPolicy {
+    /// 编译后策略语义指纹；热更新改变限额定义时隔离旧窗口，未变化时继续沿用账本。
+    pub state_key: u64,
+    /// 限额维度键,与 `limit_req` 共用 DSL。
+    pub key: LimitReqKey,
+    /// 请求方向带宽策略。
+    pub request_bandwidth: Option<crate::traffic_limit::BandwidthPolicy>,
+    /// 响应方向带宽策略。
+    pub response_bandwidth: Option<crate::traffic_limit::BandwidthPolicy>,
+    /// 多窗口限额策略。
+    pub quota: Option<crate::traffic_limit::QuotaPolicy>,
+    /// 成本来源。
+    pub cost_source: crate::traffic_limit::CostSource,
+    /// 计数不可用时的处置。
+    pub fail_mode: crate::traffic_limit::QuotaFailMode,
+}
+
+/// 业务作用：把 route 的 traffic_limit 配置编译成数据面策略。
+///
+/// 参数说明：
+/// - `cfg`: route 上的原始配置。
+///
+/// 返回：编译后的策略;任一取值非法时返回错误,阻止该快照生效——
+/// 带宽为 0 或 delay 队列无界这类配置一旦放行,表现分别是连接挂死和内存耗尽,
+/// 都必须在配置期拦住。
+fn build_traffic_limit(cfg: &crate::config::model::TrafficLimitCfg) -> Result<TrafficLimitPolicy> {
+    use crate::traffic_limit::{
+        BandwidthPolicy, CostSource, LimitAlgorithm, LimitWindow, OverflowAction, QuotaFailMode,
+        QuotaPolicy,
+    };
+
+    let key = parse_limit_key(&cfg.key)?;
+    let build_bandwidth = |raw: &crate::config::model::BandwidthCfg| -> Result<BandwidthPolicy> {
+        let policy = BandwidthPolicy {
+            bytes_per_second: raw.bytes_per_second,
+            burst_bytes: raw.burst_bytes,
+            after_bytes: raw.after_bytes,
+        };
+        policy.validate()?;
+        Ok(policy)
+    };
+    let request_bandwidth = cfg
+        .request_bandwidth
+        .as_ref()
+        .map(&build_bandwidth)
+        .transpose()
+        .context("traffic_limit.request_bandwidth")?;
+    let response_bandwidth = cfg
+        .response_bandwidth
+        .as_ref()
+        .map(&build_bandwidth)
+        .transpose()
+        .context("traffic_limit.response_bandwidth")?;
+
+    let mut cost_source = CostSource::PerRequest(1);
+    let quota = match cfg.quota.as_ref() {
+        None => None,
+        Some(raw) => {
+            let algorithm = LimitAlgorithm::parse(&raw.algorithm)?;
+            let overflow = match raw.overflow.trim().to_ascii_lowercase().as_str() {
+                "reject" => OverflowAction::Reject,
+                "delay" => OverflowAction::Delay {
+                    max_queue: raw.max_queue,
+                    max_wait_ms: raw.max_wait_ms,
+                },
+                other => bail!("未知 overflow 动作 `{other}`,可选 reject|delay"),
+            };
+            let windows = raw
+                .windows
+                .iter()
+                .map(|window| LimitWindow {
+                    limit: window.limit,
+                    window: Duration::from_millis(window.window_ms),
+                    burst: window.burst,
+                })
+                .collect::<Vec<_>>();
+            let policy = QuotaPolicy {
+                algorithm,
+                windows,
+                overflow,
+            };
+            policy.validate().context("traffic_limit.quota")?;
+            cost_source = match raw.cost_source.trim().to_ascii_lowercase().as_str() {
+                "per_request" => CostSource::PerRequest(raw.reserve.max(1)),
+                "response_bytes" => CostSource::ResponseBytes {
+                    reserve: raw.reserve,
+                    bytes_per_unit: raw.bytes_per_unit.max(1),
+                },
+                "grpc_messages" => CostSource::GrpcMessages {
+                    reserve: raw.reserve,
+                },
+                "graphql_cost" => bail!(
+                    "traffic_limit quota.cost_source=graphql_cost 尚无可信查询成本结算入口，不能静默按 fallback 扣费"
+                ),
+                "trusted_usage" => bail!(
+                    "traffic_limit quota.cost_source=trusted_usage 尚无绑定上游解析器的可信 usage 入口，不能接受未验证数据结算"
+                ),
+                other => bail!("未知 cost_source `{other}`"),
+            };
+            Some(policy)
+        }
+    };
+
+    // 状态键覆盖完整声明，使窗口数量相同但额度、周期或算法变化时也不会沿用旧账本。
+    // 同一配置重载得到同一键，避免借热更新反复获得一份全新额度。
+    let state_key = crate::lb_hash::stable_hash(format!("{cfg:?}").as_bytes());
+    Ok(TrafficLimitPolicy {
+        state_key,
+        key,
+        request_bandwidth,
+        response_bandwidth,
+        quota,
+        cost_source,
+        fail_mode: QuotaFailMode::parse(&cfg.fail_mode)?,
+    })
 }

@@ -1064,6 +1064,21 @@ pub(crate) struct CollectedBody {
 }
 
 impl CollectedBody {
+    /// 业务作用：用已检查或遮蔽后的同方向实体替换聚合字节，同时保留原始 trailers。
+    ///
+    /// 参数说明：`bytes` 是受资源上限保护的新实体。
+    ///
+    /// 返回：返回可由统一 buffered body 重放的聚合对象。
+    pub(crate) fn replace_bytes(mut self, bytes: Bytes) -> Self {
+        self.bytes = bytes;
+        self
+    }
+
+    /// 业务作用：判断聚合实体是否携带 trailers，供不支持 trailers 的协议转换拒绝歧义输入。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：存在至少一组 trailers 时返回 true。
     pub(crate) fn has_trailers(&self) -> bool {
         self.trailers.is_some()
     }

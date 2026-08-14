@@ -27,6 +27,10 @@ pub enum LongProto {
     GrpcStream,
     /// SSE 长响应：关闭时结束 body，客户端按 EventSource 重连语义处理。
     Sse,
+    /// CONNECT-UDP 会话：关闭时结束 extended CONNECT 控制流并撤销 DATAGRAM 映射。
+    ConnectUdp,
+    /// WebTransport session：关闭时停止新 stream/datagram 并关闭上下游 QUIC 会话。
+    WebTransport,
 }
 
 /// 一条长连接的登记项(内部)。

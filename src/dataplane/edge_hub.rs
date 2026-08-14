@@ -623,37 +623,6 @@ impl EdgeRing {
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
-
-    /// 单测专用:以给定 hub 记账构造一帧(生产路径走 fanout 内部构造)。
-    #[cfg(test)]
-    pub(crate) fn test_frame(hub: &Arc<EdgeHub>, bytes: Bytes) -> QueuedFrame {
-        let len = bytes.len();
-        hub.payload_bytes.fetch_add(len, Ordering::Relaxed);
-        QueuedFrame {
-            bytes,
-            key: None,
-            _lease: Arc::new(PayloadLease {
-                len,
-                hub: hub.clone(),
-            }),
-            _queue_ref: QueueRefGuard::try_new(hub.clone(), usize::MAX)
-                .expect("test queue-ref reservation"),
-        }
-    }
-
-    /// 单测专用：构造带显式合并键的队列帧，验证替换与预算结算不依赖 protobuf fixture。
-    #[cfg(test)]
-    pub(crate) fn test_frame_with_key(hub: &Arc<EdgeHub>, bytes: Bytes, key: Bytes) -> QueuedFrame {
-        let mut frame = Self::test_frame(hub, bytes);
-        frame.key = Some(key);
-        frame
-    }
-
-    /// 单测专用的非阻塞取帧(生产消费者一律走 `poll_pop` 以获得唤醒登记)。
-    #[cfg(test)]
-    pub(crate) fn try_pop_for_test(&self) -> Option<Result<QueuedFrame, EdgeCloseReason>> {
-        self.try_pop()
-    }
 }
 
 // ── EdgeHub:tenant 作用域订阅索引 + 基数上限 ──

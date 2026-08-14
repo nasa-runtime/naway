@@ -2306,17 +2306,25 @@ pub struct LocalReplayGuard {
     seen: Mutex<HashMap<String, Instant>>,
 }
 
+/// 单进程防重放账本的最大活跃 nonce 数；满载时必须拒绝新 nonce，
+/// 不得驱逐仍在有效期内的记录导致旧请求再次通过。
+const MAX_LOCAL_REPLAY_ENTRIES: usize = 65_536;
+
 impl LocalReplayGuard {
     fn check_and_set_sync(&self, key: &str, ttl: Duration) -> bool {
         let now = Instant::now();
         let mut seen = self.seen.lock();
-        // 表偏大时顺带清理过期项,避免无界增长(nonce TTL 短,过期即可忘)。
-        if seen.len() > 4096 {
+        // 只有过期记录可被清理；满载后若仍无空间就故障关闭，避免
+        // 通过驱逐活跃 nonce 换取可用性而重新打开重放窗口。
+        if seen.len() >= MAX_LOCAL_REPLAY_ENTRIES {
             seen.retain(|_, expiry| *expiry > now);
         }
         match seen.get(key) {
             Some(expiry) if *expiry > now => false, // 未过期且已存在 → 重放
             _ => {
+                if seen.len() >= MAX_LOCAL_REPLAY_ENTRIES {
+                    return false;
+                }
                 seen.insert(key.to_string(), now + ttl);
                 true // 首次(或旧记录已过期)→ fresh
             }

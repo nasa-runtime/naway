@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
@@ -38,6 +38,8 @@ use crate::config::GatewaySnapshot;
 use crate::config::ProxyRuntime;
 use crate::conn_registry::{CloseNotified, ConnGuard, ConnectionRegistry, LongProto};
 use crate::dubbo::{DubboError, DubboResult};
+#[cfg(feature = "ext-proc")]
+use crate::ext_proc::{ExtProcError, ExtProcPlan, ExtProcWire};
 use crate::external_plugin::{ExternalPlugin, ExternalPluginPayload};
 use crate::metrics::DubboMetric;
 use crate::opa::{OpaInputPayload, OpaPolicy};
@@ -857,6 +859,8 @@ pub(super) struct ForwardRequest<'a> {
     pub upstream_override: Option<&'a str>,
     /// V6 provider API path；设置时不继承下游 query，防客户端参数越过统一契约。
     pub path_override: Option<&'a str>,
+    /// EPP 已验证的 endpoint 子集；None 表示普通 LB 或允许的依赖故障放行。
+    pub inference_endpoints: Option<&'a InferenceEndpointSelection>,
     /// 真实客户端 IP(review L6:PROXY protocol / 可信 XFF 算出,或 socket 对端);用于 XFF/`${remote_addr}`。
     pub client_ip: IpAddr,
     /// 与 `client_ip` 已核对相等的连接级预编码值；普通直连/PROXY protocol 热路径可复用，
@@ -873,8 +877,96 @@ pub(super) struct ForwardRequest<'a> {
     pub downstream_upgrade: super::DownstreamUpgrade,
     /// WebSocket 等升级长连接的 `limit_conn` guard。普通 HTTP 响应由 proxy 外层 body 包装释放。
     pub limit_conn_guards: Vec<super::LimitConnGuard>,
+    /// Realtime 等 route 可收紧全局 WebSocket 最长寿命；None 使用 proxy 默认值。
+    pub websocket_max_lifetime_ms: Option<u64>,
+    /// Realtime 等 route 可独立收紧 WebSocket `(单帧, 单消息)` 字节门；None 沿用 route 策略。
+    pub websocket_frame_limits: Option<(u64, u64)>,
     /// 当前请求 server span；后台/内部请求可为 None，普通上游 attempt 据此建 client child。
     pub trace: Option<&'a crate::telemetry::ServerTrace>,
+}
+
+/// EPP 返回的单个 endpoint 约束；纯 IP 允许池中该 Pod 的任一声明端口。
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum InferenceEndpointTarget {
+    Ip(IpAddr),
+    Socket(std::net::SocketAddr),
+}
+
+/// 已去重、受数量硬门约束的 EPP endpoint 子集。
+pub(super) struct InferenceEndpointSelection {
+    targets: Arc<[InferenceEndpointTarget]>,
+}
+
+impl InferenceEndpointSelection {
+    /// 业务作用：严格解析 EPP 的逗号分隔目标集合，只接受 IP 或 IP:port，拒绝主机名、UDS
+    /// 和空元素，防止扩展把请求导向池目录之外。
+    ///
+    /// 参数说明：`raw` 来自授权 header 或 `envoy.lb` metadata；`max_targets` 是 route 硬门。
+    ///
+    /// 返回：至少一个唯一目标且全部语法合法时返回不可变集合，否则返回协议错误。
+    pub(super) fn parse(raw: &str, max_targets: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !raw.is_empty() && raw.len() <= 16 * 1024,
+            "EPP endpoint selection has invalid length"
+        );
+        let mut targets = Vec::new();
+        let mut unique = std::collections::HashSet::new();
+        for item in raw.split(',') {
+            let item = item.trim();
+            anyhow::ensure!(
+                !item.is_empty(),
+                "EPP endpoint selection contains an empty target"
+            );
+            let target = if let Ok(address) = item.parse::<IpAddr>() {
+                InferenceEndpointTarget::Ip(address)
+            } else if let Ok(address) = item.parse::<std::net::SocketAddr>() {
+                InferenceEndpointTarget::Socket(address)
+            } else {
+                anyhow::bail!("EPP endpoint selection must contain only IP or IP:port targets");
+            };
+            if unique.insert(target) {
+                targets.push(target);
+                anyhow::ensure!(
+                    targets.len() <= max_targets,
+                    "EPP endpoint selection exceeds route target limit"
+                );
+            }
+        }
+        anyhow::ensure!(!targets.is_empty(), "EPP endpoint selection is empty");
+        Ok(Self {
+            targets: Arc::from(targets),
+        })
+    }
+
+    /// 业务作用：把 EPP 子集与当前快照中的真实池实例求交，保证重试、健康降级和负载均衡
+    /// 都不能越出扩展授权范围。
+    ///
+    /// 参数说明：`health_key` 是候选实例 URI；InferencePool 静态实例不携带额外 TLS 身份后缀。
+    ///
+    /// 返回：候选 authority 命中任一精确 socket 或同 IP 目标时返回 true。
+    fn permits(&self, health_key: &str) -> bool {
+        let raw_uri = health_key.split('#').next().unwrap_or(health_key);
+        let Ok(uri) = raw_uri.parse::<http::Uri>() else {
+            return false;
+        };
+        let Some(authority) = uri.authority() else {
+            return false;
+        };
+        let Ok(ip) = authority.host().parse::<IpAddr>() else {
+            return false;
+        };
+        let port = authority.port_u16().or_else(|| match uri.scheme_str() {
+            Some("http") => Some(80),
+            Some("https") => Some(443),
+            _ => None,
+        });
+        self.targets.iter().any(|target| match target {
+            InferenceEndpointTarget::Ip(expected) => *expected == ip,
+            InferenceEndpointTarget::Socket(expected) => {
+                expected.ip() == ip && Some(expected.port()) == port
+            }
+        })
+    }
 }
 
 /// forward 内部统一请求体。
@@ -882,6 +974,34 @@ pub(super) struct ForwardRequest<'a> {
 /// 业务作用：把 Hyper TCP/H2 `Incoming` 与 V9 HTTP/3 request stream 擦除成同一流式 body，
 /// 让全部 route/filter/upstream 只保留一套治理管线；擦除只移动 `Bytes` frame，不聚合 payload。
 pub(crate) type ForwardBody = BoxBody;
+
+/// 业务作用：从下游 `Cookie` 头按名取值,供一致性哈希键与会话亲和令牌读取。
+///
+/// 借用式扫描:不构造 map、不分配字符串。cookie 名按 RFC 6265 大小写敏感比较——
+/// 大小写不敏感会让 `sid` 与 `SID` 互相顶替,给攻击者制造钉住实例的机会。
+///
+/// 参数说明：
+/// - `parts`: 下游请求 head。
+/// - `name`: 构建期声明的 cookie 名。
+///
+/// 返回：命中时返回借用值;缺失或非 UTF-8 时返回 `None`。
+fn request_cookie_value<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
+    for header in parts.headers.get_all(http::header::COOKIE) {
+        let Ok(header) = header.to_str() else {
+            continue;
+        };
+        for item in header.split(';') {
+            let item = item.trim();
+            let Some((key, value)) = item.split_once('=') else {
+                continue;
+            };
+            if key.trim() == name {
+                return Some(value.trim());
+            }
+        }
+    }
+    None
+}
 
 /// 单次主上游发送的不可变执行参数；收拢参数以避免 retry 调用点发生位置错配。
 struct UpstreamSendContext<'a> {
@@ -955,6 +1075,11 @@ pub(super) struct UpstreamTrace {
     pub final_upstream: Arc<str>,
     /// 本请求实际发送的上游尝试次数。
     pub attempts: usize,
+    /// 命中实例所属的逻辑服务名;直连 `http(s)://` 上游为 None(无 LB 也就无会话保持)。
+    /// 响应期据此定位服务级会话保持策略,避免为找策略再解析一次上游目标。
+    pub service: Option<Arc<str>>,
+    /// 请求带入且已通过当前服务期限门禁的会话令牌；响应期据此保留首次建立时间。
+    pub affinity: Option<crate::upstream::SessionAffinityToken>,
 }
 
 /// ext_authz 外部鉴权决策。
@@ -1034,7 +1159,7 @@ impl std::error::Error for ForwardError {}
 
 /// 把 Hyper client error 归一成稳定网关错误码。
 ///
-/// # 参数
+/// 参数说明：
 /// - `context`: 低基数调用场景，例如 `client request`/`ext_authz request`。
 /// - `error`: Hyper 返回的错误；source chain 中若含物理连接预算错误则映射 503。
 fn map_client_error(context: &'static str, error: BoxError) -> ForwardError {
@@ -1125,6 +1250,18 @@ impl super::GatewayProxy {
         let dynamic_upstream =
             ctx.upstream_override.is_none() && matches!(upstream_target, Cow::Owned(_));
         validate_upstream_target(ctx.snap, upstream_target.as_ref(), dynamic_upstream)?;
+        // 一致性哈希键与会话亲和令牌在重试链开始前算一次:多次 attempt 必须共用同一键,
+        // 否则换实例重试会把一致性哈希退化成随机选择,也会让会话在重试后漂移。
+        let lb_hints = self.lb_select_hints(
+            ctx.snap,
+            upstream_target.as_ref(),
+            &ctx.parts,
+            ctx.client_ip,
+            ctx.consumer.as_deref(),
+            &ctx.route.id,
+            ctx.request_id,
+            ctx.downstream_proto,
+        );
 
         if !ctx.route.pass_request_headers {
             ctx.parts.headers.clear();
@@ -1186,6 +1323,8 @@ impl super::GatewayProxy {
                 upstream_target.as_ref(),
                 &[],
                 &ctx.proxy.limits,
+                lb_hints,
+                ctx.inference_endpoints,
             )?;
             let uri = upstream_uri(&reservation.base, &rewritten, &query)?;
             let mut parts = prepare_attempt_parts(
@@ -1204,6 +1343,17 @@ impl super::GatewayProxy {
             let client_trace = ctx
                 .trace
                 .map(|trace| trace.begin_client(&mut parts.headers, reservation.base.as_ref(), 1));
+            let frame_policy = match ctx.websocket_frame_limits {
+                Some((max_frame_bytes, max_message_bytes)) => {
+                    // Realtime 的 API 预算必须在升级后继续生效；与 route 策略取更严格值，不能因
+                    // 进入透明隧道而绕过模型专属的 frame/message 资源门。
+                    let mut policy = ctx.route.ws_frame.as_deref().cloned().unwrap_or_default();
+                    policy.max_frame_bytes = policy.max_frame_bytes.min(max_frame_bytes);
+                    policy.max_message_bytes = policy.max_message_bytes.min(max_message_bytes);
+                    Some(Arc::new(policy))
+                }
+                None => ctx.route.ws_frame.clone(),
+            };
             return self
                 .forward_websocket(
                     parts,
@@ -1217,8 +1367,10 @@ impl super::GatewayProxy {
                     reservation,
                     limit_conn_guards,
                     ctx.proxy.timeouts.websocket_idle_timeout_ms,
-                    ctx.proxy.timeouts.websocket_max_lifetime_ms,
+                    ctx.websocket_max_lifetime_ms
+                        .unwrap_or(ctx.proxy.timeouts.websocket_max_lifetime_ms),
                     client_trace,
+                    frame_policy,
                 )
                 .await;
         }
@@ -1240,6 +1392,8 @@ impl super::GatewayProxy {
                 upstream_target.as_ref(),
                 &[],
                 &ctx.proxy.limits,
+                lb_hints,
+                ctx.inference_endpoints,
             )?;
             let primary_health_key = primary.health_key.clone();
             let secondary = self.resolve_upstream_base_excluding(
@@ -1247,6 +1401,8 @@ impl super::GatewayProxy {
                 upstream_target.as_ref(),
                 std::slice::from_ref(&primary_health_key),
                 &ctx.proxy.limits,
+                lb_hints,
+                ctx.inference_endpoints,
             );
             if let Ok(secondary) = secondary {
                 let primary_uri = upstream_uri(&primary.base, &rewritten, &query)?;
@@ -1451,6 +1607,25 @@ impl super::GatewayProxy {
             let mut attempted = Vec::new();
             let mut last_error = None;
             let mut last_response = None;
+            // 预算状态在重试链外取一次:每次 attempt 重新查表既浪费,也可能在
+            // 换代瞬间拿到不同实例,导致同一请求的重试被两份预算分别计数。
+            let retry_budget_gate = lb_service.and_then(|service| {
+                ctx.snap
+                    .upstreams
+                    .retry_budget(service)
+                    .cloned()
+                    .map(|policy| (policy, self.retry_budget_state(service)))
+            });
+            if let Some((policy, state)) = retry_budget_gate.as_ref() {
+                // 滚动请求量只统计进入该 backend 的**请求**,不含重试自身,
+                // 否则重试会抬高分母、反过来给自己放开更多预算。
+                state.record_request(policy);
+            }
+            // 反馈策略在重试链外取一次:同一请求的多次 attempt 必须用同一口径记录。
+            let retry_load_policy = lb_service
+                .and_then(|service| ctx.snap.upstreams.load_feedback(service))
+                .cloned()
+                .unwrap_or_else(crate::lb_load::LoadFeedbackPolicy::disabled);
             let max_attempts = retry_policy
                 .as_ref()
                 .map(NextUpstreamPolicy::max_attempts)
@@ -1470,6 +1645,8 @@ impl super::GatewayProxy {
                     upstream_target.as_ref(),
                     &attempted,
                     &ctx.proxy.limits,
+                    lb_hints,
+                    ctx.inference_endpoints,
                 ) {
                     Ok(reservation) => reservation,
                     Err(e) => {
@@ -1488,7 +1665,38 @@ impl super::GatewayProxy {
                 attempted.push(reservation.health_key.clone());
                 let attempt_upstream = reservation.base.clone();
                 let attempt_health_key = reservation.health_key.clone();
+                let attempt_load_entry = reservation.load_entry.clone();
                 let attempt_count = attempted.len();
+                // ★ retry budget:route 的 next_upstream 只决定「能不能重试」,
+                //   预算决定「现在还能不能再发」。第一次尝试不占预算,只有真正的
+                //   重试才申请名额;拿不到就停止重试并返回既有结果,而不是继续放大风暴。
+                let retry_permit = if attempt_count > 1 {
+                    match retry_budget_gate.as_ref() {
+                        Some((policy, state)) => match state.try_acquire(policy) {
+                            Some(permit) => Some(permit),
+                            None => {
+                                self.metrics.inc_upstream_retry_exhausted();
+                                tracing::debug!(
+                                    route = %ctx.route.id,
+                                    "retry budget exhausted, stop retrying"
+                                );
+                                if let Some(resp) = last_response {
+                                    return Ok(resp);
+                                }
+                                if let Some(err) = last_error {
+                                    return Err(err);
+                                }
+                                return Err(ForwardError::Overloaded);
+                            }
+                        },
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let admission_permit = self.acquire_admission(ctx.snap, lb_service).await?;
+                // 每次 attempt 单独计时:重试后的耗时不能算到上一个实例头上。
+                let attempt_started = std::time::Instant::now();
                 let parts = prepare_attempt_parts(
                     &ctx.parts,
                     uri,
@@ -1502,7 +1710,7 @@ impl super::GatewayProxy {
                     ctx.request_id,
                     false,
                 )?;
-                match self
+                let result = self
                     .send_upstream_request(
                         parts,
                         empty_body(),
@@ -1520,8 +1728,14 @@ impl super::GatewayProxy {
                             browser_grpc_unary_limit: ctx.proxy.limits.max_body_bytes,
                         },
                     )
-                    .await
-                {
+                    .await;
+                let elapsed = attempt_started.elapsed();
+                // 两类准入名额都只覆盖真实上游 attempt。响应头或连接错误已经给出结果后
+                // 必须立即归还；把名额带进 retry backoff 会把等待时间误算成后端并发，
+                // 在故障期反而挤掉仍可正常服务的首请求。
+                drop(admission_permit);
+                drop(retry_permit);
+                match result {
                     Ok(resp) => {
                         let should_retry = retry_policy
                             .as_ref()
@@ -1532,8 +1746,25 @@ impl super::GatewayProxy {
                         } else {
                             self.record_upstream_success(&attempt_health_key);
                         }
-                        let annotated =
-                            annotate_upstream_trace(resp, attempt_upstream.clone(), attempt_count);
+                        self.record_upstream_load(
+                            &retry_load_policy,
+                            attempt_load_entry.as_ref(),
+                            elapsed,
+                            &resp,
+                        );
+                        self.record_admission(
+                            ctx.snap,
+                            lb_service,
+                            crate::admission::AdmissionOutcome::UpstreamResponded,
+                            elapsed,
+                        );
+                        let annotated = annotate_upstream_trace(
+                            resp,
+                            attempt_upstream.clone(),
+                            attempt_count,
+                            lb_service.map(Arc::from),
+                            lb_hints.affinity,
+                        );
                         if should_retry && attempt_count < max_attempts {
                             self.metrics.inc_upstream_retry_status();
                             tracing::debug!(
@@ -1552,6 +1783,12 @@ impl super::GatewayProxy {
                     }
                     Err(e) => {
                         self.record_upstream_failure(&attempt_health_key, passive_policy);
+                        self.record_admission(
+                            ctx.snap,
+                            lb_service,
+                            crate::admission::AdmissionOutcome::UpstreamRejected,
+                            elapsed,
+                        );
                         let should_retry = retry_policy
                             .as_ref()
                             .map(|policy| should_retry_error(policy, &e))
@@ -1581,10 +1818,17 @@ impl super::GatewayProxy {
             upstream_target.as_ref(),
             &[],
             &ctx.proxy.limits,
+            lb_hints,
+            ctx.inference_endpoints,
         )?;
         let uri = upstream_uri(&reservation.base, &rewritten, &query)?;
         let attempt_upstream = reservation.base.clone();
         let attempt_health_key = reservation.health_key.clone();
+        let attempt_load_entry = reservation.load_entry.clone();
+        let attempt_load_policy = lb_service
+            .and_then(|service| ctx.snap.upstreams.load_feedback(service))
+            .cloned()
+            .unwrap_or_else(crate::lb_load::LoadFeedbackPolicy::disabled);
         // 非重试主路径只发送一次，原始 downstream Parts 在此后不再读取；直接转移所有权并
         // 原地改写，避免每请求为整张 HeaderMap 重新分配 bucket。需要多个 attempt 的上方
         // retry 分支仍显式 clone，保证各次请求 head 相互隔离。
@@ -1607,6 +1851,11 @@ impl super::GatewayProxy {
             ctx.proxy.limits.max_body_bytes,
             ctx.proxy.timeouts.stream_idle_timeout_ms,
         );
+        // 自适应并发名额必须在发出请求之前取得:过载要挡在网关,而不是传导给后端。
+        let admission_permit = self.acquire_admission(ctx.snap, lb_service).await?;
+        // 反馈用「发出请求 → 拿到响应头」的耗时,而不是整请求耗时:后者被 body 大小
+        // 与下游读取速度支配,反映的是流量特征而非后端负载。
+        let attempt_started = std::time::Instant::now();
         let result = self
             .send_upstream_request(
                 parts,
@@ -1633,10 +1882,41 @@ impl super::GatewayProxy {
                 } else {
                     self.record_upstream_success(&attempt_health_key);
                 }
-                Ok(annotate_upstream_trace(resp, attempt_upstream, 1))
+                let elapsed = attempt_started.elapsed();
+                self.record_upstream_load(
+                    &attempt_load_policy,
+                    attempt_load_entry.as_ref(),
+                    elapsed,
+                    &resp,
+                );
+                self.record_admission(
+                    ctx.snap,
+                    lb_service,
+                    crate::admission::AdmissionOutcome::UpstreamResponded,
+                    elapsed,
+                );
+                // 名额只覆盖到响应头:body 的流式传输由下游速度决定,继续占名额
+                // 会让慢客户端把上限吃光,与 minRTT 的度量口径也不一致。
+                drop(admission_permit);
+                Ok(annotate_upstream_trace(
+                    resp,
+                    attempt_upstream,
+                    1,
+                    lb_service.map(Arc::from),
+                    lb_hints.affinity,
+                ))
             }
             Err(e) => {
                 self.record_upstream_failure(&attempt_health_key, passive_policy);
+                // 上游明确失败与超时是后端事实,但不能作为延迟样本:它们的耗时由
+                // 超时配置而非后端能力决定,拿去调节并发只会得到错误的基线。
+                self.record_admission(
+                    ctx.snap,
+                    lb_service,
+                    crate::admission::AdmissionOutcome::UpstreamRejected,
+                    attempt_started.elapsed(),
+                );
+                drop(admission_permit);
                 Err(e)
             }
         }
@@ -1649,6 +1929,17 @@ impl super::GatewayProxy {
         reservation: UpstreamReservation,
         ctx: UpstreamSendContext<'_>,
     ) -> Result<Response<BoxBody>, ForwardError> {
+        if reservation
+            .tls_profile
+            .as_ref()
+            .is_some_and(|profile| !profile.allows_new_requests())
+        {
+            // 选择实例后到真正发送前仍可能跨过远程身份截止点；必须在上游 I/O 前再次复验，
+            // 不能因连接池中已有可复用 transport 就继续使用已撤权身份。
+            return Err(ForwardError::BadGateway(anyhow::anyhow!(
+                "upstream TLS client identity is no longer valid"
+            )));
+        }
         self.metrics.inc_upstream_attempt();
         // 在用户 request-header 规则之后创建 client span：传播头由网关最终盖章，避免 retry
         // 复用 server span-id。只修改几个 header，不 clone HeaderMap 或请求 body。
@@ -1773,7 +2064,9 @@ impl super::GatewayProxy {
                 } else {
                     self.record_upstream_success(health_key);
                 }
-                Ok(annotate_upstream_trace(response, upstream, attempt))
+                Ok(annotate_upstream_trace(
+                    response, upstream, attempt, None, None,
+                ))
             }
             Err(error) => {
                 self.record_upstream_failure(health_key, passive_policy);
@@ -2109,6 +2402,8 @@ impl super::GatewayProxy {
             target.upstream.as_ref(),
             &[],
             &proxy.limits,
+            crate::upstream::LbSelectHints::default(),
+            None,
         )?;
         let uri = upstream_uri(&reservation.base, target.path.as_ref(), "")?;
         let mut parts = build_ext_authz_parts(
@@ -2239,6 +2534,8 @@ impl super::GatewayProxy {
             policy.upstream.as_str(),
             &[],
             &proxy.limits,
+            crate::upstream::LbSelectHints::default(),
+            None,
         )?;
         let uri = upstream_uri(&reservation.base, policy.path.as_str(), "")?;
         let request = Request::builder()
@@ -2352,8 +2649,14 @@ impl super::GatewayProxy {
         trace: &crate::telemetry::ServerTrace,
     ) -> Result<Response<BoxBody>, ForwardError> {
         validate_upstream_target(snap, plugin.upstream(), false)?;
-        let reservation =
-            self.resolve_upstream_base_excluding(snap, plugin.upstream(), &[], &proxy.limits)?;
+        let reservation = self.resolve_upstream_base_excluding(
+            snap,
+            plugin.upstream(),
+            &[],
+            &proxy.limits,
+            crate::upstream::LbSelectHints::default(),
+            None,
+        )?;
         let uri = upstream_uri(&reservation.base, plugin.path(), "")?;
         let request = Request::builder()
             .method(http::Method::POST)
@@ -2449,6 +2752,159 @@ impl super::GatewayProxy {
         Ok(response.map(|body| reservation.wrap_body(body, 0, None)))
     }
 
+    /// 业务作用：通过普通 upstream 选择、TLS、健康与连接预算建立标准 ExternalProcessor.Process
+    /// 双向 gRPC 流，并让调用方可在 response head 到达前发送首条 `ProcessingRequest`。
+    ///
+    /// 参数说明：`snap`/`proxy`/`route` 固定当前数据面权威；`plan` 提供扩展服务和凭据；
+    /// `request_id` 与 `trace` 只用于低敏链路观测。
+    ///
+    /// 返回：建流准备成功返回可双向收发的 wire；目标、容量和请求构造失败返回 Dependency 错误。
+    #[cfg(feature = "ext-proc")]
+    pub(super) fn open_ext_proc_stream(
+        &self,
+        snap: &GatewaySnapshot,
+        proxy: &ProxyRuntime,
+        route: &Route,
+        plan: &ExtProcPlan,
+        request_id: &str,
+        trace: &crate::telemetry::ServerTrace,
+    ) -> Result<ExtProcWire, ExtProcError> {
+        validate_upstream_target(snap, plan.upstream(), false)
+            .map_err(|error| ExtProcError::dependency(anyhow::anyhow!(error.message())))?;
+        let reservation = self
+            .resolve_upstream_base_excluding(
+                snap,
+                plan.upstream(),
+                &[],
+                &proxy.limits,
+                crate::upstream::LbSelectHints::default(),
+                None,
+            )
+            .map_err(|error| ExtProcError::dependency(anyhow::anyhow!(error.message())))?;
+        if reservation.protocol == UpstreamProtocol::H3 {
+            return Err(ExtProcError::dependency(anyhow::anyhow!(
+                "ext_proc requires an HTTP/2-capable upstream"
+            )));
+        }
+        let uri = upstream_uri(&reservation.base, plan.process_path(), "")
+            .map_err(|error| ExtProcError::dependency(anyhow::anyhow!(error.message())))?;
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri(uri)
+            .version(http::Version::HTTP_2)
+            .body(())
+            .map_err(|error| {
+                ExtProcError::dependency(anyhow::anyhow!("build ext_proc gRPC request: {error}"))
+            })?;
+        let (mut parts, _) = request.into_parts();
+        if let Some(authority) = parts.uri.authority() {
+            parts.headers.insert(
+                HOST,
+                header_value(authority.as_str(), "host")
+                    .map_err(|error| ExtProcError::dependency(anyhow::anyhow!(error.message())))?,
+            );
+        }
+        parts
+            .headers
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+        parts
+            .headers
+            .insert(TE, HeaderValue::from_static("trailers"));
+        parts
+            .headers
+            .insert(ACCEPT, HeaderValue::from_static("application/grpc"));
+        if let Some(authorization) = plan.authorization() {
+            parts.headers.insert(AUTHORIZATION, authorization.clone());
+        }
+        parts.headers.insert(
+            X_REQUEST_ID,
+            header_value(request_id, "x-request-id")
+                .map_err(|error| ExtProcError::dependency(anyhow::anyhow!(error.message())))?,
+        );
+        parts.headers.insert(
+            HeaderName::from_static("x-gateway-route-id"),
+            header_value(route.id.as_str(), "x-gateway-route-id")
+                .map_err(|error| ExtProcError::dependency(anyhow::anyhow!(error.message())))?,
+        );
+        let client_trace = trace.begin_client(&mut parts.headers, reservation.base.as_ref(), 1);
+        parts.extensions.clear();
+        let (sender, body) = http_body_util::channel::Channel::<Bytes, crate::BoxError>::new(1);
+        let request = Request::from_parts(parts, body.boxed());
+        let use_h2c = reservation.protocol == UpstreamProtocol::H2c;
+        let client = (!use_h2c).then(|| self.http_client_for(&reservation, true, None));
+        let h2c_client = use_h2c.then(|| self.h2c_client_for(&reservation, None));
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let sent = if use_h2c {
+                h2c_client
+                    .expect("h2c ext_proc client prepared")
+                    .request(request)
+                    .await
+            } else {
+                client
+                    .expect("TLS ext_proc client prepared")
+                    .request(request)
+                    .await
+            };
+            let result = match sent {
+                Ok(response) => {
+                    client_trace.finish_status(response.status().as_u16());
+                    if response.status() != StatusCode::OK {
+                        Err(ExtProcError::dependency(anyhow::anyhow!(
+                            "ext_proc returned HTTP status {}",
+                            response.status()
+                        )))
+                    } else if !response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| value.starts_with("application/grpc"))
+                    {
+                        Err(ExtProcError::protocol(anyhow::anyhow!(
+                            "ext_proc returned a non-gRPC content-type"
+                        )))
+                    } else {
+                        let grpc_status = response
+                            .headers()
+                            .get("grpc-status")
+                            .map(|_| crate::ext_proc::parse_grpc_status(response.headers()))
+                            .transpose();
+                        if let Err(error) = grpc_status {
+                            Err(error)
+                        } else if grpc_status
+                            .as_ref()
+                            .expect("error handled above")
+                            .is_some_and(|status| status != 0)
+                        {
+                            Err(crate::ext_proc::classify_grpc_status(
+                                grpc_status
+                                    .expect("error handled above")
+                                    .expect("nonzero status checked above"),
+                                true,
+                            ))
+                        } else {
+                            Ok((
+                                response
+                                    .map(|body| reservation.wrap_body(body, 0, None))
+                                    .into_body(),
+                                grpc_status.expect("error handled above"),
+                            ))
+                        }
+                    }
+                }
+                Err(error) => {
+                    let mapped = map_client_error("ext_proc request", error);
+                    client_trace.finish_error(mapped.message());
+                    Err(ExtProcError::dependency(
+                        anyhow::anyhow!(mapped.to_string()),
+                    ))
+                }
+            };
+            let _ = response_tx.send(result);
+        });
+        Ok(ExtProcWire::new(sender, response_rx))
+    }
+
     /// 业务作用：使用普通 upstream 选择/预算与 Dubbo 专用有界 TCP pool 发送一次已校验的
     /// generic invocation，并把 provider 结果映射为 HTTP JSON 与低基数指标。
     ///
@@ -2473,6 +2929,8 @@ impl super::GatewayProxy {
             route.upstream.as_str(),
             &[],
             &proxy.limits,
+            crate::upstream::LbSelectHints::default(),
+            None,
         )?;
         let upstream = reservation.base.clone();
         let health_key = reservation.health_key.clone();
@@ -2539,7 +2997,7 @@ impl super::GatewayProxy {
                 )));
             }
         };
-        Ok(annotate_upstream_trace(response, upstream, 1))
+        Ok(annotate_upstream_trace(response, upstream, 1, None, None))
     }
 
     /// 业务作用：按稳定采样结果异步发送 route 镜像请求，且镜像失败不阻塞主请求响应。
@@ -2635,6 +3093,106 @@ impl super::GatewayProxy {
         }
     }
 
+    /// 业务作用：为命中采样的 LLM shadow 模型建立独立后台请求；其状态、实体和失败永不进入
+    /// 主模型 fallback 或下游响应，但保留固定模型身份与 provider 凭据。
+    ///
+    /// 参数说明：`snap`/`proxy`/`route` 提供同一不可变快照；`parts`/`body` 已按 shadow provider
+    /// 完成无损转换；`target`/`path`、网络身份、deadline 与低基数 `model_id` 都来自可信计划。
+    ///
+    /// 返回：上游计划可同步构建时启动后台任务并返回成功；目标或 request head 无效时返回错误，
+    /// 调用方只记录并继续主链路。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn spawn_llm_shadow_request(
+        &self,
+        snap: &GatewaySnapshot,
+        proxy: &ProxyRuntime,
+        route: &Route,
+        parts: Parts,
+        body: Bytes,
+        target: &str,
+        path: &str,
+        client_ip: IpAddr,
+        trusted_inbound: bool,
+        client_cert_verified: bool,
+        downstream_proto: &'static str,
+        request_id: &str,
+        trace: &crate::telemetry::ServerTrace,
+        max_duration: Duration,
+        model_id: Arc<str>,
+    ) -> Result<(), ForwardError> {
+        validate_upstream_target(snap, target, false)?;
+        let reservation = self.resolve_upstream_base_excluding(
+            snap,
+            target,
+            &[],
+            &proxy.limits,
+            crate::upstream::LbSelectHints::default(),
+            None,
+        )?;
+        let uri = upstream_uri(&reservation.base, path, "")?;
+        let downstream_version = parts.version;
+        let mut parts = prepare_attempt_parts(
+            &parts,
+            uri,
+            route,
+            reservation.protocol,
+            client_ip,
+            None,
+            trusted_inbound,
+            client_cert_verified,
+            downstream_proto,
+            request_id,
+            false,
+        )?;
+        let client_trace = trace.begin_client(&mut parts.headers, reservation.base.as_ref(), 1);
+        parts.extensions.clear();
+        let use_h2c = reservation.protocol == UpstreamProtocol::H2c;
+        #[cfg(feature = "http3")]
+        let use_h3 = reservation.protocol == UpstreamProtocol::H3;
+        #[cfg(not(feature = "http3"))]
+        let use_h3 = false;
+        let h2_request = parts.version == http::Version::HTTP_2;
+        let client =
+            (!use_h2c && !use_h3).then(|| self.http_client_for(&reservation, h2_request, None));
+        let h2c_client = use_h2c.then(|| self.h2c_client_for(&reservation, None));
+        #[cfg(feature = "http3")]
+        let h3_client = use_h3
+            .then(|| self.h3_client_for(&reservation))
+            .transpose()?;
+        let ttfb_timeout_ms = proxy
+            .timeouts
+            .upstream_ttfb_timeout_ms
+            .min(max_duration.as_millis().min(u128::from(u64::MAX)) as u64);
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                max_duration,
+                send_mirror_request(
+                    client,
+                    h2c_client,
+                    #[cfg(feature = "http3")]
+                    h3_client,
+                    parts,
+                    full_body(body),
+                    reservation,
+                    MirrorSendContext {
+                        ttfb_timeout_ms,
+                        downstream_version,
+                        client_trace: Some(client_trace),
+                    },
+                ),
+            )
+            .await;
+            match result {
+                Ok(Ok(())) => tracing::debug!(model = %model_id, "LLM shadow evaluation completed"),
+                Ok(Err(error)) => {
+                    tracing::debug!(model = %model_id, %error, "LLM shadow evaluation failed")
+                }
+                Err(_) => tracing::debug!(model = %model_id, "LLM shadow evaluation timed out"),
+            }
+        });
+        Ok(())
+    }
+
     /// 业务作用：为显式开启 body 的 mirror 准备可复用请求体，同时保持主请求获得相同字节。
     ///
     /// 参数说明：`ctx` 是当前主请求转发上下文，函数会把原始 body 替换成可复用 `Bytes` body。
@@ -2694,6 +3252,8 @@ impl super::GatewayProxy {
             mirror.target.as_str(),
             &[],
             &ctx.proxy.limits,
+            crate::upstream::LbSelectHints::default(),
+            None,
         )?;
         let uri = upstream_uri(&reservation.base, path, query)?;
         let mut parts = prepare_attempt_parts(
@@ -2752,7 +3312,7 @@ impl super::GatewayProxy {
     #[allow(clippy::too_many_arguments)]
     async fn forward_websocket(
         &self,
-        parts: Parts,
+        mut parts: Parts,
         body: ForwardBody,
         downstream_upgrade: OnUpgrade,
         downstream_connection_lease: Option<super::DownstreamConnectionLease>,
@@ -2765,9 +3325,17 @@ impl super::GatewayProxy {
         idle_timeout_ms: u64,
         max_lifetime_ms: u64,
         client_trace: Option<crate::telemetry::ClientTrace>,
+        frame_policy: Option<Arc<crate::ws_frame::FramePolicy>>,
     ) -> Result<Response<BoxBody>, ForwardError> {
         self.metrics.inc_upstream_attempt();
         let final_upstream = reservation.base.clone();
+        if frame_policy.is_some() {
+            // frame-aware 路径尚未承担 permessage-deflate 的上下文接管，握手时必须移除
+            // 扩展提议。继续协商却按明文校验会把合法压缩帧误判，跳过校验又会留下压缩炸弹入口。
+            parts
+                .headers
+                .remove(HeaderName::from_static("sec-websocket-extensions"));
+        }
         let ureq = Request::from_parts(parts, body);
         // WebSocket upgrade 固定使用 HTTP/1.1，不得因 route protocol=auto 扩大成 h2 shard 池。
         let client = self.http_client_for(&reservation, false, None);
@@ -2789,6 +3357,16 @@ impl super::GatewayProxy {
                 return Err(mapped);
             }
         };
+        if resp.status() == StatusCode::SWITCHING_PROTOCOLS
+            && frame_policy.is_some()
+            && resp
+                .headers()
+                .contains_key(HeaderName::from_static("sec-websocket-extensions"))
+        {
+            return Err(ForwardError::BadGateway(anyhow::anyhow!(
+                "upstream negotiated an unsolicited WebSocket extension"
+            )));
+        }
         if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
             let upstream_upgrade = hyper::upgrade::on(&mut resp);
             // WebSocket task 与注册表共享一份 route id；长连接生命周期内日志和关闭匹配都只
@@ -2829,7 +3407,14 @@ impl super::GatewayProxy {
                 let close = guard.closed();
                 tokio::pin!(close);
                 tokio::select! {
-                    r = io::copy_bidirectional(&mut downstream, &mut upstream) => {
+                    // 透明模式(默认)与帧级模式共用同一套 idle/lifetime/撤权治理,
+                    // 只有数据搬运方式不同:透明模式一个字节都不解析。
+                    r = govern_or_copy(
+                        &mut downstream,
+                        &mut upstream,
+                        frame_policy.as_deref(),
+                        &route_id,
+                    ) => {
                         if let Err(e) = r { tracing::debug!(route = %route_id, error = %e, "websocket tunnel closed"); }
                     }
                     // select 先取消 copy future，再写控制帧；同一 write half 不会发生帧交错。
@@ -2852,12 +3437,16 @@ impl super::GatewayProxy {
                 resp.map(|b| reservation.wrap_body(b, 0, None)),
                 final_upstream,
                 1,
+                None,
+                None,
             ));
         }
         let resp = annotate_upstream_trace(
             resp.map(|b| reservation.wrap_body(b, 0, None)),
             final_upstream,
             1,
+            None,
+            None,
         );
         Ok(super::wrap_limit_conn_response(resp, limit_conn_guards))
     }
@@ -2868,7 +3457,7 @@ impl super::GatewayProxy {
 /// 两个转发方向只 clone 这个小对象的 `Arc`。全局 clock 的值由单一后台 worker 每 10ms 更新；
 /// 同一 tick 内无论搬运多少帧，连接时间戳最多写一次，避免双向高吞吐在一个 cache line 上反复
 /// 写入。数据 buffer 不进入本对象，也不会发生帧复制。
-struct WsActivity {
+pub(super) struct WsActivity {
     /// 进程级粗粒度单调毫秒值。
     clock_ms: Arc<AtomicU64>,
     /// 本连接最近一次活动对应的 clock tick。
@@ -2876,8 +3465,12 @@ struct WsActivity {
 }
 
 impl WsActivity {
-    /// 创建连接状态；初值取当前 tick，使无数据的新隧道从升级完成时开始计算 idle。
-    fn new(clock_ms: Arc<AtomicU64>) -> Arc<Self> {
+    /// 业务作用：创建 WebSocket 连接活动状态，使无数据隧道从升级完成时开始计算 idle。
+    ///
+    /// 参数说明：`clock_ms` 是进程级粗粒度单调时钟。
+    ///
+    /// 返回：返回两个转发方向共享的活动状态。
+    pub(super) fn new(clock_ms: Arc<AtomicU64>) -> Arc<Self> {
         let initial = clock_ms.load(Ordering::Relaxed);
         Arc::new(Self {
             clock_ms,
@@ -2885,8 +3478,11 @@ impl WsActivity {
         })
     }
 
-    /// 记录当前 tick。先 load 再按需 store；一次 echo 的多次 read/write 通常落在同一个 tick，
-    /// 因而只有第一次进展写连接 cache line。Relaxed 足够：idle 只依赖最终数值，不发布其它状态。
+    /// 业务作用：记录本连接最近一次真实字节进展，供 idle 回收判断。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；同一 tick 只写一次，idle 只依赖最终数值而不发布其它状态。
     fn record(&self) {
         let now_ms = self.clock_ms.load(Ordering::Relaxed);
         if self.last_activity_ms.load(Ordering::Relaxed) != now_ms {
@@ -2899,7 +3495,7 @@ impl WsActivity {
 ///
 /// wrapper 不创建中间缓冲，也不改变 `ReadBuf`/write slice；有正字节进展时只通知共享的
 /// [`WsActivity`]，供 WS idle 监控读取。
-struct ActivityIo<T> {
+pub(super) struct ActivityIo<T> {
     /// 实际下游或上游字节流。
     inner: T,
     /// 两个方向共享的连接活动状态。
@@ -2907,25 +3503,33 @@ struct ActivityIo<T> {
 }
 
 impl<T> ActivityIo<T> {
-    /// 包装一个 IO，并接入指定隧道的共享活动时间戳。
+    /// 业务作用：包装一个 IO 并接入隧道共享活动时间戳，同时保持透明读写语义。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `inner`: 原始异步 IO；数据仍直接读写它。
     /// - `activity`: 两个方向共享的粗粒度活动时间。
     ///
     /// 返回：不分配数据缓冲的透明 IO wrapper。
-    fn new(inner: T, activity: Arc<WsActivity>) -> Self {
+    pub(super) fn new(inner: T, activity: Arc<WsActivity>) -> Self {
         Self { inner, activity }
     }
 
-    /// 记录本次确有字节进展的单调毫秒值。
+    /// 业务作用：把一次确有字节进展的读写提交到连接活动状态。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无。
     fn record_activity(&self) {
         self.activity.record();
     }
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
-    /// 原样委托读操作；仅在 `ReadBuf` 实际增长时更新活动时间。
+    /// 业务作用：透明委托读操作，并仅在 `ReadBuf` 实际增长时更新活动时间。
+    ///
+    /// 参数说明：`cx` 是异步任务上下文；`buf` 是调用方提供的读取缓冲。
+    ///
+    /// 返回：返回底层读取结果，不改变字节内容或背压。
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -2942,7 +3546,11 @@ impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
 }
 
 impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
-    /// 原样委托写操作；正字节完成时更新共享活动时间。
+    /// 业务作用：透明委托写操作，并在正字节完成时更新共享活动时间。
+    ///
+    /// 参数说明：`cx` 是异步任务上下文；`buf` 是待写字节。
+    ///
+    /// 返回：返回底层实际写入字节数或错误。
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -2956,22 +3564,38 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
         result
     }
 
-    /// flush 不代表新增字节活动，故仅透明委托。
+    /// 业务作用：透明刷新底层 IO，且不把 flush 误记为业务活动。
+    ///
+    /// 参数说明：`cx` 是异步任务上下文。
+    ///
+    /// 返回：返回底层 flush 结果。
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
 
-    /// shutdown 不计入业务活动，避免关闭过程反向延长 idle 生命周期。
+    /// 业务作用：透明关闭底层写方向，且不让关闭过程反向延长 idle 生命周期。
+    ///
+    /// 参数说明：`cx` 是异步任务上下文。
+    ///
+    /// 返回：返回底层 shutdown 结果。
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 
-    /// 保留底层 vectored-write 能力，避免 wrapper 让批量写退化。
+    /// 业务作用：暴露底层 vectored-write 能力，避免活动记录 wrapper 让批量写退化。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：底层支持 vectored write 时返回 true。
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
     }
 
-    /// vectored write 原样委托，并按实际写入字节数更新时间。
+    /// 业务作用：透明执行 vectored write，并按实际写入字节数更新时间。
+    ///
+    /// 参数说明：`cx` 是异步任务上下文；`bufs` 是待写切片集合。
+    ///
+    /// 返回：返回底层实际写入字节数或错误。
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -2986,12 +3610,14 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
     }
 }
 
-/// 等待 WS 隧道达到“任一方向都没有字节活动”的 idle 上限。
+/// 业务作用：等待 WebSocket 隧道达到双向无字节活动的 idle 上限，供连接治理安全回收。
 ///
-/// # 参数
+/// 参数说明：
 /// - `activity`: 与 `ActivityIo` 共享的粗粒度单调时钟和最近活动值。
 /// - `idle_timeout_ms`: 空闲上限；0 时永久等待，调用者通常会禁用对应 select 分支。
-async fn wait_for_ws_inactivity(activity: Arc<WsActivity>, idle_timeout_ms: u64) {
+///
+/// 返回：达到 idle 上限时返回；上限为零时永不自行完成。
+pub(super) async fn wait_for_ws_inactivity(activity: Arc<WsActivity>, idle_timeout_ms: u64) {
     if idle_timeout_ms == 0 {
         std::future::pending::<()>().await;
         return;
@@ -3069,6 +3695,16 @@ async fn send_mirror_request(
     reservation: UpstreamReservation,
     ctx: MirrorSendContext,
 ) -> Result<(), ForwardError> {
+    if reservation
+        .tls_profile
+        .as_ref()
+        .is_some_and(|profile| !profile.allows_new_requests())
+    {
+        // mirror 不是豁免业务流量；若等待后台调度期间身份到期，同样必须在 I/O 前停止。
+        return Err(ForwardError::BadGateway(anyhow::anyhow!(
+            "upstream TLS client identity is no longer valid"
+        )));
+    }
     let use_h2c = reservation.protocol == UpstreamProtocol::H2c;
     #[cfg(feature = "http3")]
     let use_h3 = reservation.protocol == UpstreamProtocol::H3;
@@ -3610,6 +4246,13 @@ fn prepare_attempt_parts_rendered(
     } else {
         uri
     };
+    if let Some(credentials) = &route.upstream_credentials {
+        // 凭据必须是发送前最后一项业务 head 变更：客户端和普通 filter 的同名值均已确定，
+        // 此处统一删除后注入，后续只允许协议级 hop-by-hop 处理，避免被再次覆盖或发往错误 backend。
+        credentials
+            .apply(&mut parts)
+            .map_err(ForwardError::BadGateway)?;
+    }
     // ★上游请求版本按【上游 protocol 配置】设(review L1):auto 时 gRPC 走 h2、普通 http 走 h1;
     //   WS 是 h1 upgrade 固定 1.1。避免把下游版本误传给 h1 上游。
     parts.version = upstream_version;
@@ -3829,16 +4472,107 @@ fn annotate_upstream_trace(
     mut resp: Response<BoxBody>,
     final_upstream: Arc<str>,
     attempts: usize,
+    service: Option<Arc<str>>,
+    affinity: Option<crate::upstream::SessionAffinityToken>,
 ) -> Response<BoxBody> {
     resp.extensions_mut().insert(UpstreamTrace {
         final_upstream,
         attempts,
+        service,
+        affinity,
     });
     resp
 }
 
-/// 构造零字节 body。
-fn empty_body() -> BoxBody {
+/// 业务作用：在响应上下发会话亲和载体,使同一会话的后续请求稳定回到同一实例。
+///
+/// 令牌由实例 URI 派生(见 [`SessionAffinityPolicy::token_for`]),**不携带任何地址信息**,
+/// 因此下发给客户端不泄漏内网拓扑。仅当服务确实配置了会话保持时才写,避免给所有响应
+/// 附加无意义的 `Set-Cookie`。
+///
+/// 参数说明：
+/// - `resp`: 即将回写下游的响应。
+/// - `snap`: 当前请求快照。
+/// - `trace`: 上游追踪信息,提供服务名与最终实例 URI。
+///
+/// 返回：无；未配置亲和或响应头值无法安全编码时保持原响应不变。
+pub(super) fn apply_session_affinity(
+    resp: &mut Response<BoxBody>,
+    snap: &GatewaySnapshot,
+    trace: &UpstreamTrace,
+) {
+    use crate::upstream::SessionAffinityMode;
+    let Some(service) = trace.service.as_deref() else {
+        return;
+    };
+    let Some(policy) = snap.upstreams.session_affinity(service) else {
+        return;
+    };
+    let now_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (token, token_state) =
+        policy.token_for(trace.final_upstream.as_ref(), trace.affinity, now_seconds);
+    match &policy.mode {
+        SessionAffinityMode::Cookie {
+            name,
+            ttl_seconds,
+            permanent: _,
+            path,
+            domain,
+            same_site,
+            secure,
+            http_only,
+        } => {
+            let mut value = format!("{name}={token}");
+            if let Some(path) = path {
+                value.push_str("; Path=");
+                value.push_str(path);
+            }
+            if let Some(domain) = domain {
+                value.push_str("; Domain=");
+                value.push_str(domain);
+            }
+            // Gateway API 持久 cookie 的剩余期限必须随绝对期限递减；原生 ttl 配置保留
+            // 既有滚动 Max-Age 语义，两者不能相互覆盖。
+            if let Some(max_age) = policy.permanent_cookie_max_age(token_state, now_seconds) {
+                value.push_str("; Max-Age=");
+                value.push_str(&max_age.to_string());
+            } else if *ttl_seconds > 0 {
+                value.push_str("; Max-Age=");
+                value.push_str(&ttl_seconds.to_string());
+            }
+            value.push_str("; SameSite=");
+            value.push_str(same_site);
+            if *secure {
+                value.push_str("; Secure");
+            }
+            if *http_only {
+                value.push_str("; HttpOnly");
+            }
+            if let Ok(header) = HeaderValue::from_str(&value) {
+                // append 而非 insert:上游或 filter 可能已下发业务 cookie,不能被亲和 cookie 顶掉。
+                resp.headers_mut().append(http::header::SET_COOKIE, header);
+            }
+        }
+        SessionAffinityMode::Header { name } => {
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(&token),
+            ) {
+                resp.headers_mut().insert(name, value);
+            }
+        }
+    }
+}
+
+/// 业务作用：构造 CONNECT 等无实体成功响应使用的零字节 body，避免伪造内容长度。
+///
+/// 参数说明：无。
+///
+/// 返回：返回立即结束且不产生 data frame 的统一 body。
+pub(super) fn empty_body() -> BoxBody {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
@@ -4091,10 +4825,19 @@ impl super::GatewayProxy {
             connect_timeout_ms: target.connect_timeout_ms,
             tls_profile: target.tls_profile.clone(),
             pool_policy,
+            load_entry: None,
             counter: None,
             pending_counter: None,
             release_on_drop: false,
         };
+        if reservation
+            .tls_profile
+            .as_ref()
+            .is_some_and(|profile| !profile.allows_new_requests())
+        {
+            // 预热也是新上游工作；身份过期时不能为旧 generation 建立或复用连接。
+            return false;
+        }
         let Ok(uri) = upstream_uri(&reservation.base, target.policy.path.as_ref(), "") else {
             return false;
         };
@@ -4172,7 +4915,7 @@ impl super::GatewayProxy {
     /// cache key 包含 profile 指纹与池参数：reload 改证书或预算会建立新池；旧请求持有的 client clone
     /// 继续 drain，cache 仅在超过 `old_pool_retain_ms` 后移除旧 handle，不会中断在途 body。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `reservation`: 本次已选中的实例预留，携带 TLS profile 与当前 proxy 的池预算。
     ///
     /// 返回：可直接发送本次请求的 Hyper client handle。
@@ -4274,7 +5017,7 @@ impl super::GatewayProxy {
 
     /// 获取一个跨 HTTP client generation 共享的物理连接预算。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `reservation`: 已选实例；完整 health_key + protocol 构成预算身份。
     fn physical_connection_budget_for(
         &self,
@@ -4365,7 +5108,7 @@ impl super::GatewayProxy {
 
     /// 获取匹配当前池参数的 h2c prior-knowledge client。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `reservation`: 本次实例预留；h2c 不使用 TLS profile，但复用其中的池预算与旧池保留期。
     ///
     /// 返回：已强制 `http2_only` 的 Hyper client，保证不会静默退化成 HTTP/1.1。
@@ -4469,13 +5212,221 @@ impl super::GatewayProxy {
         client
     }
 
+    /// 业务作用：为一次上游请求取得自适应并发名额,必要时在有界队列中短暂等待。
+    ///
+    /// 名额覆盖「发出请求 → 拿到响应头」这一段,与 minRTT 的度量口径一致;响应 body
+    /// 的流式传输不占名额,否则慢客户端会把上限吃光。**队列必须有界且有 deadline**:
+    /// 无界等待只是把过载从 503 变成超时,对下游更糟。
+    ///
+    /// 参数说明：
+    /// - `snap`: 当前请求快照。
+    /// - `service`: `lb://` 逻辑服务名;直连上游不参与自适应并发。
+    ///
+    /// 返回：取得名额返回 RAII 令牌;并发与队列都满时返回 `Overloaded`(503)。
+    async fn acquire_admission(
+        &self,
+        snap: &GatewaySnapshot,
+        service: Option<&str>,
+    ) -> Result<Option<crate::admission::ConcurrencyPermit>, ForwardError> {
+        let Some(service) = service else {
+            return Ok(None);
+        };
+        let Some(policy) = snap.upstreams.adaptive_concurrency(service).cloned() else {
+            return Ok(None);
+        };
+        let state = self.admission_state(service, &policy);
+        if let Some(permit) = state.try_acquire() {
+            return Ok(Some(permit));
+        }
+        // 并发已满:只有显式配置了队列才等待,且必须先占到有界队列位,
+        // 否则等待本身就是一条无界资源。
+        let Some(_slot) = state.try_enqueue(&policy) else {
+            self.metrics.inc_upstream_overloaded();
+            return Err(ForwardError::Overloaded);
+        };
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(policy.queue_deadline_ms);
+        loop {
+            if let Some(permit) = state.try_acquire() {
+                return Ok(Some(permit));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.metrics.inc_upstream_overloaded();
+                return Err(ForwardError::Overloaded);
+            }
+            // 轮询间隔取队列 deadline 的一小段:既不空转烧 CPU,也保证在 deadline 内
+            // 有足够次数的重试机会。名额释放是 Drop 触发的,没有可等待的唤醒点。
+            tokio::time::sleep(Duration::from_millis(
+                (policy.queue_deadline_ms / 10).max(1),
+            ))
+            .await;
+        }
+    }
+
+    /// 业务作用：把一次上游结果并入自适应并发的采样,并推进上限调节。
+    ///
+    /// 参数说明：`snap`/`service` 定位策略与状态;`outcome` 是结果分类;`rtt` 是响应头耗时。
+    ///
+    /// 返回：无；未配置自适应并发的服务不产生运行态写入。
+    fn record_admission(
+        &self,
+        snap: &GatewaySnapshot,
+        service: Option<&str>,
+        outcome: crate::admission::AdmissionOutcome,
+        rtt: Duration,
+    ) {
+        let Some(service) = service else {
+            return;
+        };
+        let Some(policy) = snap.upstreams.adaptive_concurrency(service) else {
+            return;
+        };
+        let state = self.admission_state(service, policy);
+        state.record(policy, outcome, rtt.as_micros() as u64);
+    }
+
+    /// 业务作用：把一次真实上游响应并入该实例的负载反馈。
+    ///
+    /// **只在反馈开启时做任何事**:关闭时不读响应头、不建条目、不写原子,保持零开销。
+    /// 反馈句柄在实例被选中时固定。目录换代会从权威表撤下旧句柄；旧请求即使迟到也只
+    /// 能更新自己持有的旧对象，不能按同名 key 重建条目或污染新目录。
+    ///
+    /// 参数说明：
+    /// - `policy`: 服务级反馈策略。
+    /// - `entry`: 选择实例时固定的反馈句柄；表已满或反馈关闭时为空。
+    /// - `elapsed`: 从发出上游请求到拿到响应头的耗时。
+    /// - `resp`: 上游响应,用于读取 ORCA 报告头。
+    ///
+    /// 返回：无；反馈关闭、条目缺失或报告非法时不更新调度状态。
+    fn record_upstream_load(
+        &self,
+        policy: &crate::lb_load::LoadFeedbackPolicy,
+        entry: Option<&Arc<crate::lb_load::InstanceLoad>>,
+        elapsed: Duration,
+        resp: &Response<BoxBody>,
+    ) {
+        use crate::lb_load::LoadFeedback;
+        if !policy.enabled() {
+            return;
+        }
+        let Some(entry) = entry else {
+            return;
+        };
+        match policy.feedback {
+            LoadFeedback::None => {}
+            LoadFeedback::LatencyEwma => {
+                entry.record_latency(elapsed.as_micros() as u64, policy.smoothing_bp);
+            }
+            LoadFeedback::Utilization => {
+                // 后端未上报、上报越界或格式非法时不写入任何值:该实例保持"无反馈",
+                // 由 panic 判定与中性基线接管,而不是被当成极空闲或极繁忙。
+                if let Some(utilization) = resp
+                    .headers()
+                    .get(policy.orca_header.as_ref())
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(crate::lb_load::parse_orca_utilization)
+                {
+                    entry.record_utilization(utilization, policy.smoothing_bp);
+                }
+            }
+        }
+    }
+
+    /// 业务作用：按服务声明的受控来源计算一致性哈希键与会话亲和令牌。
+    ///
+    /// 两者都在**整条重试链开始前算一次**:同一请求的多次 attempt 必须使用同一哈希键,
+    /// 否则换实例重试会把一致性哈希变成随机选择。缺键时返回空提示,选择完全退回常规 LB,
+    /// 不因缺键拒绝服务。
+    ///
+    /// 参数说明：
+    /// - `snap`: 当前请求固定的配置快照。
+    /// - `upstream_target`: 渲染后的上游目标;非 `lb://` 直连没有 LB 概念。
+    /// - `parts`: 下游请求 head,用于读取 allowlist 内的 header/cookie。
+    /// - `client_ip`: 经可信代理链与连接元数据判定的真实客户端 IP。
+    /// - `consumer`: 已验证 consumer 身份;未认证时为 None。
+    /// - `route_id`/`request_id`/`downstream_proto`: 变量来源求值所需的上下文。
+    ///
+    /// 返回：本次请求的哈希键与亲和令牌;来源缺失时对应字段为 `None`。
+    #[allow(clippy::too_many_arguments)]
+    fn lb_select_hints(
+        &self,
+        snap: &GatewaySnapshot,
+        upstream_target: &str,
+        parts: &Parts,
+        client_ip: IpAddr,
+        consumer: Option<&str>,
+        route_id: &str,
+        request_id: &str,
+        downstream_proto: &'static str,
+    ) -> crate::upstream::LbSelectHints {
+        use crate::upstream::{LbHashSource, SessionAffinityMode};
+        let mut hints = crate::upstream::LbSelectHints::default();
+        let Some(service) = upstream_target.strip_prefix("lb://") else {
+            return hints;
+        };
+        if let Some(source) = snap.upstreams.hash_source(service) {
+            let owned;
+            let value: Option<&str> = match source {
+                LbHashSource::Consumer => consumer,
+                LbHashSource::Header(name) => parts
+                    .headers
+                    .get(name.as_ref())
+                    .and_then(|value| value.to_str().ok()),
+                LbHashSource::Cookie(name) => request_cookie_value(parts, name.as_ref()),
+                LbHashSource::RemoteAddr => {
+                    owned = client_ip.to_string();
+                    Some(owned.as_str())
+                }
+                LbHashSource::Variable(name) => {
+                    let eval_ctx = crate::variable::EvalContext {
+                        parts,
+                        client_ip,
+                        downstream_proto,
+                        request_id,
+                        route_id,
+                        response_status: None,
+                    };
+                    match snap.variables.eval_named(name.as_ref(), &eval_ctx) {
+                        Some(value) if !value.is_empty() => {
+                            owned = value;
+                            Some(owned.as_str())
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            // 空值等同于缺键:把空串也算成合法键会让所有匿名请求钉到同一个实例。
+            hints.hash = value
+                .filter(|value| !value.is_empty())
+                .map(|value| crate::lb_hash::stable_hash(value.as_bytes()));
+        }
+        if let Some(policy) = snap.upstreams.session_affinity(service) {
+            let raw = match &policy.mode {
+                SessionAffinityMode::Cookie { name, .. } => {
+                    request_cookie_value(parts, name.as_ref())
+                }
+                SessionAffinityMode::Header { name } => parts
+                    .headers
+                    .get(name.as_ref())
+                    .and_then(|value| value.to_str().ok()),
+            };
+            let now_seconds = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            hints.affinity = raw.and_then(|raw| policy.parse_token(raw, now_seconds));
+        }
+        hints
+    }
+
     /// 解析直连或 `lb://service` 上游、执行健康/LB 选择，并同时占用 least_conn 与过载预算。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `snap`: 当前请求固定持有的配置快照；整个重试链不得跨版本读取新快照。
     /// - `upstream`: route 渲染后的上游目标，允许静态 http(s) URI 或已声明的 `lb://service`。
     /// - `excluded`: 当前重试链已经尝试的完整 `health_key`，避免再次命中同一逻辑实例。
     /// - `limits`: 当前 proxy 的资源预算；pending 与连接池参数都随本次预留固化。
+    /// - `inference_endpoints`: EPP 已批准的当前池子集；存在时所有选择与重试都不得越界。
     ///
     /// 返回：成功时给出 RAII `UpstreamReservation`；无健康实例或预算满时返回 503 类错误。
     fn resolve_upstream_base_excluding(
@@ -4484,25 +5435,46 @@ impl super::GatewayProxy {
         upstream: &str,
         excluded: &[Arc<str>],
         limits: &crate::config::model::ServerLimitsCfg,
+        hints: crate::upstream::LbSelectHints,
+        inference_endpoints: Option<&InferenceEndpointSelection>,
     ) -> Result<UpstreamReservation, ForwardError> {
         if let Some(service) = upstream.strip_prefix("lb://") {
             let passive_policy = snap
                 .upstreams
                 .passive_health_policy(service)
                 .unwrap_or_else(PassiveHealthPolicy::disabled);
-            // ★主动健康探测(§5.1):被后台探测判为不健康的实例也排除,与被动摘除叠加成双保险。
+            // 被后台探测判为不健康的实例也要排除，与被动摘除叠加后才能避免继续选择已失效目标。
             // 这里直接持有 Arc<HashSet> 迭代,不把整份主动不健康集合克隆进 Vec,保持请求热路径少分配。
             let passive_excluded = self.ejected_upstreams(passive_policy);
             let active_unhealthy = self.active_health.unhealthy_set();
+            // 反馈基线与 panic 判定每请求算一次:选择内部的比较闭包必须看到一致口径,
+            // 中途切换会让同一次 P2C 的两个候选用不同量纲比较。
+            let load_policy = snap
+                .upstreams
+                .load_feedback(service)
+                .cloned()
+                .unwrap_or_else(crate::lb_load::LoadFeedbackPolicy::disabled);
+            let load_now_ms = crate::lb_load::monotonic_ms();
+            let load_baseline = load_policy
+                .enabled()
+                .then(|| {
+                    snap.upstreams
+                        .load_feedback_baseline(service, |health_key| {
+                            self.upstream_load_score(health_key, &load_policy, load_now_ms)
+                        })
+                })
+                .flatten();
             let has_attempted = !excluded.is_empty();
             let has_passive_excluded = !passive_excluded.is_empty();
             let has_active_unhealthy = !active_unhealthy.is_empty();
+            let has_inference_subset = inference_endpoints.is_some();
             // least_conn 计数放在 DashMap entry 的 AtomicU64 中：不同 hash shard 可并行，命中
             // 同一实例也只拿共享读 guard。选择仍是并发近似快照；最终 reserve 在 Arc 原子上完成。
             let inst = snap
                 .upstreams
-                .select_instance_where(
+                .select_instance_hinted(
                     service,
+                    hints,
                     |health_key| {
                         // 重试/被动摘除集合通常很短，直接借用扫描比每请求合并 HashSet 更省分配；
                         // 主动健康集合本身已是快照 HashSet，保持 O(1) 查询。三个 `has_*`
@@ -4514,8 +5486,20 @@ impl super::GatewayProxy {
                                     .iter()
                                     .any(|excluded| excluded == health_key))
                             || (has_active_unhealthy && active_unhealthy.contains(health_key))
+                            || (has_inference_subset
+                                && !inference_endpoints
+                                    .expect("subset presence was checked")
+                                    .permits(health_key))
                     },
                     |health_key| {
+                        // 反馈可用时整服务统一用反馈分数比较;不可用(未配置/样本不足/
+                        // 过期/低于 panic 阈值)时统一回退在途请求数。两种口径**绝不混用**,
+                        // 否则「微秒」与「计数」会被当成同一量纲比较,得出完全错误的择优。
+                        if let Some(baseline) = load_baseline {
+                            return self
+                                .upstream_load_score(health_key, &load_policy, load_now_ms)
+                                .unwrap_or(baseline);
+                        }
                         self.upstream_inflight
                             .get(health_key)
                             .map(|counter| counter.load(Ordering::Relaxed))
@@ -4529,6 +5513,12 @@ impl super::GatewayProxy {
             let protocol = inst.protocol;
             let connect_timeout_ms = inst.connect_timeout_ms;
             let tls_profile = inst.tls_profile.clone();
+            // 反馈句柄必须在目录仍权威时固定。响应阶段按 key 重新查询会让旧代迟到响应
+            // 在对账删除后重新创建同名条目，破坏目录换代隔离。
+            let load_entry = load_policy
+                .enabled()
+                .then(|| self.upstream_load_entry(&health_key))
+                .flatten();
             // 只有 least_conn 会读取 in-flight；RR/first 为每请求维护一份永不读取的计数既增加
             // DashMap 查找，也让所有响应 body 在同一 atomic 上增减。单候选 least_conn 在选择时
             // 虽不读 load，仍维护计数，以便热更加入第二个实例后立即获得真实基线。
@@ -4555,6 +5545,7 @@ impl super::GatewayProxy {
                     connect_timeout_ms,
                     tls_profile,
                     pool_policy: HttpPoolPolicy::from_limits(limits),
+                    load_entry,
                     counter,
                     pending_counter: None,
                     release_on_drop: true,
@@ -4571,6 +5562,7 @@ impl super::GatewayProxy {
                 connect_timeout_ms: 0,
                 tls_profile: None,
                 pool_policy: HttpPoolPolicy::from_limits(limits),
+                load_entry: None,
                 counter: None,
                 pending_counter: None,
                 release_on_drop: false,
@@ -4592,6 +5584,16 @@ impl super::GatewayProxy {
         mut reservation: UpstreamReservation,
         limit: usize,
     ) -> Result<UpstreamReservation, ForwardError> {
+        if reservation
+            .tls_profile
+            .as_ref()
+            .is_some_and(|profile| !profile.allows_new_requests())
+        {
+            // 在计入 pending 或建立 client 前关闭过期远程身份，避免无效请求占用容量或触发拨号。
+            return Err(ForwardError::BadGateway(anyhow::anyhow!(
+                "upstream TLS client identity is no longer valid"
+            )));
+        }
         if limit == 0 {
             return Ok(reservation);
         }
@@ -5044,6 +6046,8 @@ struct UpstreamReservation {
     tls_profile: Option<UpstreamTlsProfile>,
     /// 当前 proxy 快照给出的连接池预算；进入 cache key，reload 改参数会创建新池并延迟淘汰旧池。
     pool_policy: HttpPoolPolicy,
+    /// 实例被选中时固定的反馈句柄；目录换代后旧响应只更新脱离权威表的旧对象。
+    load_entry: Option<Arc<crate::lb_load::InstanceLoad>>,
     /// least_conn 在途计数器；直连 URI 不参与服务级 LB，故为空。
     counter: Option<Arc<AtomicU64>>,
     /// §23 每实例在途请求预算计数器。
@@ -5737,4 +6741,236 @@ fn sanitize_te(parts: &mut Parts) {
 fn header_value(value: &str, name: &str) -> Result<HeaderValue, ForwardError> {
     HeaderValue::from_str(value)
         .map_err(|e| ForwardError::BadGateway(anyhow::anyhow!("invalid {name} header: {e}")))
+}
+
+/// 为隧道施加**总字节预算**的 IO 装饰器。
+///
+/// 预算必须在搬运过程中生效,不能等隧道结束再统计:事后统计只能用于计费,
+/// 挡不住一条隧道把出口带宽吃干。两个方向共享同一计数器,因此 `max_bytes`
+/// 表示的是这条隧道的**总量**,而不是每个方向各一份。
+pub(super) struct BudgetIo<T> {
+    /// 原始下游或上游字节流。
+    inner: T,
+    /// 两个方向共享的累计实际搬运字节数。
+    counter: Arc<AtomicU64>,
+    /// 隧道总字节预算；0 表示不限制。
+    limit: u64,
+}
+
+impl<T> BudgetIo<T> {
+    /// 业务作用：包装一个隧道方向并接入共享字节预算。
+    ///
+    /// 参数说明：
+    /// - `inner`: 原始字节流。
+    /// - `counter`: 两个方向共享的已用字节计数。
+    /// - `limit`: 总预算;0 表示不限制。
+    ///
+    /// 返回：透明 IO wrapper,不引入额外缓冲。
+    pub(super) fn new(inner: T, counter: Arc<AtomicU64>, limit: u64) -> Self {
+        Self {
+            inner,
+            counter,
+            limit,
+        }
+    }
+
+    /// 业务作用：为隧道实际搬运字节记账，并在总预算耗尽时终止继续传输。
+    ///
+    /// 参数说明：`bytes` 是本次底层 IO 已实际完成的字节数。
+    ///
+    /// 返回：预算内返回成功；累计值超过上限时返回 IO 错误。
+    fn charge(&self, bytes: usize) -> std::io::Result<()> {
+        if self.limit == 0 || bytes == 0 {
+            return Ok(());
+        }
+        let used = self
+            .counter
+            .fetch_add(bytes as u64, Ordering::Relaxed)
+            .saturating_add(bytes as u64);
+        if used > self.limit {
+            return Err(std::io::Error::other("tunnel byte budget exhausted"));
+        }
+        Ok(())
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for BudgetIo<T> {
+    /// 业务作用：透明读取隧道字节，并按真实读取量执行共享总预算门禁。
+    ///
+    /// 参数说明：`cx` 是异步任务上下文；`buf` 是下游提供的读取缓冲。
+    ///
+    /// 返回：返回底层读取结果；读后超预算时返回错误终止隧道。
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result {
+            let read = buf.filled().len().saturating_sub(before);
+            if let Err(error) = self.charge(read) {
+                return Poll::Ready(Err(error));
+            }
+        }
+        result
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for BudgetIo<T> {
+    /// 业务作用：透明写入隧道字节，并按真实写入量执行共享总预算门禁。
+    ///
+    /// 参数说明：`cx` 是异步任务上下文；`buf` 是待写字节。
+    ///
+    /// 返回：返回底层写入结果；写后超预算时返回错误终止隧道。
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = &result {
+            if let Err(error) = self.charge(*written) {
+                return Poll::Ready(Err(error));
+            }
+        }
+        result
+    }
+
+    /// 业务作用：透明刷新隧道写缓冲，且不对未产生的新字节重复计费。
+    ///
+    /// 参数说明：`cx` 是异步任务上下文。
+    ///
+    /// 返回：返回底层 flush 结果。
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    /// 业务作用：透明关闭隧道写方向，保持半关闭语义且不重复计费。
+    ///
+    /// 参数说明：`cx` 是异步任务上下文。
+    ///
+    /// 返回：返回底层 shutdown 结果。
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// 业务作用：按 route 是否开启帧级治理,选择透明搬运或 frame-aware 转发。
+///
+/// 透明模式仍然走 `copy_bidirectional`,**不引入任何解析或聚合**——帧级治理的开销
+/// 只能落在显式开启它的 route 上,否则等于让所有 WebSocket 连接为一个可选功能买单。
+///
+/// 参数说明：
+/// - `downstream`: 下游连接。
+/// - `upstream`: 上游连接。
+/// - `policy`: 帧级策略;`None` 表示透明模式。
+/// - `route_id`: 日志用路由标识。
+///
+/// 返回：隧道结束时返回 `Ok`;IO 错误上抛。帧级违规不作为错误返回,
+/// 而是记录原因后正常收尾,由 close 帧把语义传达给对端。
+async fn govern_or_copy<D, U>(
+    downstream: &mut D,
+    upstream: &mut U,
+    policy: Option<&crate::ws_frame::FramePolicy>,
+    route_id: &str,
+) -> std::io::Result<()>
+where
+    D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Some(policy) = policy else {
+        io::copy_bidirectional(downstream, upstream).await?;
+        return Ok(());
+    };
+    let (down_read, mut down_write) = tokio::io::split(downstream);
+    let (up_read, mut up_write) = tokio::io::split(upstream);
+    let stats = crate::ws_frame::FrameStats::default();
+    // 两个方向各自独立治理:客户端方向要求掩码,服务端方向要求无掩码,
+    // 用同一份状态会让其中一个方向的判定必然出错。
+    let (outcome, violation_from_client) = {
+        let client_side =
+            crate::ws_frame::govern_stream(down_read, &mut up_write, policy, true, false, &stats);
+        let server_side =
+            crate::ws_frame::govern_stream(up_read, &mut down_write, policy, false, false, &stats);
+        tokio::pin!(client_side);
+        tokio::pin!(server_side);
+        // 任一方向结束即取消另一方向；借用在块末释放后，才能串行写 close 控制帧，
+        // 避免治理转发与关闭帧同时写同一个 half 造成线路交错。
+        tokio::select! {
+            result = &mut client_side => (result?, true),
+            result = &mut server_side => (result?, false),
+        }
+    };
+    if let crate::ws_frame::GovernOutcome::Violation(error) = outcome {
+        tracing::warn!(
+            route = %route_id,
+            reason = error.as_str(),
+            close_code = error.close_code(),
+            "websocket frame policy violation"
+        );
+        match crate::ws_frame::effective_action(policy, true) {
+            crate::ws_frame::MessageAction::PolicyClose | crate::ws_frame::MessageAction::Drop => {
+                write_governance_close(
+                    &mut down_write,
+                    &mut up_write,
+                    error.close_code(),
+                    !violation_from_client,
+                )
+                .await;
+            }
+            crate::ws_frame::MessageAction::UpstreamClose => {
+                if !violation_from_client {
+                    let mut mask = [0_u8; 4];
+                    if getrandom::getrandom(&mut mask).is_ok() {
+                        let _ = up_write
+                            .write_all(&crate::conn_registry::ws_masked_close_frame(
+                                error.close_code(),
+                                mask,
+                            ))
+                            .await;
+                    }
+                }
+                let _ = up_write.shutdown().await;
+                // 上游被策略关闭后隧道已无法继续；给下游明确的内部错误收尾，
+                // 不让它把无响应 EOF 误判为可重连的正常结束。
+                let _ = down_write
+                    .write_all(&crate::conn_registry::ws_close_frame(1011))
+                    .await;
+                let _ = down_write.shutdown().await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 业务作用：向 WebSocket 两端按各自角色写入同一治理 close code，并半关闭写方向。
+///
+/// 参数说明：`downstream` 是 server 角色写端；`upstream` 是 client 角色写端；
+/// `code` 是协议或预算违规对应的 close code；`notify_upstream` 仅在违规源自上游时
+/// 允许写上游 close，客户端违规时保持上游零字节并直接半关闭。
+///
+/// 返回：无；任一写入失败仍继续关闭另一端，系统随机源失败时不发送不合规的上游帧。
+async fn write_governance_close<D, U>(
+    downstream: &mut D,
+    upstream: &mut U,
+    code: u16,
+    notify_upstream: bool,
+) where
+    D: tokio::io::AsyncWrite + Unpin,
+    U: tokio::io::AsyncWrite + Unpin,
+{
+    let _ = downstream
+        .write_all(&crate::conn_registry::ws_close_frame(code))
+        .await;
+    if notify_upstream {
+        let mut mask = [0_u8; 4];
+        if getrandom::getrandom(&mut mask).is_ok() {
+            let _ = upstream
+                .write_all(&crate::conn_registry::ws_masked_close_frame(code, mask))
+                .await;
+        }
+    }
+    let _ = downstream.shutdown().await;
+    let _ = upstream.shutdown().await;
 }

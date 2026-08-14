@@ -3,27 +3,31 @@
 //! 本模块只负责 QUIC/H3 frame 与网关统一 `BoxBody` 之间的流式桥接；路由、鉴权、限流、
 //! gRPC 与上游选择仍全部进入 [`GatewayProxy`]，避免产生第二套治理实现。
 
-use std::net::{SocketAddr, UdpSocket};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h3::error::Code;
 use http::header::HOST;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
 use parking_lot::Mutex;
-use tokio::sync::watch;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 
 use crate::config::{Http3RuntimeCfg, TlsRuntimeCfg};
 use crate::metrics::Metrics;
 use crate::proxy::GatewayProxy;
 use crate::proxy_protocol::ConnInfo;
 use crate::tls::build_server_config;
-use crate::{BoxBody, BoxError};
+use crate::{full_body, BoxBody, BoxError};
 
 /// HTTP/3 禁止转发到 wire 的 hop-by-hop header；后两个没有 `http::header` 常量。
 const H3_FORBIDDEN_HEADERS: [&str; 5] = [
@@ -72,6 +76,47 @@ impl Drop for Http3StreamMetrics {
     /// 返回：无；同时累加固定 success/error 结果。
     fn drop(&mut self) {
         self.metrics.finish_http3_stream(self.success);
+    }
+}
+
+/// 单个 WebTransport session 的观测 RAII 边界。
+struct WebTransportSessionMetrics {
+    metrics: Arc<Metrics>,
+    success: bool,
+}
+
+impl WebTransportSessionMetrics {
+    /// 业务作用：在上下游 session 都已建立后登记活跃会话，避免把认证或连接失败算成业务会话。
+    ///
+    /// 参数说明：`metrics` 是进程级低基数指标集。
+    ///
+    /// 返回：默认错误终态的 guard；完整收口后由调用方标记成功。
+    fn new(metrics: Arc<Metrics>) -> Self {
+        metrics.inc_webtransport_session();
+        Self {
+            metrics,
+            success: false,
+        }
+    }
+
+    /// 业务作用：标记 WebTransport session 已按协议关闭、超时、撤权或停机路径完整收口。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；Drop 时记录固定成功终态。
+    fn complete(&mut self) {
+        self.success = true;
+    }
+}
+
+impl Drop for WebTransportSessionMetrics {
+    /// 业务作用：在所有 WebTransport 终态归还活跃 gauge 并登记成功或错误结果。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无。
+    fn drop(&mut self) {
+        self.metrics.finish_webtransport_session(self.success);
     }
 }
 
@@ -146,6 +191,12 @@ fn build_quic_server_config(
     let mut tls_config = (*tls_config).clone();
     // QUIC TLS 不能与 TCP 的 h1/h2 ALPN 混用；只发布 h3，避免协商出 transport 无法承载的协议。
     tls_config.alpn_protocols = vec![b"h3".to_vec()];
+    // QUIC 只能用最大 early-data 尺寸表示“由 transport 自身控制流量”；route 门禁还会在
+    // 任何认证、插件或上游副作用前复验方法、凭据、实体与一次性 nonce。
+    tls_config.max_early_data_size = if http3.zero_rtt { u32::MAX } else { 0 };
+    // 服务端响应必须等到握手确认后才可交付；即使客户端 early data 最终被拒绝，也不能让
+    // 未认证握手收到半程响应并形成协议状态分叉。
+    tls_config.send_half_rtt_data = false;
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
         .context("convert rustls config into QUIC TLS config")?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
@@ -155,6 +206,8 @@ fn build_quic_server_config(
             .context("convert HTTP/3 max_idle_timeout_ms into QUIC idle timeout")?;
     let bidi_streams = quinn::VarInt::from_u64(u64::from(http3.max_bidi_streams_per_connection))
         .context("convert HTTP/3 bidi stream budget into QUIC VarInt")?;
+    let uni_streams = quinn::VarInt::from_u64(u64::from(http3.max_uni_streams_per_connection))
+        .context("convert HTTP/3 uni stream budget into QUIC VarInt")?;
     let stream_window = quinn::VarInt::from_u64(
         u64::try_from(http3.max_stream_buffer_bytes)
             .context("HTTP/3 stream buffer budget exceeds u64")?,
@@ -164,13 +217,27 @@ fn build_quic_server_config(
     transport
         .max_idle_timeout(Some(idle_timeout))
         .max_concurrent_bidi_streams(bidi_streams)
-        // H3 必须保留 control/QPACK 单向流；设为固定小上限，拒绝 WebTransport/MASQUE 扩张。
-        .max_concurrent_uni_streams(quinn::VarInt::from_u32(8))
+        // H3 至少消费 control/QPACK 单向流；剩余名额是 WebTransport 的
+        // 真实传输上限，不能用一个固定小常量让 route 声明的预算永久无法到达。
+        .max_concurrent_uni_streams(uni_streams)
         .stream_receive_window(stream_window)
         // aggregate receive window 不得大于单 stream 配置预算，避免并发 stream 把内存上限相乘。
-        .receive_window(stream_window)
-        .datagram_receive_buffer_size(None)
-        .datagram_send_buffer_size(0);
+        .receive_window(stream_window);
+    if http3.datagram {
+        let datagram_buffer = http3
+            .max_datagram_queue
+            .saturating_mul(http3.max_datagram_bytes)
+            .min(16 * 1024 * 1024);
+        // Quinn 的内部 DATAGRAM 缓冲与应用层每 session 队列各自有界；前者吸收 driver 调度抖动，
+        // 后者在 session 归属已知后执行精确丢弃，任一层都不能按连接数无界放大。
+        transport
+            .datagram_receive_buffer_size(Some(datagram_buffer))
+            .datagram_send_buffer_size(datagram_buffer);
+    } else {
+        transport
+            .datagram_receive_buffer_size(None)
+            .datagram_send_buffer_size(0);
+    }
     let pending_total = u64::try_from(http3.max_pending_handshakes)
         .context("HTTP/3 pending handshake count exceeds u64")?
         .checked_mul(http3.max_pending_handshake_bytes)
@@ -210,6 +277,7 @@ pub fn spawn_cert_watcher(
     let cert_material = material.clone();
     let cert_updates = updates.clone();
     let cert_http3 = http3.clone();
+    let session_tls = tls.clone();
     crate::tls::spawn_cert_material_watcher_until(
         tls,
         move |tls_config| {
@@ -227,8 +295,12 @@ pub fn spawn_cert_watcher(
         let period = Duration::from_secs(http3.retry_token_rotation_seconds);
         let mut rotation = tokio::time::interval(period);
         rotation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let session_period = Duration::from_secs(http3.early_data_session_rotation_seconds);
+        let mut session_rotation = tokio::time::interval(session_period);
+        session_rotation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // `interval` 首次 tick 立即就绪；初始 endpoint 已有随机密钥，不需要 commit 后立刻再换一次。
         rotation.tick().await;
+        session_rotation.tick().await;
         let mut shutdown = shutdown;
         loop {
             tokio::select! {
@@ -247,6 +319,24 @@ pub fn spawn_cert_watcher(
                         Err(error) => tracing::warn!(
                             error = %format!("{error:#}"),
                             "HTTP/3 Retry token key rotation failed; keeping previous config"
+                        ),
+                    }
+                }
+                _ = session_rotation.tick(), if http3.zero_rtt => {
+                    // 有状态 session id 是一次性凭据，但未使用项仍可能在客户端保存；周期性发布
+                    // 新 storage 代会统一撤销旧项，并保持已建立 connection 完全不受影响。
+                    match build_server_config(&session_tls).and_then(|tls_config| {
+                        let server_config = build_quic_server_config(tls_config.clone(), &http3)?;
+                        Ok((tls_config, server_config))
+                    }) {
+                        Ok((tls_config, server_config)) => {
+                            *material.lock() = Some(tls_config);
+                            updates.send_replace(Some(server_config));
+                            tracing::info!("HTTP/3 early-data session generation rotated");
+                        }
+                        Err(error) => tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "HTTP/3 early-data session rotation failed; keeping previous config"
                         ),
                     }
                 }
@@ -276,59 +366,138 @@ pub async fn serve_connection(
     proxy: Arc<GatewayProxy>,
     proxy_id: Arc<str>,
     initial_peer: SocketAddr,
-    max_header_bytes: usize,
+    http3: Http3RuntimeCfg,
     metrics: Arc<Metrics>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let quic_connection = connection.clone();
     let mut builder = h3::server::builder();
     builder
-        .max_field_section_size(u64::try_from(max_header_bytes).unwrap_or(u64::MAX))
-        .enable_extended_connect(false)
-        .enable_datagram(false)
-        .enable_webtransport(false)
-        .max_webtransport_sessions(0);
+        .max_field_section_size(u64::try_from(http3.max_request_header_bytes).unwrap_or(u64::MAX))
+        .enable_extended_connect(http3.connect_udp || http3.webtransport)
+        .enable_datagram(http3.datagram)
+        .enable_webtransport(http3.webtransport)
+        .max_webtransport_sessions(u64::from(http3.webtransport));
+    let (tracked_connection, early_streams) = crate::h3_quinn_tracked::Connection::new(connection);
     let mut connection = builder
-        .build(h3_quinn::Connection::new(connection))
+        .build(tracked_connection)
         .await
         .context("initialize HTTP/3 connection")?;
 
+    let extensions = Arc::new(QuicExtensionContext::new(
+        quic_connection.clone(),
+        &http3,
+        metrics.clone(),
+    ));
+    if http3.datagram {
+        let dispatcher = extensions.dispatcher.clone();
+        let datagram_connection = quic_connection.clone();
+        tokio::spawn(async move {
+            receive_h3_datagrams(datagram_connection, dispatcher).await;
+        });
+    }
+
     let mut draining = false;
     let mut migration_observed = false;
+    let mut resolvers = JoinSet::new();
     loop {
-        let accepted = if draining {
-            connection.accept().await
-        } else {
-            tokio::select! {
-                accepted = connection.accept() => accepted,
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        // 先发送 GOAWAY，随后继续 poll accept 直到已接收 stream 全部释放；直接
-                        // drop connection 会把可安全完成的 gRPC/上传流错误重置。
-                        connection
-                            .shutdown(0)
-                            .await
-                            .context("send HTTP/3 GOAWAY")?;
-                        draining = true;
-                    }
-                    continue;
+        let resolved = tokio::select! {
+            accepted = connection.accept() => {
+                let accepted = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.is_h3_no_error() => return Ok(()),
+                    Err(error) => return Err(error).context("accept HTTP/3 request"),
+                };
+                let Some(resolver) = accepted else {
+                    return Ok(());
+                };
+                // RequestResolver 拥有独立 stream 与共享 QPACK 状态；并发解析避免一个被阻塞的
+                // field section 阻止同连接其它 stream 进入。任务总量仍受 QUIC bidi 硬门限制。
+                resolvers.spawn(async move { resolver.resolve_request().await });
+                continue;
+            }
+            resolved = resolvers.join_next(), if !resolvers.is_empty() => {
+                let resolved = resolved.expect("non-empty resolver set yields a task");
+                resolved.context("HTTP/3 request resolver task failed")?
+            }
+            changed = shutdown.changed(), if !draining => {
+                if changed.is_err() || *shutdown.borrow() {
+                    // 先发送 GOAWAY，随后继续 poll accept 直到已接收 stream 全部释放；直接
+                    // drop connection 会把可安全完成的 gRPC/上传流错误重置。
+                    connection
+                        .shutdown(0)
+                        .await
+                        .context("send HTTP/3 GOAWAY")?;
+                    draining = true;
                 }
+                continue;
             }
         };
-        let Some(resolver) = accepted.context("accept HTTP/3 request")? else {
-            return Ok(());
+        let (mut request, stream) = match resolved {
+            Ok(resolved) => resolved,
+            Err(h3::error::StreamError::ConnectionError(error)) if error.is_h3_no_error() => {
+                return Ok(());
+            }
+            Err(h3::error::StreamError::ConnectionError(error)) => {
+                return Err(error).context("resolve HTTP/3 request headers");
+            }
+            Err(error) => {
+                // HeaderTooBig、RESET 与单 request frame 错误只终止对应 stream；升级为
+                // connection close 会让一个坏请求驱逐同连接其它无关请求。
+                tracing::debug!(%initial_peer, %error, "HTTP/3 request stream rejected during header resolution");
+                continue;
+            }
         };
+        // 0-RTT 身份必须取自 Quinn stream 属性，不能信任客户端能够自行添加的 `Early-Data`
+        // header。证据按 stream id 一次性消费，避免后续内部请求复用同一放行事实。
+        if early_streams.take(stream.id()) {
+            request
+                .extensions_mut()
+                .insert(crate::masque::EarlyDataRequest);
+        }
+        prepare_h3_request(&mut request, initial_peer)?;
+        let protocol = request.extensions().get::<h3::ext::Protocol>().copied();
         if !migration_observed && quic_connection.remote_address() != initial_peer {
             // 业务安全身份仍使用 initial_peer；迁移只做低基数观测，不更写 ACL/rate key。
             migration_observed = true;
             metrics.inc_quic_migration();
         }
+        if protocol == Some(h3::ext::Protocol::WEB_TRANSPORT) {
+            let mut stream_metrics = Http3StreamMetrics::new(metrics.clone());
+            let result = serve_webtransport(
+                request,
+                stream,
+                connection,
+                proxy,
+                proxy_id,
+                initial_peer,
+                extensions,
+                shutdown,
+            )
+            .await;
+            if result.is_ok() {
+                stream_metrics.complete();
+            }
+            return result;
+        }
         let proxy = proxy.clone();
         let proxy_id = proxy_id.clone();
         let metrics = metrics.clone();
+        let extensions = extensions.clone();
+        let request_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let mut stream_metrics = Http3StreamMetrics::new(metrics);
-            match serve_request(resolver, proxy, proxy_id, initial_peer).await {
+            match serve_resolved_request(
+                request,
+                stream,
+                proxy,
+                proxy_id,
+                initial_peer,
+                extensions,
+                request_shutdown,
+            )
+            .await
+            {
                 Ok(()) => stream_metrics.complete(),
                 Err(error) => {
                     tracing::debug!(peer = %initial_peer, %error, "HTTP/3 request stream closed with error");
@@ -347,24 +516,51 @@ pub async fn serve_connection(
 /// `initial_peer` 是连接握手期固化的客户端地址。
 ///
 /// 返回：完整写完 response HEADERS/body/trailers 后成功；请求解析、治理 body 或发送失败时返回错误。
-async fn serve_request(
-    resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
+async fn serve_resolved_request(
+    mut request: Request<()>,
+    mut stream: h3::server::RequestStream<crate::h3_quinn_tracked::BidiStream<Bytes>, Bytes>,
     proxy: Arc<GatewayProxy>,
     proxy_id: Arc<str>,
     initial_peer: SocketAddr,
+    extensions: Arc<QuicExtensionContext>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (mut request, stream) = resolver
-        .resolve_request()
-        .await
-        .context("resolve HTTP/3 request headers")?;
-    request.extensions_mut().insert(initial_peer);
-    *request.version_mut() = Version::HTTP_3;
-    // 既有虚拟主机路由以 Host 为统一输入；H3 authority 是等价权威字段，只在 Host 缺失时映射。
-    if !request.headers().contains_key(HOST) {
-        if let Some(authority) = request.uri().authority() {
-            let host = http::HeaderValue::from_str(authority.as_str())
-                .context("convert HTTP/3 authority into Host header")?;
-            request.headers_mut().insert(HOST, host);
+    let protocol = request.extensions().get::<h3::ext::Protocol>().copied();
+    if protocol == Some(h3::ext::Protocol::CONNECT_UDP) {
+        return serve_connect_udp(
+            request,
+            stream,
+            proxy,
+            proxy_id,
+            initial_peer,
+            extensions,
+            shutdown,
+        )
+        .await;
+    }
+    if request
+        .extensions()
+        .get::<crate::masque::EarlyDataRequest>()
+        .is_some()
+    {
+        // early route 的安全合同是空实体。必须在进入统一管线前读到 FIN，客户端即使省略
+        // Content-Length，也不能让 DATA 或 trailers 在网关已经执行上游后才被发现。
+        let has_entity = match stream
+            .recv_data()
+            .await
+            .context("inspect early HTTP/3 request body")?
+        {
+            Some(_) => true,
+            None => stream
+                .recv_trailers()
+                .await
+                .context("inspect early HTTP/3 request trailers")?
+                .is_some(),
+        };
+        if has_entity {
+            request
+                .extensions_mut()
+                .insert(crate::masque::EarlyDataRequestBody);
         }
     }
     let request_method = request.method().clone();
@@ -381,6 +577,1168 @@ async fn serve_request(
     send_response(send, response, &request_method).await
 }
 
+/// 业务作用：把 H3 authority 与可信连接身份一次性映射到统一路由输入。
+///
+/// 参数说明：`request` 是已解码的 H3 HEADERS；`initial_peer` 是握手完成时冻结的对端地址。
+///
+/// 返回：Host 可安全构造时成功；非法 authority 返回错误并阻止请求进入治理管线。
+fn prepare_h3_request(request: &mut Request<()>, initial_peer: SocketAddr) -> Result<()> {
+    request.extensions_mut().insert(initial_peer);
+    *request.version_mut() = Version::HTTP_3;
+    // 虚拟主机路由统一读取 Host；只在缺失时从等价 authority 映射，不能覆盖已解码字段。
+    if !request.headers().contains_key(HOST) {
+        if let Some(authority) = request.uri().authority() {
+            let host = http::HeaderValue::from_str(authority.as_str())
+                .context("convert HTTP/3 authority into Host header")?;
+            request.headers_mut().insert(HOST, host);
+        }
+    }
+    Ok(())
+}
+
+/// 保持上游 WebTransport UDP endpoint 与 session 同寿命。
+///
+/// 业务作用：Quinn connection 依赖 endpoint 驱动；把两者放进同一所有权对象，避免上游
+/// session 建立后 endpoint 提前 Drop 导致所有 stream 被动关闭。
+struct WebTransportUpstream {
+    _endpoint: wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
+    connection: Arc<wtransport::Connection>,
+}
+
+/// WebTransport stream 名额的 RAII 守卫。
+///
+/// 业务作用：无论正常 EOF、上游失败、取消或 task abort 都归还 session stream 计数，避免
+/// 迟到错误把会话永久锁死在并发上限。
+struct WebTransportStreamLease {
+    state: Arc<crate::masque::WebTransportSession>,
+    bidirectional: bool,
+}
+
+impl Drop for WebTransportStreamLease {
+    /// 业务作用：在 stream 所有终态统一归还对应方向的并发名额。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；计数已为零时底层实现保持不变。
+    fn drop(&mut self) {
+        self.state.close_stream(self.bidirectional);
+    }
+}
+
+/// 业务作用：执行经统一 route 管线授权的 WebTransport CONNECT，并桥接真实上游 session。
+///
+/// 参数说明：`request`/`stream`/`connection` 是下游 H3 CONNECT 与连接所有权；
+/// `proxy`/`proxy_id` 执行公共安全治理；`initial_peer` 固化迁移前身份；`extensions` 提供
+/// DATAGRAM 分发表；`shutdown` 在 listener 换代或进程停机时关闭会话。
+///
+/// 返回：上下游 session 正常结束时成功；治理拒绝会发送对应 HTTP 响应，上游建连或 relay
+/// 失败时返回错误并关闭两个 QUIC 连接。
+async fn serve_webtransport(
+    request: Request<()>,
+    stream: h3::server::RequestStream<crate::h3_quinn_tracked::BidiStream<Bytes>, Bytes>,
+    connection: h3::server::Connection<crate::h3_quinn_tracked::Connection, Bytes>,
+    proxy: Arc<GatewayProxy>,
+    proxy_id: Arc<str>,
+    initial_peer: SocketAddr,
+    extensions: Arc<QuicExtensionContext>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    anyhow::ensure!(
+        request.method() == Method::CONNECT,
+        "WebTransport protocol requires CONNECT method"
+    );
+    // H3 session accept 仍需持有原始 Protocol extension；治理请求只复制一次小型 CONNECT head，
+    // body 永远为空且不会复制任何业务 stream/datagram payload。
+    let mut route_request = Request::builder()
+        .method(request.method().clone())
+        .uri(request.uri().clone())
+        .version(request.version())
+        .body(full_body(Bytes::new()))
+        .context("build WebTransport governance request")?;
+    *route_request.headers_mut() = request.headers().clone();
+    route_request.extensions_mut().insert(initial_peer);
+    route_request
+        .extensions_mut()
+        .insert(crate::masque::WebTransportRequest);
+    if request
+        .extensions()
+        .get::<crate::masque::EarlyDataRequest>()
+        .is_some()
+    {
+        route_request
+            .extensions_mut()
+            .insert(crate::masque::EarlyDataRequest);
+    }
+    let mut response = match proxy
+        .clone()
+        .handle_boxed(
+            route_request,
+            ConnInfo::plain(initial_peer),
+            "https",
+            proxy_id.clone(),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(never) => match never {},
+    };
+    let Some(plan) = response
+        .extensions_mut()
+        .remove::<crate::masque::WebTransportPlan>()
+    else {
+        let (send, _recv) = stream.split();
+        return send_response(send, response, &Method::CONNECT).await;
+    };
+
+    // 上游必须先完成 TLS、SETTINGS 与 session 2xx，之后才能向下游确认成功；反过来会留下
+    // “客户端已成功、网关却没有后端”的半完成长连接。
+    let upstream = match connect_webtransport_upstream(plan.policy.as_ref(), plan.origin.as_ref())
+        .await
+    {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            tracing::debug!(route = %plan.route_id, %error, "WebTransport upstream unavailable");
+            let response = Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(full_body(Bytes::from_static(
+                    b"WebTransport upstream unavailable",
+                )))
+                .expect("fixed WebTransport upstream response");
+            let (send, _recv) = stream.split();
+            return send_response(send, response, &Method::CONNECT).await;
+        }
+    };
+    let stream_id = stream.send_id().into_inner();
+    let queue = usize::try_from(plan.policy.budget.max_datagram_queue)
+        .context("convert WebTransport DATAGRAM queue")?;
+    let (datagrams, incoming_datagrams) = mpsc::channel(queue);
+    anyhow::ensure!(
+        extensions
+            .dispatcher
+            .register(stream_id, datagrams, DatagramProtocol::WebTransport,),
+        "WebTransport stream id is already registered"
+    );
+    let _registration = DatagramRegistration {
+        dispatcher: extensions.dispatcher.clone(),
+        stream_id,
+    };
+    let downstream =
+        match h3_webtransport::server::WebTransportSession::accept(request, stream, connection)
+            .await
+        {
+            Ok(session) => Arc::new(session),
+            Err(error) => {
+                upstream
+                    .connection
+                    .close(wtransport::VarInt::from_u32(0), b"downstream rejected");
+                return Err(error).context("accept downstream WebTransport session");
+            }
+        };
+    let mut session_metrics =
+        WebTransportSessionMetrics::new(extensions.dispatcher.metrics.clone());
+    let result = relay_webtransport(
+        downstream,
+        upstream.connection.clone(),
+        incoming_datagrams,
+        extensions.clone(),
+        stream_id,
+        proxy,
+        proxy_id,
+        initial_peer,
+        plan,
+        shutdown,
+    )
+    .await;
+    if result.is_ok() {
+        session_metrics.complete();
+    }
+    upstream
+        .connection
+        .close(wtransport::VarInt::from_u32(0), b"gateway session closed");
+    // 当前实现每条下游 QUIC connection 只允许一个 WebTransport session；结束时关闭连接，
+    // 使所有残余 stream 都取得一致终态，不留下失去 session owner 的普通 H3 请求。
+    extensions
+        .connection
+        .close(quinn::VarInt::from_u32(0), b"WebTransport session closed");
+    result
+}
+
+/// 业务作用：使用构建期冻结的 HTTPS URL 与信任根建立真实上游 WebTransport session。
+///
+/// 参数说明：`policy` 提供固定目标、TLS 与资源门；`origin` 是下游已通过 allowlist 的来源。
+///
+/// 返回：连接成功时返回同时持有 endpoint 与 session 的对象；DNS、TLS、SETTINGS、非 2xx 或
+/// deadline 失败时返回错误，调用方不得向下游发送成功响应。
+async fn connect_webtransport_upstream(
+    policy: &crate::masque::WebTransportPolicy,
+    origin: &str,
+) -> Result<WebTransportUpstream> {
+    let tls = wtransport::tls::client::build_default_tls_config(policy.roots(), None);
+    let mut transport = wtransport::config::QuicTransportConfig::default();
+    transport
+        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(
+            u32::try_from(policy.budget.max_bidi_streams)
+                .context("convert WebTransport bidi stream budget")?,
+        ))
+        .max_concurrent_uni_streams(quinn::VarInt::from_u32(
+            u32::try_from(policy.budget.max_uni_streams)
+                .context("convert WebTransport uni stream budget")?,
+        ));
+    let datagram_buffer = usize::try_from(
+        policy
+            .budget
+            .max_datagram_queue
+            .saturating_mul(policy.budget.max_datagram_bytes as u64),
+    )
+    .context("convert WebTransport DATAGRAM buffer budget")?;
+    transport
+        .datagram_receive_buffer_size(Some(datagram_buffer))
+        .datagram_send_buffer_size(datagram_buffer);
+    let config = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_custom_tls_and_transport(tls, transport)
+        .max_idle_timeout(Some(Duration::from_millis(policy.budget.idle_timeout_ms)))
+        .map_err(|_| anyhow::anyhow!("invalid WebTransport upstream idle timeout"))?
+        .build();
+    let endpoint = wtransport::Endpoint::client(config).context("create WebTransport endpoint")?;
+    let options = wtransport::endpoint::ConnectOptions::builder(policy.upstream())
+        .add_header("origin", origin)
+        .build();
+    let connection = tokio::time::timeout(
+        Duration::from_millis(policy.connect_timeout_ms),
+        endpoint.connect(options),
+    )
+    .await
+    .context("WebTransport upstream connect timeout")?
+    .context("connect WebTransport upstream")?;
+    Ok(WebTransportUpstream {
+        _endpoint: endpoint,
+        connection: Arc::new(connection),
+    })
+}
+
+/// 业务作用：在一个 WebTransport session 内双向接收 stream/datagram，并按共享硬门转发。
+///
+/// 参数说明：`downstream`/`upstream` 是已完成握手的 session；`incoming_datagrams` 接收连接级
+/// 分发的下游消息；`extensions` 用于回写下游 DATAGRAM；`stream_id` 绑定当前 session；
+/// 其余参数用于普通 H3 请求复用、身份冻结、撤权与 shutdown。
+///
+/// 返回：正常关闭、idle/lifetime 或撤权返回成功；协议、stream relay 和连接错误返回失败。
+#[allow(clippy::too_many_arguments)]
+async fn relay_webtransport(
+    downstream: Arc<
+        h3_webtransport::server::WebTransportSession<crate::h3_quinn_tracked::Connection, Bytes>,
+    >,
+    upstream: Arc<wtransport::Connection>,
+    mut incoming_datagrams: mpsc::Receiver<Bytes>,
+    extensions: Arc<QuicExtensionContext>,
+    stream_id: u64,
+    proxy: Arc<GatewayProxy>,
+    proxy_id: Arc<str>,
+    initial_peer: SocketAddr,
+    plan: crate::masque::WebTransportPlan,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let budget = plan.policy.budget;
+    let metrics = extensions.dispatcher.metrics.clone();
+    let state = Arc::new(crate::masque::WebTransportSession::default());
+    state.freeze_identity(initial_peer.ip().to_string());
+    let started_ms = crate::lb_load::monotonic_ms();
+    let last_activity = Arc::new(AtomicU64::new(started_ms));
+    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    let session_id = downstream.session_id();
+    let relay_result = loop {
+        let timeout = webtransport_next_timeout(
+            last_activity.load(Ordering::Acquire),
+            started_ms,
+            budget.idle_timeout_ms,
+            plan.policy.max_lifetime_ms,
+        );
+        tokio::select! {
+            _ = plan.guard.closed() => break Ok(()),
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break Ok(());
+                }
+            }
+            _ = tokio::time::sleep(timeout) => {
+                let now = crate::lb_load::monotonic_ms();
+                let idle = now.saturating_sub(last_activity.load(Ordering::Acquire));
+                let lifetime = now.saturating_sub(started_ms);
+                if idle >= budget.idle_timeout_ms
+                    || (plan.policy.max_lifetime_ms > 0
+                        && lifetime >= plan.policy.max_lifetime_ms)
+                {
+                    break Ok(());
+                }
+            }
+            accepted = downstream.accept_bi() => {
+                let accepted = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(_) if webtransport_downstream_closed_normally(&extensions.connection) => {
+                        break Ok(());
+                    }
+                    Err(error) => return Err(error).context("accept downstream WebTransport bidi stream"),
+                };
+                match accepted {
+                    Some(h3_webtransport::server::AcceptedBi::BidiStream(id, mut stream)) => {
+                        if id != session_id
+                            || state.open_stream(&budget, true)
+                                != crate::masque::SessionAdmission::Accepted
+                        {
+                            // 已被 transport 接受的流必须显式 RESET/STOP；只 Drop 会让对端无法
+                            // 区分容量拒绝与调度延迟，并可能继续发送直至 flow-control 耗尽。
+                            h3::quic::RecvStream::stop_sending(
+                                &mut stream,
+                                Code::H3_REQUEST_REJECTED.value(),
+                            );
+                            h3::quic::SendStream::<Bytes>::reset(
+                                &mut stream,
+                                Code::H3_REQUEST_REJECTED.value(),
+                            );
+                            metrics.inc_webtransport_stream_rejected(true);
+                            continue;
+                        }
+                        metrics.inc_webtransport_stream(true);
+                        last_activity.store(crate::lb_load::monotonic_ms(), Ordering::Release);
+                        let upstream = upstream.clone();
+                        let state = state.clone();
+                        let activity = last_activity.clone();
+                        tasks.spawn(async move {
+                            let _lease = WebTransportStreamLease {
+                                state: state.clone(),
+                                bidirectional: true,
+                            };
+                            let opening = upstream.open_bi().await.context("open upstream bidi stream")?;
+                            let peer = wtransport::stream::BiStream::join(
+                                opening.await.context("initialize upstream bidi stream")?,
+                            );
+                            relay_webtransport_bidi(stream, peer, state, budget, activity).await
+                        });
+                    }
+                    Some(h3_webtransport::server::AcceptedBi::Request(mut request, stream)) => {
+                        prepare_h3_request(&mut request, initial_peer)?;
+                        if request.extensions().get::<h3::ext::Protocol>()
+                            == Some(&h3::ext::Protocol::WEB_TRANSPORT)
+                        {
+                            let response = Response::builder()
+                                .status(StatusCode::TOO_MANY_REQUESTS)
+                                .body(full_body(Bytes::from_static(b"one WebTransport session per connection")))
+                                .expect("fixed WebTransport session capacity response");
+                            let (send, _recv) = stream.split();
+                            tasks.spawn(async move { send_response(send, response, &Method::CONNECT).await });
+                        } else {
+                            let proxy = proxy.clone();
+                            let proxy_id = proxy_id.clone();
+                            let extensions = extensions.clone();
+                            let request_shutdown = shutdown.clone();
+                            let metrics = extensions.dispatcher.metrics.clone();
+                            tasks.spawn(async move {
+                                let mut stream_metrics = Http3StreamMetrics::new(metrics);
+                                let result = serve_resolved_request(
+                                    request,
+                                    stream,
+                                    proxy,
+                                    proxy_id,
+                                    initial_peer,
+                                    extensions,
+                                    request_shutdown,
+                                )
+                                .await;
+                                if result.is_ok() {
+                                    stream_metrics.complete();
+                                }
+                                result
+                            });
+                        }
+                    }
+                    None => break Ok(()),
+                }
+            }
+            accepted = downstream.accept_uni() => {
+                let accepted = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(_) if webtransport_downstream_closed_normally(&extensions.connection) => {
+                        break Ok(());
+                    }
+                    Err(error) => return Err(error).context("accept downstream WebTransport uni stream"),
+                };
+                let Some((id, mut stream)) = accepted else {
+                    break Ok(());
+                };
+                if id != session_id
+                    || state.open_stream(&budget, false)
+                        != crate::masque::SessionAdmission::Accepted
+                {
+                    h3::quic::RecvStream::stop_sending(
+                        &mut stream,
+                        Code::H3_REQUEST_REJECTED.value(),
+                    );
+                    metrics.inc_webtransport_stream_rejected(false);
+                    continue;
+                }
+                metrics.inc_webtransport_stream(false);
+                last_activity.store(crate::lb_load::monotonic_ms(), Ordering::Release);
+                let upstream = upstream.clone();
+                let state = state.clone();
+                let activity = last_activity.clone();
+                tasks.spawn(async move {
+                    let _lease = WebTransportStreamLease {
+                        state: state.clone(),
+                        bidirectional: false,
+                    };
+                    let opening = upstream.open_uni().await.context("open upstream uni stream")?;
+                    let peer = opening.await.context("initialize upstream uni stream")?;
+                    copy_webtransport_direction(stream, peer, state, budget, activity).await
+                });
+            }
+            accepted = upstream.accept_bi() => {
+                let (mut peer_send, peer_recv) = match accepted {
+                    Ok(stream) => stream,
+                    Err(error) if webtransport_upstream_closed_normally(&error) => break Ok(()),
+                    Err(error) => return Err(error).context("accept upstream bidi stream"),
+                };
+                if state.open_stream(&budget, true)
+                    != crate::masque::SessionAdmission::Accepted
+                {
+                    let _ = peer_send.reset(wtransport::VarInt::from_u32(0));
+                    peer_recv.stop(wtransport::VarInt::from_u32(0));
+                    metrics.inc_webtransport_stream_rejected(true);
+                    continue;
+                }
+                metrics.inc_webtransport_stream(true);
+                let peer = wtransport::stream::BiStream::join((peer_send, peer_recv));
+                last_activity.store(crate::lb_load::monotonic_ms(), Ordering::Release);
+                let downstream = downstream.clone();
+                let state = state.clone();
+                let activity = last_activity.clone();
+                tasks.spawn(async move {
+                    let _lease = WebTransportStreamLease {
+                        state: state.clone(),
+                        bidirectional: true,
+                    };
+                    let stream = downstream
+                        .open_bi(downstream.session_id())
+                        .await
+                        .context("open downstream bidi stream")?;
+                    relay_webtransport_bidi(stream, peer, state, budget, activity).await
+                });
+            }
+            accepted = upstream.accept_uni() => {
+                let peer = match accepted {
+                    Ok(stream) => stream,
+                    Err(error) if webtransport_upstream_closed_normally(&error) => break Ok(()),
+                    Err(error) => return Err(error).context("accept upstream uni stream"),
+                };
+                if state.open_stream(&budget, false)
+                    != crate::masque::SessionAdmission::Accepted
+                {
+                    peer.stop(wtransport::VarInt::from_u32(0));
+                    metrics.inc_webtransport_stream_rejected(false);
+                    continue;
+                }
+                metrics.inc_webtransport_stream(false);
+                last_activity.store(crate::lb_load::monotonic_ms(), Ordering::Release);
+                let downstream = downstream.clone();
+                let state = state.clone();
+                let activity = last_activity.clone();
+                tasks.spawn(async move {
+                    let _lease = WebTransportStreamLease {
+                        state: state.clone(),
+                        bidirectional: false,
+                    };
+                    let stream = downstream
+                        .open_uni(downstream.session_id())
+                        .await
+                        .context("open downstream uni stream")?;
+                    copy_webtransport_direction(peer, stream, state, budget, activity).await
+                });
+            }
+            datagram = incoming_datagrams.recv() => {
+                let Some(payload) = datagram else {
+                    break Ok(());
+                };
+                if payload.len() > budget.max_datagram_bytes {
+                    metrics.inc_webtransport_datagram_drop();
+                    continue;
+                }
+                if state.admit_bytes(&budget, payload.len())
+                    != crate::masque::SessionAdmission::Accepted
+                {
+                    metrics.inc_webtransport_datagram_drop();
+                    break Ok(());
+                }
+                if upstream.send_datagram(payload.as_ref()).is_ok() {
+                    last_activity.store(crate::lb_load::monotonic_ms(), Ordering::Release);
+                    metrics.inc_webtransport_datagram(true);
+                } else {
+                    metrics.inc_webtransport_datagram_drop();
+                }
+            }
+            datagram = upstream.receive_datagram() => {
+                let datagram = match datagram {
+                    Ok(datagram) => datagram,
+                    Err(error) if webtransport_upstream_closed_normally(&error) => break Ok(()),
+                    Err(error) => return Err(error).context("receive upstream WebTransport DATAGRAM"),
+                };
+                let payload = datagram.payload();
+                if payload.len() > budget.max_datagram_bytes {
+                    metrics.inc_webtransport_datagram_drop();
+                    continue;
+                }
+                if state.admit_bytes(&budget, payload.len())
+                    != crate::masque::SessionAdmission::Accepted
+                {
+                    metrics.inc_webtransport_datagram_drop();
+                    break Ok(());
+                }
+                let mut wire = Vec::with_capacity(payload.len().saturating_add(8));
+                crate::masque::encode_varint(stream_id / 4, &mut wire)?;
+                wire.extend_from_slice(payload.as_ref());
+                if extensions.connection.send_datagram(Bytes::from(wire)).is_ok() {
+                    last_activity.store(crate::lb_load::monotonic_ms(), Ordering::Release);
+                    metrics.inc_webtransport_datagram(false);
+                } else {
+                    metrics.inc_webtransport_datagram_drop();
+                }
+            }
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(_))) if webtransport_downstream_closed_normally(&extensions.connection) => break Ok(()),
+                    Some(Ok(Err(error))) => break Err(error),
+                    Some(Err(error)) => break Err(error).context("WebTransport stream task failed"),
+                    None => {}
+                }
+            }
+        }
+    };
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    tracing::debug!(route = %plan.route_id, "WebTransport session closed");
+    relay_result
+}
+
+/// 业务作用：区分下游主动结束 WebTransport 与 QUIC/HTTP3 协议故障，使正常关闭不污染错误率。
+///
+/// 参数说明：`connection` 是承载该 session 的下游 Quinn connection。
+///
+/// 返回：对端 application close 或网关已主动关闭时返回 true；transport、协议、超时错误返回 false。
+fn webtransport_downstream_closed_normally(connection: &quinn::Connection) -> bool {
+    matches!(
+        connection.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(_) | quinn::ConnectionError::LocallyClosed)
+    )
+}
+
+/// 业务作用：区分上游 WebTransport 正常 application close 与连接或协议故障。
+///
+/// 参数说明：`error` 是 wtransport 接收流或数据报时返回的连接终态。
+///
+/// 返回：远端或本地应用主动关闭时返回 true；网络、HTTP3、超时与容量故障返回 false。
+fn webtransport_upstream_closed_normally(error: &wtransport::error::ConnectionError) -> bool {
+    matches!(
+        error,
+        wtransport::error::ConnectionError::ApplicationClosed(_)
+            | wtransport::error::ConnectionError::LocallyClosed
+    )
+}
+
+/// 业务作用：计算 WebTransport 下一次 idle/lifetime 复验等待，避免每个 packet 创建独立 timer。
+///
+/// 参数说明：`last_activity_ms`、`started_ms` 是单调时钟；`idle_ms` 与 `lifetime_ms` 是硬门。
+///
+/// 返回：返回到最近门限的非负等待时间；已到期时返回零时长。
+fn webtransport_next_timeout(
+    last_activity_ms: u64,
+    started_ms: u64,
+    idle_ms: u64,
+    lifetime_ms: u64,
+) -> Duration {
+    let now = crate::lb_load::monotonic_ms();
+    let idle_remaining = last_activity_ms.saturating_add(idle_ms).saturating_sub(now);
+    let remaining = if lifetime_ms > 0 {
+        idle_remaining.min(started_ms.saturating_add(lifetime_ms).saturating_sub(now))
+    } else {
+        idle_remaining
+    };
+    Duration::from_millis(remaining)
+}
+
+/// 业务作用：在一条 WebTransport 双向 stream 上同时桥接两个方向并共享会话字节预算。
+///
+/// 参数说明：`left`/`right` 是下游与上游 stream；`state`/`budget` 是 session 共享硬门；
+/// `activity` 发布成功写入的单调时间。
+///
+/// 返回：双向 EOF 时成功；任一方向 I/O 或累计字节超限时失败并让 session owner 收口。
+async fn relay_webtransport_bidi<L, R>(
+    left: L,
+    right: R,
+    state: Arc<crate::masque::WebTransportSession>,
+    budget: crate::masque::WebTransportBudget,
+    activity: Arc<AtomicU64>,
+) -> Result<()>
+where
+    L: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (left_read, left_write) = tokio::io::split(left);
+    let (right_read, right_write) = tokio::io::split(right);
+    tokio::try_join!(
+        copy_webtransport_direction(
+            left_read,
+            right_write,
+            state.clone(),
+            budget,
+            activity.clone(),
+        ),
+        copy_webtransport_direction(right_read, left_write, state, budget, activity),
+    )?;
+    Ok(())
+}
+
+/// 业务作用：逐块转发 WebTransport stream，不聚合业务消息，并在写入前执行共享字节硬门。
+///
+/// 参数说明：`reader`/`writer` 是单方向流；`state`/`budget` 提供全 session 累计额度；
+/// `activity` 只在真实写成功后推进。
+///
+/// 返回：EOF 与半关闭完成时成功；读取、写入或预算耗尽时返回错误。
+async fn copy_webtransport_direction<R, W>(
+    mut reader: R,
+    mut writer: W,
+    state: Arc<crate::masque::WebTransportSession>,
+    budget: crate::masque::WebTransportBudget,
+    activity: Arc<AtomicU64>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let length = reader
+            .read(&mut buffer)
+            .await
+            .context("read WebTransport stream")?;
+        if length == 0 {
+            writer
+                .shutdown()
+                .await
+                .context("finish WebTransport stream")?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            state.admit_bytes(&budget, length) == crate::masque::SessionAdmission::Accepted,
+            "WebTransport session byte budget exhausted"
+        );
+        writer
+            .write_all(&buffer[..length])
+            .await
+            .context("write WebTransport stream")?;
+        activity.store(crate::lb_load::monotonic_ms(), Ordering::Release);
+    }
+}
+
+/// 单条 QUIC connection 的扩展协议共享运行态。
+///
+/// 业务作用：集中持有 DATAGRAM stream-id 分发表与 CONNECT-UDP socket 准入，确保 request task
+/// 之间共享同一连接预算，不会因并发 stream 各建一份计数而突破上限。
+struct QuicExtensionContext {
+    connection: quinn::Connection,
+    dispatcher: Arc<H3DatagramDispatcher>,
+    connect_udp_slots: Arc<Semaphore>,
+    max_datagram_queue: usize,
+    max_datagram_bytes: usize,
+}
+
+impl QuicExtensionContext {
+    /// 业务作用：按已校验 HTTP/3 计划构造单连接扩展运行态。
+    ///
+    /// 参数说明：`connection` 是原始 Quinn 句柄；`http3` 提供会话与 DATAGRAM 硬门；
+    /// `metrics` 接收固定低基数处置结果。
+    ///
+    /// 返回：返回尚无活动 session 的共享上下文，不启动外部 I/O。
+    fn new(connection: quinn::Connection, http3: &Http3RuntimeCfg, metrics: Arc<Metrics>) -> Self {
+        Self {
+            connection,
+            dispatcher: Arc::new(H3DatagramDispatcher::new(
+                crate::masque::MAX_DATAGRAM_PAYLOAD,
+                metrics,
+            )),
+            connect_udp_slots: Arc::new(Semaphore::new(http3.max_connect_udp_sessions)),
+            max_datagram_queue: http3.max_datagram_queue,
+            max_datagram_bytes: http3.max_datagram_bytes,
+        }
+    }
+}
+
+/// connection-wide HTTP/3 DATAGRAM 到 request stream 的有界分发表。
+struct H3DatagramDispatcher {
+    sessions: Mutex<HashMap<u64, DatagramSink>>,
+    max_datagram_bytes: usize,
+    metrics: Arc<Metrics>,
+}
+
+/// HTTP/3 DATAGRAM 所属的扩展协议。
+#[derive(Clone, Copy)]
+enum DatagramProtocol {
+    ConnectUdp,
+    WebTransport,
+}
+
+/// 一个活动 request stream 的有界 DATAGRAM 投递目标。
+#[derive(Clone)]
+struct DatagramSink {
+    sender: mpsc::Sender<Bytes>,
+    protocol: DatagramProtocol,
+}
+
+/// 活动 DATAGRAM 映射的 RAII 守卫。
+///
+/// 业务作用：保证 H3 response 写失败、relay 错误、取消与 panic unwind 都撤销 stream-id 映射，
+/// 防止关闭队列永久留在连接级表中并吞掉后续迟到报文。
+struct DatagramRegistration {
+    dispatcher: Arc<H3DatagramDispatcher>,
+    stream_id: u64,
+}
+
+impl Drop for DatagramRegistration {
+    /// 业务作用：在所有 session 终态统一撤销 DATAGRAM 分发表权威。
+    ///
+    /// 参数说明：无。
+    ///
+    /// 返回：无；Drop 可重复安全执行，缺失条目不报错。
+    fn drop(&mut self) {
+        self.dispatcher.unregister(self.stream_id);
+    }
+}
+
+impl H3DatagramDispatcher {
+    /// 业务作用：创建空分发表并冻结单 payload 上限。
+    ///
+    /// 参数说明：`max_datagram_bytes` 是 UDP payload 上限；`metrics` 记录固定转发/丢弃结果。
+    ///
+    /// 返回：返回不持有 session 的 dispatcher。
+    fn new(max_datagram_bytes: usize, metrics: Arc<Metrics>) -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            max_datagram_bytes,
+            metrics,
+        }
+    }
+
+    /// 业务作用：把一个 request stream 登记为 DATAGRAM 唯一消费者。
+    ///
+    /// 参数说明：`stream_id` 是 client-initiated bidi stream id；`sender` 是该 session 有界队列；
+    /// `protocol` 冻结丢弃指标的协议归属。
+    ///
+    /// 返回：首次登记成功返回 true；重复 id 返回 false，防止数据报被后到 task 劫持。
+    fn register(
+        &self,
+        stream_id: u64,
+        sender: mpsc::Sender<Bytes>,
+        protocol: DatagramProtocol,
+    ) -> bool {
+        let mut sessions = self.sessions.lock();
+        if sessions.contains_key(&stream_id) {
+            return false;
+        }
+        sessions.insert(stream_id, DatagramSink { sender, protocol });
+        true
+    }
+
+    /// 业务作用：在 session 终止时撤销 stream-id 权威映射。
+    ///
+    /// 参数说明：`stream_id` 是不再接收 DATAGRAM 的 request stream。
+    ///
+    /// 返回：无；后续迟到报文按无 session 丢弃。
+    fn unregister(&self, stream_id: u64) {
+        self.sessions.lock().remove(&stream_id);
+    }
+
+    /// 业务作用：解析 Quarter Stream ID 并把单个 DATAGRAM 非阻塞投递给对应 session。
+    ///
+    /// 参数说明：`datagram` 是 Quinn 收到的完整 HTTP/3 DATAGRAM wire payload。
+    ///
+    /// 返回：无；畸形、未知 stream、超限或队列满都按不可靠语义丢弃并计数，不阻塞其它 session。
+    fn dispatch(&self, datagram: Bytes) {
+        let mut cursor = datagram.as_ref();
+        let Some(quarter_stream_id) = crate::masque::decode_varint(&mut cursor) else {
+            self.metrics.inc_http3_datagram_drop();
+            return;
+        };
+        let Some(stream_id) = quarter_stream_id.checked_mul(4) else {
+            self.metrics.inc_http3_datagram_drop();
+            return;
+        };
+        let consumed = datagram.len().saturating_sub(cursor.len());
+        let payload = datagram.slice(consumed..);
+        let sink = self.sessions.lock().get(&stream_id).cloned();
+        let Some(sink) = sink else {
+            self.metrics.inc_http3_datagram_drop();
+            return;
+        };
+        // CONNECT-UDP payload 还包含 Context ID，WebTransport payload 则没有；dispatcher 只做
+        // 协议绝对上限，各 session 随后执行自己的更小配置门。
+        if payload.len() > self.max_datagram_bytes.saturating_add(8) {
+            self.inc_datagram_drop(sink.protocol);
+            return;
+        }
+        match sink.sender.try_send(payload) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
+                self.inc_datagram_drop(sink.protocol);
+            }
+        }
+    }
+
+    /// 业务作用：把已归属 session 的 DATAGRAM 丢弃计入正确协议，避免 WebTransport 污染
+    /// CONNECT-UDP 指标并掩盖各自的容量问题。
+    ///
+    /// 参数说明：`protocol` 是注册 session 时冻结的协议身份。
+    ///
+    /// 返回：无；只更新对应固定计数器。
+    fn inc_datagram_drop(&self, protocol: DatagramProtocol) {
+        match protocol {
+            DatagramProtocol::ConnectUdp => self.metrics.inc_connect_udp_datagram_drop(),
+            DatagramProtocol::WebTransport => self.metrics.inc_webtransport_datagram_drop(),
+        }
+    }
+}
+
+/// 业务作用：独占读取一条 QUIC connection 的 DATAGRAM 并送入 stream-id 分发表。
+///
+/// 参数说明：`connection` 提供 Quinn datagram 接口；`dispatcher` 持有活动 session 队列。
+///
+/// 返回：无；连接关闭即停止，错误不会重启第二个 reader 与当前 generation 争抢报文。
+async fn receive_h3_datagrams(
+    connection: quinn::Connection,
+    dispatcher: Arc<H3DatagramDispatcher>,
+) {
+    while let Ok(datagram) = connection.read_datagram().await {
+        dispatcher.dispatch(datagram);
+    }
+}
+
+/// 业务作用：执行已通过统一 route 安全管线的 CONNECT-UDP session，并在同一 request stream
+/// 生命周期内桥接 HTTP/3 DATAGRAM、DATAGRAM capsule 与单个已校验 UDP 目标。
+///
+/// 参数说明：`request`/`stream` 是 extended CONNECT head 与控制流；`proxy`/`proxy_id` 执行
+/// 统一治理；`initial_peer` 是迁移前冻结身份；`extensions` 是连接级有界运行态；`shutdown`
+/// 在 listener 换代时结束会话。
+///
+/// 返回：会话正常收尾时成功；配置未开放、治理拒绝、socket 或 H3 协议失败时返回错误。
+async fn serve_connect_udp(
+    mut request: Request<()>,
+    mut stream: h3::server::RequestStream<crate::h3_quinn_tracked::BidiStream<Bytes>, Bytes>,
+    proxy: Arc<GatewayProxy>,
+    proxy_id: Arc<str>,
+    initial_peer: SocketAddr,
+    extensions: Arc<QuicExtensionContext>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    anyhow::ensure!(
+        request.method() == Method::CONNECT,
+        "CONNECT-UDP protocol requires CONNECT method"
+    );
+    let permit = match extensions.connect_udp_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let response = Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(full_body(Bytes::from_static(
+                    b"CONNECT-UDP session limit reached",
+                )))
+                .expect("fixed CONNECT-UDP capacity response");
+            let (send, _recv) = stream.split();
+            return send_response(send, response, &Method::CONNECT).await;
+        }
+    };
+    request
+        .extensions_mut()
+        .insert(crate::masque::ConnectUdpRequest);
+    let (parts, ()) = request.into_parts();
+    let request = Request::from_parts(parts, full_body(Bytes::new()));
+    let mut response = match proxy
+        .handle_boxed(request, ConnInfo::plain(initial_peer), "https", proxy_id)
+        .await
+    {
+        Ok(response) => response,
+        Err(never) => match never {},
+    };
+    let Some(plan) = response
+        .extensions_mut()
+        .remove::<crate::masque::ConnectUdpPlan>()
+    else {
+        let (send, _recv) = stream.split();
+        return send_response(send, response, &Method::CONNECT).await;
+    };
+    let socket = match connect_checked_udp(plan.addresses.as_ref(), plan.policy.connect_timeout())
+        .await
+    {
+        Ok(socket) => socket,
+        Err(error) => {
+            tracing::debug!(route = %plan.route_id, %error, "CONNECT-UDP socket preparation failed");
+            let response = Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(full_body(Bytes::from_static(
+                    b"CONNECT-UDP target unavailable",
+                )))
+                .expect("fixed CONNECT-UDP target response");
+            let (send, _recv) = stream.split();
+            return send_response(send, response, &Method::CONNECT).await;
+        }
+    };
+    let stream_id = stream.send_id().into_inner();
+    let (datagrams, incoming_datagrams) = mpsc::channel(extensions.max_datagram_queue);
+    anyhow::ensure!(
+        extensions
+            .dispatcher
+            .register(stream_id, datagrams, DatagramProtocol::ConnectUdp),
+        "CONNECT-UDP stream id is already registered"
+    );
+    let _registration = DatagramRegistration {
+        dispatcher: extensions.dispatcher.clone(),
+        stream_id,
+    };
+
+    let (mut response_parts, _) = response.into_parts();
+    response_parts.version = Version::HTTP_3;
+    strip_forbidden_headers(&mut response_parts.headers);
+    stream
+        .send_response(Response::from_parts(response_parts, ()))
+        .await
+        .context("send CONNECT-UDP response")?;
+    let (send, recv) = stream.split();
+    relay_connect_udp(
+        send,
+        recv,
+        socket,
+        incoming_datagrams,
+        extensions.connection.clone(),
+        stream_id,
+        extensions.max_datagram_bytes,
+        plan,
+        permit,
+        extensions.dispatcher.metrics.clone(),
+        shutdown,
+    )
+    .await
+}
+
+/// 业务作用：按已校验地址创建 connected UDP socket，禁止把原始 hostname 再交给系统解析。
+///
+/// 参数说明：`addresses` 是同一请求刚完成 SSRF 复验的地址；`timeout` 限制本地 socket 准备。
+///
+/// 返回：首个可用地址对应的 connected socket；所有地址都失败时返回错误且不得发送 2xx。
+async fn connect_checked_udp(
+    addresses: &[SocketAddr],
+    timeout: Duration,
+) -> Result<tokio::net::UdpSocket> {
+    for address in addresses {
+        let bind = match address.ip() {
+            IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        };
+        let Ok(socket) = tokio::net::UdpSocket::bind(bind).await else {
+            continue;
+        };
+        // 这里只连接本请求已经逐个校验的 IP；绝不使用 host:port 触发第二次 DNS 解析。
+        if matches!(
+            tokio::time::timeout(timeout, socket.connect(*address)).await,
+            Ok(Ok(()))
+        ) {
+            return Ok(socket);
+        }
+    }
+    anyhow::bail!("CONNECT-UDP target is unreachable")
+}
+
+/// 业务作用：在一个 CONNECT-UDP session 内执行双向数据报转发、capsule fallback、共享字节
+/// 预算、idle/lifetime 与 shutdown 门，任何终态都关闭控制 stream 并归还 session 准入。
+///
+/// 参数说明：`send`/`recv` 是 CONNECT 控制流；`socket` 已按校验 IP connected；
+/// `incoming_datagrams` 是该 stream 的有界分发队列；其余参数固定 wire id、预算和生命周期。
+///
+/// 返回：正常超时、客户端结束或 shutdown 返回成功；H3/UDP I/O 错误返回失败。
+#[allow(clippy::too_many_arguments)]
+async fn relay_connect_udp(
+    mut send: h3::server::RequestStream<crate::h3_quinn_tracked::SendStream<Bytes>, Bytes>,
+    mut recv: h3::server::RequestStream<crate::h3_quinn_tracked::RecvStream, Bytes>,
+    socket: tokio::net::UdpSocket,
+    mut incoming_datagrams: mpsc::Receiver<Bytes>,
+    connection: quinn::Connection,
+    stream_id: u64,
+    max_datagram_bytes: usize,
+    plan: crate::masque::ConnectUdpPlan,
+    _permit: OwnedSemaphorePermit,
+    metrics: Arc<Metrics>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let started = tokio::time::Instant::now();
+    let mut last_activity = started;
+    let mut used_bytes = 0_u64;
+    let mut udp_buffer = vec![0_u8; max_datagram_bytes.saturating_add(1)];
+    let mut capsule_buffer = BytesMut::new();
+    let close = plan.guard.closed();
+    tokio::pin!(close);
+    loop {
+        let idle_deadline = (plan.policy.idle_timeout_ms > 0)
+            .then(|| last_activity + Duration::from_millis(plan.policy.idle_timeout_ms));
+        let lifetime_deadline = (plan.policy.max_lifetime_ms > 0)
+            .then(|| started + Duration::from_millis(plan.policy.max_lifetime_ms));
+        let deadline = match (idle_deadline, lifetime_deadline) {
+            (Some(idle), Some(lifetime)) => idle.min(lifetime),
+            (Some(deadline), None) | (None, Some(deadline)) => deadline,
+            (None, None) => started + Duration::from_secs(365 * 24 * 60 * 60),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = &mut close => break,
+            incoming = incoming_datagrams.recv() => {
+                let Some(datagram) = incoming else {
+                    break;
+                };
+                let mut payload = datagram.as_ref();
+                let Some(context_id) = crate::masque::decode_varint(&mut payload) else {
+                    metrics.inc_connect_udp_datagram_drop();
+                    continue;
+                };
+                let Some(next_used) = connect_udp_next_bytes(
+                    used_bytes,
+                    payload.len(),
+                    plan.policy.max_bytes,
+                ) else {
+                    metrics.inc_connect_udp_datagram_drop();
+                    continue;
+                };
+                if context_id != 0 || payload.len() > max_datagram_bytes {
+                    metrics.inc_connect_udp_datagram_drop();
+                    continue;
+                }
+                socket.send(payload).await.context("send CONNECT-UDP payload")?;
+                used_bytes = next_used;
+                last_activity = tokio::time::Instant::now();
+                metrics.inc_connect_udp_datagram(true);
+            }
+            received = socket.recv(&mut udp_buffer) => {
+                let length = received.context("receive CONNECT-UDP payload")?;
+                let Some(next_used) = connect_udp_next_bytes(
+                    used_bytes,
+                    length,
+                    plan.policy.max_bytes,
+                ) else {
+                    metrics.inc_connect_udp_datagram_drop();
+                    continue;
+                };
+                if length > max_datagram_bytes {
+                    metrics.inc_connect_udp_datagram_drop();
+                    continue;
+                }
+                let mut wire = Vec::with_capacity(length.saturating_add(16));
+                crate::masque::encode_varint(stream_id / 4, &mut wire)?;
+                crate::masque::encode_varint(0, &mut wire)?;
+                wire.put_slice(&udp_buffer[..length]);
+                match connection.send_datagram(Bytes::from(wire)) {
+                    Ok(()) => {
+                        used_bytes = next_used;
+                        last_activity = tokio::time::Instant::now();
+                        metrics.inc_connect_udp_datagram(false);
+                    }
+                    Err(quinn::SendDatagramError::TooLarge
+                        | quinn::SendDatagramError::UnsupportedByPeer
+                        | quinn::SendDatagramError::Disabled) => {
+                        metrics.inc_connect_udp_datagram_drop();
+                    }
+                    Err(quinn::SendDatagramError::ConnectionLost(error)) => {
+                        return Err(error).context("send CONNECT-UDP DATAGRAM");
+                    }
+                }
+            }
+            frame = recv.recv_data() => {
+                let Some(mut frame) = frame.context("receive CONNECT-UDP capsule DATA")? else {
+                    break;
+                };
+                if capsule_buffer.len().saturating_add(frame.remaining())
+                    > crate::masque::MAX_CAPSULE_LEN as usize + 16
+                {
+                    anyhow::bail!("CONNECT-UDP capsule buffer exceeds limit");
+                }
+                capsule_buffer.extend_from_slice(&frame.copy_to_bytes(frame.remaining()));
+                loop {
+                    let mut cursor = capsule_buffer.as_ref();
+                    match crate::masque::parse_capsule(&mut cursor) {
+                        crate::masque::CapsuleOutcome::Incomplete => break,
+                        crate::masque::CapsuleOutcome::TooLarge { .. } => {
+                            anyhow::bail!("CONNECT-UDP capsule exceeds limit");
+                        }
+                        crate::masque::CapsuleOutcome::Capsule { kind, payload } => {
+                            let consumed = capsule_buffer.len().saturating_sub(cursor.len());
+                            capsule_buffer.advance(consumed);
+                            if kind != crate::masque::CAPSULE_TYPE_DATAGRAM {
+                                continue;
+                            }
+                            let Some((context_id, payload)) = crate::masque::parse_datagram_capsule(&payload) else {
+                                metrics.inc_connect_udp_datagram_drop();
+                                continue;
+                            };
+                            let Some(next_used) = connect_udp_next_bytes(
+                                used_bytes,
+                                payload.len(),
+                                plan.policy.max_bytes,
+                            ) else {
+                                metrics.inc_connect_udp_datagram_drop();
+                                continue;
+                            };
+                            if context_id != 0 || payload.len() > max_datagram_bytes {
+                                metrics.inc_connect_udp_datagram_drop();
+                                continue;
+                            }
+                            socket.send(payload).await.context("send CONNECT-UDP capsule payload")?;
+                            used_bytes = next_used;
+                            last_activity = tokio::time::Instant::now();
+                            metrics.inc_connect_udp_datagram(true);
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    recv.stop_sending(Code::H3_NO_ERROR);
+    send.finish()
+        .await
+        .context("finish CONNECT-UDP response stream")?;
+    tracing::debug!(
+        route = %plan.route_id,
+        host = %plan.target.host,
+        port = plan.target.port,
+        used_bytes,
+        "CONNECT-UDP session closed"
+    );
+    Ok(())
+}
+
+/// 业务作用：让 CONNECT-UDP 两个方向共享一份累计字节预算，避免分别计数造成双倍放行。
+///
+/// 参数说明：`used` 是已转发总量；`length` 是候选 payload 大小；`maximum` 为零时表示不限制。
+///
+/// 返回：预算允许时返回成功发送后的新累计值；溢出或超限返回 None，原计数不变。
+fn connect_udp_next_bytes(used: u64, length: usize, maximum: u64) -> Option<u64> {
+    let next = used.checked_add(length as u64)?;
+    if maximum > 0 && next > maximum {
+        return None;
+    }
+    Some(next)
+}
+
 /// 把统一网关响应流写回一个 HTTP/3 request stream。
 ///
 /// 业务作用：保持 DATA/trailers 的顺序与背压，并在任何 body/send 失败时同时终止发送和接收方向，
@@ -391,7 +1749,7 @@ async fn serve_request(
 ///
 /// 返回：成功表示 FIN 已写出；失败表示 stream 已用 `H3_INTERNAL_ERROR` 终止。
 async fn send_response(
-    mut stream: h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    mut stream: h3::server::RequestStream<crate::h3_quinn_tracked::SendStream<Bytes>, Bytes>,
     response: Response<BoxBody>,
     request_method: &Method,
 ) -> Result<()> {
@@ -469,7 +1827,7 @@ fn strip_forbidden_headers(headers: &mut HeaderMap) {
 
 /// 把 H3 receive half 暴露为 `http_body::Body`，不预读也不聚合请求 payload。
 struct H3RequestBody {
-    stream: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>,
+    stream: h3::server::RequestStream<crate::h3_quinn_tracked::RecvStream, Bytes>,
     data_done: bool,
     trailers_done: bool,
 }
@@ -483,7 +1841,7 @@ impl H3RequestBody {
     /// 参数说明：`stream` 是单个 H3 请求独占的 receive half。
     ///
     /// 返回：尚未读取任何 frame 的流式 Body。
-    fn new(stream: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>) -> Self {
+    fn new(stream: h3::server::RequestStream<crate::h3_quinn_tracked::RecvStream, Bytes>) -> Self {
         Self {
             stream,
             data_done: false,

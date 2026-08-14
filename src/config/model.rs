@@ -37,6 +37,15 @@ pub struct GatewayConfig {
     /// 静态上游定义；`lb://service` 路由从这里选实例，Nacos 等动态注册中心通过同一发现抽象补充实例。
     #[serde(default)]
     pub upstreams: UpstreamsCfg,
+    /// 可复用上游凭据对象；route/service 只能按名称引用且必须通过 backend allowlist。
+    #[serde(default)]
+    pub upstream_credentials: Vec<UpstreamCredentialCfg>,
+    /// 远程 Secret provider 目录；只在候选构建和后台刷新阶段访问，数据面不得发起读取。
+    #[serde(default)]
+    pub secret_providers: Vec<RemoteSecretProviderCfg>,
+    /// 不导出私钥的远程加解密/签名 provider 目录。
+    #[serde(default)]
+    pub crypto_providers: Vec<ExternalCryptoProviderCfg>,
     /// 服务发现后端配置。V2-B 接 Nacos watch;其它注册中心后端留到 V7。
     #[serde(default)]
     pub discovery: DiscoveryCfg,
@@ -456,7 +465,7 @@ pub struct ServerCfg {
     /// 数据面超时预算:连接空闲、上游响应头等。
     #[serde(default)]
     pub timeouts: TimeoutCfg,
-    /// 可信前置代理网段(据 review L6 / §12);语义同 `ProxyCfg.trusted_proxies`。
+    /// 可信前置代理网段；语义同 `ProxyCfg.trusted_proxies`。
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 }
@@ -484,7 +493,7 @@ pub struct ProxyCfg {
     /// listener 隔离路由；HTTPS 再与 TLS SNI 的选择结果比较，不一致时返回 421。
     #[serde(default)]
     pub gateway_listeners: Vec<GatewayListenerCfg>,
-    /// 可信前置代理网段(据 review L6 / §12):只有来自这些 CIDR 的直连对端,才信任其
+    /// 可信前置代理网段：只有来自这些 CIDR 的直连对端，才信任其
     /// `X-Forwarded-For` / `traceparent` 等入站头(取真实客户端 IP、续用 trace);否则一律用 socket
     /// 对端并重生成 trace,防伪造绕过 IP ACL / 限流 / 审计。空 = 不信任任何 XFF(安全默认)。
     #[serde(default)]
@@ -833,9 +842,17 @@ pub enum StreamProtocolCfg {
 #[serde(deny_unknown_fields)]
 pub struct StreamTlsCfg {
     /// PEM 证书链文件，相对主配置文件目录解析。
+    #[serde(default)]
     pub cert_file: String,
     /// 与证书匹配的 PEM 私钥文件，相对主配置文件目录解析。
+    #[serde(default)]
     pub key_file: String,
+    /// 可选外部 TLS 签名身份；配置后 `key_file` 必须为空。
+    #[serde(default)]
+    pub private_key_provider: Option<ExternalPrivateKeyCfg>,
+    /// 可选 SPIRE Workload API 身份；配置后文件身份、外部 signer 与 SNI 身份必须为空。
+    #[serde(default)]
+    pub spire: Option<SpireWorkloadCfg>,
     /// 同一 stream socket 上按 SNI 选择的额外证书身份。
     #[serde(default)]
     pub certs: Vec<SniCertCfg>,
@@ -845,6 +862,12 @@ pub struct StreamTlsCfg {
     /// 可选 mTLS 客户端 CA，与 L7 `tls.client_auth` 使用同一 require/optional 契约。
     #[serde(default)]
     pub client_auth: Option<ClientAuthCfg>,
+    /// 默认证书的服务端 OCSP staple；SNI 附加证书分别在各自条目声明。
+    #[serde(default)]
+    pub ocsp_stapling: Option<OcspStaplingCfg>,
+    /// 可选共享 session ticket key 集；语义与 HTTP TLS listener 一致。
+    #[serde(default)]
+    pub session_tickets: Option<SessionTicketCfg>,
 }
 
 /// UDP listener 的有界 5-tuple 会话配置。
@@ -1079,9 +1102,17 @@ pub struct TlsCfg {
     /// TLS 数据面监听地址。
     pub listen: String,
     /// 【默认】证书链 PEM 文件路径(相对 gateway.yml 所在目录或绝对路径);SNI 不匹配 `certs[]` 时兜底用它。
+    #[serde(default)]
     pub cert_file: String,
     /// 【默认】私钥 PEM 文件路径(相对 gateway.yml 所在目录或绝对路径)。
+    #[serde(default)]
     pub key_file: String,
+    /// 可选外部 TLS 签名身份；配置后 `key_file` 必须为空且私钥不会进入进程。
+    #[serde(default)]
+    pub private_key_provider: Option<ExternalPrivateKeyCfg>,
+    /// 可选 SPIRE Workload API 身份；配置后服务端证书和私钥由本地 Agent 流式提供。
+    #[serde(default)]
+    pub spire: Option<SpireWorkloadCfg>,
     /// 可选 cert/key pair 原子指针 manifest（相对 gateway.yml 或绝对路径）。配置后，网关优先从
     /// manifest 指向的不可变版本目录加载 `cert.pem` + `key.pem`；manifest 尚不存在时兼容回退
     /// `cert_file`/`key_file`，便于从 seed 证书平滑迁移及 ACME 无 seed 首签。
@@ -1093,12 +1124,18 @@ pub struct TlsCfg {
     /// 双向 TLS(mTLS,§19):校验客户端证书。缺省 None = 关闭(不要求客户端证书)。
     #[serde(default)]
     pub client_auth: Option<ClientAuthCfg>,
+    /// 默认证书的服务端 OCSP staple；SNI 附加证书分别在各自条目声明。
+    #[serde(default)]
+    pub ocsp_stapling: Option<OcspStaplingCfg>,
+    /// 可选共享 session ticket key 集；首项签发、全部项解密，支持跨节点重叠轮换与撤销。
+    #[serde(default)]
+    pub session_tickets: Option<SessionTicketCfg>,
     /// ACME 自动签发/续期；None 表示完全关闭并只使用静态 cert/key。
     #[serde(default)]
     pub acme: Option<AcmeCfg>,
 }
 
-/// V9 HTTP/3/QUIC listener 配置。
+/// HTTP/3/QUIC listener 配置。
 ///
 /// 业务作用：为同一逻辑 TLS listener 声明 UDP/H3 transport 预算与安全策略；路由、过滤器和
 /// 上游语义仍复用现有 proxy，不允许用该配置建立第二套路由模型。
@@ -1108,6 +1145,17 @@ pub struct Http3Cfg {
     /// 是否为 `tls.listen` 同端口绑定 QUIC/UDP。
     #[serde(default)]
     pub enabled: bool,
+    /// QUIC 扩展能力声明：webtransport|connect_udp|datagram|early_data。
+    ///
+    /// 默认全部关闭；能力必须满足其依赖与资源门，关闭时不会创建相应会话或 DATAGRAM 缓冲。
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// 0-RTT 是否具备跨节点共享的 anti-replay 缓存。多节点集群启用 early_data 时必填。
+    #[serde(default)]
+    pub early_data_shared_replay_cache: bool,
+    /// 本集群是否为多节点部署。用于判定 early_data 的重放防护是否成立。
+    #[serde(default)]
+    pub multi_node: bool,
     /// readiness 成功后是否在 TCP TLS 响应中发布 `Alt-Svc: h3=...`。
     #[serde(default = "default_true")]
     pub advertise_alt_svc: bool,
@@ -1132,12 +1180,25 @@ pub struct Http3Cfg {
     /// 单 QUIC connection 允许的客户端双向 request stream 上限。
     #[serde(default = "default_http3_max_bidi_streams_per_connection")]
     pub max_bidi_streams_per_connection: u32,
+    /// 单 QUIC connection 允许客户端打开的单向 stream 总上限；其中包含 H3
+    /// control/QPACK stream，只有剩余名额可供 WebTransport 使用。
+    #[serde(default = "default_http3_max_uni_streams_per_connection")]
+    pub max_uni_streams_per_connection: u32,
     /// H3 解码后单次 header section 上限。
     #[serde(default = "default_http3_max_request_header_bytes")]
     pub max_request_header_bytes: usize,
     /// 单 request stream 在网关内允许暂存的 body/发送队列字节上限。
     #[serde(default = "default_http3_max_stream_buffer_bytes")]
     pub max_stream_buffer_bytes: usize,
+    /// 单条 QUIC connection 同时存活的 CONNECT-UDP 会话上限。
+    #[serde(default = "default_http3_max_connect_udp_sessions")]
+    pub max_connect_udp_sessions: usize,
+    /// 单个 CONNECT-UDP 会话等待处理的下行 DATAGRAM 数量上限；队列满时按不可靠语义丢弃。
+    #[serde(default = "default_http3_max_datagram_queue")]
+    pub max_datagram_queue: usize,
+    /// CONNECT-UDP 单个 UDP payload 上限；不包含 Quarter Stream ID 与 Context ID。
+    #[serde(default = "default_http3_max_datagram_bytes")]
+    pub max_datagram_bytes: usize,
     /// 地址验证 Retry 策略。
     #[serde(default)]
     pub retry: Http3RetryCfg,
@@ -1147,14 +1208,21 @@ pub struct Http3Cfg {
     /// Retry token 认证主密钥轮换周期（秒）。
     #[serde(default = "default_http3_retry_token_rotation_seconds")]
     pub retry_token_rotation_seconds: u64,
-    /// 0-RTT early data；V9 首版必须保持 false，true 在构建期拒绝。
+    /// 是否在 TLS 层接受 0-RTT early data；必须同时声明 `early_data` capability
+    /// 且至少一条 route 显式授权，默认关闭。
     #[serde(default)]
     pub zero_rtt: bool,
+    /// 有状态 TLS 1.3 恢复代的最长轮换周期；新代发布后旧 session 不能再进入 0-RTT。
+    #[serde(default = "default_http3_early_data_session_rotation_seconds")]
+    pub early_data_session_rotation_seconds: u64,
 }
 
 impl Default for Http3Cfg {
     fn default() -> Self {
         Self {
+            capabilities: Vec::new(),
+            early_data_shared_replay_cache: false,
+            multi_node: false,
             enabled: false,
             advertise_alt_svc: true,
             alt_svc_max_age_seconds: default_http3_alt_svc_max_age_seconds(),
@@ -1164,12 +1232,18 @@ impl Default for Http3Cfg {
             max_pending_handshakes: default_http3_max_pending_handshakes(),
             max_pending_handshake_bytes: default_http3_max_pending_handshake_bytes(),
             max_bidi_streams_per_connection: default_http3_max_bidi_streams_per_connection(),
+            max_uni_streams_per_connection: default_http3_max_uni_streams_per_connection(),
             max_request_header_bytes: default_http3_max_request_header_bytes(),
             max_stream_buffer_bytes: default_http3_max_stream_buffer_bytes(),
+            max_connect_udp_sessions: default_http3_max_connect_udp_sessions(),
+            max_datagram_queue: default_http3_max_datagram_queue(),
+            max_datagram_bytes: default_http3_max_datagram_bytes(),
             retry: Http3RetryCfg::default(),
             retry_token_lifetime_seconds: default_http3_retry_token_lifetime_seconds(),
             retry_token_rotation_seconds: default_http3_retry_token_rotation_seconds(),
             zero_rtt: false,
+            early_data_session_rotation_seconds: default_http3_early_data_session_rotation_seconds(
+            ),
         }
     }
 }
@@ -1199,6 +1273,33 @@ const fn default_http3_max_connections() -> usize {
     100_000
 }
 
+/// 业务作用：限制单连接可占用的 CONNECT-UDP socket 数，避免一个 QUIC peer 耗尽文件描述符。
+///
+/// 参数说明：无。
+///
+/// 返回：返回默认会话上限 64。
+const fn default_http3_max_connect_udp_sessions() -> usize {
+    64
+}
+
+/// 业务作用：为不可靠 DATAGRAM 提供小型突发吸收队列，同时保持丢包背压有界。
+///
+/// 参数说明：无。
+///
+/// 返回：返回默认队列上限 128。
+const fn default_http3_max_datagram_queue() -> usize {
+    128
+}
+
+/// 业务作用：给 CONNECT-UDP payload 设置保守默认值，使常见 QUIC path MTU 无需 IP 分片。
+///
+/// 参数说明：无。
+///
+/// 返回：返回默认 payload 上限 1150 字节。
+const fn default_http3_max_datagram_bytes() -> usize {
+    1_150
+}
+
 const fn default_http3_max_connections_per_ip() -> usize {
     1024
 }
@@ -1215,6 +1316,15 @@ const fn default_http3_max_bidi_streams_per_connection() -> u32 {
     256
 }
 
+/// 业务作用：为 H3 控制流与 WebTransport 单向业务流预留共享的连接级容量。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 256 条客户端单向 stream 的默认硬上限。
+const fn default_http3_max_uni_streams_per_connection() -> u32 {
+    256
+}
+
 const fn default_http3_max_request_header_bytes() -> usize {
     64 * 1024
 }
@@ -1228,6 +1338,15 @@ const fn default_http3_retry_token_lifetime_seconds() -> u64 {
 }
 
 const fn default_http3_retry_token_rotation_seconds() -> u64 {
+    3600
+}
+
+/// 业务作用：限制可接受 early data 的 TLS 恢复状态存活代次，缩短泄漏 session 的风险窗口。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回一小时的默认恢复代轮换周期。
+const fn default_http3_early_data_session_rotation_seconds() -> u64 {
     3600
 }
 
@@ -1373,8 +1492,233 @@ pub struct ClientAuthCfg {
     /// `insecure_fallback` 请求任意证书但只校验私钥持有。默认 `require`。
     #[serde(default = "default_client_auth_mode")]
     pub mode: String,
-    /// 受信任的客户端 CA 证书链 PEM 文件路径(校验客户端证书签名)。
+    /// 受信任的客户端 CA 证书链 PEM 文件路径；SPIRE listener 使用动态 bundle 时留空。
+    #[serde(default)]
     pub ca_file: String,
+    /// 客户端证书 CRL PEM 文件列表；每个文件可包含多张 CRL。
+    #[serde(default)]
+    pub crl_files: Vec<String>,
+    /// `off|hard_fail|soft_fail`；soft-fail 只放行 CRL 无法判定，明确 revoked 始终拒绝。
+    #[serde(default = "default_client_revocation_mode")]
+    pub revocation_mode: String,
+    /// 是否把超过 CRL `nextUpdate` 的材料视为握手错误。
+    #[serde(default = "default_true")]
+    pub enforce_crl_expiration: bool,
+    /// 可选客户端证书在线 OCSP 复验；在 TLS 链校验成功后、开放业务协议前执行。
+    #[serde(default)]
+    pub ocsp: Option<ClientCertificateOcspCfg>,
+    /// 精确允许的 SPIFFE ID；非空时客户端叶证书必须只有一个 URI SAN 且命中列表。
+    #[serde(default)]
+    pub allowed_spiffe_ids: Vec<String>,
+    /// 允许任意 workload path 的 SPIFFE trust domain；与精确 ID 列表取并集。
+    #[serde(default)]
+    pub allowed_spiffe_trust_domains: Vec<String>,
+}
+
+/// SPIRE Workload API 的 X.509-SVID 选择、资源上限与重连策略。
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpireWorkloadCfg {
+    /// SPIRE Agent Workload API Unix socket 的绝对路径。
+    pub socket_path: String,
+    /// 当前 listener 或上游客户端必须使用的精确 SPIFFE ID。
+    pub spiffe_id: String,
+    /// 多身份场景的可选精确 hint；为空时只按 SPIFFE ID 选择。
+    #[serde(default)]
+    pub hint: Option<String>,
+    /// 明确允许导入的 federation trust domain；未列出的 foreign bundle 永不进入验证器。
+    #[serde(default)]
+    pub federation_trust_domains: Vec<String>,
+    /// 建连和首响应的总 deadline。
+    #[serde(default = "default_spire_timeout_ms")]
+    pub timeout_ms: u64,
+    /// 断流后最短重连退避。
+    #[serde(default = "default_spire_reconnect_min_ms")]
+    pub reconnect_min_ms: u64,
+    /// 断流后最大重连退避。
+    #[serde(default = "default_spire_reconnect_max_ms")]
+    pub reconnect_max_ms: u64,
+    /// 单次完整响应允许的证书、私钥、bundle 与 CRL 总字节上限。
+    #[serde(default = "default_spire_max_response_bytes")]
+    pub max_response_bytes: usize,
+    /// 新身份在发布时至少还需具备的有效时间，避免刚发布即到期。
+    #[serde(default = "default_spire_min_validity_seconds")]
+    pub min_validity_seconds: u64,
+    /// 证书 notBefore 与本机时钟允许的最大偏差。
+    #[serde(default = "default_spire_clock_skew_seconds")]
+    pub clock_skew_seconds: u64,
+}
+
+/// 客户端证书在线 OCSP 的依赖失败与缓存策略。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ClientCertificateOcspCfg {
+    /// `hard_fail|soft_fail`；明确 revoked、unknown 或坏签名在两种模式下都拒绝。
+    #[serde(default = "default_client_ocsp_mode")]
+    pub mode: String,
+    /// 单次 DNS、连接与响应读取的总 deadline。
+    #[serde(default = "default_client_ocsp_timeout_ms")]
+    pub timeout_ms: u64,
+    /// soft-fail 最多可沿用已验证但刚过 freshness 的缓存时长；0 表示不沿用。
+    #[serde(default)]
+    pub max_stale_seconds: u64,
+    /// 响应无 `nextUpdate` 时从 `thisUpdate` 起允许的最长年龄。
+    #[serde(default = "default_ocsp_max_age_without_next_update_seconds")]
+    pub max_age_without_next_update_seconds: u64,
+    /// responder 与网关的允许时钟偏差。
+    #[serde(default = "default_ocsp_clock_skew_seconds")]
+    pub clock_skew_seconds: u64,
+    /// 单 listener 缓存的客户端证书状态上限。
+    #[serde(default = "default_client_ocsp_cache_entries")]
+    pub max_cache_entries: usize,
+    /// 同一 listener 允许的并发 responder 请求数。
+    #[serde(default = "default_client_ocsp_concurrency")]
+    pub max_concurrency: usize,
+    /// 客户端可控 AIA 访问私网 responder 的唯一 allowlist；空值仅允许公网地址。
+    #[serde(default)]
+    pub allowed_responder_cidrs: Vec<String>,
+}
+
+/// 业务作用：客户端证书在线吊销检查默认在 responder 不可用时故障关闭。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `hard_fail`。
+fn default_client_ocsp_mode() -> String {
+    "hard_fail".to_owned()
+}
+
+/// 业务作用：限制客户端握手后等待 OCSP responder 的总时长。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 3 秒。
+const fn default_client_ocsp_timeout_ms() -> u64 {
+    3_000
+}
+
+/// 业务作用：限制单 listener 客户端证书 OCSP 缓存的身份数量。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 4096 项。
+const fn default_client_ocsp_cache_entries() -> usize {
+    4096
+}
+
+/// 业务作用：限制单 listener 因新客户端证书同时发起的 OCSP 请求。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 8 个并发。
+const fn default_client_ocsp_concurrency() -> usize {
+    8
+}
+
+/// TLS session ticket 的共享密钥与有效期策略。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTicketCfg {
+    /// 按顺序排列的 Base64 32-byte SecretSource；首项签发，后续项只用于轮换重叠期解密。
+    pub keys: Vec<String>,
+    /// 发给客户端的 ticket lifetime hint，也是配置要求的最长轮换窗口。
+    #[serde(default = "default_session_ticket_lifetime_seconds")]
+    pub lifetime_seconds: u32,
+}
+
+/// 服务端证书 OCSP stapling 的本地材料与 freshness 策略。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct OcspStaplingCfg {
+    /// DER 编码的完整 OCSPResponse 文件；写入方必须以 rename 原子替换。
+    pub response_file: String,
+    /// 可选 issuer 证书 PEM；缺省时使用服务端证书链的第二张证书。
+    #[serde(default)]
+    pub issuer_file: Option<String>,
+    /// `optional|required`；required 在材料缺失、无效或过期时拒绝握手。
+    #[serde(default = "default_ocsp_stapling_mode")]
+    pub mode: String,
+    /// 响应没有 `nextUpdate` 时，从 `thisUpdate` 起允许的最长年龄。
+    #[serde(default = "default_ocsp_max_age_without_next_update_seconds")]
+    pub max_age_without_next_update_seconds: u64,
+    /// 允许 responder 与网关时钟偏差的秒数。
+    #[serde(default = "default_ocsp_clock_skew_seconds")]
+    pub clock_skew_seconds: u64,
+    /// 是否从叶证书 AIA 的 OCSP responder 主动获取并原子预刷新 `response_file`。
+    #[serde(default)]
+    pub fetch_from_aia: bool,
+    /// 开启主动获取时的固定刷新间隔；响应到期门禁不依赖刷新成功。
+    #[serde(default = "default_ocsp_refresh_interval_seconds")]
+    pub refresh_interval_seconds: u64,
+    /// 单次 DNS、连接、响应读取共用的 deadline。
+    #[serde(default = "default_ocsp_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    /// AIA responder 若位于私网，必须被这些精确 CIDR 显式授权；空值仅允许公网地址。
+    #[serde(default)]
+    pub allowed_responder_cidrs: Vec<String>,
+}
+
+/// 业务作用：为 OCSP stapling 选择允许启动但不覆盖证书 must-staple 的默认策略。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `optional`；含 TLS Feature status_request 的证书仍会被强制提升为 required。
+fn default_ocsp_stapling_mode() -> String {
+    "optional".to_owned()
+}
+
+/// 业务作用：限制没有 `nextUpdate` 的 OCSP 响应可被重放的最长窗口。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 24 小时。
+const fn default_ocsp_max_age_without_next_update_seconds() -> u64 {
+    24 * 60 * 60
+}
+
+/// 业务作用：为 OCSP responder 与网关的轻微时钟漂移提供有界容差。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 5 分钟。
+const fn default_ocsp_clock_skew_seconds() -> u64 {
+    5 * 60
+}
+
+/// 业务作用：为主动 OCSP 获取提供早于常见 `nextUpdate` 的保守预刷新周期。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 1 小时。
+const fn default_ocsp_refresh_interval_seconds() -> u64 {
+    60 * 60
+}
+
+/// 业务作用：限制单次 OCSP responder 交互占用后台任务的时间。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 5 秒。
+const fn default_ocsp_request_timeout_ms() -> u64 {
+    5_000
+}
+
+/// 业务作用：默认关闭客户端证书吊销检查，避免没有 CRL 时产生含糊的软失败语义。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 `off`。
+fn default_client_revocation_mode() -> String {
+    "off".to_owned()
+}
+
+/// 业务作用：为显式启用的 session ticket 设置有界 lifetime hint。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 12 小时。
+const fn default_session_ticket_lifetime_seconds() -> u32 {
+    12 * 60 * 60
 }
 
 /// 一组 SNI 证书:命中这些 server_name 的握手用这套 cert/key(§19,对齐 nginx 多 `server{ssl_certificate}`)。
@@ -1385,7 +1729,14 @@ pub struct SniCertCfg {
     /// 证书链 PEM 文件路径。
     pub cert_file: String,
     /// 私钥 PEM 文件路径。
+    #[serde(default)]
     pub key_file: String,
+    /// 该 SNI 身份的外部签名引用；配置后本地私钥路径必须为空。
+    #[serde(default)]
+    pub private_key_provider: Option<ExternalPrivateKeyCfg>,
+    /// 该 SNI 证书专属的 OCSP staple；不能复用默认证书的响应。
+    #[serde(default)]
+    pub ocsp_stapling: Option<OcspStaplingCfg>,
 }
 
 /// 单个 HTTP proxy 的资源安全预算。
@@ -3131,6 +3482,27 @@ pub struct KubernetesRouteSourceCfg {
     /// 是否读取 gateway.networking.k8s.io/v1 GatewayClass/Gateway/HTTPRoute。
     #[serde(default = "default_true")]
     pub gateway_api_enabled: bool,
+    /// 是否读取 Gateway API Experimental Channel 与 MCS 资源；制品必须带 `gateway-api-experimental`。
+    #[serde(default)]
+    pub gateway_api_experimental: bool,
+    /// 是否读取 `inference.networking.k8s.io/v1` InferencePool，并把 EPP 决策接入 HTTPRoute。
+    /// 制品必须带 `inference-gateway`，关闭时不会请求 Inference Extension CRD 或 Pod LIST。
+    #[serde(default)]
+    pub inference_gateway_enabled: bool,
+    /// 固定的 Gateway API Inference Extension CRD 与 conformance contract 版本。
+    #[serde(default = "default_kubernetes_inference_extension_version")]
+    pub inference_extension_version: String,
+    /// 是否已有外部透明流量捕获把 Service/ServiceImport parent 流量送入 Naway。
+    /// false 时 mesh parent 明确发布不接纳状态，不能只因 CRD 可解析就宣称已编程。
+    #[serde(default)]
+    pub gateway_mesh_interception_ready: bool,
+    /// Mesh Profile 专用 listener 的绑定地址；应与公网 Gateway listener 隔离，
+    /// 只允许透明流量捕获组件访问。
+    #[serde(default = "default_kubernetes_gateway_mesh_bind_address")]
+    pub gateway_mesh_bind_address: String,
+    /// Mesh Profile 专用 listener 端口；外部透明流量捕获必须把 Service 流量送到该端口。
+    #[serde(default = "default_kubernetes_gateway_mesh_port")]
+    pub gateway_mesh_port: u16,
     /// 本控制器的 GatewayClass `spec.controllerName`。
     #[serde(default = "default_kubernetes_gateway_controller_name")]
     pub gateway_controller_name: String,
@@ -3202,6 +3574,12 @@ impl Default for KubernetesRouteSourceCfg {
             ingress_enabled: true,
             ingress_classes: default_kubernetes_ingress_classes(),
             gateway_api_enabled: true,
+            gateway_api_experimental: false,
+            inference_gateway_enabled: false,
+            inference_extension_version: default_kubernetes_inference_extension_version(),
+            gateway_mesh_interception_ready: false,
+            gateway_mesh_bind_address: default_kubernetes_gateway_mesh_bind_address(),
+            gateway_mesh_port: default_kubernetes_gateway_mesh_port(),
             gateway_controller_name: default_kubernetes_gateway_controller_name(),
             gateway_api_version: default_kubernetes_gateway_api_version(),
             gateway_bind_address: default_kubernetes_gateway_bind_address(),
@@ -3277,6 +3655,25 @@ fn default_kubernetes_gateway_bind_address() -> String {
     "0.0.0.0".to_owned()
 }
 
+/// 业务作用：把 Mesh Profile listener 默认限制在本机，避免来源 namespace header
+/// 被外部客户端伪造后取得 consumer Route 权限。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 IPv4 loopback 地址；跨 network namespace 部署必须显式配置受保护地址。
+fn default_kubernetes_gateway_mesh_bind_address() -> String {
+    "127.0.0.1".to_owned()
+}
+
+/// 业务作用：为透明流量捕获提供独立且稳定的 Mesh Profile 接收端口。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回默认端口 15001。
+const fn default_kubernetes_gateway_mesh_port() -> u16 {
+    15_001
+}
+
 /// 业务作用：为 Gateway API 生成的 stream listener 提供向后兼容的全接口默认绑定地址。
 /// 参数说明: 无。
 /// 返回：返回 IPv4 未指定地址；需要同端口隔离 L7 与 L4 时由部署方显式配置独立地址。
@@ -3289,6 +3686,15 @@ fn default_kubernetes_gateway_stream_bind_address() -> String {
 /// 返回：返回当前实现支持的稳定版本 `v1.5.1`。
 fn default_kubernetes_gateway_api_version() -> String {
     "v1.5.1".to_owned()
+}
+
+/// 业务作用：固定控制器实现与一致性声明共同采用的 Inference Extension 合同版本。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回当前支持的 `v1.5.0` 合同版本。
+fn default_kubernetes_inference_extension_version() -> String {
+    "v1.5.0".to_owned()
 }
 
 /// 业务作用：固定未启用 TLS backend policy 时 GRPCRoute 的明文 HTTP/2 transport。
@@ -3907,6 +4313,641 @@ const fn default_gateway_redirect_status_code() -> u16 {
     302
 }
 
+/// route 级内置 API WAF 配置。
+///
+/// 未配置时请求保持流式快路径；仅 `inspect_body: true` 会为 JSON/XML 请求启用有界聚合。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WafCfg {
+    /// 处置模式：`enforce` 拦截，`monitor` 只记录低基数命中结果后继续转发。
+    #[serde(default = "default_waf_mode")]
+    pub mode: String,
+    /// 是否检查 JSON/XML 请求体；false 时只检查 method、URI 与 headers。
+    #[serde(default)]
+    pub inspect_body: bool,
+    /// 请求体聚合上限；超过后故障关闭，不允许绕过检查进入上游。
+    #[serde(default = "default_waf_body_bytes")]
+    pub max_body_bytes: u64,
+    /// 单个 URI/header/结构化字符串允许扫描的最大字节数；超过后按异常输入处理。
+    #[serde(default = "default_waf_value_bytes")]
+    pub max_value_bytes: usize,
+    /// 启用的固定规则 id；空数组表示启用全部内置规则。
+    #[serde(default)]
+    pub enabled_rules: Vec<String>,
+    /// 按规则与精确 target 配置的例外；不支持通配符，避免例外范围无意扩大。
+    #[serde(default)]
+    pub exclusions: Vec<WafExclusionCfg>,
+    /// 可选外部 literal 规则包；候选发布前必须同时通过摘要、签名、格式和资源预算校验。
+    #[serde(default)]
+    pub rule_pack: Option<WafRulePackCfg>,
+    /// JSON 最大嵌套深度。
+    #[serde(default = "default_waf_structured_depth")]
+    pub max_json_depth: usize,
+    /// 单个 JSON document 最大 value 节点数。
+    #[serde(default = "default_waf_structured_nodes")]
+    pub max_json_nodes: usize,
+    /// XML 最大元素嵌套深度。
+    #[serde(default = "default_waf_structured_depth")]
+    pub max_xml_depth: usize,
+    /// 单个 XML document 最大事件节点数。
+    #[serde(default = "default_waf_structured_nodes")]
+    pub max_xml_nodes: usize,
+    /// 单个 XML document 最大属性总数。
+    #[serde(default = "default_waf_xml_attributes")]
+    pub max_xml_attributes: usize,
+}
+
+/// 一条 WAF 精确例外。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WafExclusionCfg {
+    /// 被豁免的固定规则 id。
+    pub rule: String,
+    /// 精确 target：`path`、`query`、`body` 或 `header:<lowercase-name>`。
+    pub target: String,
+}
+
+/// 外部 WAF literal 规则包的真实性与资源边界。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WafRulePackCfg {
+    /// 本地 JSON 规则包；相对主配置目录解析并纳入统一 dependency watcher。
+    pub source: String,
+    /// 原始 JSON 字节的 SHA-256 十六进制摘要。
+    pub sha256: String,
+    /// 原始 JSON 字节的 detached Ed25519 signature，使用 Base64 SecretSource。
+    pub signature: String,
+    /// 32 字节 Ed25519 public key，使用 Base64 SecretSource。
+    pub public_key: String,
+    /// 规则包原始字节硬上限。
+    #[serde(default = "default_waf_rule_pack_bytes")]
+    pub max_pack_bytes: usize,
+    /// 规则条目硬上限。
+    #[serde(default = "default_waf_rule_pack_rules")]
+    pub max_rules: usize,
+    /// 全部规则 literal 数量硬上限。
+    #[serde(default = "default_waf_rule_pack_patterns")]
+    pub max_patterns: usize,
+    /// 同步候选构建允许消耗的最长 wall time。
+    #[serde(default = "default_waf_rule_pack_compile_ms")]
+    pub max_compile_ms: u64,
+}
+
+/// route 级 Bot 识别、行为评分与挑战策略。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BotCfg {
+    /// 处置模式：`enforce|monitor`。
+    #[serde(default = "default_waf_mode")]
+    pub mode: String,
+    /// User-Agent allowlist glob；非空时不匹配的请求进入挑战。
+    #[serde(default)]
+    pub allowed_user_agents: Vec<String>,
+    /// User-Agent denylist glob。
+    #[serde(default)]
+    pub denied_user_agents: Vec<String>,
+    /// 必须存在且只有一个合法值的 header 名。
+    #[serde(default)]
+    pub required_headers: Vec<String>,
+    /// 出现即计为自动化信号的 header 名。
+    #[serde(default = "default_bot_automation_headers")]
+    pub automation_headers: Vec<String>,
+    /// 参与稳定客户端指纹的 header 名；User-Agent 始终参与且原值不会进入日志或限流 key。
+    #[serde(default = "default_bot_fingerprint_headers")]
+    pub fingerprint_headers: Vec<String>,
+    /// 明确拒绝的 SHA-256 指纹，使用 64 位小写十六进制字符串。
+    #[serde(default)]
+    pub denied_fingerprints: Vec<String>,
+    /// 缺少或非法 User-Agent 的行为分数。
+    #[serde(default = "default_bot_signal_score")]
+    pub missing_user_agent_score: u32,
+    /// 浏览器 User-Agent 与基础浏览器 header 不一致时的行为分数。
+    #[serde(default = "default_bot_browser_mismatch_score")]
+    pub browser_header_mismatch_score: u32,
+    /// 每个已出现 automation header 的行为分数。
+    #[serde(default = "default_bot_signal_score")]
+    pub automation_header_score: u32,
+    /// 累积分数达到该阈值时进入挑战。
+    #[serde(default = "default_bot_score_threshold")]
+    pub score_threshold: u32,
+    /// 通过 HMAC 请求签名复验后才可信的搜索机器人声明。
+    #[serde(default)]
+    pub trusted_search_bots: Vec<TrustedSearchBotCfg>,
+    /// 可选的客户端指纹速率信号，复用进程级有界 RateLimiter。
+    #[serde(default)]
+    pub rate: Option<BotRateCfg>,
+    /// 挑战响应状态码，必须是 4xx；速率拒绝固定使用 429。
+    #[serde(default = "default_bot_challenge_status")]
+    pub challenge_status: u16,
+    /// `WWW-Authenticate` 的安全 realm，只允许短 ASCII token。
+    #[serde(default = "default_bot_challenge_realm")]
+    pub challenge_realm: String,
+}
+
+/// 一个需要逐请求签名复验的可信搜索机器人声明。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedSearchBotCfg {
+    /// 稳定、低基数的声明名称，仅用于配置错误定位。
+    pub name: String,
+    /// 声称该身份的 User-Agent glob；匹配后签名失败会故障关闭。
+    pub user_agents: Vec<String>,
+    /// HMAC-SHA256 SecretSource，构建期解析且至少 32 bytes。
+    pub signature_secret: String,
+    /// Base64URL 无填充签名 header。
+    #[serde(default = "default_bot_signature_header")]
+    pub signature_header: String,
+    /// Unix 秒时间戳 header。
+    #[serde(default = "default_bot_timestamp_header")]
+    pub timestamp_header: String,
+    /// 签名时间戳允许的最大绝对偏差。
+    #[serde(default = "default_bot_signature_skew_secs")]
+    pub max_clock_skew_secs: u64,
+}
+
+/// Bot 客户端指纹速率信号。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BotRateCfg {
+    /// 窗口内允许的请求数。
+    pub limit: u64,
+    /// 统计窗口毫秒数。
+    pub window_ms: u64,
+    /// 基础额度外允许的突发请求数。
+    #[serde(default)]
+    pub burst: u64,
+    /// 单规则最多维护的活动客户端指纹数。
+    #[serde(default = "default_bot_max_active_keys")]
+    pub max_active_keys: usize,
+    /// 活动指纹表耗尽时是否放行新指纹；默认故障关闭。
+    #[serde(default)]
+    pub active_keys_fail_open: bool,
+}
+
+/// route 级浏览器 CSRF 来源与 token 策略。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CsrfCfg {
+    /// 处置模式：`enforce|monitor`。
+    #[serde(default = "default_waf_mode")]
+    pub mode: String,
+    /// 需要 CSRF 门禁的 HTTP 方法；默认覆盖常见状态变更方法。
+    #[serde(default = "default_csrf_methods")]
+    pub methods: Vec<String>,
+    /// 允许的精确 `scheme://authority`；`same-origin` 表示与当前请求一致。
+    #[serde(default = "default_csrf_allowed_origins")]
+    pub allowed_origins: Vec<String>,
+    /// Origin 缺失时是否允许用 Referer 的 origin 复验。
+    #[serde(default = "default_true")]
+    pub allow_referer_fallback: bool,
+    /// Origin 与 Referer 均缺失时是否显式放行；默认故障关闭。
+    #[serde(default)]
+    pub allow_missing_origin: bool,
+    /// token 模式：`double_submit|signed`。
+    #[serde(default = "default_csrf_token_mode")]
+    pub token_mode: String,
+    /// 必须使用 `__Host-` 前缀的 CSRF cookie 名。
+    #[serde(default = "default_csrf_cookie_name")]
+    pub cookie_name: String,
+    /// 客户端回传 CSRF token 的单值 header 名。
+    #[serde(default = "default_csrf_header_name")]
+    pub header_name: String,
+    /// `signed` 模式的 HMAC-SHA256 SecretSource；double-submit 模式必须为空。
+    #[serde(default)]
+    pub token_secret: String,
+    /// signed token 最大年龄。
+    #[serde(default = "default_csrf_token_ttl_secs")]
+    pub token_ttl_secs: u64,
+    /// 是否在未受保护方法的响应中签发新 token header 与 cookie。
+    #[serde(default = "default_true")]
+    pub issue_on_safe_methods: bool,
+}
+
+/// route 级 PII、凭据与 secret 检测、遮蔽和阻断策略。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DlpCfg {
+    /// 命中动作：`block|redact|monitor`。
+    #[serde(default = "default_dlp_action")]
+    pub action: String,
+    /// 启用的固定规则名；空数组表示启用全部内置规则。
+    #[serde(default)]
+    pub enabled_rules: Vec<String>,
+    /// 要检查的请求 header 精确名称。
+    #[serde(default)]
+    pub request_headers: Vec<String>,
+    /// 要检查的响应 header 精确名称。
+    #[serde(default)]
+    pub response_headers: Vec<String>,
+    /// 是否解码并检查 query 参数名和值。
+    #[serde(default = "default_true")]
+    pub inspect_query: bool,
+    /// 是否检查 access log 会记录的 path，并在命中时用固定路径替代。
+    #[serde(default = "default_true")]
+    pub protect_log_path: bool,
+    /// 是否有界聚合并检查请求 body。
+    #[serde(default)]
+    pub inspect_request_body: bool,
+    /// 是否有界聚合并检查响应 body。
+    #[serde(default)]
+    pub inspect_response_body: bool,
+    /// body 检查允许的 media type 精确值或 `application/*+json`。
+    #[serde(default = "default_dlp_body_media_types")]
+    pub body_media_types: Vec<String>,
+    /// 单方向 body 聚合硬上限。
+    #[serde(default = "default_dlp_body_bytes")]
+    pub max_body_bytes: u64,
+    /// redact 动作写入字段或值的固定替代文本。
+    #[serde(default = "default_dlp_replacement")]
+    pub replacement: String,
+    /// 按固定 rule 与精确 target 配置的例外。
+    #[serde(default)]
+    pub exclusions: Vec<DlpExclusionCfg>,
+}
+
+/// 一条 DLP 精确例外。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DlpExclusionCfg {
+    /// 被豁免的固定规则名。
+    pub rule: String,
+    /// 精确 target：header/query 带名称，body 与 path_log 使用固定名。
+    pub target: String,
+}
+
+/// 业务作用：为敏感数据策略提供故障关闭的默认处置。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `block`。
+fn default_dlp_action() -> String {
+    "block".to_owned()
+}
+
+/// 业务作用：限制默认 DLP body 慢路径只处理结构明确、可安全重放的 media type。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 JSON 与 URL encoded form 的固定 media type 列表。
+fn default_dlp_body_media_types() -> Vec<String> {
+    vec![
+        "application/json".to_owned(),
+        "application/*+json".to_owned(),
+        "application/x-www-form-urlencoded".to_owned(),
+    ]
+}
+
+/// 业务作用：约束显式 DLP body 慢路径的默认并发内存占用。
+///
+/// 参数说明：无。
+///
+/// 返回：返回一 MiB。
+const fn default_dlp_body_bytes() -> u64 {
+    1024 * 1024
+}
+
+/// 业务作用：提供不包含命中原值的默认遮蔽文本。
+///
+/// 参数说明：无。
+///
+/// 返回：返回固定 `[REDACTED]`。
+fn default_dlp_replacement() -> String {
+    "[REDACTED]".to_owned()
+}
+
+/// 业务作用：提供默认 CSRF 状态变更方法集合。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 POST、PUT、PATCH 与 DELETE。
+fn default_csrf_methods() -> Vec<String> {
+    ["POST", "PUT", "PATCH", "DELETE"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// 业务作用：默认只信任与当前请求 scheme 和 authority 相同的浏览器来源。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `same-origin` 唯一规则。
+fn default_csrf_allowed_origins() -> Vec<String> {
+    vec!["same-origin".to_owned()]
+}
+
+/// 业务作用：提供不依赖服务端状态的默认 CSRF token 模式。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `double_submit`。
+fn default_csrf_token_mode() -> String {
+    "double_submit".to_owned()
+}
+
+/// 业务作用：提供符合浏览器 host-only 安全约束的默认 CSRF cookie 名。
+///
+/// 参数说明：无。
+///
+/// 返回：返回带 `__Host-` 前缀的固定名称。
+fn default_csrf_cookie_name() -> String {
+    "__Host-naway-csrf".to_owned()
+}
+
+/// 业务作用：提供 CSRF token 回传的默认 header 名。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `x-csrf-token`。
+fn default_csrf_header_name() -> String {
+    "x-csrf-token".to_owned()
+}
+
+/// 业务作用：限制服务端签名 CSRF token 的默认有效期。
+///
+/// 参数说明：无。
+///
+/// 返回：返回两小时对应的秒数。
+const fn default_csrf_token_ttl_secs() -> u64 {
+    2 * 60 * 60
+}
+
+/// 业务作用：提供默认的常见自动化声明 header，只把其出现作为可组合信号而非单独身份事实。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 Playwright、Puppeteer 与 WebDriver 常用的固定 header 名。
+fn default_bot_automation_headers() -> Vec<String> {
+    vec![
+        "x-playwright".to_owned(),
+        "x-puppeteer".to_owned(),
+        "webdriver".to_owned(),
+    ]
+}
+
+/// 业务作用：选择不含凭据且跨请求稳定的默认浏览器指纹字段。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 Accept、语言和 Client Hints 的固定 header 名。
+fn default_bot_fingerprint_headers() -> Vec<String> {
+    vec![
+        "accept".to_owned(),
+        "accept-language".to_owned(),
+        "sec-ch-ua".to_owned(),
+        "sec-ch-ua-platform".to_owned(),
+    ]
+}
+
+/// 业务作用：为单个确定自动化信号设置默认风险分值。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 4，使一个强信号默认达到挑战阈值。
+const fn default_bot_signal_score() -> u32 {
+    4
+}
+
+/// 业务作用：为浏览器声明与 header 形态不一致设置较低的组合分值。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 2，避免单个弱信号直接阻断。
+const fn default_bot_browser_mismatch_score() -> u32 {
+    2
+}
+
+/// 业务作用：提供 Bot 行为评分的默认挑战门槛。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 4。
+const fn default_bot_score_threshold() -> u32 {
+    4
+}
+
+/// 业务作用：提供 Bot 挑战的默认 HTTP 状态。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 403。
+const fn default_bot_challenge_status() -> u16 {
+    403
+}
+
+/// 业务作用：提供不暴露 route 或策略细节的默认挑战 realm。
+///
+/// 参数说明：无。
+///
+/// 返回：返回固定 realm。
+fn default_bot_challenge_realm() -> String {
+    "verification-required".to_owned()
+}
+
+/// 业务作用：提供可信机器人签名 header 的默认名称。
+///
+/// 参数说明：无。
+///
+/// 返回：返回固定小写 header 名。
+fn default_bot_signature_header() -> String {
+    "x-naway-bot-signature".to_owned()
+}
+
+/// 业务作用：提供可信机器人签名时间戳 header 的默认名称。
+///
+/// 参数说明：无。
+///
+/// 返回：返回固定小写 header 名。
+fn default_bot_timestamp_header() -> String {
+    "x-naway-bot-timestamp".to_owned()
+}
+
+/// 业务作用：限制可信机器人签名的默认重放时间窗口。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 60 秒。
+const fn default_bot_signature_skew_secs() -> u64 {
+    60
+}
+
+/// 业务作用：限制本地或共享限流器为单条 Bot 规则维护的默认客户端基数。
+///
+/// 参数说明：无。
+///
+/// 返回：返回十万个活动指纹。
+const fn default_bot_max_active_keys() -> usize {
+    100_000
+}
+
+/// route 级 GeoIP、ASN 与匿名网络策略。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct GeoIpCfg {
+    /// GeoIP2/GeoLite2 Country、City 或 Enterprise MMDB；配置国家规则时必填。
+    #[serde(default)]
+    pub country_database_file: Option<String>,
+    /// GeoIP2/GeoLite2 ASN MMDB；配置 ASN 规则时必填。
+    #[serde(default)]
+    pub asn_database_file: Option<String>,
+    /// GeoIP2 Anonymous-IP MMDB；配置匿名网络规则时必填。
+    #[serde(default)]
+    pub anonymous_database_file: Option<String>,
+    /// 允许的 ISO 3166-1 alpha-2 国家代码；非空时形成 allowlist。
+    #[serde(default)]
+    pub allowed_countries: Vec<String>,
+    /// 拒绝的 ISO 3166-1 alpha-2 国家代码。
+    #[serde(default)]
+    pub denied_countries: Vec<String>,
+    /// 允许的 Autonomous System Number；非空时形成 allowlist。
+    #[serde(default)]
+    pub allowed_asns: Vec<u32>,
+    /// 拒绝的 Autonomous System Number。
+    #[serde(default)]
+    pub denied_asns: Vec<u32>,
+    /// 要拒绝的匿名网络 trait 固定名。
+    #[serde(default)]
+    pub denied_anonymous_traits: Vec<String>,
+    /// 规则需要字段但数据库没有该地址记录时的动作：`allow|deny`。
+    #[serde(default = "default_geoip_missing_action")]
+    pub on_not_found: String,
+    /// MMDB 查询或 record 解码失败时的动作：`allow|deny`。
+    #[serde(default = "default_geoip_error_action")]
+    pub on_lookup_error: String,
+    /// 数据库 build epoch 超过允许年龄时的动作：`reject|allow|deny`。
+    #[serde(default = "default_geoip_stale_action")]
+    pub on_stale: String,
+    /// MMDB build epoch 的最大允许年龄；每次候选构建都会重新核对。
+    #[serde(default = "default_geoip_database_age_secs")]
+    pub max_database_age_secs: u64,
+}
+
+/// 业务作用：为 GeoIP 无记录提供故障关闭的默认动作。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `deny`，避免未知地址被伪装成允许国家或 ASN。
+fn default_geoip_missing_action() -> String {
+    "deny".to_owned()
+}
+
+/// 业务作用：为 MMDB 查询或 record 解码失败提供故障关闭的默认动作。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `deny`，使损坏或类型漂移的 record 不会绕过策略。
+fn default_geoip_error_action() -> String {
+    "deny".to_owned()
+}
+
+/// 业务作用：为过期 GeoIP 数据库提供 last-known-good 安全默认。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `reject`，候选换版失败并继续使用上一份有效快照。
+fn default_geoip_stale_action() -> String {
+    "reject".to_owned()
+}
+
+/// 业务作用：为 GeoIP 数据 freshness 设置覆盖常见月度更新周期的默认窗口。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 45 天对应的秒数。
+const fn default_geoip_database_age_secs() -> u64 {
+    45 * 24 * 60 * 60
+}
+
+/// 业务作用：为 WAF 提供故障关闭的默认处置模式。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `enforce`，使新增策略默认拦截确定命中的攻击输入。
+fn default_waf_mode() -> String {
+    "enforce".to_owned()
+}
+
+/// 业务作用：约束显式 WAF 请求体慢路径的默认并发内存占用。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 1 MiB 请求体聚合上限。
+const fn default_waf_body_bytes() -> u64 {
+    1024 * 1024
+}
+
+/// 业务作用：约束单个 URI、header 或结构化字符串的扫描成本。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 64 KiB 单值扫描上限。
+const fn default_waf_value_bytes() -> usize {
+    64 * 1024
+}
+
+/// 业务作用：限制 JSON/XML 解析的默认嵌套深度，避免深层输入耗尽栈或解析预算。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 64 层结构化数据深度上限。
+const fn default_waf_structured_depth() -> usize {
+    64
+}
+
+/// 业务作用：限制单个 JSON/XML document 的默认结构规模。
+///
+/// 参数说明：无。
+///
+/// 返回：返回十万个结构节点上限。
+const fn default_waf_structured_nodes() -> usize {
+    100_000
+}
+
+/// 业务作用：限制 XML 属性解析总量，防止宽元素制造无界 CPU 消耗。
+///
+/// 参数说明：无。
+///
+/// 返回：返回一万个 XML 属性上限。
+const fn default_waf_xml_attributes() -> usize {
+    10_000
+}
+
+/// 业务作用：限制外部 WAF 规则包在候选构建阶段的单文件内存占用。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 4 MiB 原始 JSON 上限。
+const fn default_waf_rule_pack_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+/// 业务作用：限制外部 WAF 规则包可增加的规则扫描规模。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 1024 条规则上限。
+const fn default_waf_rule_pack_rules() -> usize {
+    1024
+}
+
+/// 业务作用：限制外部 WAF 规则包可增加的 literal 总量。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 16384 个 literal 上限。
+const fn default_waf_rule_pack_patterns() -> usize {
+    16_384
+}
+
+/// 业务作用：为有界 JSON 解析和 literal 索引构建提供确定的默认时间门。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 2000 毫秒候选构建上限。
+const fn default_waf_rule_pack_compile_ms() -> u64 {
+    2_000
+}
+
 /// 一条 HTTP 路由及其断言、过滤器、后端和资源预算。
 #[derive(Debug, Deserialize, Clone)]
 pub struct RouteCfg {
@@ -3924,6 +4965,12 @@ pub struct RouteCfg {
     /// route filter DSL 列表。
     #[serde(default)]
     pub filters: Vec<String>,
+    /// 发给该 route 后端的命名 header/query 凭据引用。
+    #[serde(default)]
+    pub upstream_credentials: Vec<String>,
+    /// 已完成全局引用和 backend 归属校验的凭据声明，不直接从 YAML 反序列化。
+    #[serde(skip)]
+    pub(crate) resolved_upstream_credentials: Vec<UpstreamCredentialCfg>,
     /// 是否在普通反向代理时保留下游 Host/authority；Gateway API/Ingress 需要开启，
     /// 手写 nginx 风格 route 默认仍使用上游 authority。
     #[serde(default)]
@@ -3937,6 +4984,30 @@ pub struct RouteCfg {
     /// V5 请求契约校验。未配置时保持纯流式快路径；body 校验必须携带显式有界上限。
     #[serde(default)]
     pub request_validation: Option<RequestValidationCfg>,
+    /// 下游请求实体的声明式有界转换；未配置时请求 body 保持原始流。
+    #[serde(default)]
+    pub request_transform: Option<BodyTransformCfg>,
+    /// 上游响应实体的声明式有界转换；在响应插件之后、契约校验之前执行。
+    #[serde(default)]
+    pub response_transform: Option<BodyTransformCfg>,
+    /// 最终下游响应的 OpenAPI 契约；默认 observe，不会阻断业务响应。
+    #[serde(default)]
+    pub response_contract: Option<ResponseContractCfg>,
+    /// 内置 API WAF。未配置时不扫描 URI/header，也不读取请求体。
+    #[serde(default)]
+    pub waf: Option<WafCfg>,
+    /// 本地 MMDB 驱动的国家、ASN 与匿名网络策略；未配置时不执行任何地址查询。
+    #[serde(default)]
+    pub geoip: Option<GeoIpCfg>,
+    /// 可组合 User-Agent、指纹、行为、速率与签名复验的 Bot 策略。
+    #[serde(default)]
+    pub bot: Option<BotCfg>,
+    /// 浏览器状态变更请求的 Origin/Referer 与双提交或服务端签名 token 门禁。
+    #[serde(default)]
+    pub csrf: Option<CsrfCfg>,
+    /// 请求、响应与 access log path 的 PII/secret 检测、遮蔽或阻断策略。
+    #[serde(default)]
+    pub dlp: Option<DlpCfg>,
     /// V7 GraphQL 查询预算守卫。未配置时普通 HTTP route 不读取或解析请求体。
     #[serde(default)]
     pub graphql_guard: Option<GraphqlGuardCfg>,
@@ -3958,6 +5029,12 @@ pub struct RouteCfg {
     /// 永不离开网关；数组顺序就是同一 phase 的执行顺序。
     #[serde(default)]
     pub external_plugins: Vec<ExternalPluginCfg>,
+    /// Envoy External Processing 双向流；未配置时不编码 protobuf，也不建立扩展服务连接。
+    #[serde(default)]
+    pub ext_proc: Option<ExtProcCfg>,
+    /// InferencePool 数据面约束；只允许 Kubernetes 控制器为已验证的池后端生成。
+    #[serde(default)]
+    pub inference_pool: Option<InferencePoolRouteCfg>,
     /// V7 BFF 有界扇出聚合。它是终端后端，与 uri/serve/llm/mock 互斥。
     #[serde(default)]
     pub bff_aggregation: Option<BffAggregationCfg>,
@@ -3973,6 +5050,25 @@ pub struct RouteCfg {
     /// V7 usage-plan 绑定。consumer 优先使用全局映射，未映射时可落到 default_plan。
     #[serde(default)]
     pub usage_plan: Option<UsagePlanRouteCfg>,
+    /// 双向带宽整形与成本型限额。未配置时该 route 不做任何额外整形,
+    /// 保持既有 `limit_rate`/`limit_req` 行为不变。
+    #[serde(default)]
+    pub traffic_limit: Option<TrafficLimitCfg>,
+    /// 受控动态正向代理(HTTP CONNECT)。未配置时该 route 拒绝 CONNECT,
+    /// 不存在"默认放行"的形态。
+    #[serde(default)]
+    pub forward_proxy: Option<ForwardProxyCfg>,
+    /// WebTransport 终端代理。客户端 session 只有在整条 route 治理通过且上游 session
+    /// 已建立后才会收到成功响应。
+    #[serde(default)]
+    pub webtransport: Option<WebTransportCfg>,
+    /// 允许真实 QUIC 0-RTT 执行本 route。只有可证明无认证副作用的安全方法
+    /// 才能开启，且每个 early request 必须携带一次性 nonce。
+    #[serde(default)]
+    pub early_data: Option<EarlyDataRouteCfg>,
+    /// WebSocket 帧级治理。未配置时保持透明隧道,不做任何额外聚合。
+    #[serde(default)]
+    pub ws_frame: Option<WsFrameCfg>,
     /// V6 AI/LLM 统一 OpenAI-compatible 入口。存在时 route 不再使用顶层 `uri`，而由
     /// `models[]` 声明主模型与有序 fallback 后端。
     #[serde(default)]
@@ -4006,6 +5102,24 @@ pub struct RouteCfg {
     /// 用于在 yaml 不便重排时显式定序,如 `/api/admin/**`(order:-10)优先于 `/api/**`(order:0)兜底。
     #[serde(default)]
     pub order: i32,
+}
+
+/// InferencePool 后端的请求期 EPP 选择约束。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct InferencePoolRouteCfg {
+    /// 单次 EPP 决策允许返回的 endpoint 数量上限，防止 header 或 metadata 扩大选择扫描成本。
+    #[serde(default = "default_inference_pool_max_selected_endpoints")]
+    pub max_selected_endpoints: usize,
+}
+
+/// 业务作用：限制 EPP 单次可交给负载均衡器的 endpoint 子集规模。
+///
+/// 参数说明: 无。
+///
+/// 返回：默认允许六十四个候选 endpoint。
+const fn default_inference_pool_max_selected_endpoints() -> usize {
+    64
 }
 
 /// route 级 descriptor 驱动 protobuf JSON 转码契约。
@@ -4144,8 +5258,12 @@ const fn default_hedge_max_attempts() -> usize {
 pub struct WasmPluginCfg {
     /// 稳定插件 id，仅用于构建报错和低基数日志。
     pub id: String,
-    /// `.wasm` 文件，相对于 gateway.yml 所在目录。
+    /// 本地 `.wasm` 文件，相对于 gateway.yml 所在目录；与 `module_source` 必须二选一。
+    #[serde(default)]
     pub module_file: String,
+    /// 受验证的 HTTPS 或 OCI 远程模块；候选快照构建期获取，不进入请求路径。
+    #[serde(default)]
+    pub module_source: Option<WasmModuleSourceCfg>,
     /// 执行相位。
     pub phase: WasmPluginPhaseCfg,
     /// 传给 `proxy_on_configure` 的 JSON 值；构建期序列化并执行 64KiB 硬上限。
@@ -4205,6 +5323,71 @@ pub struct WasmPluginCfg {
     /// 可定义内部 metric 数量硬上限。
     #[serde(default = "default_wasm_max_metrics")]
     pub max_metrics: usize,
+}
+
+/// Proxy-Wasm 远程制品来源与供应链验证声明。
+///
+/// `sha256` 固定最终 wasm 原始字节；OCI tag 还必须固定 `manifest_sha256`。远程模块必须
+/// 配置 detached Ed25519 signature、签名 in-toto statement，或同时配置两者。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WasmModuleSourceCfg {
+    /// 固定 HTTPS URL，或 `oci://registry/repository:tag|@sha256:...` reference。
+    pub reference: String,
+    /// 最终 wasm 原始字节的 SHA-256 十六进制摘要。
+    pub sha256: String,
+    /// OCI manifest 摘要；使用 tag 时必填，使用 digest reference 时可省略但不得冲突。
+    #[serde(default)]
+    pub manifest_sha256: String,
+    /// HTTP Authorization 完整值；支持 SecretSource，不会发送给模块来源以外的目标。
+    #[serde(default)]
+    pub authorization: String,
+    /// 附加 TLS 根证书 PEM；支持 SecretSource，平台根证书仍保留。
+    #[serde(default)]
+    pub ca_certificate: String,
+    /// 内容寻址离线缓存目录；相对路径以 gateway.yml 所在目录解析，空值关闭磁盘缓存。
+    #[serde(default)]
+    pub cache_dir: String,
+    /// connect、response head 与完整 body 共用的固定 deadline。
+    #[serde(default = "default_wasm_source_timeout_ms")]
+    pub timeout_ms: u64,
+    /// detached Ed25519 signature 的 Base64 SecretSource；必须与 `public_key` 同时配置。
+    #[serde(default)]
+    pub signature: String,
+    /// detached signature 对应的 32-byte Ed25519 public key Base64 SecretSource。
+    #[serde(default)]
+    pub public_key: String,
+    /// 可选签名 in-toto statement；存在时同时验证 statement 签名、subject 摘要和 provenance。
+    #[serde(default)]
+    pub attestation: Option<WasmAttestationCfg>,
+}
+
+/// 签名 in-toto Statement v1 的最小可信约束。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WasmAttestationCfg {
+    /// 原始 JSON statement SecretSource；detached signature 精确覆盖这些 UTF-8 字节。
+    pub statement: String,
+    /// statement detached Ed25519 signature 的 Base64 SecretSource。
+    pub signature: String,
+    /// statement signer 的 32-byte Ed25519 public key Base64 SecretSource。
+    pub public_key: String,
+    /// 必须精确匹配 statement `predicateType` 的受信类型。
+    pub predicate_type: String,
+    /// 必须精确匹配 statement `predicate.builder.id` 的受信构建者身份。
+    pub builder_id: String,
+    /// 可选 subject name；空值只要求至少一个 subject 的 SHA-256 匹配模块。
+    #[serde(default)]
+    pub subject_name: String,
+}
+
+/// 业务作用：为远程 Wasm 获取提供足够实际部署、又能限制挂起时间的默认 deadline。
+///
+/// 参数说明：无。
+///
+/// 返回：默认十秒 deadline。
+const fn default_wasm_source_timeout_ms() -> u64 {
+    10_000
 }
 
 /// Proxy-Wasm callout 的固定上游能力声明。
@@ -4286,6 +5469,153 @@ pub enum ExternalPluginPhaseCfg {
     RequestHeaders,
     /// 内部跳转、error_page 和声明式响应过滤之后，Proxy-Wasm/压缩之前。
     ResponseHeaders,
+}
+
+/// route 绑定的 Envoy External Processing 双向流契约。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExtProcCfg {
+    /// `http(s)://host[:port]` 或 `lb://service` 扩展服务。
+    pub target: String,
+    /// 依赖连接、超时或服务不可用时是否继续；协议拒绝与非法 mutation 永不放行。
+    #[serde(default)]
+    pub fail_open: bool,
+    /// 可选 gRPC Authorization metadata；支持 SecretSource，且不会进入下游可见头。
+    #[serde(default)]
+    pub authorization: String,
+    /// 是否把 request headers 发送给处理器。
+    #[serde(default = "default_true")]
+    pub request_headers: bool,
+    /// 是否把 response headers 发送给处理器。
+    #[serde(default = "default_true")]
+    pub response_headers: bool,
+    /// request body 的传递方式。
+    #[serde(default)]
+    pub request_body: ExtProcBodyModeCfg,
+    /// response body 的传递方式。
+    #[serde(default)]
+    pub response_body: ExtProcBodyModeCfg,
+    /// 是否发送 request trailers。
+    #[serde(default)]
+    pub request_trailers: bool,
+    /// 是否发送 response trailers。
+    #[serde(default)]
+    pub response_trailers: bool,
+    /// 单个 phase 等待匹配响应的 deadline。
+    #[serde(default = "default_ext_proc_message_timeout_ms")]
+    pub message_timeout_ms: u64,
+    /// 整条处理流的总生命周期上限。
+    #[serde(default = "default_ext_proc_total_timeout_ms")]
+    pub total_timeout_ms: u64,
+    /// 单条 protobuf payload 的编码后字节上限。
+    #[serde(default = "default_ext_proc_max_message_bytes")]
+    pub max_message_bytes: usize,
+    /// 一条业务请求在扩展流双向累计传输的字节上限。
+    #[serde(default = "default_ext_proc_max_total_bytes")]
+    pub max_total_bytes: usize,
+    /// buffered body 的聚合上限，也是 streamed body 的累计上限。
+    #[serde(default = "default_ext_proc_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// 单 route 可同时占用的处理流数量；满额立即执行依赖失败策略。
+    #[serde(default = "default_ext_proc_max_in_flight")]
+    pub max_in_flight: usize,
+    /// 连续依赖失败达到该值后打开 circuit；成功响应会清零。
+    #[serde(default = "default_ext_proc_failure_threshold")]
+    pub failure_threshold: u32,
+    /// circuit 打开后允许下一次探测前的冷却时间。
+    #[serde(default = "default_ext_proc_reset_timeout_ms")]
+    pub reset_timeout_ms: u64,
+    /// 处理器可 set/remove 的普通 header allowlist。
+    #[serde(default)]
+    pub mutation_headers: Vec<String>,
+    /// 允许写入当前请求动态 metadata 的顶层 namespace allowlist。
+    #[serde(default)]
+    pub writable_metadata_namespaces: Vec<String>,
+}
+
+/// External Processing body 的交付模式。
+#[derive(Debug, Deserialize, Clone, Copy, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtProcBodyModeCfg {
+    /// 不发送 body，也不允许 body mutation。
+    #[default]
+    None,
+    /// 聚合到显式上限后发送单条完整 body。
+    Buffered,
+    /// 按原始 DATA frame 顺序发送，并逐条等待匹配响应形成背压。
+    Streamed,
+}
+
+/// 业务作用：限制扩展处理器单个 phase 占用请求任务的时间。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 200ms。
+const fn default_ext_proc_message_timeout_ms() -> u64 {
+    200
+}
+
+/// 业务作用：限制一条 External Processing 双向流的总生命周期。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 30 秒。
+const fn default_ext_proc_total_timeout_ms() -> u64 {
+    30_000
+}
+
+/// 业务作用：限制单条 protobuf 消息，避免处理器制造超大分配。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 1 MiB。
+const fn default_ext_proc_max_message_bytes() -> usize {
+    1024 * 1024
+}
+
+/// 业务作用：限制单请求扩展流的双向累计流量。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 16 MiB。
+const fn default_ext_proc_max_total_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+/// 业务作用：限制显式进入扩展处理路径的业务实体总量。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 8 MiB。
+const fn default_ext_proc_max_body_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+/// 业务作用：为单 route 提供有界 External Processing 在途预算。
+///
+/// 参数说明：无。
+///
+/// 返回：默认 64 条并发流。
+const fn default_ext_proc_max_in_flight() -> usize {
+    64
+}
+
+/// 业务作用：限制依赖连续失败后仍继续尝试建流的次数。
+///
+/// 参数说明：无。
+///
+/// 返回：默认连续五次失败后打开 circuit。
+const fn default_ext_proc_failure_threshold() -> u32 {
+    5
+}
+
+/// 业务作用：为已打开的扩展依赖 circuit 提供有界恢复探测间隔。
+///
+/// 参数说明：无。
+///
+/// 返回：默认一秒。
+const fn default_ext_proc_reset_timeout_ms() -> u64 {
+    1_000
 }
 
 fn default_external_plugin_path() -> String {
@@ -4726,10 +6056,13 @@ const fn default_wasm_max_metrics() -> usize {
     256
 }
 
-/// V6 路由级 AI/LLM 代理配置。
+/// 路由级 AI/LLM 代理配置。
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct LlmRouteCfg {
+    /// 下游与上游共同使用的独立 API 契约；不同类型不会经 Chat Completions 适配器转换。
+    #[serde(default)]
+    pub api_type: LlmApiTypeCfg,
     /// 可接受的 JSON 请求体硬上限；LLM 格式转换需要显式有界缓冲。
     #[serde(default = "default_llm_max_body_bytes")]
     pub max_body_bytes: u64,
@@ -4739,6 +6072,19 @@ pub struct LlmRouteCfg {
     /// completion 允许上限；请求未声明 `max_tokens` 时也会注入该值，防无限输出。
     #[serde(default = "default_llm_max_completion_tokens")]
     pub max_completion_tokens: u64,
+    /// 非流式 provider response 聚合硬上限；SSE/JSONL 使用累计字节门，Realtime 用作单消息硬门。
+    #[serde(default = "default_llm_max_response_bytes")]
+    pub max_response_bytes: u64,
+    /// SSE、JSONL 或 WebSocket 单帧硬上限。
+    #[serde(default = "default_llm_max_stream_frame_bytes")]
+    pub max_stream_frame_bytes: u64,
+    /// 单次 provider 请求或长连接最长持续时间；到期停止转发，单位毫秒。
+    #[serde(default = "default_llm_max_duration_ms")]
+    pub max_duration_ms: u64,
+    /// 请求可选择模型的估算费用上限，单位微美元；`u64::MAX` 保留兼容的仅观测模式，
+    /// 其它值在价格未知或估算超限时于 provider I/O 前拒绝。
+    #[serde(default = "default_llm_max_cost_microusd")]
+    pub max_cost_microusd: u64,
     /// 可选共享 token 配额；一次原子预留 prompt 估算 + completion 上限。
     #[serde(default)]
     pub token_quota: Option<LlmTokenQuotaCfg>,
@@ -4756,6 +6102,33 @@ pub struct LlmRouteCfg {
     pub selection: LlmSelectionCfg,
     /// 依次尝试的模型；首项是主模型，后续项只在连接错误、超时或 5xx 时 fallback。
     pub models: Vec<LlmModelCfg>,
+}
+
+/// AI route 的 wire/API 类型；每个变体拥有独立 content-type、流协议与预算语义。
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmApiTypeCfg {
+    /// OpenAI Chat Completions JSON/SSE。
+    #[default]
+    ChatCompletions,
+    /// OpenAI Responses JSON/SSE。
+    Responses,
+    /// 向量 embedding JSON。
+    Embeddings,
+    /// 文档重排 JSON。
+    Rerank,
+    /// 图片生成或编辑；JSON 或 route 固定的 multipart 原生请求。
+    Image,
+    /// 语音生成、转写或翻译；JSON 或 route 固定的 multipart 原生请求。
+    Audio,
+    /// 视频生成；JSON 或 route 固定的 multipart 原生请求。
+    Video,
+    /// 异步批处理 JSON。
+    Batch,
+    /// 文件上传/读取原生协议。
+    File,
+    /// WebSocket Realtime 双向事件协议。
+    Realtime,
 }
 
 /// 外部 OpenAI-compatible moderation 配置。
@@ -4861,14 +6234,14 @@ pub struct LlmEmbeddingCfg {
     pub max_dimensions: usize,
 }
 
-/// 单个 LLM 模型后端。客户端始终使用 OpenAI Chat Completions 契约，gateway 在构建好的
-/// provider adapter 中完成必要格式转换。
+/// 单个 AI 模型后端。route 的 `api_type` 冻结 wire 契约；只有显式支持无损转换的 Chat
+/// provider adapter 会重写实体，其它 API 保持 provider 原生协议。
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct LlmModelCfg {
     /// 配置内稳定、低基数模型 id，用于 metrics/日志；不接受请求动态值。
     pub id: String,
-    /// `openai`、`anthropic` 或 Google Gemini Developer API 的 `google`。
+    /// 固定 wire provider；可选值由 `LlmProviderCfg` 定义，不能由请求动态选择。
     pub provider: LlmProviderCfg,
     /// 模型后端地址，支持 `http(s)://` 与 `lb://service`。
     pub uri: String,
@@ -4884,18 +6257,61 @@ pub struct LlmModelCfg {
     /// provider API key SecretSource；空表示不注入凭据，适合本地 vLLM/Ollama。
     #[serde(default)]
     pub api_key: String,
+    /// 远程 Secret provider 在候选构建期物化的 API key；不参与配置序列化。
+    #[serde(skip, default)]
+    pub resolved_api_key: Option<String>,
     /// Anthropic API 版本；OpenAI provider 必须留空。
     #[serde(default)]
     pub anthropic_version: String,
+    /// Azure API 版本或其它 provider 明确版本；会进入固定 path/query，客户端不能覆盖。
+    #[serde(default)]
+    pub api_version: String,
+    /// 云 provider 固定 region；Bedrock SigV4 scope 与 Vertex endpoint 均由此字段冻结。
+    #[serde(default)]
+    pub region: String,
+    /// Vertex AI 固定 project；只用于构建可信 API path。
+    #[serde(default)]
+    pub project: String,
+    /// AWS access key id SecretSource；仅 Bedrock SigV4 使用。
+    #[serde(default)]
+    pub aws_access_key_id: String,
+    /// 远程 Secret provider 在候选构建期物化的 AWS access key id。
+    #[serde(skip, default)]
+    pub resolved_aws_access_key_id: Option<String>,
+    /// AWS secret access key SecretSource；仅 Bedrock SigV4 使用。
+    #[serde(default)]
+    pub aws_secret_access_key: String,
+    /// 远程 Secret provider 在候选构建期物化的 AWS secret access key。
+    #[serde(skip, default)]
+    pub resolved_aws_secret_access_key: Option<String>,
+    /// AWS 临时 session token SecretSource；仅 Bedrock SigV4 使用，可为空。
+    #[serde(default)]
+    pub aws_session_token: String,
+    /// 远程 Secret provider 在候选构建期物化的 AWS session token。
+    #[serde(skip, default)]
+    pub resolved_aws_session_token: Option<String>,
+    /// 组合云凭据的最早有效截止点；reload 调度不得让其中任一项过期后继续使用旧快照。
+    #[serde(skip, default)]
+    pub resolved_not_after: Option<std::time::Instant>,
+    /// 是否直接使用 provider 原生 request/response，不执行跨 provider 字段转换。
+    #[serde(default)]
+    pub native_passthrough: bool,
     /// 每百万 prompt token 的微美元成本，用于低基数成本观测；0 表示未知。
     #[serde(default)]
     pub input_cost_microusd_per_million: u64,
     /// 每百万 completion token 的微美元成本；0 表示未知。
     #[serde(default)]
     pub output_cost_microusd_per_million: u64,
-    /// 此模型提供的固定能力标签，如 `vision`/`tools`/`json`；只接受安全 ASCII token。
+    /// image/audio/video/batch/file 等非 token 计价请求的保守固定费用，单位微美元。
+    #[serde(default)]
+    pub fixed_cost_microusd: u64,
+    /// 此模型提供的固定能力标签，如 `multimodal`、`tools`、`structured_output`、加速器、
+    /// 拓扑位置、prefix-cache、队列或 LoRA 状态；只接受安全 ASCII token。
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// 冻结 catalog 中的预期首 token 延迟；joint 策略在运行样本不足时使用，单位毫秒。
+    #[serde(default)]
+    pub expected_first_token_latency_ms: u64,
     /// `selection.strategy=weighted` 的相对权重；0 表示不参与首选但仍可作为 fallback。
     #[serde(default = "default_llm_model_weight")]
     pub weight: u32,
@@ -4905,15 +6321,33 @@ pub struct LlmModelCfg {
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LlmSelectionCfg {
-    /// `ordered` / `cost` / `latency` / `weighted`。
+    /// `ordered` / `cost` / `latency` / `weighted` / `joint`。
     #[serde(default)]
     pub strategy: LlmSelectionStrategyCfg,
     /// route 固定要求的能力集合，最多 16 项。
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+    /// joint 策略的软偏好能力；命中项越多，语义得分越高。
+    #[serde(default)]
+    pub preferred_capabilities: Vec<String>,
+    /// joint 策略允许的首 token 延迟上界；模型声明值或运行 EWMA 超过时不作为首选。
+    #[serde(default)]
+    pub max_first_token_latency_ms: u64,
+    /// 可选 shadow 模型 id；只接收按比例采样的副本，结果永不进入主响应或 fallback。
+    #[serde(default)]
+    pub shadow_model: String,
+    /// shadow 采样万分比，范围 0..=10000。
+    #[serde(default)]
+    pub shadow_basis_points: u16,
+    /// 灰度候选模型 id；命中采样时提升为首选，失败仍回落到正常模型顺序。
+    #[serde(default)]
+    pub rollout_model: String,
+    /// 灰度请求万分比，范围 0..=10000。
+    #[serde(default)]
+    pub rollout_basis_points: u16,
 }
 
-/// V6 模型首选排序策略。
+/// 模型首选排序策略。
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmSelectionStrategyCfg {
@@ -4926,6 +6360,8 @@ pub enum LlmSelectionStrategyCfg {
     Latency,
     /// 按配置权重为请求稳定选择首模型，其余保持 fallback 顺序。
     Weighted,
+    /// 同时按能力、SLO、估算费用和本进程语义亲和度计算首选顺序。
+    Joint,
 }
 
 /// LLM token bucket 配额。与 QPS 共用 §17 RateLimiter，但 `cost` 是本次 token 预留值。
@@ -4988,6 +6424,28 @@ pub enum LlmProviderCfg {
     Anthropic,
     /// Google Gemini Developer API `generateContent` / `streamGenerateContent`。
     Google,
+    /// Azure OpenAI / Microsoft Foundry OpenAI-compatible API。
+    AzureOpenai,
+    /// AWS Bedrock 原生或 OpenAI-compatible API。
+    Bedrock,
+    /// Google Vertex AI Gemini API。
+    VertexAi,
+    /// Cohere v2 native API。
+    Cohere,
+    /// Mistral API。
+    Mistral,
+    /// Hugging Face Inference Providers / Endpoint API。
+    HuggingFace,
+    /// xAI API。
+    Xai,
+    /// Alibaba Cloud Model Studio / DashScope API。
+    Dashscope,
+    /// DeepSeek OpenAI-compatible API。
+    Deepseek,
+    /// Ollama native 或 OpenAI-compatible API。
+    Ollama,
+    /// vLLM native/OpenAI-compatible API。
+    Vllm,
 }
 
 fn default_llm_max_body_bytes() -> u64 {
@@ -5000,6 +6458,22 @@ fn default_llm_max_prompt_tokens() -> u64 {
 
 fn default_llm_max_completion_tokens() -> u64 {
     8 * 1024
+}
+
+fn default_llm_max_response_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_llm_max_stream_frame_bytes() -> u64 {
+    1024 * 1024
+}
+
+fn default_llm_max_duration_ms() -> u64 {
+    120_000
+}
+
+fn default_llm_max_cost_microusd() -> u64 {
+    u64::MAX
 }
 
 fn default_llm_quota_max_active_keys() -> usize {
@@ -5085,6 +6559,324 @@ pub struct RequestValidationCfg {
     /// 显式 body schema 的空 body 语义；缺省为 required。OpenAPI 来源默认服从 requestBody.required。
     #[serde(default)]
     pub body_required: Option<bool>,
+}
+
+/// 路由级 OpenAPI 响应契约配置。
+///
+/// schema 在候选快照构建期按 operation、status 和 media type 全部编译。`observe`
+/// 以透传包装体记录结果；`block` 与 `replace_error` 才会在写下游前有界收集实体。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseContractCfg {
+    /// OpenAPI 3 JSON/YAML 文件；路径相对主配置目录解析。
+    pub openapi_file: String,
+    /// OpenAPI operationId；与 `operation_path` + `operation_method` 二选一。
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    /// OpenAPI path template；与 `operation_method` 成对。
+    #[serde(default)]
+    pub operation_path: Option<String>,
+    /// OpenAPI method；与 `operation_path` 成对。
+    #[serde(default)]
+    pub operation_method: Option<String>,
+    /// 响应不符合契约时的动作；缺省只观察。
+    #[serde(default)]
+    pub mode: ResponseContractModeCfg,
+    /// 可检查的实体字节上限，必须在 1..=16MiB 内显式设置。
+    pub max_body_bytes: u64,
+    /// `replace_error` 使用的固定状态码。
+    #[serde(default = "default_response_contract_replacement_status")]
+    pub replacement_status: u16,
+    /// `replace_error` 使用的固定低敏响应文本。
+    #[serde(default = "default_response_contract_replacement_body")]
+    pub replacement_body: String,
+    /// 显式受信本地 schema catalog；只有列出的文档才允许被外部 `$ref` 引用。
+    #[serde(default)]
+    pub catalog_files: Vec<String>,
+    /// 显式 HTTPS schema registry 文档；URL、摘要和 detached 签名共同冻结内容身份。
+    #[serde(default)]
+    pub registry_documents: Vec<SchemaRegistryDocumentCfg>,
+}
+
+/// 一个可进入响应契约 catalog 的签名 HTTPS schema 文档。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaRegistryDocumentCfg {
+    /// 固定 HTTPS URL，不允许 redirect 或运行期派生 authority。
+    pub url: String,
+    /// 原始响应字节的 SHA-256 十六进制摘要。
+    pub sha256: String,
+    /// detached Ed25519 signature SecretSource，内容为 Base64。
+    pub signature: String,
+    /// Ed25519 public key SecretSource，内容为 32-byte Base64。
+    pub public_key: String,
+    /// 可选自定义 CA PEM 文件，路径相对主配置目录解析。
+    #[serde(default)]
+    pub ca_file: Option<String>,
+    /// 单文档响应硬上限。
+    #[serde(default = "default_schema_registry_max_bytes")]
+    pub max_bytes: usize,
+    /// 单次 HTTPS 请求总 deadline。
+    #[serde(default = "default_schema_registry_timeout_ms")]
+    pub timeout_ms: u64,
+    /// 已验签进程内缓存的最长复用时间。
+    #[serde(default = "default_schema_registry_cache_ttl_ms")]
+    pub cache_ttl_ms: u64,
+}
+
+/// 响应契约不符合时的数据面动作。
+#[derive(Debug, Deserialize, Clone, Copy, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseContractModeCfg {
+    /// 原响应立即透传，在流结束后记录校验结论。
+    #[default]
+    Observe,
+    /// 写下游前完成有界校验，不符合契约时返回固定 502。
+    Block,
+    /// 写下游前完成有界校验，不符合契约时返回配置的低敏错误响应。
+    ReplaceError,
+}
+
+/// 声明式实体转换配置。
+///
+/// JSON 操作只接受精确 JSON Pointer，不支持 wildcard 或脚本。XML/SOAP 输入先按
+/// namespace-aware 路径提取为 JSON，输出则从 JSON Pointer 映射到固定 XML 元素路径。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BodyTransformCfg {
+    /// 输入实体格式。
+    #[serde(default)]
+    pub input: BodyFormatCfg,
+    /// 输出实体格式。
+    #[serde(default)]
+    pub output: BodyFormatCfg,
+    /// 输入实体的聚合硬上限，必须在 1..=16MiB 内。
+    pub max_body_bytes: u64,
+    /// 序列化后实体的硬上限，必须在 1..=16MiB 内。
+    pub max_output_bytes: u64,
+    /// 对中间 JSON 值按声明顺序执行的确定性字段操作。
+    #[serde(default)]
+    pub operations: Vec<JsonTransformOperationCfg>,
+    /// XML prefix 到 namespace URI 的固定映射。
+    #[serde(default)]
+    pub namespaces: std::collections::BTreeMap<String, String>,
+    /// XML/SOAP 输入到中间 JSON 的精确字段映射。
+    #[serde(default)]
+    pub xml_extract: Vec<XmlFieldMappingCfg>,
+    /// 中间 JSON 到 XML/SOAP 输出的固定结构。
+    #[serde(default)]
+    pub xml_emit: Option<XmlEmitCfg>,
+    /// SOAP 输入必须匹配或 SOAP 输出需要设置的固定 SOAPAction。
+    #[serde(default)]
+    pub soap_action: Option<String>,
+    /// SOAP Fault 命中时修改 HTTP status 的固定映射，仅响应转换可用。
+    #[serde(default)]
+    pub soap_fault: Option<SoapFaultMappingCfg>,
+    /// XML 最大元素深度。
+    #[serde(default = "default_transform_xml_depth")]
+    pub max_xml_depth: usize,
+    /// XML 最大节点事件数。
+    #[serde(default = "default_transform_xml_nodes")]
+    pub max_xml_nodes: usize,
+    /// 单元素最大属性数。
+    #[serde(default = "default_transform_xml_attributes")]
+    pub max_xml_attributes: usize,
+    /// XML 文本总字节上限。
+    #[serde(default = "default_transform_xml_text_bytes")]
+    pub max_xml_text_bytes: usize,
+}
+
+/// 实体转换支持的受限格式。
+#[derive(Debug, Deserialize, Clone, Copy, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyFormatCfg {
+    /// JSON 或 `application/*+json`。
+    #[default]
+    Json,
+    /// 普通 XML。
+    Xml,
+    /// SOAP 1.1/1.2 envelope。
+    Soap,
+}
+
+/// 中间 JSON 值上的确定性字段操作。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum JsonTransformOperationCfg {
+    /// 把现有字段移动到新位置；目标必须尚不存在。
+    Rename { from: String, to: String },
+    /// 在尚不存在的位置增加固定值。
+    Add {
+        path: String,
+        value: serde_json::Value,
+    },
+    /// 删除现有字段；字段不存在时保持幂等。
+    Remove { path: String },
+    /// 只在字段不存在时写入固定默认值。
+    Default {
+        path: String,
+        value: serde_json::Value,
+    },
+    /// 要求字段存在且属于指定 JSON 类型。
+    TypeCheck {
+        path: String,
+        expected: JsonValueTypeCfg,
+    },
+}
+
+/// JSON 字段类型约束。
+#[derive(Debug, Deserialize, Clone, Copy, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonValueTypeCfg {
+    Null,
+    Boolean,
+    Number,
+    Integer,
+    String,
+    Array,
+    Object,
+}
+
+/// XML/SOAP 输入字段到中间 JSON Pointer 的映射。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct XmlFieldMappingCfg {
+    /// namespace-aware 元素路径，例如 `/soap:Envelope/soap:Body/m:Get/m:id`。
+    pub from: String,
+    /// 中间 JSON 的精确 JSON Pointer。
+    pub to: String,
+    /// 路径未命中时是否拒绝本次转换。
+    #[serde(default)]
+    pub required: bool,
+    /// 提取文本需要转换成的 JSON 类型；缺省为 string。
+    #[serde(default)]
+    pub value_type: XmlValueTypeCfg,
+}
+
+/// XML 文本到 JSON 值的受限转换类型。
+#[derive(Debug, Deserialize, Clone, Copy, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum XmlValueTypeCfg {
+    #[default]
+    String,
+    Integer,
+    Number,
+    Boolean,
+}
+
+/// XML/SOAP 输出的固定根和字段映射。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct XmlEmitCfg {
+    /// 输出根元素的 QName；SOAP 输出时这是 Body 内的业务根元素。
+    pub root: String,
+    /// 中间 JSON Pointer 到输出元素路径的映射。
+    #[serde(default)]
+    pub fields: Vec<XmlEmitFieldCfg>,
+}
+
+/// 中间 JSON 字段到固定 XML 元素路径的映射。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct XmlEmitFieldCfg {
+    /// 中间 JSON 的精确 JSON Pointer。
+    pub from: String,
+    /// 相对 `xml_emit.root` 的 QName 路径，使用 `/` 分隔。
+    pub to: String,
+    /// 输入字段不存在时是否拒绝转换。
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// SOAP Fault 到 HTTP 状态的固定映射。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SoapFaultMappingCfg {
+    /// namespace-aware Fault 元素路径。
+    pub path: String,
+    /// Fault 命中后写入的 HTTP 状态码。
+    pub status: u16,
+}
+
+/// 业务作用：提供响应契约替换错误的安全默认状态，避免无配置时伪装成上游成功。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 502。
+const fn default_response_contract_replacement_status() -> u16 {
+    502
+}
+
+/// 业务作用：为远端 schema 文档设置单次读取上限，限制控制面候选内存。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 1 MiB 默认上限。
+const fn default_schema_registry_max_bytes() -> usize {
+    1024 * 1024
+}
+
+/// 业务作用：为显式 HTTPS schema registry 设置有限请求 deadline。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 3000 毫秒默认值。
+const fn default_schema_registry_timeout_ms() -> u64 {
+    3_000
+}
+
+/// 业务作用：限制已验签 schema 缓存复用时间，使远端撤换在下一次候选构建时可重新取证。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 60000 毫秒默认值。
+const fn default_schema_registry_cache_ttl_ms() -> u64 {
+    60_000
+}
+
+/// 业务作用：提供不暴露 schema、字段名或上游实体的固定替换错误文本。
+///
+/// 参数说明：无。
+///
+/// 返回：返回稳定的低敏错误消息。
+fn default_response_contract_replacement_body() -> String {
+    "upstream response does not satisfy contract".to_string()
+}
+
+/// 业务作用：限制 XML 转换的默认嵌套层级，避免深层文档放大解析栈和路径状态。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 64 层默认上限。
+const fn default_transform_xml_depth() -> usize {
+    64
+}
+
+/// 业务作用：限制单次 XML 转换处理的节点事件总量。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 100000 个事件默认上限。
+const fn default_transform_xml_nodes() -> usize {
+    100_000
+}
+
+/// 业务作用：限制单元素属性数量，避免属性洪泛消耗解析资源。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 128 个属性默认上限。
+const fn default_transform_xml_attributes() -> usize {
+    128
+}
+
+/// 业务作用：限制 XML 文本累计字节，避免小结构携带超大文本绕过节点预算。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 16 MiB 默认上限。
+const fn default_transform_xml_text_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 /// V7 route 级 GraphQL 查询深度/复杂度守卫。
@@ -5579,6 +7371,400 @@ pub struct StaticServeCfg {
     pub range: bool,
 }
 
+/// 可复用上游凭据声明。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamCredentialCfg {
+    /// 全局唯一稳定名称，route/service 只保存此引用。
+    pub name: String,
+    /// 凭据类型：`api_key|bearer|basic|header|query|tls_client_identity`。
+    pub kind: String,
+    /// API key、Bearer、自定义 header/query 或 Basic password 的 SecretSource。
+    #[serde(default)]
+    pub value: String,
+    /// Basic 用户名；其它类型必须为空。
+    #[serde(default)]
+    pub username: String,
+    /// `api_key|header|query` 的 header/query 名；Bearer/Basic/TLS 必须为空。
+    #[serde(default)]
+    pub target: String,
+    /// 是否允许覆盖 route 自身产生的同名 header；必须显式声明。客户端同名值始终先删除。
+    pub overwrite: Option<bool>,
+    /// 允许接收该凭据的规范 backend origin 或 `lb://service`，不能为空。
+    pub allowed_backends: Vec<String>,
+    /// TLS client certificate PEM 的 SecretSource，仅 `tls_client_identity` 使用。
+    #[serde(default)]
+    pub client_certificate: String,
+    /// TLS client private key PEM 的 SecretSource，仅 `tls_client_identity` 使用。
+    #[serde(default)]
+    pub client_private_key: String,
+    /// 已从本地或远程来源解析的普通凭据；不参与反序列化和配置导出。
+    #[serde(skip)]
+    pub(crate) resolved_value: Option<String>,
+    /// 已解析的 TLS 客户端证书；与原始远程引用隔离，避免运行期再次访问 provider。
+    #[serde(skip)]
+    pub(crate) resolved_client_certificate: Option<String>,
+    /// 已解析的 TLS 客户端私钥；不实现公开序列化或调试输出。
+    #[serde(skip)]
+    pub(crate) resolved_client_private_key: Option<String>,
+    /// 远程凭据允许用于新请求的单调时钟截止点；本地来源没有该限制。
+    #[serde(skip)]
+    pub(crate) resolved_not_after: Option<std::time::Instant>,
+}
+
+/// HTTPS keyless/KMS 或 PKCS#11/HSM 密码 provider 的传输、认证与资源预算。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalCryptoProviderCfg {
+    /// 全局唯一名称，TLS signer 与 envelope secret 按名称引用。
+    pub name: String,
+    /// 固定 HTTPS operation endpoint；请求 body 中声明 `sign|encrypt|decrypt`，不拼接动态路径。
+    #[serde(default)]
+    pub endpoint: String,
+    /// 可选 PKCS#11/HSM transport；存在时 `endpoint` 与 HTTP 身份字段必须为空。
+    #[serde(default)]
+    pub pkcs11: Option<Pkcs11CryptoProviderCfg>,
+    /// Authorization 值 SecretSource；空值表示由 mTLS/workload 网络身份认证。
+    #[serde(default)]
+    pub authorization: String,
+    /// Authorization 值前缀，Bearer token 通常为 `Bearer `。
+    #[serde(default)]
+    pub authorization_prefix: String,
+    /// 自定义根 CA PEM SecretSource；空值使用平台根。
+    #[serde(default)]
+    pub ca_certificate: String,
+    /// provider mTLS 客户端证书 SecretSource。
+    #[serde(default)]
+    pub client_certificate: String,
+    /// provider mTLS 客户端私钥 SecretSource。
+    #[serde(default)]
+    pub client_private_key: String,
+    /// provider 允许执行的签名算法集合。
+    #[serde(default)]
+    pub allowed_algorithms: Vec<String>,
+    /// 单次 operation deadline。
+    #[serde(default = "default_external_crypto_timeout_ms")]
+    pub timeout_ms: u64,
+    /// 单 provider 同时执行的远程 operation 上限。
+    #[serde(default = "default_external_crypto_concurrency")]
+    pub max_concurrency: usize,
+    /// TLS 同步签名桥接的有界等待队列。
+    #[serde(default = "default_external_crypto_queue_capacity")]
+    pub queue_capacity: usize,
+    /// 连续依赖失败达到该值后打开熔断器。
+    #[serde(default = "default_external_crypto_circuit_failures")]
+    pub circuit_failure_threshold: u32,
+    /// 熔断后拒绝新 operation 的时间。
+    #[serde(default = "default_external_crypto_circuit_open_ms")]
+    pub circuit_open_ms: u64,
+    /// 单个请求 message/ciphertext 的原始字节上限。
+    #[serde(default = "default_external_crypto_input_bytes")]
+    pub max_input_bytes: usize,
+    /// provider JSON 响应体上限。
+    #[serde(default = "default_external_crypto_response_bytes")]
+    pub max_response_bytes: usize,
+}
+
+/// PKCS#11 token 的模块、槽位与登录身份。
+///
+/// provider 只取得不可导出 private-key object handle 并执行签名，不读取私钥属性；module、token 和
+/// key label 都由配置显式固定，避免自动选择主机上的其它 HSM。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Pkcs11CryptoProviderCfg {
+    /// PKCS#11 共享库的绝对路径。
+    pub module_path: String,
+    /// 固定 slot id；与 `token_label` 必须恰好配置一项。
+    #[serde(default)]
+    pub slot_id: Option<u64>,
+    /// 固定 token label；与 `slot_id` 必须恰好配置一项。
+    #[serde(default)]
+    pub token_label: String,
+    /// User PIN 的本地 SecretSource；不得递归使用远程 provider。
+    pub user_pin: String,
+}
+
+/// TLS 证书对不导出私钥 signer 的引用。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalPrivateKeyCfg {
+    /// `crypto_providers[]` 中的 provider 名称。
+    pub provider: String,
+    /// provider 内固定 key identity；只用于请求，不进入日志。
+    pub key_id: String,
+    /// 该证书允许协商的 TLS signature scheme。
+    pub algorithms: Vec<String>,
+}
+
+/// 业务作用：限制远程密码 operation 占用握手或后台任务的默认时长。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 3 秒。
+const fn default_external_crypto_timeout_ms() -> u64 {
+    3_000
+}
+
+/// 业务作用：限制单 provider 并行调用，防依赖变慢时耗尽连接与线程。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 8 个并发。
+const fn default_external_crypto_concurrency() -> usize {
+    8
+}
+
+/// 业务作用：限制等待远程 signer 的 TLS 握手数量。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 64 项。
+const fn default_external_crypto_queue_capacity() -> usize {
+    64
+}
+
+/// 业务作用：设置依赖连续失败后打开熔断器的默认门槛。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 5 次。
+const fn default_external_crypto_circuit_failures() -> u32 {
+    5
+}
+
+/// 业务作用：限制 signer 依赖故障期间重复外呼的默认熔断窗口。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 10 秒。
+const fn default_external_crypto_circuit_open_ms() -> u64 {
+    10_000
+}
+
+/// 业务作用：限制送往外部密码 provider 的单次原始输入。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 64 KiB。
+const fn default_external_crypto_input_bytes() -> usize {
+    64 * 1024
+}
+
+/// 业务作用：限制远程密码 provider 返回 JSON 的内存占用。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 64 KiB。
+const fn default_external_crypto_response_bytes() -> usize {
+    64 * 1024
+}
+
+/// 固定 HTTPS JSON Secret provider 的连接、认证、响应契约与陈旧期策略。
+///
+/// provider 只返回 `{value, version, lease}` 语义，不参与业务路由；各云厂商或 Vault 可通过
+/// 固定 endpoint、JSON Pointer、工作负载身份文件和 mTLS 映射到同一安全边界。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSecretProviderCfg {
+    /// 全局唯一稳定名称，`remote://<provider>/<secret>` 通过该名称引用。
+    pub name: String,
+    /// 固定 HTTPS API 前缀；secret path 只作为逐段 percent-encoded 后缀追加。
+    pub endpoint: String,
+    /// provider API 适配器；默认使用可配置 JSON Pointer 的通用契约。
+    #[serde(default)]
+    pub adapter: RemoteSecretAdapterCfg,
+    /// 发给 provider 的认证值 SecretSource；可指向轮换中的 workload identity 文件。
+    #[serde(default)]
+    pub authorization: String,
+    /// 认证 header 名；默认 `authorization`，Vault 可使用 `x-vault-token`。
+    #[serde(default = "default_remote_secret_authorization_header")]
+    pub authorization_header: String,
+    /// 认证值前缀；Bearer token 通常配置为 `Bearer `，空值表示直接使用 SecretSource 内容。
+    #[serde(default)]
+    pub authorization_prefix: String,
+    /// 自定义 provider CA bundle 的 SecretSource；空值使用平台信任根。
+    #[serde(default)]
+    pub ca_certificate: String,
+    /// provider mTLS 客户端证书 PEM SecretSource，必须与私钥同时配置。
+    #[serde(default)]
+    pub client_certificate: String,
+    /// provider mTLS 客户端私钥 PEM SecretSource，必须与证书同时配置。
+    #[serde(default)]
+    pub client_private_key: String,
+    /// 可选 envelope 解密计划；存在时 JSON `value` 必须是标准 Base64 ciphertext。
+    #[serde(default)]
+    pub envelope: Option<RemoteSecretEnvelopeCfg>,
+    /// JSON 中 secret 字符串的 Pointer。
+    #[serde(default = "default_remote_secret_value_pointer")]
+    pub value_pointer: String,
+    /// JSON 中单调 `u64` 版本的 Pointer；版本回退或同版异值拒绝候选。
+    #[serde(default = "default_remote_secret_version_pointer")]
+    pub version_pointer: String,
+    /// JSON 中可选 lease 秒数的 Pointer；空值表示 provider 不提供 lease。
+    #[serde(default)]
+    pub lease_seconds_pointer: String,
+    /// 后台重新拉取的目标间隔，必须短于最大陈旧期。
+    #[serde(default = "default_remote_secret_refresh_interval_ms")]
+    pub refresh_interval_ms: u64,
+    /// 最近一次成功拉取的值可用于新请求的最长时间。
+    #[serde(default = "default_remote_secret_max_stale_ms")]
+    pub max_stale_ms: u64,
+    /// TCP/TLS 建连 deadline。
+    #[serde(default = "default_remote_secret_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// 单次完整 HTTP 请求 deadline。
+    #[serde(default = "default_remote_secret_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    /// provider 响应体硬上限。
+    #[serde(default = "default_remote_secret_response_bytes")]
+    pub max_response_bytes: usize,
+    /// 第一次依赖失败后的退避时长。
+    #[serde(default = "default_remote_secret_retry_base_ms")]
+    pub retry_base_ms: u64,
+    /// 连续失败退避上限。
+    #[serde(default = "default_remote_secret_retry_max_ms")]
+    pub retry_max_ms: u64,
+}
+
+/// 远程 Secret provider 的原生 API 适配器。
+///
+/// 所有适配器复用同一套 HTTPS、并发、版本单调、lease、退避和 last-known-good 规则；这里只描述
+/// 云 API 固有的认证或 wire 差异，不允许适配器改变数据面的 SecretSource 语义。
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteSecretAdapterCfg {
+    /// 通过 `value_pointer`、`version_pointer` 和可选 `lease_seconds_pointer` 读取固定 JSON 契约。
+    #[default]
+    GenericJson,
+    /// AWS Secrets Manager `GetSecretValue`，使用轮换中的容器凭据 JSON 执行 SigV4。
+    AwsSecretsManager {
+        /// SigV4 credential scope 中的固定 AWS region。
+        region: String,
+        /// AWS 容器凭据 JSON 的本地 SecretSource。
+        credentials: String,
+    },
+    /// Azure Key Vault Secret REST API，OAuth Bearer 仍由 provider 的 `authorization` 提供。
+    AzureKeyVault {
+        /// 固定 Key Vault REST API 版本。
+        #[serde(default = "default_azure_key_vault_api_version")]
+        api_version: String,
+    },
+    /// Google Secret Manager `versions:access`，OAuth Bearer 仍由 provider 的 `authorization` 提供。
+    GcpSecretManager,
+}
+
+/// 业务作用：固定 Azure Key Vault 的稳定 REST 契约版本，避免热换时跟随服务端默认值漂移。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回受支持的 Key Vault API 版本。
+fn default_azure_key_vault_api_version() -> String {
+    "7.5".to_owned()
+}
+
+/// 远程 Secret ciphertext 对不可导出 KEK 的引用。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSecretEnvelopeCfg {
+    /// `crypto_providers[]` 中执行 decrypt 的 provider 名称。
+    pub crypto_provider: String,
+    /// provider 内固定 KEK identity；只进入受保护请求体，不进入日志。
+    pub key_id: String,
+    /// 额外 AAD 上下文；运行时还会强制绑定 Secret provider、路径和单调版本。
+    #[serde(default)]
+    pub aad_context: String,
+}
+
+/// 业务作用：提供远程 provider 默认认证 header，避免空名称进入 HTTP 构建期。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回标准 `authorization` header 名。
+fn default_remote_secret_authorization_header() -> String {
+    "authorization".to_owned()
+}
+
+/// 业务作用：固定远程 secret 值的默认 JSON Pointer 契约。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 `/value`。
+fn default_remote_secret_value_pointer() -> String {
+    "/value".to_owned()
+}
+
+/// 业务作用：固定远程 secret 单调版本的默认 JSON Pointer 契约。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 `/version`。
+fn default_remote_secret_version_pointer() -> String {
+    "/version".to_owned()
+}
+
+/// 业务作用：给远程 secret 后台刷新提供不产生高频控制面请求的默认周期。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 30 秒。
+const fn default_remote_secret_refresh_interval_ms() -> u64 {
+    30_000
+}
+
+/// 业务作用：限制 provider 暂时不可用时旧 secret 可继续服务的默认窗口。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 5 分钟。
+const fn default_remote_secret_max_stale_ms() -> u64 {
+    300_000
+}
+
+/// 业务作用：固定远程 provider 建连默认 deadline。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 3 秒。
+const fn default_remote_secret_connect_timeout_ms() -> u64 {
+    3_000
+}
+
+/// 业务作用：固定远程 provider 完整请求默认 deadline。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 5 秒。
+const fn default_remote_secret_request_timeout_ms() -> u64 {
+    5_000
+}
+
+/// 业务作用：防错误 provider 返回大文档占用候选构建内存。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 64 KiB。
+const fn default_remote_secret_response_bytes() -> usize {
+    64 * 1024
+}
+
+/// 业务作用：固定远程 provider 首次失败退避，避免立即重试放大故障。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 1 秒。
+const fn default_remote_secret_retry_base_ms() -> u64 {
+    1_000
+}
+
+/// 业务作用：限制远程 provider 连续失败退避，仍给 lease 和陈旧期留出复验机会。
+///
+/// 参数说明: 无。
+///
+/// 返回：返回 30 秒。
+const fn default_remote_secret_retry_max_ms() -> u64 {
+    30_000
+}
+
 /// 上游逻辑服务目录与进程级预热扫描参数。
 #[derive(Debug, Deserialize)]
 pub struct UpstreamsCfg {
@@ -5608,6 +7794,9 @@ pub struct StaticServiceCfg {
     /// 静态来源的实例列表；动态来源必须留空。
     #[serde(default)]
     pub instances: Vec<StaticInstanceCfg>,
+    /// 绑定到本逻辑服务连接池身份的命名 TLS client credential 引用。
+    #[serde(default)]
+    pub upstream_credentials: Vec<String>,
     /// 上游实例来源：`static`(默认)、`nacos`、`consul`、`eureka`、`dns`、`kubernetes` 或 `xds`。
     #[serde(default)]
     pub source: Option<String>,
@@ -5617,6 +7806,9 @@ pub struct StaticServiceCfg {
     /// V7 非 Nacos 注册中心中的物理服务名/DNS host；缺省使用 map key。
     #[serde(default)]
     pub registry_service: Option<String>,
+    /// Kubernetes discovery 是否按 MCS `ServiceImport` 的 EndpointSlice label 获取跨集群端点。
+    #[serde(default)]
+    pub registry_service_import: bool,
     /// K8s service namespace；缺省使用 `discovery.kubernetes.namespace`。
     #[serde(default)]
     pub registry_namespace: Option<String>,
@@ -5638,9 +7830,33 @@ pub struct StaticServiceCfg {
     /// 兼容 架构规范 示例里的 `lb: least_conn`。
     #[serde(default)]
     pub lb: Option<String>,
+    /// 一致性哈希键来源:`consumer` / `remote_addr` / `header:<name>` / `cookie:<name>` / `var:<name>`。
+    /// `ring_hash`/`maglev` 必须声明;`ip_hash` 会自动展开为 `ring_hash` + `remote_addr`。
+    /// 只接受受控来源,拒绝任意高基数字段污染哈希环与跨节点共享状态。
+    #[serde(default)]
+    pub hash_on: Option<String>,
+    /// ring-hash 每单位权重生成的虚拟节点数;默认 100,构建期钳制到硬上限。
+    #[serde(default)]
+    pub hash_ring_replicas: Option<u32>,
+    /// Maglev 查找表期望长度;构建期归一到不小于它的质数并受硬上限约束。
+    #[serde(default)]
+    pub hash_table_size: Option<usize>,
+    /// 服务级会话保持;route 级策略优先(Gateway API 语义)。
+    #[serde(default)]
+    pub session_affinity: Option<SessionAffinityCfg>,
     /// V9 zone-aware locality/failover；未配置时保持既有全实例 LB 语义。
     #[serde(default)]
     pub locality: Option<UpstreamLocalityCfg>,
+    /// 后端负载反馈:让 `weighted_least_request` 按真实延迟或后端自报利用率择优。
+    /// 未配置时保持纯在途请求数比较,不采集任何反馈、不产生额外状态。
+    #[serde(default)]
+    pub load_feedback: Option<LoadFeedbackCfg>,
+    /// backend 级 retry budget;未配置时重试只受 `next_upstream_tries` 约束。
+    #[serde(default)]
+    pub retry_budget: Option<RetryBudgetCfg>,
+    /// 自适应并发:按 minRTT 与采样延迟动态调节该服务的在途上限。
+    #[serde(default)]
+    pub adaptive_concurrency: Option<AdaptiveConcurrencyCfg>,
     /// 上游 HTTP 协议：`auto`(默认，按 scheme + gRPC content-type 判) | `h1` | `h2` | `h2c` | `h3`。
     /// `h3` 要求 `https://` 实例和 `http3` feature，不满足时构建期 fail closed，不静默退化。
     /// gRPC 上游应配 `h2`(TLS)/`h2c`(明文),否则会退化成 h1 多连接、丢多路复用。
@@ -5676,18 +7892,158 @@ pub struct StaticServiceCfg {
     pub prewarm: Option<UpstreamPrewarmCfg>,
 }
 
+/// backend 级 retry budget 配置。
+///
+/// route 的 `next_upstream` 决定「这次失败能不能重试」;本预算决定「当前整体还能不能
+/// 再发重试」。两者都通过才真正发起重试,缺一不可。
+#[derive(Debug, Deserialize, Clone)]
+pub struct RetryBudgetCfg {
+    /// 是否启用;默认 false 保持既有「只受 next_upstream_tries 约束」的行为。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 活动重试数占滚动请求数的百分比(1..=100),默认 20。
+    #[serde(default)]
+    pub budget_percent: Option<u32>,
+    /// 无论比例如何都允许的最小并发重试数,默认 3;保证低流量服务仍能重试。
+    #[serde(default)]
+    pub min_retry_concurrency: Option<u64>,
+    /// 每个滚动窗口至少允许的重试总数；用于表达 Gateway API `minRetryRate`。
+    #[serde(default)]
+    pub min_retries_per_window: Option<u64>,
+    /// 滚动统计窗口(ms),默认 10000。
+    #[serde(default)]
+    pub window_ms: Option<u64>,
+}
+
+/// 自适应并发配置。
+#[derive(Debug, Deserialize, Clone)]
+pub struct AdaptiveConcurrencyCfg {
+    /// 是否启用;默认 false。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 在途上限下界,默认 4;再拥塞也保留该并发,避免把后端彻底饿死。
+    #[serde(default)]
+    pub min_concurrency: Option<u64>,
+    /// 在途上限上界,默认 1024。
+    #[serde(default)]
+    pub max_concurrency: Option<u64>,
+    /// 采样窗口(ms),默认 1000。
+    #[serde(default)]
+    pub sample_window_ms: Option<u64>,
+    /// minRTT 重标定周期(ms),默认 30000。
+    #[serde(default)]
+    pub min_rtt_window_ms: Option<u64>,
+    /// 标定周期抖动万分比,默认 1000;避免多节点同时标定造成同步震荡。
+    #[serde(default)]
+    pub jitter_bp: Option<u32>,
+    /// 超上限时允许排队的请求数,默认 0(直接拒绝不排队)。
+    #[serde(default)]
+    pub queue_limit: Option<u64>,
+    /// 排队最长等待(ms),默认 100;超时按过载拒绝。
+    #[serde(default)]
+    pub queue_deadline_ms: Option<u64>,
+}
+
+/// 后端负载反馈配置。
+///
+/// 反馈只影响**同一候选层内部的择优顺序**,不参与健康裁决:任何缺失、过期、越界或
+/// 格式非法的报告都只让该实例回落基础算法,绝不会把它判成不可用。
+#[derive(Debug, Deserialize, Clone)]
+pub struct LoadFeedbackCfg {
+    /// 反馈口径:`none`(默认)、`latency_ewma`、`utilization`。
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// 反馈最大有效期(ms),默认 30000;超期即视为无反馈。
+    #[serde(default)]
+    pub freshness_ms: Option<u64>,
+    /// 参与比较所需最小样本数,默认 3;防止冷启动实例被单次采样定性。
+    #[serde(default)]
+    pub min_samples: Option<u64>,
+    /// EWMA 平滑系数万分比(1..=10000),默认 2000。越小越平滑。
+    #[serde(default)]
+    pub smoothing_bp: Option<u32>,
+    /// panic 阈值万分比(0..=10000),默认 5000:有新鲜反馈的候选占比低于它时,
+    /// 整服务停用反馈回退基础算法,避免把全部流量压到少数「有数据」的实例上。
+    #[serde(default)]
+    pub panic_threshold_bp: Option<u32>,
+    /// ORCA 报告响应头名,默认 `endpoint-load-metrics`(仅 `utilization` 使用)。
+    #[serde(default)]
+    pub orca_header: Option<String>,
+}
+
+/// 会话保持配置:网关生成 cookie,或复用客户端提供的请求头。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAffinityCfg {
+    /// 载体:`cookie`(默认)或 `header`。
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// cookie 名或请求头名;缺省 cookie 模式为 `naway_affinity`。
+    #[serde(default)]
+    pub name: Option<String>,
+    /// cookie 有效期(秒);0 或缺省表示会话 cookie(浏览器关闭即失效)。
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+    /// 会话从首次建立起的绝对有效期（秒）；0 或缺省表示不由网关校验绝对期限。
+    #[serde(default)]
+    pub absolute_timeout_seconds: Option<u64>,
+    /// 相邻两次有效请求之间允许的最大空闲期（秒）；0 或缺省表示不校验空闲期限。
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
+    /// cookie 是否为持久 cookie；开启时必须配置 `absolute_timeout_seconds`，且
+    /// `Max-Age` 按剩余绝对期限递减，不能因响应再次下发而延长会话。
+    #[serde(default)]
+    pub permanent_cookie: Option<bool>,
+    /// cookie `Path`,缺省 `/`。
+    #[serde(default)]
+    pub path: Option<String>,
+    /// 是否省略 cookie `Path`；用于 backend 级策略覆盖多个不同路径时避免缩小作用域。
+    #[serde(default)]
+    pub omit_path: Option<bool>,
+    /// cookie `Domain`;缺省不下发该属性(仅当前 host 生效,范围最小)。
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// cookie `SameSite`:`Lax`(默认)/`Strict`/`None`。`None` 必须同时 `secure=true`。
+    #[serde(default)]
+    pub same_site: Option<String>,
+    /// 是否下发 `Secure`,**缺省 true**;明文调试场景才需显式关掉。
+    #[serde(default)]
+    pub secure: Option<bool>,
+    /// 是否下发 `HttpOnly`,**缺省 true**,防止脚本读取亲和令牌。
+    #[serde(default)]
+    pub http_only: Option<bool>,
+}
+
 /// 上游 zone-aware locality 与显式跨区故障转移策略。
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamLocalityCfg {
     /// 本 Naway 数据面所在的可信 zone；仅与配置/发现 metadata 比较。
     pub local_zone: String,
+    /// locality 调度模式:
+    /// - `failover`(默认):严格按顺序,本区有容量就绝不外泄,跨区只作故障转移;
+    /// - `weighted`:全部已声明 zone 同级参与,按「zone 权重 × 该 zone 健康实例数」分份额。
+    ///
+    /// 两者语义完全不同,必须显式选择:把 weighted 当默认会让本区优先的部署突然开始跨区分流。
+    #[serde(default)]
+    pub mode: Option<String>,
     /// 本区无健康容量时按数组顺序选择的跨区 failover zone。
     #[serde(default)]
     pub failover_zones: Vec<String>,
     /// 是否在已列 zone 全无健康容量后允许 zone 缺失/未列实例。默认 false。
     #[serde(default)]
     pub allow_unlisted: bool,
+    /// zone → 相对权重。声明后同一优先级内按「权重 × 该 zone 健康实例数」分配份额,
+    /// 而不是把本区之外的流量一刀切。未列 zone 取默认权重 1。
+    #[serde(default)]
+    pub zone_weights: std::collections::HashMap<String, u32>,
+    /// 降级 zone:与本区同优先级参与,但份额按 `degraded_weight_percent` 打折。
+    /// 用于「机房可用但已知劣化」这类既不该全量、也不该完全摘除的状态。
+    #[serde(default)]
+    pub degraded_zones: Vec<String>,
+    /// 降级 zone 的份额百分比(1..=100),默认 20。
+    #[serde(default)]
+    pub degraded_weight_percent: Option<u32>,
 }
 
 /// 上游 Hyper 连接池预热策略。预热只发送 HEAD 且不携带下游 head/body/身份。
@@ -5774,6 +8130,9 @@ pub struct UpstreamTlsCfg {
     /// 覆盖发往上游的 TLS SNI 与证书校验名,等价 nginx `proxy_ssl_name`。
     #[serde(default, alias = "proxy_ssl_name")]
     pub server_name: Option<String>,
+    /// 只加密传输而不认证服务端证书；仅适用于身份已由受控服务发现边界约束的动态自签名端点。
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
     /// 自定义上游服务端 CA PEM,等价 nginx `proxy_ssl_trusted_certificate`;为空使用系统根证书。
     #[serde(default, alias = "proxy_ssl_trusted_certificate")]
     pub ca_file: Option<String>,
@@ -5796,6 +8155,36 @@ pub struct UpstreamTlsCfg {
     /// 内联客户端私钥；不进入日志或错误上下文，必须与内联证书链成对出现。
     #[serde(default)]
     pub client_key_pem: Option<String>,
+    /// 可选 SPIRE Workload API 客户端身份；与文件或内联客户端证书互斥。
+    #[serde(default)]
+    pub spire: Option<SpireWorkloadCfg>,
+    /// 远程身份允许创建新上游请求的截止点；仅由候选构建器写入。
+    #[serde(skip)]
+    pub(crate) client_identity_not_after: Option<std::time::Instant>,
+}
+
+const fn default_spire_timeout_ms() -> u64 {
+    3_000
+}
+
+const fn default_spire_reconnect_min_ms() -> u64 {
+    100
+}
+
+const fn default_spire_reconnect_max_ms() -> u64 {
+    5_000
+}
+
+const fn default_spire_max_response_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+const fn default_spire_min_validity_seconds() -> u64 {
+    30
+}
+
+const fn default_spire_clock_skew_seconds() -> u64 {
+    30
 }
 
 fn default_guard_file() -> String {
@@ -6753,4 +9142,436 @@ impl Default for GrpcEdgeRelayTlsCfg {
             handshake_timeout_ms: 5_000,
         }
     }
+}
+
+/// route 级双向带宽与成本型限额配置。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TrafficLimitCfg {
+    /// 限额维度键。与 `limit_req` 使用同一套 DSL(global/ip/route/header:<n>/query:<n>),
+    /// 保证同一 route 上两种限流对"谁是同一个调用方"的理解一致。
+    #[serde(default = "default_traffic_limit_key")]
+    pub key: String,
+    /// 请求方向带宽整形。
+    #[serde(default)]
+    pub request_bandwidth: Option<BandwidthCfg>,
+    /// 响应方向带宽整形。与 route filter 的 `limit_rate` 的区别是本策略按维度跨流共享。
+    #[serde(default)]
+    pub response_bandwidth: Option<BandwidthCfg>,
+    /// 多窗口限额。
+    #[serde(default)]
+    pub quota: Option<QuotaCfg>,
+    /// 计数不可用时的处置:fail_open|fail_closed。必须显式选择。
+    #[serde(default = "default_traffic_limit_fail_mode")]
+    pub fail_mode: String,
+}
+
+/// 业务作用：为流量治理选择不会跨调用方聚合的默认维度。
+///
+/// 参数说明：无。
+///
+/// 返回：返回客户端 IP 维度配置名。
+fn default_traffic_limit_key() -> String {
+    "ip".to_string()
+}
+
+/// 业务作用：定义本地流量计数不可用时的兼容处置，避免反序列化缺省值含义漂移。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `fail_open`；需要强制保护的路由必须显式配置 `fail_closed`。
+fn default_traffic_limit_fail_mode() -> String {
+    "fail_open".to_string()
+}
+
+/// 单方向带宽配置。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BandwidthCfg {
+    /// 稳态速率(字节/秒)。
+    pub bytes_per_second: u64,
+    /// 突发容量(字节)。
+    #[serde(default)]
+    pub burst_bytes: u64,
+    /// 前 N 字节不整形。
+    #[serde(default)]
+    pub after_bytes: u64,
+}
+
+/// 多窗口限额配置。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaCfg {
+    /// 算法:fixed_window|sliding_window|leaky_bucket。
+    #[serde(default = "default_quota_algorithm")]
+    pub algorithm: String,
+    /// 并行窗口集合;全部通过才放行。
+    pub windows: Vec<QuotaWindowCfg>,
+    /// 超额动作:reject|delay。
+    #[serde(default = "default_quota_overflow")]
+    pub overflow: String,
+    /// `overflow: delay` 时的最大排队请求数。
+    #[serde(default = "default_quota_max_queue")]
+    pub max_queue: u64,
+    /// `overflow: delay` 时的单请求最长等待(ms)。
+    #[serde(default = "default_quota_max_wait_ms")]
+    pub max_wait_ms: u64,
+    /// 成本来源:per_request|response_bytes|grpc_messages|graphql_cost|trusted_usage。
+    #[serde(default = "default_quota_cost_source")]
+    pub cost_source: String,
+    /// 准入期预留额度(成本型来源使用)。
+    #[serde(default = "default_quota_reserve")]
+    pub reserve: u64,
+    /// `response_bytes` 下每多少字节记 1 个额度。
+    #[serde(default = "default_quota_bytes_per_unit")]
+    pub bytes_per_unit: u64,
+    /// 结算硬上限,防止上游返回异常用量击穿账本。
+    #[serde(default = "default_quota_max_actual")]
+    pub max_actual: u64,
+}
+
+/// 单个限额窗口配置。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaWindowCfg {
+    /// 窗口内额度。
+    pub limit: u64,
+    /// 窗口长度(ms)。
+    pub window_ms: u64,
+    /// 突发额度;漏桶算法忽略该值。
+    #[serde(default)]
+    pub burst: u64,
+}
+
+/// 业务作用：为未指定算法的多窗口额度选择能平滑窗口边界的默认实现。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `sliding_window`。
+fn default_quota_algorithm() -> String {
+    "sliding_window".to_string()
+}
+
+/// 业务作用：定义额度耗尽时不隐式积压请求的默认动作。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `reject`。
+fn default_quota_overflow() -> String {
+    "reject".to_string()
+}
+
+/// 业务作用：限制显式延迟模式的默认排队请求数，避免过载时形成无界内存队列。
+///
+/// 参数说明：无。
+///
+/// 返回：返回默认队列上限 128。
+const fn default_quota_max_queue() -> u64 {
+    128
+}
+
+/// 业务作用：限制额度等待的默认时长，避免请求长期占用连接与并发槽。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 1000 毫秒。
+const fn default_quota_max_wait_ms() -> u64 {
+    1_000
+}
+
+/// 业务作用：为未声明成本来源的额度规则提供一次请求一次计费的确定语义。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `per_request`。
+fn default_quota_cost_source() -> String {
+    "per_request".to_string()
+}
+
+/// 业务作用：为需要事后结算的成本来源预留最小准入额度。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 1 个额度单位。
+const fn default_quota_reserve() -> u64 {
+    1
+}
+
+/// 业务作用：定义响应字节成本到额度单位的默认换算粒度。
+///
+/// 参数说明：无。
+///
+/// 返回：返回每 1024 字节一个额度单位。
+const fn default_quota_bytes_per_unit() -> u64 {
+    1_024
+}
+
+/// 业务作用：限制单请求事后结算的默认最大成本，防止异常响应击穿额度账本。
+///
+/// 参数说明：无。
+///
+/// 返回：返回一百万个额度单位。
+const fn default_quota_max_actual() -> u64 {
+    1_000_000
+}
+
+/// route 级受控正向代理配置。
+///
+/// 所有 allowlist 都必须显式给出:没有"留空即全放行"的语义。正向代理把网关的
+/// 网络位置交给调用方使用,一个默认放行的配置就是可被立刻利用的内网入口。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardProxyCfg {
+    /// 允许 CONNECT 的目标端口。不得为空。
+    pub allowed_ports: Vec<u16>,
+    /// 允许的目标域名,支持 `*.example.com` 形式的子域通配;不接受裸 `*`。
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// 允许的目标 CIDR。
+    #[serde(default)]
+    pub allowed_cidrs: Vec<String>,
+    /// 是否允许目标解析到私网地址。环回、链路本地与元数据地址即使开启也永远拒绝。
+    #[serde(default)]
+    pub allow_private: bool,
+    /// 隧道空闲上限(ms);0 表示不限制。
+    #[serde(default = "default_connect_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+    /// 隧道绝对寿命上限(ms);0 表示不限制。
+    #[serde(default)]
+    pub max_lifetime_ms: u64,
+    /// 单条隧道允许搬运的最大字节数;0 表示不限制。
+    #[serde(default)]
+    pub max_bytes: u64,
+    /// 建连超时(ms)。
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+}
+
+/// route 级 WebTransport 真上游代理配置。
+///
+/// 该后端只接受 HTTP/3 extended CONNECT，普通 HTTP 请求不会被静默转成 WebTransport。
+/// 上游 URL 和信任根都在候选快照构建期冻结，客户端不能借请求字段改写拨号目标。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebTransportCfg {
+    /// 固定 HTTPS WebTransport 上游 URL，包含上游 session path。
+    pub upstream: String,
+    /// 允许建立 session 的浏览器 Origin 精确集合；不得为空或包含通配符。
+    pub allowed_origins: Vec<String>,
+    /// 可选自定义 CA PEM；为空时使用系统信任根。相对路径按主配置目录解析并纳入热更新依赖。
+    #[serde(default)]
+    pub ca_file: Option<String>,
+    /// 建立上游 QUIC 与 WebTransport session 的总时限。
+    #[serde(default = "default_webtransport_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// 单 session 同时转发的双向 stream 上限。
+    #[serde(default = "default_webtransport_max_bidi_streams")]
+    pub max_bidi_streams: u64,
+    /// 单 session 同时转发的单向 stream 上限。
+    #[serde(default = "default_webtransport_max_uni_streams")]
+    pub max_uni_streams: u64,
+    /// 单方向等待转发的 DATAGRAM 数量上限；队列满时按不可靠语义丢弃。
+    #[serde(default = "default_webtransport_max_datagram_queue")]
+    pub max_datagram_queue: u64,
+    /// 单个 WebTransport DATAGRAM payload 上限。
+    #[serde(default = "default_webtransport_max_datagram_bytes")]
+    pub max_datagram_bytes: usize,
+    /// session 两个方向合计允许转发的最大字节数；0 表示不限制。
+    #[serde(default)]
+    pub max_bytes: u64,
+    /// session 无 stream/datagram 活动后的回收时限。
+    #[serde(default = "default_webtransport_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+    /// session 从建立起的最长存活时间；0 表示不额外限制。
+    #[serde(default)]
+    pub max_lifetime_ms: u64,
+}
+
+/// route 级 QUIC 0-RTT 安全契约。
+///
+/// 业务作用：仅对显式、无凭据且无认证副作用的读路由开放 early data；
+/// listener 级 TLS 恢复与共享 anti-replay 是另一道必须同时成立的门禁。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EarlyDataRouteCfg {
+    /// 是否显式允许本 route 接收 0-RTT；默认关闭。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 一次性 nonce 在 anti-replay 账本中的保留时间。
+    #[serde(default = "default_early_data_replay_window_ms")]
+    pub replay_window_ms: u64,
+}
+
+/// 业务作用：为 0-RTT 重放去重提供短且可容忍跨节点延迟的默认窗口。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 10 秒的默认 anti-replay 保留时间。
+const fn default_early_data_replay_window_ms() -> u64 {
+    10_000
+}
+
+/// 业务作用：限制 WebTransport 上游握手占用会话准入资源的时间。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 5 秒默认建连时限。
+const fn default_webtransport_connect_timeout_ms() -> u64 {
+    5_000
+}
+
+/// 业务作用：为单个 WebTransport session 提供保守的双向 stream 并发上限。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 64 条双向 stream。
+const fn default_webtransport_max_bidi_streams() -> u64 {
+    64
+}
+
+/// 业务作用：为单个 WebTransport session 提供保守的单向 stream 并发上限。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 64 条单向 stream。
+const fn default_webtransport_max_uni_streams() -> u64 {
+    64
+}
+
+/// 业务作用：为 WebTransport 不可靠消息提供小型突发队列且保持内存有界。
+///
+/// 参数说明：无。
+///
+/// 返回：返回每方向 128 个 DATAGRAM。
+const fn default_webtransport_max_datagram_queue() -> u64 {
+    128
+}
+
+/// 业务作用：限制 WebTransport 单个 DATAGRAM，避免 QUIC path 分片与大包内存放大。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 1150 字节 payload 上限。
+const fn default_webtransport_max_datagram_bytes() -> usize {
+    1_150
+}
+
+/// 业务作用：回收没有任何业务活动的 WebTransport session。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 60 秒默认空闲时限。
+const fn default_webtransport_idle_timeout_ms() -> u64 {
+    60_000
+}
+
+/// 业务作用：为 CONNECT 隧道提供默认空闲回收期限，避免无流量连接永久占用资源。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 60000 毫秒。
+const fn default_connect_idle_timeout_ms() -> u64 {
+    60_000
+}
+
+/// 业务作用：限制 CONNECT 目标建连的默认等待时间，避免不可达目标长期占用准入资源。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 5000 毫秒。
+const fn default_connect_timeout_ms() -> u64 {
+    5_000
+}
+
+/// route 级 WebSocket 帧级治理配置。
+///
+/// 缺省即透明模式:不解析帧、不聚合消息,与既有行为完全一致。只有显式配置本块
+/// 才进入 frame-aware 模式,相应的解析与聚合开销也只落在该 route 上。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WsFrameCfg {
+    /// 单帧载荷上限(字节)。
+    #[serde(default = "default_ws_max_frame_bytes")]
+    pub max_frame_bytes: u64,
+    /// 单条消息(所有分片之和)上限(字节)。
+    #[serde(default = "default_ws_max_message_bytes")]
+    pub max_message_bytes: u64,
+    /// 单条消息允许的最大分片数;用于挡住分片炸弹。
+    #[serde(default = "default_ws_max_fragments")]
+    pub max_fragments: u32,
+    /// 交给插件的载荷上限(字节);超出部分不进插件视野。
+    #[serde(default = "default_ws_max_plugin_payload_bytes")]
+    pub max_plugin_payload_bytes: usize,
+    /// 单个插件处理一帧的时限(ms);超时按放行处理并计数。
+    #[serde(default = "default_ws_plugin_timeout_ms")]
+    pub plugin_timeout_ms: u64,
+    /// permessage-deflate 允许的最大解压比。
+    #[serde(default = "default_ws_max_decompress_ratio")]
+    pub max_decompress_ratio: u32,
+    /// 违规处置动作:drop|policy_close|upstream_close。
+    #[serde(default = "default_ws_on_violation")]
+    pub on_violation: String,
+}
+
+/// 业务作用：给帧级治理设置默认单帧硬上限，阻止对端声明无界载荷。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 1 MiB。
+const fn default_ws_max_frame_bytes() -> u64 {
+    1024 * 1024
+}
+
+/// 业务作用：给分片消息设置默认聚合上限，约束跨帧状态占用。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 8 MiB。
+const fn default_ws_max_message_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+
+/// 业务作用：限制单条消息的默认分片数量，阻止小分片放大解析与状态成本。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 256 个分片。
+const fn default_ws_max_fragments() -> u32 {
+    256
+}
+
+/// 业务作用：限制默认插件可见载荷，避免插件链复制过大的业务消息。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 64 KiB。
+const fn default_ws_max_plugin_payload_bytes() -> usize {
+    64 * 1024
+}
+
+/// 业务作用：约束单次帧插件默认执行期限，避免插件挂住长连接。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 100 毫秒。
+const fn default_ws_plugin_timeout_ms() -> u64 {
+    100
+}
+
+/// 业务作用：限制压缩消息默认解压倍率，降低压缩炸弹风险。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 100 倍。
+const fn default_ws_max_decompress_ratio() -> u32 {
+    100
+}
+
+/// 业务作用：定义帧级违规的默认协议化关闭动作，避免静默丢弃导致双方状态分叉。
+///
+/// 参数说明：无。
+///
+/// 返回：返回 `policy_close`。
+fn default_ws_on_violation() -> String {
+    "policy_close".to_string()
 }
