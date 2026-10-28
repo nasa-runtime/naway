@@ -1,7 +1,7 @@
 //! 路由级 OpenAPI / JSON Schema 请求校验。
 //!
-//! 该能力被明确归入 `` 的 slow path：只有 route 显式配置后才构造 JSON
-//! envelope 或读取 body。schema 在快照构建时编译成只读 validator，请求阶段只借用 head；
+//! 只有 route 显式配置后才构造 JSON envelope 或读取 body。
+//! Schema 在快照构建时编译成只读 validator，请求阶段只借用 head；
 //! body 必须有硬上限，校验后复用同一份 [`Bytes`] 交给上游。
 
 use std::collections::HashMap;
@@ -20,16 +20,18 @@ use crate::config::model::RequestValidationCfg;
 use crate::{BoxBody, BoxError};
 
 use super::forward::ForwardBody;
+use super::schema::CompiledSchema;
 
 /// 单 route 允许的最大 schema 校验 body。控制面还能配置更小值；该硬上限约束并发内存。
 const MAX_VALIDATION_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
 /// 编译后的请求校验计划。`jsonschema::Validator` 可在线程间共享，reload 时随旧快照退场。
+#[derive(PartialEq, Eq)]
 pub(crate) struct RequestValidationPlan {
     /// 可选 head validator 与它的实例构造方式。
     head: Option<HeadValidation>,
     /// 可选 JSON body validator。
-    body: Option<jsonschema::Validator>,
+    body: Option<CompiledSchema>,
     /// body 是否必须非空。
     body_required: bool,
     /// body 聚合硬上限；只有 `body.is_some` 时非零。
@@ -38,11 +40,13 @@ pub(crate) struct RequestValidationPlan {
     body_media_types: Vec<String>,
 }
 
+#[derive(PartialEq, Eq)]
 struct HeadValidation {
-    validator: jsonschema::Validator,
+    validator: CompiledSchema,
     mode: HeadMode,
 }
 
+#[derive(PartialEq, Eq)]
 enum HeadMode {
     /// 路由内联 schema 的稳定、无类型转换 envelope。
     Raw,
@@ -50,6 +54,7 @@ enum HeadMode {
     OpenApi(OpenApiHeadPlan),
 }
 
+#[derive(PartialEq, Eq)]
 struct OpenApiHeadPlan {
     path_template: String,
     parameters: Vec<ParameterPlan>,
@@ -62,13 +67,14 @@ struct OpenApiCompilation {
     body_media_types: Vec<String>,
 }
 
+#[derive(PartialEq, Eq)]
 struct ParameterPlan {
     location: ParameterLocation,
     name: String,
     decode: ParameterDecode,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ParameterLocation {
     Query,
     Header,
@@ -76,6 +82,7 @@ enum ParameterLocation {
     Cookie,
 }
 
+#[derive(PartialEq, Eq)]
 enum ParameterDecode {
     Scalar(ScalarKind),
     Array {
@@ -85,7 +92,7 @@ enum ParameterDecode {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ScalarKind {
     String,
     Integer,
@@ -335,9 +342,15 @@ fn resolve_schema_path(config_dir: &Path, file: &str) -> std::path::PathBuf {
 }
 
 /// 业务作用：编译 validator，并显式禁止外部引用。
-fn compile_validator(schema: Value, label: &str) -> Result<jsonschema::Validator> {
+///
+/// 参数说明：
+/// - `schema`：实际展开后的候选 Schema。
+/// - `label`：定位请求头、正文或 OpenAPI 参数的编译错误。
+///
+/// 返回：引用仅限文档内部且编译成功时返回带材料身份的验证器，否则拒绝候选。
+fn compile_validator(schema: Value, label: &str) -> Result<CompiledSchema> {
     reject_external_refs(&schema, label)?;
-    jsonschema::validator_for(&schema)
+    CompiledSchema::build(&schema)
         .map_err(|error| anyhow::anyhow!("compile {label} JSON Schema: {error}"))
 }
 

@@ -40,6 +40,7 @@ pub(super) fn changes(
                 || !current.same_basic_configuration(next)
                 || !current.same_authentication_configuration(next)
                 || !current.same_local_security_configuration(next)
+                || !current.same_content_configuration(next)
                 || current.admin_semantic_json() != next.admin_semantic_json())
             .then(|| name(key))
         })

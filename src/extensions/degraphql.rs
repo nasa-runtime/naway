@@ -28,6 +28,7 @@ const MAX_VARIABLES: usize = 64;
 const MAX_GENERATED_BODY_BYTES: usize = 1024 * 1024;
 
 /// 构建期编译后的 REST→GraphQL 计划。
+#[derive(PartialEq, Eq)]
 pub(crate) struct DegraphqlPlan {
     cost: u64,
     query: Arc<str>,
@@ -38,16 +39,19 @@ pub(crate) struct DegraphqlPlan {
     max_body_bytes: usize,
 }
 
+#[derive(PartialEq, Eq)]
 struct PathTemplate {
     signature: String,
     segments: Vec<PathSegment>,
 }
 
+#[derive(PartialEq, Eq)]
 enum PathSegment {
     Literal(Arc<str>),
     Variable(Arc<str>),
 }
 
+#[derive(PartialEq, Eq)]
 enum VariablePlan {
     Path {
         name: Arc<str>,
@@ -70,7 +74,7 @@ enum VariablePlan {
     Literal(Value),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum VariableKind {
     String,
     Integer,

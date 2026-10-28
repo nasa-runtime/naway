@@ -29,6 +29,7 @@ const HARD_MAX_DEPTH: usize = 128;
 const HARD_MAX_COMPLEXITY: usize = 10_000_000;
 
 /// 构建期验证后的 GraphQL route 策略。
+#[derive(PartialEq, Eq)]
 pub(crate) struct GraphqlGuardPolicy {
     max_body_bytes: u64,
     max_query_bytes: usize,

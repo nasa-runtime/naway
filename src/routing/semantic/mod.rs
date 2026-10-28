@@ -2,6 +2,7 @@
 
 use super::Route;
 mod authentication;
+mod content;
 mod security;
 
 impl Route {

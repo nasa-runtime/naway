@@ -13,6 +13,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use crate::cache::expiry::ExpiringCache;
+
+mod semantic;
 #[cfg(any(feature = "redis-runtime", test))]
 use anyhow::Context as _;
 use anyhow::Result;
