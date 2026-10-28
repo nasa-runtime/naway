@@ -1,3 +1,5 @@
+mod semantic;
+
 use super::config::{LimitsCfg, McpCfg, SecurityCfg};
 use super::identity::{validate_security, Identity};
 use super::tools::{rest_request, Backend, Tool};

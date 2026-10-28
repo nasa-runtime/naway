@@ -1,3 +1,5 @@
+mod semantic;
+
 use super::config::{SideEffect, ToolBackendCfg, ToolCfg};
 use super::identity::Acl;
 use super::transport::{Outbound, Target};
@@ -23,6 +25,7 @@ pub(super) struct Tool {
     pub output: Option<jsonschema::Validator>,
 }
 
+#[derive(PartialEq, Eq)]
 pub(super) enum Backend {
     Rest {
         target: Arc<Target>,

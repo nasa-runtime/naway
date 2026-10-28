@@ -27,7 +27,7 @@ pub struct McpCfg {
     pub openapi: Vec<OpenApiCfg>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct A2aCfg {
     pub protocol_version: String,
@@ -47,7 +47,7 @@ pub struct A2aCfg {
     pub invocation: AclCfg,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum A2aBinding {
     Jsonrpc,
@@ -87,7 +87,7 @@ pub struct AclCfg {
     pub scopes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsCfg {
     pub max_request_bytes: usize,
@@ -160,7 +160,7 @@ pub struct ToolCfg {
     pub backend: ToolBackendCfg,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SideEffect {
     ReadOnly,

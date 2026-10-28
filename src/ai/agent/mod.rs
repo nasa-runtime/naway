@@ -56,12 +56,14 @@ mod tools;
 pub(crate) mod transport;
 
 /// 候选快照中的 Agent 终端计划；关闭 feature 时不能构造可执行实例。
+#[derive(PartialEq, Eq)]
 pub(crate) struct Plan {
     #[cfg(feature = "agent-protocols")]
     kind: Kind,
 }
 
 #[cfg(feature = "agent-protocols")]
+#[derive(PartialEq, Eq)]
 enum Kind {
     Mcp(std::sync::Arc<mcp::Plan>),
     A2a(std::sync::Arc<a2a::Plan>),

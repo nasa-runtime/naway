@@ -1,3 +1,5 @@
+mod semantic;
+
 use super::config::{AclCfg, SecurityCfg};
 use anyhow::{ensure, Result};
 use http::HeaderMap;
@@ -18,6 +20,8 @@ pub(crate) struct Acl {
     consumers: HashSet<String>,
     groups: HashSet<String>,
     scopes: Option<PolicySet>,
+    /// NASA scope 策略构建输入的有序身份，不保留第二份 scope 字符串。
+    scope_identity: [u8; 32],
 }
 
 impl Acl {
@@ -61,6 +65,7 @@ impl Acl {
             consumers: cfg.consumers.iter().cloned().collect(),
             groups: cfg.groups.iter().cloned().collect(),
             scopes,
+            scope_identity: semantic::scope_identity(&cfg.scopes),
         })
     }
 

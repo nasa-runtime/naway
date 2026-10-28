@@ -49,6 +49,7 @@ pub(super) fn changes(
                 || !current.same_sandbox_configuration(next)
                 || !current.same_backend_configuration(next)
                 || !current.same_llm_configuration(next)
+                || !current.same_agent_configuration(next)
                 || !current.same_grpc_configuration(next))
             .then(|| name(key))
         })

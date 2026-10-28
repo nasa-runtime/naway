@@ -1,3 +1,5 @@
+mod semantic;
+
 mod catalog;
 mod protocol;
 mod rest;
