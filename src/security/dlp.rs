@@ -170,6 +170,8 @@ struct Detector {
     secret: Regex,
 }
 
+mod semantic;
+
 impl Detector {
     /// 业务作用：编译固定 DLP detector，并限制启用规则集合。
     ///
@@ -263,6 +265,7 @@ impl Detector {
 }
 
 /// 快照内不可变的 route DLP 策略。
+#[derive(PartialEq, Eq)]
 pub(crate) struct DlpPolicy {
     action: DlpAction,
     detector: Detector,

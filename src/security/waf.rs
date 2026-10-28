@@ -133,7 +133,7 @@ enum DetectedRule {
 }
 
 /// 已规范化的外部 literal 规则。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ExternalRule {
     order: usize,
     id: Arc<str>,
@@ -141,7 +141,14 @@ struct ExternalRule {
 }
 
 /// 按请求位置预索引的只读外部规则包。
+#[derive(PartialEq, Eq)]
 struct ExternalRulePack {
+    material_identity: [u8; 32],
+    signing_key: [u8; 32],
+    max_pack_bytes: usize,
+    max_rules: usize,
+    max_patterns: usize,
+    max_compile_ms: u64,
     path: Vec<ExternalRule>,
     query: Vec<ExternalRule>,
     body: Vec<ExternalRule>,
@@ -189,8 +196,8 @@ impl ExternalRulePack {
         let source = resolve_rule_pack_path(config_dir, cfg.source.as_str())?;
         let bytes =
             crate::io::bounded_io::read_file(&source, cfg.max_pack_bytes, "WAF rule pack source")?;
-        verify_rule_pack_digest(bytes.as_slice(), cfg.sha256.as_str())?;
-        verify_rule_pack_signature(bytes.as_slice(), cfg, config_dir)?;
+        let material_identity = verify_rule_pack_digest(bytes.as_slice(), cfg.sha256.as_str())?;
+        let signing_key = verify_rule_pack_signature(bytes.as_slice(), cfg, config_dir)?;
         ensure_compile_deadline(started, deadline)?;
 
         let document: RulePackDocument =
@@ -204,6 +211,12 @@ impl ExternalRulePack {
         }
 
         let mut output = Self {
+            material_identity,
+            signing_key,
+            max_pack_bytes: cfg.max_pack_bytes,
+            max_rules: cfg.max_rules,
+            max_patterns: cfg.max_patterns,
+            max_compile_ms: cfg.max_compile_ms,
             path: Vec::new(),
             query: Vec::new(),
             body: Vec::new(),
@@ -371,6 +384,7 @@ pub(crate) enum WafBodyOutcome {
 }
 
 /// 快照内只读的 route 级 WAF 策略。
+#[derive(PartialEq, Eq)]
 pub(crate) struct WafPolicy {
     /// 命中后的处置方式。
     mode: WafMode,
@@ -1070,20 +1084,20 @@ fn resolve_rule_pack_path(config_dir: &Path, raw: &str) -> Result<PathBuf> {
 /// - `bytes`：是原始 JSON
 /// - `expected`：是配置声明的 SHA-256 十六进制值。
 ///
-/// 返回：摘要严格一致时成功；格式错误或内容不匹配返回错误。
-fn verify_rule_pack_digest(bytes: &[u8], expected: &str) -> Result<()> {
+/// 返回：摘要严格一致时返回实际材料身份，供配置审查复用；格式错误或内容不匹配返回错误。
+fn verify_rule_pack_digest(bytes: &[u8], expected: &str) -> Result<[u8; 32]> {
     if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("WAF rule pack sha256 must contain exactly 64 hexadecimal characters");
     }
     let actual = Sha256::digest(bytes);
-    let actual = actual
+    let encoded = actual
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    if !actual.eq_ignore_ascii_case(expected) {
+    if !encoded.eq_ignore_ascii_case(expected) {
         bail!("WAF rule pack sha256 does not match source bytes");
     }
-    Ok(())
+    Ok(actual.into())
 }
 
 /// 业务作用：复验规则包原始字节的 detached Ed25519 signature，阻止未授权规则进入候选。
@@ -1093,8 +1107,12 @@ fn verify_rule_pack_digest(bytes: &[u8], expected: &str) -> Result<()> {
 /// - `cfg`：提供 signature/public-key SecretSource。
 /// - `config_dir`：提供 signature/public-key SecretSource。
 ///
-/// 返回：签名、key 与 Base64 均合法且严格验签通过时成功，否则返回错误。
-fn verify_rule_pack_signature(bytes: &[u8], cfg: &WafRulePackCfg, config_dir: &Path) -> Result<()> {
+/// 返回：严格验签通过时返回实际固定公钥，供配置比较复用；非法编码、key 或签名返回错误。
+fn verify_rule_pack_signature(
+    bytes: &[u8],
+    cfg: &WafRulePackCfg,
+    config_dir: &Path,
+) -> Result<[u8; 32]> {
     let signature = crate::security::secret::resolve_text(
         cfg.signature.as_str(),
         config_dir,
@@ -1120,7 +1138,8 @@ fn verify_rule_pack_signature(bytes: &[u8], cfg: &WafRulePackCfg, config_dir: &P
         VerifyingKey::from_bytes(&public_key).context("decode WAF rule pack public key")?;
     public_key
         .verify_strict(bytes, &signature)
-        .context("verify WAF rule pack signature")
+        .context("verify WAF rule pack signature")?;
+    Ok(public_key.to_bytes())
 }
 
 /// 业务作用：限制规则包和规则 id 为低敏、稳定、可安全记录的标识符。

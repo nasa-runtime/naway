@@ -13,6 +13,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use casbin::{CoreApi, DefaultModel, Enforcer, StringAdapter};
 use http::header::HeaderName;
 use http::request::Parts;
+use sha2::{Digest, Sha256};
+
+mod semantic;
 
 use crate::config::model::CasbinAuthorizationCfg;
 
@@ -24,6 +27,7 @@ const MAX_CASBIN_INPUT_BYTES_HARD: usize = 256 * 1024;
 /// 已编译的 route 级 Casbin 决策器。
 pub(crate) struct CasbinPolicy {
     enforcer: Enforcer,
+    material_identity: [u8; 32],
     arguments: Arc<[CasbinArgument]>,
     require_identity: bool,
     fail_open: bool,
@@ -31,7 +35,7 @@ pub(crate) struct CasbinPolicy {
     max_input_bytes: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum CasbinArgument {
     Consumer,
     Method,
@@ -70,6 +74,13 @@ impl CasbinPolicy {
         let policy_path = resolve(config_dir, &cfg.policy_file);
         let model_text = read_bounded_utf8(&model_path, "Casbin model")?;
         let policy_text = read_bounded_utf8(&policy_path, "Casbin policy")?;
+        // 材料身份与 Enforcer 使用同一次读取，避免同名文件轮换被遗漏；摘要不代替授权求值。
+        let mut identity = Sha256::new();
+        for part in [model_text.as_bytes(), policy_text.as_bytes()] {
+            identity.update((part.len() as u64).to_be_bytes());
+            identity.update(part);
+        }
+        let material_identity = identity.finalize().into();
         let arguments = cfg
             .arguments
             .iter()
@@ -98,6 +109,7 @@ impl CasbinPolicy {
 
         Ok(Self {
             enforcer,
+            material_identity,
             arguments: arguments.into(),
             require_identity: cfg.require_identity,
             fail_open: cfg.fail_open,

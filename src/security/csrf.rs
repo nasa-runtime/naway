@@ -76,6 +76,7 @@ impl CsrfDecision {
 }
 
 /// CSRF token 的固定验证方式。
+#[derive(PartialEq, Eq)]
 enum TokenMode {
     /// header 与 host-only cookie 携带相同随机 token。
     DoubleSubmit,
@@ -86,6 +87,7 @@ enum TokenMode {
 }
 
 /// 快照内不可变的 route CSRF 策略。
+#[derive(PartialEq, Eq)]
 pub(crate) struct CsrfPolicy {
     monitor: bool,
     methods: HashSet<Method>,

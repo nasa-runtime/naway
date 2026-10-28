@@ -2,6 +2,7 @@
 
 use super::Route;
 mod authentication;
+mod security;
 
 impl Route {
     /// 业务作用：比较基础 HTTP 处理与流量预算的实际参数，识别同名过滤器的策略修改。

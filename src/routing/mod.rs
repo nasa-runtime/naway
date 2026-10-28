@@ -5640,7 +5640,7 @@ fn jwk_type_matches_algorithm(jwk: &jsonwebtoken::jwk::Jwk, algorithm: Algorithm
 /// nginx `if` 安全子集的固定返回规则。
 ///
 /// 表达式是有界的字符串比较计划，不支持 rewrite 循环、正则脚本、括号或子请求。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConditionalReturn {
     /// 构建期已编译的条件表达式。
     condition: ConditionExpr,
@@ -5649,7 +5649,7 @@ pub struct ConditionalReturn {
 }
 
 /// `if` 安全子集支持的比较符。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ConditionOp {
     /// 字符串相等。
     Eq,
@@ -5664,7 +5664,7 @@ enum ConditionOp {
 }
 
 /// 一个已编译的原子比较。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ConditionComparison {
     left: ValueTemplate,
     op: ConditionOp,
@@ -5672,7 +5672,7 @@ struct ConditionComparison {
 }
 
 /// 析取后的析取范式：外层是 OR，每个分组内是 AND。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ConditionExpr {
     any: Vec<Vec<ConditionComparison>>,
 }

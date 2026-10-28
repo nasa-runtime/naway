@@ -11,13 +11,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSetBuilder};
 use hmac::{Hmac, Mac};
 use http::header::{HeaderName, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, HOST, USER_AGENT};
 use http::request::Parts;
 use sha2::{Digest, Sha256};
 
 use crate::config::model::{BotCfg, BotRateCfg, TrustedSearchBotCfg};
+
+mod semantic;
+use semantic::GlobPlan;
 
 const MAX_USER_AGENT_BYTES: usize = 4096;
 const MAX_GLOB_RULES: usize = 256;
@@ -79,6 +82,7 @@ impl BotDecision {
 }
 
 /// 已编译的 Bot 速率信号。
+#[derive(PartialEq, Eq)]
 pub(crate) struct BotRatePolicy {
     /// 窗口内基础令牌数。
     pub(crate) limit: u64,
@@ -93,10 +97,11 @@ pub(crate) struct BotRatePolicy {
 }
 
 /// 快照内不可变的 route Bot 策略。
+#[derive(PartialEq, Eq)]
 pub(crate) struct BotPolicy {
     monitor: bool,
-    allowed_user_agents: Option<GlobSet>,
-    denied_user_agents: Option<GlobSet>,
+    allowed_user_agents: Option<GlobPlan>,
+    denied_user_agents: Option<GlobPlan>,
     required_headers: Vec<HeaderName>,
     automation_headers: Vec<HeaderName>,
     fingerprint_headers: Vec<HeaderName>,
@@ -361,8 +366,9 @@ impl BotPolicy {
 }
 
 /// 已编译的单个可信搜索机器人签名规则。
+#[derive(PartialEq, Eq)]
 struct TrustedSearchBot {
-    user_agents: GlobSet,
+    user_agents: GlobPlan,
     signature_secret: Vec<u8>,
     signature_header: HeaderName,
     timestamp_header: HeaderName,
@@ -435,7 +441,7 @@ impl TrustedSearchBot {
 /// - `patterns`：是配置的 glob 列表。
 ///
 /// 返回：空列表返回 `None`；全部 glob 合法且不重复时返回集合，否则拒绝候选。
-fn build_globs(field: &str, patterns: &[String]) -> Result<Option<GlobSet>> {
+fn build_globs(field: &str, patterns: &[String]) -> Result<Option<GlobPlan>> {
     if patterns.is_empty() {
         return Ok(None);
     }
@@ -461,11 +467,21 @@ fn build_globs(field: &str, patterns: &[String]) -> Result<Option<GlobSet>> {
                 .with_context(|| format!("compile {field} glob"))?,
         );
     }
-    Ok(Some(
-        builder
+    // glob 集合按任一匹配执行；规范大小写并排序身份，使声明次序不制造无效差异。
+    // 每段加入长度，避免不同 pattern 边界合并；请求期只访问已编译 matcher。
+    let mut patterns: Vec<_> = seen.iter().collect();
+    patterns.sort_unstable();
+    let mut identity = Sha256::new();
+    for pattern in patterns {
+        identity.update((pattern.len() as u64).to_be_bytes());
+        identity.update(pattern.as_bytes());
+    }
+    Ok(Some(GlobPlan {
+        matcher: builder
             .build()
             .with_context(|| format!("build {field} glob set"))?,
-    ))
+        identity: identity.finalize().into(),
+    }))
 }
 
 /// 业务作用：拒绝 allow/deny 中完全相同的 User-Agent glob，避免处置优先级依赖实现细节。

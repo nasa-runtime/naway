@@ -17,7 +17,7 @@ use crate::routing::ContentCoding;
 use crate::{text_status, BoxBody};
 
 /// 冻结到单次请求的内容解码硬边界。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Policy {
     gzip: bool,
     brotli: bool,
