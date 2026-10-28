@@ -51,7 +51,7 @@ impl Protocol {
 }
 
 /// 单个路由只能进入一个固定脚本，不能把请求路径拼成文件名。
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CgiCfg {
     pub protocol: Protocol,

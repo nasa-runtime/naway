@@ -7,6 +7,7 @@ mod locks;
 pub(crate) mod metrics;
 mod properties;
 pub(crate) mod proxy;
+mod semantic;
 mod stream;
 
 use crate::config::{

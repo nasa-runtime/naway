@@ -5,6 +5,7 @@ mod flv;
 pub(crate) mod metrics;
 mod mp4;
 mod reader;
+mod semantic;
 
 use crate::config::media::{Format, MediaCfg};
 use crate::{text_status, BoxBody, BoxError};

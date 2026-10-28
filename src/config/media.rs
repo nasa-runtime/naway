@@ -9,7 +9,7 @@ pub enum Format {
     Flv,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MediaCfg {
     /// 只解释显式选中的容器，不能从请求头切换解析器。

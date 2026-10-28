@@ -17,7 +17,7 @@ pub enum LockScope {
     Process,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WebDavCfg {
     pub mode: Mode,

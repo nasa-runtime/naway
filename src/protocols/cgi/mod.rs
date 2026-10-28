@@ -2,6 +2,7 @@
 
 pub(crate) mod metrics;
 mod params;
+mod semantic;
 mod wire;
 
 use crate::proxy::forward::{PhysicalConnectionBudget, PhysicalConnectionSlot};

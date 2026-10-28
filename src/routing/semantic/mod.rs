@@ -3,6 +3,7 @@
 use super::Route;
 mod authentication;
 mod content;
+mod resources;
 mod security;
 mod traffic;
 

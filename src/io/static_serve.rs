@@ -31,7 +31,7 @@ const DEFAULT_TYPE: &str = "application/octet-stream";
 const FILE_CHUNK_SIZE: usize = 16 * 1024;
 
 /// 已编译静态文件后端配置。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StaticServe {
     /// 配置 root 的原始绝对路径。
     root: PathBuf,
