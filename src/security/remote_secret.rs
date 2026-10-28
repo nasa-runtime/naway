@@ -3,6 +3,8 @@
 //! 远端 I/O 只在 bootstrap 或统一 reload 候选构建阶段发生。成功值被冻结进业务计划；请求路径
 //! 仅检查不可变值的有效截止点，不读取配置、磁盘、环境变量或 provider API。
 
+mod policy;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -106,6 +108,8 @@ struct PreparedProvider {
     retry_max: Duration,
     max_response_bytes: usize,
     envelope: Option<crate::security::external_crypto::ExternalEnvelopePlan>,
+    /// 当前信任材料与完整策略身份；与逻辑缓存键分离，不能重置对象的版本水位。
+    policy_identity: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -146,6 +150,8 @@ struct CachedSecret {
     failures: u32,
     retry_not_before: Instant,
     last_success: Instant,
+    /// 只有同一策略可以使用该值执行退避或 LKG 回退。
+    policy_identity: [u8; 32],
 }
 
 struct FetchedSecret {
@@ -329,6 +335,7 @@ fn prepare_providers(
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
             .timeout(Duration::from_millis(config.request_timeout_ms));
+        let mut material = policy::Material::new();
         if !config.ca_certificate.is_empty() {
             let pem = resolve_bootstrap_secret(
                 config.ca_certificate.as_str(),
@@ -338,12 +345,18 @@ fn prepare_providers(
             let certificate = crate::tls::trust::http_ca(pem.as_bytes())
                 .context("remote secret provider CA is invalid")?;
             builder = builder.add_root_certificate(certificate);
+            material.field(Some(pem.as_bytes()));
+        } else {
+            material.field(None);
         }
         match (
             config.client_certificate.is_empty(),
             config.client_private_key.is_empty(),
         ) {
-            (true, true) => {}
+            (true, true) => {
+                material.field(None);
+                material.field(None);
+            }
             (false, false) => {
                 let certificate = resolve_bootstrap_secret(
                     config.client_certificate.as_str(),
@@ -365,12 +378,14 @@ fn prepare_providers(
                     reqwest::Identity::from_pem(format!("{certificate}\n{private_key}").as_bytes())
                         .context("remote secret provider client identity is invalid")?;
                 builder = builder.identity(identity);
+                material.field(Some(certificate.as_bytes()));
+                material.field(Some(private_key.as_bytes()));
             }
             _ => {
                 bail!("remote secret provider mTLS certificate and key must be configured together")
             }
         }
-        let provider = Arc::new(PreparedProvider {
+        let mut provider = PreparedProvider {
             name: Arc::from(config.name.as_str()),
             endpoint,
             client: builder
@@ -388,8 +403,18 @@ fn prepare_providers(
             retry_max: Duration::from_millis(config.retry_max_ms),
             max_response_bytes: config.max_response_bytes,
             envelope,
-        });
-        if providers.insert(config.name.clone(), provider).is_some() {
+            policy_identity: [0; 32],
+        };
+        provider.policy_identity = policy::identity(
+            &provider,
+            config.connect_timeout_ms,
+            config.request_timeout_ms,
+            material.finish(),
+        );
+        if providers
+            .insert(config.name.clone(), Arc::new(provider))
+            .is_some()
+        {
             bail!("duplicate remote secret provider name `{}`", config.name);
         }
     }
@@ -753,7 +778,7 @@ fn validate_pointer(pointer: &str, field: &str) -> Result<()> {
 /// - `provider`：是不可变连接计划
 /// - `secret_path`：是受限相对路径。
 ///
-/// 返回：新值或仍在有效期内的缓存值；版本回退、同版异值和过期依赖均失败闭合。
+/// 返回：新值或同策略下仍有效的缓存值；新策略必须成功拉取，版本回退、同版异值和过期依赖均失败闭合。
 async fn resolve_one(
     provider: &PreparedProvider,
     secret_path: &str,
@@ -761,7 +786,11 @@ async fn resolve_one(
     let cache_key = cache_key(provider, secret_path);
     let now = Instant::now();
     if let Some(cached) = cache().lock().get(&cache_key).cloned() {
-        if now < cached.retry_not_before && now < cached.not_after {
+        // 退避只证明旧策略下的依赖失败；新认证、信任或期限策略必须先重新成功取得值。
+        if cached.policy_identity == provider.policy_identity
+            && now < cached.retry_not_before
+            && now < cached.not_after
+        {
             return Ok(ResolvedRemoteSecret {
                 value: cached.value,
                 not_after: cached.not_after,
@@ -826,6 +855,7 @@ async fn resolve_one(
             failures: 0,
             retry_not_before: now,
             last_success: now,
+            policy_identity: provider.policy_identity,
         },
     );
     Ok(resolved)
@@ -838,7 +868,7 @@ async fn resolve_one(
 /// - `cache_key`：标识事实源
 /// - `error`：不含响应 body。
 ///
-/// 返回：仍有效 LKG 返回成功；没有缓存或缓存过期时返回原依赖错误。
+/// 返回：仅同策略且仍有效的 LKG 返回成功；策略变化、缓存缺失或过期时拒绝回退。
 fn fallback_after_failure(
     provider: &PreparedProvider,
     cache_key: String,
@@ -849,6 +879,10 @@ fn fallback_after_failure(
     let Some(cached) = entries.get_mut(&cache_key) else {
         return Err(error);
     };
+    // 新策略未获得自己的成功证据时不能借用旧值，也不能延长旧策略的退避或改变其失败计数。
+    if cached.policy_identity != provider.policy_identity {
+        return Err(error.context("remote secret cache belongs to a different provider policy"));
+    }
     cached.failures = cached.failures.saturating_add(1);
     let exponent = cached.failures.saturating_sub(1).min(20);
     let factor = 1_u32 << exponent;

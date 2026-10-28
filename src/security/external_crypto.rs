@@ -1,5 +1,7 @@
 //! 不导出私钥的远程密码操作与 TLS 签名桥接。
 
+mod semantic;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{mpsc, Arc};

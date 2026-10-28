@@ -785,6 +785,11 @@ prepare→publish reload，不直接改活动 route；临时故障仅能在 `max
 复用 last-known-good。截止后 header/query 凭据返回上游错误，远程 mTLS 身份也不能创建新请求；
 请求路径不会访问 provider、文件或环境变量。
 
+缓存回退和退避只适用于取得该值时的完整 provider 策略。认证、实际 CA/mTLS 材料、适配器、
+envelope、lease 映射或请求与重试预算发生变化后，候选必须重新成功取得值；失败时保留活动快照，
+不能用旧策略的缓存批准新策略。同一逻辑对象的版本水位独立于这些策略，因此改变信任材料也不能
+接受版本回退或同版异值；只改变本地材料路径而实际内容相同，不改变传输身份。
+
 `adapter.kind` 可选择 `aws_secrets_manager`、`azure_key_vault` 或 `gcp_secret_manager`，并复用上述
 TLS、刷新、退避、版本单调和失效规则。AWS 适配器调用 `GetSecretValue`，用本地 SecretSource 中的
 标准容器凭据 JSON（`AccessKeyId`、`SecretAccessKey`、`Token`、`Expiration`）执行 SigV4，版本取
