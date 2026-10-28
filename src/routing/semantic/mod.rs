@@ -1,6 +1,7 @@
 //! 管理面借用路由执行计划比较参数，不复制请求头、响应体或安全凭据。
 
 use super::Route;
+mod authentication;
 
 impl Route {
     /// 业务作用：比较基础 HTTP 处理与流量预算的实际参数，识别同名过滤器的策略修改。

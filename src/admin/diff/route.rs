@@ -38,6 +38,7 @@ pub(super) fn changes(
             (variables_changed
                 || position != next_position
                 || !current.same_basic_configuration(next)
+                || !current.same_authentication_configuration(next)
                 || current.admin_semantic_json() != next.admin_semantic_json())
             .then(|| name(key))
         })

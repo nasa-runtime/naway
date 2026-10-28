@@ -3978,7 +3978,7 @@ pub struct DirectResponse {
 /// `auth_basic` 已编译策略。
 ///
 /// 数据面只读取 `Authorization` header 并做常量时间字节比较;用户名/密码不暴露为 public 字段。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BasicAuthPolicy {
     /// 展示给客户端的 Basic realm。
     realm: String,
@@ -3991,7 +3991,7 @@ pub struct BasicAuthPolicy {
 /// API-Key 已编译策略。
 ///
 /// 数据面只读取一个 header 或 query 参数,并与构建期保存的 key 做常量时间比较。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ApiKeyPolicy {
     /// SHA-256 前128位的稳定十六进制身份；构建期生成，不保存原始秘密于账本键。
     fingerprint: Arc<str>,
@@ -4004,7 +4004,7 @@ pub struct ApiKeyPolicy {
 }
 
 /// API-Key 的构建期校验材料；摘要模式使 Console 创建 key 后无需把原值写回配置事实源。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum ApiKeyExpected {
     /// 兼容既有声明式 SecretSource，运行态以常量时间直接比较。
     Plain(Vec<u8>),
@@ -4013,7 +4013,7 @@ enum ApiKeyExpected {
 }
 
 /// HMAC-SHA256 已编译策略。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HmacAuthPolicy {
     /// 构建期从 SecretSource 解析的共享密钥；随所属不可变路由快照交接。
     secret: String,
@@ -4035,7 +4035,7 @@ pub struct HmacAuthPolicy {
 }
 
 /// 已编译 JWT/JWKS/OIDC 策略。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JwtAuthPolicy {
     /// 固定算法与 key 来源；header `alg` 必须精确一致。
     verifier: JwtVerifier,
@@ -4067,17 +4067,20 @@ pub struct JwtAuthPolicy {
 #[cfg(feature = "enterprise-jwe")]
 struct JweLayer {
     decrypter: josekit::jwe::alg::rsaes::RsaesJweDecrypter,
+    /// 构建时实际读取的密钥材料身份，只供配置比较，不代替解密或签名验证。
+    key_identity: [u8; 32],
     max_compact_bytes: usize,
 }
 
 #[derive(Clone)]
 enum JwtVerifier {
     Hs256(Arc<str>),
-    Static(Arc<DecodingKey>),
+    /// 静态验证器与同一次构建读取的材料身份；不在认证路径计算摘要。
+    Static(Arc<DecodingKey>, [u8; 32]),
     Remote(Arc<RemoteJwks>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct JwtIdentityHeader {
     claim: Arc<str>,
     header: HeaderName,
@@ -4105,6 +4108,8 @@ pub(crate) struct OidcRpPolicy {
     max_sessions: usize,
     timeout: Duration,
     client: reqwest::Client,
+    /// HTTP client 的实际自定义 CA 身份；None 保留平台默认信任。
+    ca_identity: Option<[u8; 32]>,
     id_token_verifier: JwtAuthPolicy,
     identity_headers: Arc<Vec<JwtIdentityHeader>>,
     pending: parking_lot::Mutex<HashMap<String, OidcPendingLogin>>,
@@ -4141,7 +4146,7 @@ impl OidcRpPolicy {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum OidcClientAuth {
     SecretBasic,
     SecretPost,
@@ -4182,6 +4187,8 @@ struct RemoteJwks {
     issuer: Arc<str>,
     algorithm: Algorithm,
     client: reqwest::Client,
+    /// 记录构建时实际读取的 CA，路径相同不代表信任材料未改变。
+    ca_identity: Option<[u8; 32]>,
     timeout: Duration,
     min_ttl: Duration,
     max_ttl: Duration,
@@ -4191,6 +4198,7 @@ struct RemoteJwks {
     refresh: AsyncMutex<()>,
 }
 
+#[derive(PartialEq, Eq)]
 enum RemoteJwksEndpoint {
     Direct(Arc<str>),
     Discovery(Arc<str>),
@@ -4215,7 +4223,7 @@ struct OidcDiscoveryDocument {
 /// ext_authz / nginx auth_request 基础版已编译策略。
 ///
 /// 策略只构造一个无请求体的鉴权子请求;原始下游 body 继续留给主链路流式转发。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExtAuthzPolicy {
     /// 鉴权服务目标。支持 `http(s)://host[:port][/path]` 或 `lb://service`。
     pub target: String,
@@ -4244,7 +4252,7 @@ pub struct ExtAuthzPolicy {
 }
 
 /// API-Key 来源。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum ApiKeySource {
     /// 从请求头读取。
     Header(HeaderName),
@@ -4253,7 +4261,7 @@ enum ApiKeySource {
 }
 
 /// JWT token 来源。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum JwtTokenSource {
     /// 从 `Authorization: Bearer <token>` 读取。
     Bearer,
@@ -4262,7 +4270,7 @@ enum JwtTokenSource {
 }
 
 /// 多认证策略组合方式。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SatisfyMode {
     /// 所有已配置认证方式都必须通过。
     All,
@@ -4494,7 +4502,7 @@ impl JwtAuthPolicy {
         let header = self.validate_header(token)?;
         let payload = match &self.verifier {
             JwtVerifier::Hs256(secret) => verify_hs256_token(token, secret.as_ref())?,
-            JwtVerifier::Static(key) => self.verify_asymmetric(token, key)?,
+            JwtVerifier::Static(key, _) => self.verify_asymmetric(token, key)?,
             JwtVerifier::Remote(remote) => {
                 let kid = header.kid.as_deref()?;
                 let key = remote.cached_key(kid)?;
@@ -7841,8 +7849,10 @@ pub(crate) fn parse_oidc_rp(spec: &str, config_dir: &Path) -> Result<OidcRpPolic
     let mut client_builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true);
+    let mut ca_identity = None;
     if let Some(source) = ca_certificate {
         let pem = crate::security::secret::resolve_text(&source, config_dir, "OIDC IdP CA")?;
+        ca_identity = Some(Sha256::digest(pem.as_bytes()).into());
         let certificate =
             crate::tls::trust::http_ca(pem.as_bytes()).context("parse OIDC IdP CA PEM")?;
         client_builder = client_builder.add_root_certificate(certificate);
@@ -7868,6 +7878,7 @@ pub(crate) fn parse_oidc_rp(spec: &str, config_dir: &Path) -> Result<OidcRpPolic
         max_sessions,
         timeout: Duration::from_millis(timeout_ms),
         client: client_builder.build().context("build OIDC RP client")?,
+        ca_identity,
         id_token_verifier,
         identity_headers: Arc::new(identity_headers),
         pending: parking_lot::Mutex::new(HashMap::new()),
@@ -8105,7 +8116,7 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
                     DecodingKey::from_ec_pem(pem.as_bytes())
                 }
                 .with_context(|| format!("{cmd} invalid public key PEM"))?;
-                JwtVerifier::Static(Arc::new(key))
+                JwtVerifier::Static(Arc::new(key), Sha256::digest(pem.as_bytes()).into())
             } else {
                 let issuer_value = issuer
                     .as_deref()
@@ -8130,6 +8141,7 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
                 let mut client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .https_only(true);
+                let mut ca_identity = None;
                 if let Some(source) = ca_certificate {
                     let pem = crate::security::secret::resolve_text(
                         &source,
@@ -8138,6 +8150,7 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
                     )?;
                     let certificate = crate::tls::trust::http_ca(pem.as_bytes())
                         .context("parse JWT identity metadata CA PEM")?;
+                    ca_identity = Some(Sha256::digest(pem.as_bytes()).into());
                     client = client.add_root_certificate(certificate);
                 }
                 let now = Instant::now();
@@ -8145,6 +8158,7 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
                     endpoint,
                     issuer: Arc::from(issuer_value),
                     algorithm,
+                    ca_identity,
                     client: client
                         .build()
                         .context("build JWT identity metadata client")?,
@@ -8186,6 +8200,7 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
                 .context("compile JWE RSA-OAEP-256 private key")?;
             Ok(Arc::new(JweLayer {
                 decrypter,
+                key_identity: Sha256::digest(pem.as_bytes()).into(),
                 max_compact_bytes: jwe_max_compact_bytes.unwrap_or(MAX_JWT_TOKEN_BYTES),
             }))
         })
