@@ -5,6 +5,8 @@
 //! 明确拒绝都失败闭合，`fail_open` 只覆盖可分类的依赖故障。
 #![cfg_attr(not(feature = "ext-proc"), allow(dead_code))]
 
+mod semantic;
+
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -64,6 +66,7 @@ pub(crate) struct ExtProcPlan {
     frozen_identity_headers: HashSet<HeaderName>,
     writable_metadata_namespaces: HashSet<String>,
     inference_endpoint_picker: bool,
+    max_in_flight: usize,
     in_flight: Arc<Semaphore>,
     circuit: Mutex<CircuitState>,
     failure_threshold: u32,
@@ -412,6 +415,7 @@ impl ExtProcPlan {
                 frozen_identity_headers: frozen_identity_headers.clone(),
                 writable_metadata_namespaces,
                 inference_endpoint_picker,
+                max_in_flight: cfg.max_in_flight,
                 in_flight: Arc::new(Semaphore::new(cfg.max_in_flight)),
                 circuit: Mutex::new(CircuitState {
                     consecutive_failures: 0,

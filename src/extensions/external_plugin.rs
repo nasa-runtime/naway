@@ -33,6 +33,7 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
 /// 已构建的 route 外部插件链。相位在换版时分组，数据面不逐请求过滤枚举。
+#[derive(PartialEq, Eq)]
 pub(crate) struct ExternalPluginChain {
     request_headers: Arc<[Arc<ExternalPlugin>]>,
     response_headers: Arc<[Arc<ExternalPlugin>]>,
@@ -70,6 +71,7 @@ pub(crate) struct HeaderChanges {
 }
 
 /// 已构建的一条外部 HTTP 插件。
+#[derive(PartialEq, Eq)]
 pub(crate) struct ExternalPlugin {
     id: Arc<str>,
     upstream: Arc<str>,

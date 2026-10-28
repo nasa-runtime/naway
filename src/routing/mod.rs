@@ -325,7 +325,7 @@ pub struct Route {
 }
 
 /// 已编译的 InferencePool 请求期选择边界。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InferencePoolPolicy {
     /// 单次 EPP 决策可携带的最大 endpoint 数。
     #[cfg(feature = "inference-gateway")]
