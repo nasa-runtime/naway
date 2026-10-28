@@ -11,6 +11,7 @@ pub(crate) mod traffic;
 pub mod variable;
 
 pub mod predicate;
+mod semantic;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -398,7 +399,7 @@ impl InferencePoolPolicy {
 }
 
 /// 构建期已验证的 hedged request 执行计划。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HedgePolicy {
     /// 启动第二实例副本前的固定延迟。
     pub delay: Duration,
@@ -2994,7 +2995,7 @@ impl Route {
 }
 
 /// Gateway API 与 nginx 请求头变更的统一执行操作。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum RequestHeaderOp {
     /// 替换全部同名值；对应 nginx `proxy_set_header` 与 Gateway API `set`。
     Set(RequestHeaderSet),
@@ -3005,7 +3006,7 @@ pub enum RequestHeaderOp {
 }
 
 /// 请求头设置规则,对应 nginx `proxy_set_header`。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RequestHeaderSet {
     /// 待写入的上游请求头名。
     pub name: HeaderName,
@@ -3014,6 +3015,7 @@ pub struct RequestHeaderSet {
 }
 
 /// 响应头追加规则,对应 nginx `add_header`。
+#[derive(PartialEq, Eq)]
 pub struct ResponseHeaderSet {
     /// 待追加的下游响应头名。
     pub name: HeaderName,
@@ -3022,6 +3024,7 @@ pub struct ResponseHeaderSet {
 }
 
 /// 响应头过滤操作。
+#[derive(PartialEq, Eq)]
 pub enum ResponseHeaderOp {
     /// 追加响应头。
     Add(ResponseHeaderSet),
@@ -3038,7 +3041,7 @@ pub enum ResponseHeaderOp {
 }
 
 /// nginx `sub_filter` 的单条流式替换规则。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SubFilterRule {
     /// 要查找的原始字节串。基础按 bytes 匹配,不做字符集转换。
     pub needle: Vec<u8>,
@@ -3069,6 +3072,7 @@ impl ContentCoding {
 ///
 /// 所有字符串与数值都在快照构建期完成校验；单请求只做 header 借用扫描、MIME
 /// 匹配和小枚举选择。未知 `Content-Length` 的响应不会为判定阈值而聚合 body。
+#[derive(PartialEq, Eq)]
 pub struct CompressionPolicy {
     /// 服务端允许的算法及相同客户端 q 值时的优先顺序。
     pub(crate) algorithms: Vec<ContentCoding>,
@@ -3104,6 +3108,7 @@ impl CompressionPolicy {
 }
 
 /// build 期编译的可压缩 MIME 匹配器。
+#[derive(PartialEq, Eq)]
 enum CompressionContentType {
     /// `*`：运维显式选择压缩所有带 Content-Type 的实体。
     Any,
@@ -3145,6 +3150,7 @@ impl ResponseHeaderOp {
 }
 
 /// nginx `proxy_redirect from to` 的已编译规则。
+#[derive(PartialEq, Eq)]
 pub struct ProxyRedirectRule {
     /// 上游返回的 URL 前缀。
     pub from: String,
@@ -3153,6 +3159,7 @@ pub struct ProxyRedirectRule {
 }
 
 /// nginx `proxy_cookie_domain/path/flags` 的已编译规则。
+#[derive(PartialEq, Eq)]
 pub enum CookieRewriteRule {
     /// 改写 Set-Cookie 的 Domain 属性。
     Domain {
@@ -3173,6 +3180,7 @@ pub enum CookieRewriteRule {
 }
 
 /// nginx `proxy_cookie_flags` 的已编译规则。
+#[derive(PartialEq, Eq)]
 pub struct CookieFlagsRule {
     /// cookie 名;`*` 表示所有 Set-Cookie。
     pub cookie: String,
@@ -3191,6 +3199,7 @@ pub struct CookieFlagsRule {
 }
 
 /// 重复响应头去重规则,兼容 SCG `DedupeResponseHeader` 中可零拷贝实现的语义。
+#[derive(PartialEq, Eq)]
 pub struct DedupeResponseHeader {
     /// 待去重的响应头名。
     pub name: HeaderName,
@@ -3199,7 +3208,7 @@ pub struct DedupeResponseHeader {
 }
 
 /// nginx `mirror` 流量镜像规则。
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct MirrorPolicy {
     /// 镜像目标 upstream,支持 `lb://service` 或静态 `http(s)://host`。
     pub target: String,
@@ -3212,7 +3221,7 @@ pub struct MirrorPolicy {
 }
 
 /// 重复响应头的保留策略。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DedupeMode {
     /// 保留第一个出现的 header value。
     RetainFirst,
@@ -3223,7 +3232,7 @@ pub enum DedupeMode {
 }
 
 /// CORS 规则的已编译形态。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CorsPolicy {
     /// Access-Control-Allow-Origin 策略。
     pub allow_origin: CorsAllowOrigin,
@@ -3240,7 +3249,7 @@ pub struct CorsPolicy {
 }
 
 /// CORS allow-origin 模式。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CorsAllowOrigin {
     /// 返回通配符 `*`。
     Any,
@@ -3253,7 +3262,7 @@ pub enum CorsAllowOrigin {
 }
 
 /// Gateway API CORS origin 的规范化匹配计划。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CorsOriginPattern {
     scheme: String,
     host: CorsOriginHost,
@@ -3261,7 +3270,7 @@ pub struct CorsOriginPattern {
 }
 
 /// Gateway API CORS origin 的主机匹配边界。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum CorsOriginHost {
     Exact(String),
     WildcardSuffix(String),
@@ -3343,7 +3352,7 @@ pub struct RewritePrefix {
 }
 
 /// Gateway API RequestRedirect 的已验证执行计划。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GatewayRedirectPolicy {
     scheme: Option<String>,
     hostname: Option<String>,
@@ -3958,7 +3967,7 @@ fn validate_usage_token(value: &str, label: &str) -> Result<()> {
 }
 
 /// route 级固定响应,对应 nginx `return` 风格能力。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DirectResponse {
     /// 响应状态码。
     pub status: StatusCode,
@@ -5690,6 +5699,7 @@ impl ConditionalReturn {
 }
 
 /// IP 访问控制规则。
+#[derive(PartialEq, Eq)]
 pub struct AccessRule {
     /// 命中后的允许/拒绝动作。
     pub action: AccessAction,
@@ -5698,6 +5708,7 @@ pub struct AccessRule {
 }
 
 /// nginx `valid_referers` 的基础策略。
+#[derive(PartialEq, Eq)]
 pub struct RefererPolicy {
     /// 是否允许缺失 Referer。
     allow_none: bool,
@@ -5710,6 +5721,7 @@ pub struct RefererPolicy {
 }
 
 /// Referer host 匹配模式。
+#[derive(PartialEq, Eq)]
 enum RefererHost {
     /// 精确 host。
     Exact(String),
@@ -5758,7 +5770,7 @@ impl RefererHost {
 }
 
 /// `limit_conn` 并发限制规则。释放绑定响应 body 生命周期,避免流式响应提前归还名额。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LimitConnPolicy {
     /// 并发维度,与 `limit_req` 共用低成本维度集合。
     pub key: LimitReqKey,
@@ -5767,7 +5779,7 @@ pub struct LimitConnPolicy {
 }
 
 /// nginx `limit_rate` 响应带宽限制。只包响应 body,不缓冲完整响应。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LimitRatePolicy {
     /// 限速字节/秒。
     pub bytes_per_second: u64,
@@ -5776,7 +5788,7 @@ pub struct LimitRatePolicy {
 }
 
 /// nginx `error_page` 形态:状态码集合 -> 固定响应或内部 reroute。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ErrorPagePolicy {
     /// 触发映射的源状态码集合。
     pub statuses: Vec<StatusCode>,
@@ -5785,7 +5797,7 @@ pub struct ErrorPagePolicy {
 }
 
 /// error_page 命中后的动作。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ErrorPageAction {
     /// 固定响应。
     Response(DirectResponse),
@@ -5801,7 +5813,7 @@ impl ErrorPagePolicy {
 }
 
 /// `limit_req` 支持的低成本维度。`HeaderName` 在构建期校验,运行期零解析。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum LimitReqKey {
     /// 所有请求共享同一桶,用于全局保护后端。
     Global,
@@ -5824,6 +5836,7 @@ pub enum AccessAction {
     Deny,
 }
 
+#[derive(PartialEq, Eq)]
 enum AccessMatcher {
     All,
     Cidr(Cidr),

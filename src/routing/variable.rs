@@ -12,6 +12,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::header::HeaderName;
 use http::request::Parts;
 use http::StatusCode;
+use sha2::{Digest, Sha256};
 
 use crate::config::model::{VariableMapCfg, VariablesCfg};
 use crate::io::net::Cidr;
@@ -20,7 +21,7 @@ use crate::io::net::Cidr;
 ///
 /// `GatewayConfig.variables` 在发布期编译成该结构;route/filter 运行时只调用已编译模板,
 /// 避免每请求解析 `${...}` 表达式。header/query allowlist 在这里固化,防止配置误读高基数字段。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VariablePlan {
     sets: HashMap<String, ValueTemplate>,
     maps: Vec<MapPlan>,
@@ -35,21 +36,21 @@ pub struct VariablePlan {
 ///
 /// 无变量的模板会保留 `static_literal`,运行期可以直接复用字面值;含变量的模板拆成
 /// literal + var 序列,按 [`EvalContext`] 渲染。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ValueTemplate {
     parts: Arc<[TemplatePart]>,
     static_literal: Option<Arc<str>>,
 }
 
 /// 模板片段:静态字面量或一个已校验变量引用。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum TemplatePart {
     Literal(Arc<str>),
     Var(Var),
 }
 
 /// Downstream/PostRoute 阶段当前已支持的变量。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum Var {
     RemoteAddr,
     Host,
@@ -75,7 +76,7 @@ pub(crate) enum VariablePhase {
 }
 
 /// 单个 nginx `map` 的编译结果。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct MapPlan {
     source: ValueTemplate,
     table: MapTable,
@@ -90,10 +91,32 @@ enum MapTable {
     /// 前缀匹配,按前缀长度倒序保存,保证先命中最长前缀。
     Prefix(Vec<(String, Arc<str>)>),
     /// glob 匹配,构建期预编译 GlobSet。
-    Glob(Arc<GlobSet>, Arc<[Arc<str>]>),
+    Glob(Arc<GlobSet>, Arc<[Arc<str>]>, [u8; 32]),
     /// CIDR 匹配,用于 nginx `geo` 的 CIDR -> value 基础语义。
     Cidr(Vec<(Cidr, Arc<str>)>),
 }
+
+impl PartialEq for MapTable {
+    /// 业务作用：比较已编译 map 的声明语义，不比较匹配器的内存地址或内部状态。
+    ///
+    /// 参数说明：
+    /// - `other`：候选变量表，glob 顺序由构建期固定。
+    ///
+    /// 返回：表类型、匹配边界与结果值一致时为真，不重新编码或复制条目。
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Exact(current), Self::Exact(candidate)) => current == candidate,
+            (Self::Prefix(current), Self::Prefix(candidate)) => current == candidate,
+            (Self::Cidr(current), Self::Cidr(candidate)) => current == candidate,
+            (Self::Glob(_, values, patterns), Self::Glob(_, next_values, next_patterns)) => {
+                patterns == next_patterns && values == next_values
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for MapTable {}
 
 /// 模板求值上下文。
 ///
@@ -543,7 +566,7 @@ impl MapPlan {
                 .find(|(prefix, _)| key.starts_with(prefix))
                 .map(|(_, value)| value.as_ref())
                 .unwrap_or(self.default.as_ref()),
-            MapTable::Glob(globset, values) => globset
+            MapTable::Glob(globset, values, _) => globset
                 .matches(key)
                 .into_iter()
                 .next()
@@ -600,10 +623,14 @@ fn build_map(cfg: &VariableMapCfg, ctx: &CompileCtx) -> Result<MapPlan> {
             }
             "glob" => {
                 let mut builder = GlobSetBuilder::new();
+                let mut patterns = Sha256::new();
                 let mut values = Vec::with_capacity(cfg.entries.len());
                 let mut entries = cfg.entries.iter().collect::<Vec<_>>();
                 entries.sort_by_key(|(pattern, _)| *pattern);
                 for (pattern, value) in entries {
+                    // 匹配器不保留可比较声明；长度分帧避免相邻 pattern 的边界被串接混淆。
+                    patterns.update((pattern.len() as u64).to_be_bytes());
+                    patterns.update(pattern.as_bytes());
                     builder.add(Glob::new(pattern).with_context(|| {
                         format!("variables.maps `{}` glob `{pattern}`", cfg.name)
                     })?);
@@ -616,6 +643,7 @@ fn build_map(cfg: &VariableMapCfg, ctx: &CompileCtx) -> Result<MapPlan> {
                             .with_context(|| format!("variables.maps `{}` globset", cfg.name))?,
                     ),
                     Arc::from(values),
+                    patterns.finalize().into(),
                 )
             }
             "cidr" | "geo" => {

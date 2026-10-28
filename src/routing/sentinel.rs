@@ -3,7 +3,7 @@
 use super::*;
 
 /// `limit_req` 流控规则的已编译形态。数据面只求维度值并调用 `RateLimiter`,不再解析 DSL。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LimitReqPolicy {
     /// 有界匀速调度，存在时不使用令牌桶或预热余额。
     pub queue: Option<crate::runtime::sentinel::queue::Policy>,

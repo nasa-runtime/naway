@@ -3,7 +3,7 @@
 use super::*;
 
 /// Sentinel 熔断规则；按 route 统计错误或慢调用，保护期内直接返回降级响应。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CircuitBreakerPolicy {
     /// 规则 id,用于状态 key 与日志定位。
     pub id: String,

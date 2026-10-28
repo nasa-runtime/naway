@@ -10,22 +10,7 @@ use crate::config::GatewaySnapshot;
 ///
 /// 返回：按字典序排列的对象增删改摘要，Sentinel 只比较同代实际规则，不重新读取原文。
 pub(super) fn compare(current: &GatewaySnapshot, candidate: &GatewaySnapshot) -> serde_json::Value {
-    let route_index = |snapshot: &GatewaySnapshot| {
-        let mut routes = std::collections::BTreeMap::new();
-        for proxy in snapshot.proxies.iter() {
-            for route in proxy.router.routes() {
-                routes.insert(
-                    format!("{}/{}", proxy.id, route.id),
-                    route.admin_semantic_json(),
-                );
-            }
-        }
-        routes
-    };
-    let current_routes = route_index(current);
-    let candidate_routes = route_index(candidate);
-    let (routes_added, routes_removed, routes_changed) =
-        map_semantic_changes(&current_routes, &candidate_routes);
+    let (routes_added, routes_removed, routes_changed) = super::route::changes(current, candidate);
     let (upstreams_added, upstreams_removed, upstreams_changed) = current
         .upstreams
         .configuration_changes(&candidate.upstreams);
@@ -57,37 +42,4 @@ pub(super) fn compare(current: &GatewaySnapshot, candidate: &GatewaySnapshot) ->
             "changed": sentinel_changed
         },
     })
-}
-
-/// 业务作用：对两个以稳定业务 id 索引的 JSON 计划计算增删改集。
-///
-/// 参数说明：
-/// - `current`：的 key 是业务身份，value 是不含密钥的规范语义。
-/// - `candidate`：的 key 是业务身份，value 是不含密钥的规范语义。
-///
-/// 返回：分别返回字典序的 added、removed 和 value 不同的 changed id。
-fn map_semantic_changes(
-    current: &std::collections::BTreeMap<String, serde_json::Value>,
-    candidate: &std::collections::BTreeMap<String, serde_json::Value>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let added = candidate
-        .keys()
-        .filter(|key| !current.contains_key(*key))
-        .cloned()
-        .collect();
-    let removed = current
-        .keys()
-        .filter(|key| !candidate.contains_key(*key))
-        .cloned()
-        .collect();
-    let changed = current
-        .iter()
-        .filter_map(|(key, value)| {
-            candidate
-                .get(key)
-                .filter(|candidate| *candidate != value)
-                .map(|_| key.clone())
-        })
-        .collect();
-    (added, removed, changed)
 }
