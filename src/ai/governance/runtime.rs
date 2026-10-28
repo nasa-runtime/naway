@@ -1,3 +1,5 @@
+mod semantic;
+
 use super::config::*;
 use crate::ai::agent::config::TargetCfg;
 use crate::ai::agent::identity::{self, Acl, Identity};
@@ -17,6 +19,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct Plan {
     cfg: GovernanceCfg,
     prompt: Option<String>,
@@ -28,6 +31,7 @@ struct Source {
     target: Arc<Target>,
     acl: Acl,
 }
+#[derive(PartialEq, Eq)]
 struct Output {
     cfg: OutputModerationCfg,
     target: Arc<Target>,

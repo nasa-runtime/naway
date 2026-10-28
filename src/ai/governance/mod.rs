@@ -6,6 +6,7 @@ mod runtime;
 #[cfg(feature = "ai-governance")]
 pub(crate) use runtime::Plan;
 #[cfg(not(feature = "ai-governance"))]
+#[derive(PartialEq, Eq)]
 pub(crate) struct Plan;
 
 #[cfg(not(feature = "ai-governance"))]

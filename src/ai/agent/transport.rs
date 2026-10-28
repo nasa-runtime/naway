@@ -70,6 +70,7 @@ pub(crate) struct Outbound {
     pub body: Bytes,
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct Target {
     pub upstream: String,
     pub path: String,

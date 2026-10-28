@@ -54,7 +54,7 @@ pub enum A2aBinding {
     Rest,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityCfg {
     /// 路由所属租户；相同后端也不会跨此命名空间共用状态。
@@ -73,7 +73,7 @@ pub struct SecurityCfg {
     pub consumer_groups: BTreeMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AclCfg {
     /// 只有显式为 true 才允许不附加任何维度约束的已认证访问。
@@ -124,7 +124,7 @@ impl Default for LimitsCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TargetCfg {
     /// 仅固定 origin 或 lb://service，不接受请求变量、用户名、query 或 fragment。

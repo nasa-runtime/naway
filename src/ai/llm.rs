@@ -4,6 +4,8 @@
 //! image/audio/video、batch/file 与 Realtime 保持各自原生 wire 契约。所有请求先受 route 字节、
 //! 时长和费用预算约束，模型目录与凭据在快照构建期冻结，客户端不能选择 provider path 或身份。
 
+mod semantic;
+
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
@@ -43,6 +45,7 @@ const LLM_CACHE_RESPONSE_MAGIC: &[u8; 4] = b"GWLR";
 const LLM_CACHE_RESPONSE_VERSION: u8 = 1;
 
 /// 已编译的 LLM route 计划。
+#[derive(PartialEq, Eq)]
 pub struct LlmRoutePolicy {
     pub(crate) governance: Option<Arc<super::governance::Plan>>,
     /// 独立 API 契约；非 Chat 类型不进入 Chat adapter。
@@ -92,6 +95,7 @@ pub struct LlmRoutePolicy {
 }
 
 /// 已解析凭据、超时和资源上限的外部 OpenAI-compatible moderation 计划。
+#[derive(PartialEq, Eq)]
 pub struct LlmModerationPolicy {
     /// `http(s)://` 或 `lb://` 上游。
     pub(crate) upstream: Arc<str>,
@@ -145,6 +149,7 @@ pub struct LlmCacheEntry {
 }
 
 /// 已解析凭据与固定请求路径的 embedding 后端。
+#[derive(PartialEq, Eq)]
 pub struct LlmEmbeddingModel {
     /// `http(s)://` 或 `lb://` 上游。
     pub(crate) upstream: Arc<str>,
@@ -159,6 +164,7 @@ pub struct LlmEmbeddingModel {
 }
 
 /// 已解析 SecretSource 与 provider 默认值的单模型计划。
+#[derive(PartialEq, Eq)]
 pub struct LlmModel {
     /// 低基数配置 id。
     pub(crate) id: Arc<str>,
@@ -203,6 +209,7 @@ pub struct LlmModel {
 }
 
 /// 已编译的 token 配额规则。
+#[derive(PartialEq, Eq)]
 pub struct LlmTokenQuota {
     /// 每 window 回填 token 数。
     pub(crate) limit: u64,

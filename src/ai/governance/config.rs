@@ -3,7 +3,7 @@ use crate::config::model::{LlmModerationCfg, LlmModerationFailModeCfg};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GovernanceCfg {
     pub security: SecurityCfg,
@@ -17,13 +17,13 @@ pub struct GovernanceCfg {
     pub output_moderation: Option<OutputModerationCfg>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Retention {
     RequestOnly,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PromptCfg {
     pub name: String,
@@ -35,7 +35,7 @@ pub struct PromptCfg {
     pub variables: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RagCfg {
     pub sources: Vec<SourceCfg>,
@@ -43,14 +43,14 @@ pub struct RagCfg {
     pub max_context_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Citations {
     Required,
     Optional,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SourceCfg {
     pub id: String,
@@ -64,7 +64,7 @@ pub struct SourceCfg {
     pub fail_mode: LlmModerationFailModeCfg,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OutputModerationCfg {
     pub service: LlmModerationCfg,

@@ -81,7 +81,7 @@ pub enum LlmApiTypeCfg {
 }
 
 /// 外部 OpenAI-compatible moderation 配置。
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LlmModerationCfg {
     /// moderation 服务地址，支持 `http(s)://` 与 `lb://service`。

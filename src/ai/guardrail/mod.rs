@@ -3,6 +3,7 @@
 //! 本地规则是确定性检测，不替代语义模型。流式规则必须有可证明的最大匹配长度；
 //! 对应文本尚可能参与后续命中时，承载它的完整 SSE event 不得交给下游。
 
+mod semantic;
 mod stream;
 
 use anyhow::{ensure, Context, Result};
@@ -23,7 +24,7 @@ pub enum Direction {
 }
 
 /// 低基数策略分类，不含 prompt、身份或命中原文。
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Category {
     PromptInjection,
@@ -95,6 +96,7 @@ struct Rule {
 }
 
 /// 构建期冻结的规则集合与流式安全窗口。
+#[derive(PartialEq, Eq)]
 pub(crate) struct Plan {
     rules: Vec<Rule>,
     window_bytes: usize,

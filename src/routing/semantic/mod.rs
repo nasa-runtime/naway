@@ -6,6 +6,7 @@ mod backends;
 mod content;
 mod external;
 mod grpc;
+mod llm;
 mod resources;
 mod sandbox;
 mod security;
