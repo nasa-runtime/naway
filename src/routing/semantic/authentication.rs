@@ -17,6 +17,7 @@ impl Route {
             && self.jwt_auth == candidate.jwt_auth
             && self.oidc_rp == candidate.oidc_rp
             && self.ext_authz == candidate.ext_authz
+            && self.enterprise_auth == candidate.enterprise_auth
             && self.satisfy == candidate.satisfy
     }
 }

@@ -15,6 +15,10 @@ use anyhow::Context;
 use anyhow::{bail, Result};
 use http::header::{HeaderName, HeaderValue};
 use http::request::Parts;
+#[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
+use sha2::{Digest, Sha256};
+
+mod semantic;
 
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
 const MAX_IDENTITY_VALUE_BYTES: usize = 256;
@@ -39,7 +43,7 @@ pub(crate) enum EnterpriseAuthResult {
 }
 
 /// route 级可选企业身份策略。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
 pub(crate) enum EnterpriseAuthPolicy {
     #[cfg(feature = "enterprise-saml")]
@@ -48,7 +52,7 @@ pub(crate) enum EnterpriseAuthPolicy {
     Ldap(Arc<LdapPolicy>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 #[cfg(not(any(feature = "enterprise-saml", feature = "enterprise-ldap")))]
 pub(crate) struct EnterpriseAuthPolicy;
 
@@ -253,10 +257,12 @@ pub(crate) struct SamlPolicy {
     acs: String,
     sp: saml_rs::Saml<saml_rs::Sp>,
     idp: saml_rs::IdpDescriptor,
+    trust_identity: [u8; 32],
     source_header: Option<HeaderName>,
     mappings: Arc<Vec<IdentityMapping>>,
     owned_headers: Arc<Vec<HeaderName>>,
     clock_skew: saml_rs::ClockSkew,
+    clock_skew_secs: i64,
     replay_ttl: Duration,
     replay: parking_lot::Mutex<std::collections::HashMap<String, SamlReplayEntry>>,
     max_assertion_bytes: usize,
@@ -338,6 +344,19 @@ impl SamlPolicy {
             config_dir,
             "SAML metadata signing certificate",
         )?;
+        // 摘要与密码对象使用同一次读取的材料，避免同路径轮换被遗漏或二次读取产生混代。
+        // 每段都有长度边界；摘要只用于配置比较，不能授予身份或跳过 metadata 签名验证。
+        let mut identity = Sha256::new();
+        for part in [
+            metadata.as_bytes(),
+            certificate.as_bytes(),
+            idp_entity_id.as_bytes(),
+            sp_entity_id.as_bytes(),
+        ] {
+            identity.update((part.len() as u64).to_be_bytes());
+            identity.update(part);
+        }
+        let trust_identity = identity.finalize().into();
         let trusted = [CertificatePem::new(certificate)];
         let idp = IdpDescriptor::from_metadata_xml_for(
             EntityId::try_new(idp_entity_id)?,
@@ -362,6 +381,7 @@ impl SamlPolicy {
             acs: acs.to_owned(),
             sp,
             idp,
+            trust_identity,
             source_header,
             mappings: Arc::new(mappings),
             owned_headers: Arc::new(owned_headers),
@@ -371,6 +391,7 @@ impl SamlPolicy {
                 skew_secs.saturating_mul(-1_000),
                 skew_secs.saturating_mul(1_000),
             ),
+            clock_skew_secs: skew_secs,
             replay_ttl: Duration::from_secs(replay_ttl_secs),
             replay: parking_lot::Mutex::new(std::collections::HashMap::new()),
             max_assertion_bytes,
@@ -539,6 +560,8 @@ impl saml_rs::ReplayCache for SharedSamlReplay<'_> {
 pub(crate) struct LdapPolicy {
     url: Arc<str>,
     settings: ldap3::LdapConnSettings,
+    starttls: bool,
+    ca_identity: Option<[u8; 32]>,
     bind_dn: Arc<str>,
     bind_password: Arc<str>,
     base_dn: Arc<str>,
@@ -616,14 +639,19 @@ impl LdapPolicy {
         let mut settings = ldap3::LdapConnSettings::new()
             .set_conn_timeout(Duration::from_millis(timeout_ms))
             .set_starttls(starttls);
+        let mut ca_identity = None;
         if let Some(source) = option(&options, "ca_certificate") {
             let pem =
                 crate::security::secret::resolve_text(source, config_dir, "LDAP CA certificate")?;
             settings = settings.set_config(ldap_tls_config(&pem)?);
+            // 固定本次 TLS 计划实际采用的 CA，连接池和正在执行的 bind 不参与配置比较。
+            ca_identity = Some(Sha256::digest(pem.as_bytes()).into());
         }
         Ok(Self {
             url: Arc::from(url),
             settings,
+            starttls,
+            ca_identity,
             bind_dn: Arc::from(bind_dn),
             bind_password: Arc::from(bind_password),
             base_dn: Arc::from(base_dn),
@@ -804,7 +832,7 @@ impl LdapPolicy {
 }
 
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct IdentityMapping {
     source: Arc<str>,
     header: HeaderName,
