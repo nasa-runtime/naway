@@ -1008,7 +1008,9 @@ Distribution registry 获取。远程来源必须固定最终 wasm 的 SHA-256�
 signature 或签名的 in-toto Statement；两者同时声明时全部验证。OCI tag 还必须固定 manifest SHA-256，
 且 registry 返回的 `Docker-Content-Digest` 必须一致，因而 tag 不能把已发布候选指向另一份内容。
 `authorization` 和附加 CA 使用 SecretSource。`cache_dir` 只保存按模块摘要命名的已验证内容，离线读取
-仍会重新验证摘要及全部供应链证明；获取、验签、编译或实例化失败时，当前路由快照保持不变。
+仍会重新验证当前字节上限、来源凭据格式、附加 CA、摘要及全部供应链证明。缓存摘要匹配但当前
+证明失效时直接拒绝候选；重新下载相同内容不能恢复失去的信任。获取、验签、编译或实例化失败时，
+当前路由快照保持不变。
 
 ```yaml
 routes:

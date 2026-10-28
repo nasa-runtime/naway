@@ -5,6 +5,7 @@ mod authentication;
 mod content;
 mod external;
 mod resources;
+mod sandbox;
 mod security;
 mod traffic;
 mod tunnels;

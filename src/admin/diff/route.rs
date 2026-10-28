@@ -45,6 +45,7 @@ pub(super) fn changes(
                 || !current.same_resource_configuration(next)
                 || !current.same_tunnel_configuration(next)
                 || !current.same_external_configuration(next)
+                || !current.same_sandbox_configuration(next)
                 || current.admin_semantic_json() != next.admin_semantic_json())
             .then(|| name(key))
         })

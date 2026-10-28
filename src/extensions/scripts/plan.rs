@@ -1,4 +1,6 @@
 //! 候选编译冻结源码与权限，调用不读取文件，旧请求继续使用自己的不可变计划。
+mod semantic;
+
 use super::{
     circuit::Circuit,
     contract::{self, Input, Output},
@@ -14,6 +16,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderName};
 use std::{collections::HashSet, io::Read, path::Path, sync::Arc, time::Duration};
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct Chain {
     phases: [Vec<Arc<Plugin>>; 6],
 }

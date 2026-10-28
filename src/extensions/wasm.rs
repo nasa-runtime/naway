@@ -7,6 +7,9 @@
 //! deadline。客体成功才原子交付整份 head/body，trap/fuel/epoch/内存/超时不会把半套
 //! 变更泄漏给后续管线。
 
+mod material;
+mod semantic;
+
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -86,6 +89,7 @@ static WASM_ENGINE: OnceLock<std::result::Result<Engine, String>> = OnceLock::ne
 static WASM_CACHE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// 一条 route 的 Proxy-Wasm HTTP 链。相位已在构建期分组，数据面不每请求过滤枚举。
+#[derive(PartialEq, Eq)]
 pub(crate) struct WasmPluginChain {
     request_headers: Arc<[Arc<WasmPlugin>]>,
     request_body: Arc<[Arc<WasmPlugin>]>,
@@ -603,6 +607,10 @@ impl WasmPluginChain {
 struct WasmPlugin {
     id: Arc<str>,
     module: Module,
+    module_digest: [u8; 32],
+    module_file: Arc<str>,
+    remote_source: Option<material::RemotePolicy>,
+    max_module_bytes: usize,
     config: Arc<[u8]>,
     fail_open: bool,
     limits: InvocationLimits,
@@ -610,7 +618,7 @@ struct WasmPlugin {
     shared: Arc<WasmSharedState>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct InvocationLimits {
     max_memory_bytes: usize,
     max_fuel: u64,
@@ -639,7 +647,7 @@ impl InvocationLimits {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct SharedLimits {
     max_entries: usize,
     max_bytes: usize,
@@ -651,6 +659,9 @@ struct SharedLimits {
 struct CalloutCluster {
     origin: reqwest::Url,
     client: reqwest::Client,
+    allow_cleartext: bool,
+    http2_prior_knowledge: bool,
+    ca_identity: Option<[u8; 32]>,
 }
 
 struct WasmSharedState {
@@ -1082,11 +1093,13 @@ impl WasmPlugin {
     /// 返回：验证成功返回可复用编译模块；文件越界、ABI/import/配置非法时拒绝快照。
     fn build(cfg: &WasmPluginCfg, config_dir: &Path, route_id: &str) -> Result<Self> {
         validate_cfg(cfg)?;
-        let (bytes, module_identity) = load_module_bytes(cfg, config_dir, route_id)?;
-        let module_digest = Sha256::digest(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let material::LoadedModule {
+            bytes,
+            label: module_identity,
+            remote,
+        } = load_module_bytes(cfg, config_dir, route_id)?;
+        let module_hash = Sha256::digest(&bytes);
+        let module_digest = format!("{module_hash:x}");
         let engine = engine()?;
         let module = Module::from_binary(engine, &bytes)
             .map_err(anyhow::Error::from)
@@ -1119,6 +1132,10 @@ impl WasmPlugin {
         let plugin = Self {
             id: Arc::from(cfg.id.as_str()),
             module,
+            module_digest: module_hash.into(),
+            module_file: Arc::from(cfg.module_file.as_str()),
+            remote_source: remote,
+            max_module_bytes: cfg.max_module_bytes,
             config: config.into(),
             fail_open: cfg.fail_open,
             limits: InvocationLimits {
@@ -2818,7 +2835,7 @@ fn build_callout_clusters(
             }
             client = client.http2_prior_knowledge();
         }
-        if !cluster.ca_certificate.trim().is_empty() {
+        let ca_identity = if !cluster.ca_certificate.trim().is_empty() {
             let pem = crate::security::secret::resolve_text(
                 &cluster.ca_certificate,
                 config_dir,
@@ -2827,13 +2844,19 @@ fn build_callout_clusters(
             let certificate = crate::tls::trust::http_ca(pem.as_bytes())
                 .context("invalid Proxy-Wasm callout CA certificate")?;
             client = client.add_root_certificate(certificate);
-        }
+            Some(Sha256::digest(pem.as_bytes()).into())
+        } else {
+            None
+        };
         if clusters
             .insert(
                 cluster.name.clone(),
                 CalloutCluster {
                     origin,
                     client: client.build().context("build Proxy-Wasm callout client")?,
+                    allow_cleartext: cluster.allow_cleartext,
+                    http2_prior_knowledge: cluster.http2_prior_knowledge,
+                    ca_identity,
                 },
             )
             .is_some()
@@ -4405,12 +4428,12 @@ fn call_optional_i32_void(
 /// - `config_dir`：解析本地来源
 /// - `route_id`：只提供低敏错误上下文。
 ///
-/// 返回：返回已验证模块字节和安全日志身份；读取、下载、摘要、签名或证明失败会拒绝候选快照。
+/// 返回：已验证模块字节、日志上下文与实际远程材料身份；读取、下载或信任校验失败拒绝候选快照。
 fn load_module_bytes(
     cfg: &WasmPluginCfg,
     config_dir: &Path,
     route_id: &str,
-) -> Result<(Vec<u8>, String)> {
+) -> Result<material::LoadedModule> {
     let Some(source) = &cfg.module_source else {
         let module_file = resolve(config_dir, cfg.module_file.as_str());
         // 模块是控制面不可信文件；必须在分配前执行上限，而不是完整读取后才检查。
@@ -4419,40 +4442,45 @@ fn load_module_bytes(
             cfg.max_module_bytes,
             "Proxy-Wasm module",
         )?;
-        return Ok((bytes, module_file.display().to_string()));
+        return Ok(material::LoadedModule {
+            bytes,
+            label: module_file.display().to_string(),
+            remote: None,
+        });
     };
 
     let expected_digest = normalize_sha256(source.sha256.as_str(), "Wasm module sha256")?;
+    // 来源凭据和信任属于本次候选的权限；即使磁盘已有模块，也不能绕过当前材料的解析和校验。
+    let transport = material::RemoteTransport::resolve(source, config_dir)?;
     if let Some(cache_path) = wasm_cache_path(source, config_dir, expected_digest.as_str()) {
         if let Ok(bytes) = crate::io::bounded_io::read_file(
             &cache_path,
             cfg.max_module_bytes,
             "Proxy-Wasm module cache",
         ) {
-            if verify_remote_module(
-                bytes.as_slice(),
-                source,
-                config_dir,
-                expected_digest.as_str(),
-            )
-            .is_ok()
-            {
-                return Ok((bytes, format!("verified cache for route `{route_id}`")));
+            if verify_sha256(&bytes, &expected_digest, "Proxy-Wasm module").is_ok() {
+                // 摘要匹配后，当前证明不成立必须拒绝；重新下载相同固定内容不能恢复已经失去的信任。
+                let proof = verify_module_proofs(&bytes, source, config_dir, &expected_digest)?;
+                return Ok(material::LoadedModule {
+                    bytes,
+                    label: format!("verified cache for route `{route_id}`"),
+                    remote: Some(transport.policy(source, expected_digest, proof)?),
+                });
             }
         }
     }
 
-    let fetch_source = source.clone();
-    let fetch_dir = config_dir.to_path_buf();
     let max_module_bytes = cfg.max_module_bytes;
     // 候选构建可能由 Tokio 控制面任务触发；blocking client 放入隔离线程，避免嵌套 runtime
     // 或把 registry I/O 阻塞到数据面 worker。
-    let bytes = std::thread::spawn(move || {
-        fetch_remote_module(&fetch_source, &fetch_dir, max_module_bytes)
+    let bytes = std::thread::scope(|scope| {
+        scope
+            .spawn(|| fetch_remote_module(source, &transport, max_module_bytes))
+            .join()
     })
-    .join()
     .map_err(|_| anyhow!("Proxy-Wasm source worker panicked"))??;
-    verify_remote_module(
+    verify_sha256(&bytes, &expected_digest, "Proxy-Wasm module")?;
+    let proof = verify_module_proofs(
         bytes.as_slice(),
         source,
         config_dir,
@@ -4465,41 +4493,46 @@ fn load_module_bytes(
             expected_digest.as_str(),
         )?;
     }
-    Ok((
+    Ok(material::LoadedModule {
         bytes,
-        format!("verified remote source for route `{route_id}`"),
-    ))
+        label: format!("verified remote source for route `{route_id}`"),
+        remote: Some(transport.policy(source, expected_digest, proof)?),
+    })
 }
 
 /// 业务作用：按 source scheme 选择固定 HTTPS 或 OCI Distribution 获取器。
 ///
 /// 参数说明：
-/// - `source`：提供固定引用、TLS 和凭据
-/// - `config_dir`：解析 SecretSource
+/// - `source`：提供固定引用、摘要和下载时限
+/// - `transport`：本次候选已经解析的实际凭据与 TLS 信任
 /// - `max_module_bytes`：是读取前硬门。
 ///
 /// 返回：网络与 registry 协议完整成功时返回原始 wasm；重定向、超限或不可变摘要不符返回错误。
 fn fetch_remote_module(
     source: &WasmModuleSourceCfg,
-    config_dir: &Path,
+    transport: &material::RemoteTransport,
     max_module_bytes: usize,
 ) -> Result<Vec<u8>> {
-    let client = build_wasm_source_client(source, config_dir)?;
-    let authorization = resolve_wasm_authorization(source, config_dir)?;
+    let client = build_wasm_source_client(source, transport)?;
     if source.reference.starts_with("https://") {
         let url = validate_https_module_url(source.reference.as_str())?;
         let (bytes, _) = fetch_bounded_source(
             &client,
             url.as_str(),
             "application/wasm, application/octet-stream",
-            authorization.as_ref(),
+            transport.authorization.as_ref(),
             max_module_bytes,
             "Wasm HTTPS module",
         )?;
         return Ok(bytes);
     }
     if source.reference.starts_with("oci://") {
-        return fetch_oci_module(&client, source, authorization.as_ref(), max_module_bytes);
+        return fetch_oci_module(
+            &client,
+            source,
+            transport.authorization.as_ref(),
+            max_module_bytes,
+        );
     }
     bail!("Wasm module_source.reference must use https:// or oci://")
 }
@@ -4507,13 +4540,13 @@ fn fetch_remote_module(
 /// 业务作用：构建拒绝 redirect、共享固定 deadline 且只信任平台根与显式附加 CA 的客户端。
 ///
 /// 参数说明：
-/// - `source`：提供 deadline 与 CA SecretSource
-/// - `config_dir`：解析本地来源。
+/// - `source`：提供固定 deadline。
+/// - `transport`：已经校验的证书对象，与控制面材料身份来自同一次读取。
 ///
 /// 返回：TLS 和配置有效时返回 blocking client；证书或 client 配置非法时返回错误。
 fn build_wasm_source_client(
     source: &WasmModuleSourceCfg,
-    config_dir: &Path,
+    transport: &material::RemoteTransport,
 ) -> Result<reqwest::blocking::Client> {
     let timeout = Duration::from_millis(source.timeout_ms);
     let mut builder = reqwest::blocking::Client::builder()
@@ -4522,15 +4555,8 @@ fn build_wasm_source_client(
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true)
         .user_agent("naway-wasm-source/1");
-    if !source.ca_certificate.trim().is_empty() {
-        let pem = crate::security::secret::resolve_text(
-            source.ca_certificate.as_str(),
-            config_dir,
-            "Proxy-Wasm source CA certificate",
-        )?;
-        let certificate = crate::tls::trust::http_ca(pem.as_bytes())
-            .context("parse Proxy-Wasm source CA certificate")?;
-        builder = builder.add_root_certificate(certificate);
+    if let Some(certificate) = &transport.certificate {
+        builder = builder.add_root_certificate(certificate.clone());
     }
     builder.build().context("build Proxy-Wasm source client")
 }
@@ -4826,35 +4852,41 @@ fn fetch_oci_module(
     Ok(bytes)
 }
 
-/// 业务作用：复验远程模块的固定摘要及所配置的全部独立供应链证明。
+/// 业务作用：在模块固定摘要已经通过后验证全部独立供应链证明，并冻结实际 signer 身份。
 ///
 /// 参数说明：
-/// - `bytes`：是候选模块
+/// - `bytes`：是已经通过固定摘要校验的候选模块
 /// - `source`：提供 pin 与证明
 /// - `config_dir`：解析 SecretSource
 /// - `expected_digest`：是已规范化摘要。
 ///
-/// 返回：摘要及所有已声明证明通过时成功；任一不匹配都会拒绝候选和 cache 命中。
-fn verify_remote_module(
+/// 返回：所有声明证明通过时返回实际材料身份；任一不匹配都会拒绝候选和 cache 命中。
+fn verify_module_proofs(
     bytes: &[u8],
     source: &WasmModuleSourceCfg,
     config_dir: &Path,
     expected_digest: &str,
-) -> Result<()> {
-    verify_sha256(bytes, expected_digest, "Proxy-Wasm module")?;
-    if !source.signature.trim().is_empty() {
-        verify_ed25519_secret(
+) -> Result<material::ProofIdentity> {
+    let signer = if !source.signature.trim().is_empty() {
+        Some(verify_ed25519_secret(
             bytes,
             source.signature.as_str(),
             source.public_key.as_str(),
             config_dir,
             "Proxy-Wasm module",
-        )?;
-    }
-    if let Some(attestation) = &source.attestation {
-        verify_wasm_attestation(attestation, config_dir, expected_digest)?;
-    }
-    Ok(())
+        )?)
+    } else {
+        None
+    };
+    let attestation = source
+        .attestation
+        .as_ref()
+        .map(|attestation| verify_wasm_attestation(attestation, config_dir, expected_digest))
+        .transpose()?;
+    Ok(material::ProofIdentity {
+        signer,
+        attestation,
+    })
 }
 
 /// 业务作用：验证 detached Ed25519 signature，确保内容只能由固定 signer 授权。
@@ -4866,14 +4898,14 @@ fn verify_remote_module(
 /// - `config_dir`：解析本地来源
 /// - `label`：提供低敏错误上下文。
 ///
-/// 返回：key 长度、签名长度和密码学验证全部通过时成功，否则返回错误。
+/// 返回：长度和密码学验证通过时返回实际验签公钥；该身份只用于配置比较，不能代替验签。
 fn verify_ed25519_secret(
     payload: &[u8],
     signature_source: &str,
     public_key_source: &str,
     config_dir: &Path,
     label: &str,
-) -> Result<()> {
+) -> Result<[u8; 32]> {
     let signature = crate::security::secret::resolve_text(
         signature_source,
         config_dir,
@@ -4898,7 +4930,8 @@ fn verify_ed25519_secret(
     let key = VerifyingKey::from_bytes(&key_bytes)
         .with_context(|| format!("decode {label} Ed25519 public key"))?;
     key.verify_strict(payload, &signature)
-        .with_context(|| format!("verify {label} Ed25519 signature"))
+        .with_context(|| format!("verify {label} Ed25519 signature"))?;
+    Ok(key_bytes)
 }
 
 #[derive(Deserialize)]
@@ -4924,18 +4957,19 @@ struct InTotoSubject {
 /// - `config_dir`：解析 SecretSource
 /// - `expected_digest`：是最终模块摘要。
 ///
-/// 返回：签名、statement 类型、subject、predicateType 与 builder 全部匹配时成功。
+/// 返回：全部信任约束匹配时返回同次材料与约束身份；不保留完整 statement 副本。
 fn verify_wasm_attestation(
     cfg: &WasmAttestationCfg,
     config_dir: &Path,
     expected_digest: &str,
-) -> Result<()> {
+) -> Result<material::AttestationIdentity> {
     let statement = crate::security::secret::resolve_text(
         cfg.statement.as_str(),
         config_dir,
         "Proxy-Wasm in-toto statement",
     )?;
-    verify_ed25519_secret(
+    let statement_identity = Sha256::digest(statement.as_bytes()).into();
+    let signer = verify_ed25519_secret(
         statement.as_bytes(),
         cfg.signature.as_str(),
         cfg.public_key.as_str(),
@@ -4969,7 +5003,13 @@ fn verify_wasm_attestation(
     if builder_id != cfg.builder_id {
         bail!("Proxy-Wasm attestation builder id does not match trusted configuration");
     }
-    Ok(())
+    Ok(material::AttestationIdentity {
+        statement: statement_identity,
+        signer,
+        predicate_type: cfg.predicate_type.clone(),
+        builder_id: cfg.builder_id.clone(),
+        subject_name: cfg.subject_name.clone(),
+    })
 }
 
 /// 业务作用：规范化完整 SHA-256 十六进制值，避免截断、算法混淆和歧义编码。
