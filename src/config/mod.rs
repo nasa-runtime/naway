@@ -17,6 +17,7 @@ pub(crate) mod monitor;
 pub mod operations;
 pub mod providers;
 pub mod scg;
+pub(crate) mod schema;
 pub mod scripts;
 mod sentinel;
 use sentinel::{load_sentinel_rules, SentinelRouteFilters};

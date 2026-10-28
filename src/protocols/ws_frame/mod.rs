@@ -314,7 +314,7 @@ impl MessageAction {
 }
 
 /// 帧级治理策略。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FramePolicy {
     /// 单帧载荷上限。
     pub max_frame_bytes: u64,

@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
 use http::HeaderValue;
+use sha2::{Digest, Sha256};
 
 use super::Failure;
 
@@ -13,6 +14,7 @@ pub(super) struct Plan {
     client: reqwest::Client,
     endpoint: reqwest::Url,
     authorization: Option<HeaderValue>,
+    ca_identity: Option<[u8; 32]>,
     pub(super) fail_open: bool,
     allow_rewrite: bool,
     include_consumer: bool,
@@ -73,7 +75,7 @@ impl Plan {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(8);
-        if !ca_certificate.is_empty() {
+        let ca_identity = if !ca_certificate.is_empty() {
             ensure!(
                 url.scheme() == "https",
                 "WebSocket plugin CA requires HTTPS"
@@ -84,11 +86,15 @@ impl Plan {
                 "WebSocket plugin CA",
             )?;
             client = client.add_root_certificate(crate::tls::trust::http_ca(pem.as_bytes())?);
-        }
+            Some(Sha256::digest(pem.as_bytes()).into())
+        } else {
+            None
+        };
         Ok(Self {
             client: client.build()?,
             endpoint: url,
             authorization,
+            ca_identity,
             fail_open: *fail_open,
             allow_rewrite: *allow_rewrite,
             include_consumer: *include_consumer,
@@ -237,3 +243,31 @@ impl Plan {
         }
     }
 }
+
+impl PartialEq for Plan {
+    /// 业务作用：比较固定消息外呼的授权、信任和修改权限，连接池活动不影响配置身份。
+    ///
+    /// 参数说明：
+    /// - `other`：已经解析实际凭据与 CA 的候选计划。
+    ///
+    /// 返回：全部冻结声明相同时为真；不发请求或访问连接池状态。
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            client: _,
+            endpoint,
+            authorization,
+            ca_identity,
+            fail_open,
+            allow_rewrite,
+            include_consumer,
+        } = self;
+        endpoint == &other.endpoint
+            && authorization == &other.authorization
+            && ca_identity == &other.ca_identity
+            && fail_open == &other.fail_open
+            && allow_rewrite == &other.allow_rewrite
+            && include_consumer == &other.include_consumer
+    }
+}
+
+impl Eq for Plan {}

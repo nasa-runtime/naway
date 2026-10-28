@@ -126,7 +126,7 @@ impl ConnectTarget {
 }
 
 /// CIDR 前缀。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cidr {
     base: IpAddr,
     prefix: u8,
@@ -207,7 +207,7 @@ fn prefix_match(base: &[u8], addr: &[u8], prefix: u8) -> bool {
 }
 
 /// 主机 allowlist 条目。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum HostRule {
     /// 精确域名(大小写无关)。
     Exact(String),
@@ -216,7 +216,7 @@ enum HostRule {
 }
 
 /// 正向代理目标策略。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ForwardProxyPolicy {
     /// 允许的端口集合。空集表示**不允许任何端口**。
     allowed_ports: Vec<u16>,

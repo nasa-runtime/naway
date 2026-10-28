@@ -20,7 +20,7 @@ use crate::config::model::RequestValidationCfg;
 use crate::{BoxBody, BoxError};
 
 use super::forward::ForwardBody;
-use super::schema::CompiledSchema;
+use crate::config::schema::CompiledSchema;
 
 /// 单 route 允许的最大 schema 校验 body。控制面还能配置更小值；该硬上限约束并发内存。
 const MAX_VALIDATION_BODY_BYTES: u64 = 16 * 1024 * 1024;

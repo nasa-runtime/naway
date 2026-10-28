@@ -33,8 +33,8 @@ use crate::{full_body, BoxBody, BoxError};
 
 use super::forward::ForwardBody;
 use super::request_validation::{buffered_body, collect_bounded, CollectError};
-use super::schema::CompiledSchema;
 use super::{normalize_content_length, strip_body_integrity_headers};
+use crate::config::schema::CompiledSchema;
 
 mod registry;
 mod semantic;

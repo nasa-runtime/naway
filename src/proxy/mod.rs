@@ -17,7 +17,6 @@ mod layers;
 mod observation;
 pub(crate) mod request_validation;
 pub(crate) mod response_contract;
-mod schema;
 #[cfg(feature = "lua-scripts")]
 mod scripts;
 mod traffic;

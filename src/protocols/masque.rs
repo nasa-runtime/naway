@@ -8,6 +8,8 @@
 //!
 //! 因此本模块的每个入口都是先判定、后放行,且默认全部关闭。
 
+mod semantic;
+
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,6 +105,7 @@ pub struct WebTransportPolicy {
     upstream: std::sync::Arc<str>,
     allowed_origins: std::sync::Arc<[String]>,
     roots: std::sync::Arc<tokio_rustls::rustls::RootCertStore>,
+    trust_identity: [u8; 32],
     /// 上游 QUIC 与 session 建立总时限。
     pub connect_timeout_ms: u64,
     /// 单 session stream、DATAGRAM、字节与空闲预算。
@@ -171,10 +174,12 @@ impl WebTransportPolicy {
             "webtransport.max_lifetime_ms must not exceed 7 days"
         );
         let roots = load_webtransport_roots(cfg.ca_file.as_deref(), config_dir)?;
+        let trust_identity = semantic::trust_identity(&roots);
         Ok(Self {
             upstream: std::sync::Arc::from(cfg.upstream.as_str()),
             allowed_origins: allowed_origins.into(),
             roots: std::sync::Arc::new(roots),
+            trust_identity,
             connect_timeout_ms: cfg.connect_timeout_ms,
             budget,
             max_lifetime_ms: cfg.max_lifetime_ms,
@@ -538,7 +543,7 @@ pub async fn resolve_connect_udp(
 // ---------------------------------------------------------------------------
 
 /// 单个 WebTransport 会话的资源预算。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WebTransportBudget {
     /// 会话内允许的最大并发双向流数。
     pub max_bidi_streams: u64,
@@ -881,7 +886,7 @@ impl EarlyDataDenial {
 ///
 /// 业务作用：把显式 early-data 开关与 anti-replay 保留时间固化到不可变
 /// route 快照；方法、认证与 body 互斥门由 Router 在构建同一候选时完成。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EarlyDataRoutePolicy {
     replay_window: Duration,
 }

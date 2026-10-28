@@ -20,7 +20,7 @@ pub(super) enum Failure {
     Drop,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Step {
     Acl {
         consumers: HashSet<String>,
@@ -35,7 +35,7 @@ enum Step {
     External(external::Plan),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Chain(Arc<[Step]>);
 
 pub(super) struct Context<'a> {

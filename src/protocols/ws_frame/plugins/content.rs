@@ -1,15 +1,16 @@
 //! 原生JSON治理在有限工作席位执行；同链复用一棵有界文档，只有修改后的内容需要重新编码。
 
 use super::Failure;
+use crate::config::schema::CompiledSchema;
 use anyhow::{ensure, Result};
 use bytes::Bytes;
 use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use std::{fmt, io::Write, sync::Arc};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Plan {
-    Schema(Arc<jsonschema::Validator>),
+    Schema(Arc<CompiledSchema>),
     Redact(Arc<[String]>),
 }
 
@@ -31,9 +32,7 @@ impl Plan {
     /// 返回：可共享的不可变校验器；复杂度、引用或正则不符合消息预算时拒绝候选。
     pub(super) fn schema(schema: &Value) -> Result<Self> {
         validate_schema(schema, 0, &mut 0)?;
-        let validator = jsonschema::options()
-            .with_pattern_options(jsonschema::PatternOptions::regex())
-            .build(schema)?;
+        let validator = CompiledSchema::build_linear(schema)?;
         Ok(Self::Schema(Arc::new(validator)))
     }
 
