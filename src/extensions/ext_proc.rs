@@ -106,7 +106,9 @@ pub(crate) struct ExtProcMetadata {
 impl ExtProcMetadata {
     /// 业务作用：读取 EPP 等处理器写入的单个字符串决策，不把完整 protobuf 结构暴露给数据面。
     ///
-    /// 参数说明：`namespace` 与 `key` 必须是快照已授权的标准 metadata 身份。
+    /// 参数说明：
+    /// - `namespace`：必须是快照已授权的标准 metadata 身份。
+    /// - `key`：必须是快照已授权的标准 metadata 身份。
     ///
     /// 返回：字段存在且类型为字符串时返回借用；缺失或类型不匹配返回 `None`。
     pub(crate) fn string(&self, namespace: &str, key: &str) -> Option<&str> {
@@ -214,7 +216,8 @@ pub(crate) struct ExtProcError {
 impl std::fmt::Display for ExtProcError {
     /// 业务作用：输出不包含认证材料与业务实体的低敏错误摘要。
     ///
-    /// 参数说明：`formatter` 接收分类和底层安全错误文本。
+    /// 参数说明：
+    /// - `formatter`：接收分类和底层安全错误文本。
     ///
     /// 返回：写入成功或格式化失败。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -225,9 +228,19 @@ impl std::fmt::Display for ExtProcError {
 impl std::error::Error for ExtProcError {}
 
 impl ExtProcError {
+    /// 业务作用：提供已确定的低敏错误类别，供固定指标出口使用。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：分类枚举，不暴露错误正文或改变放行策略。
+    #[cfg(all(feature = "telemetry-otlp", feature = "ext-proc"))]
+    pub(crate) fn class(&self) -> ExtProcErrorClass {
+        self.class
+    }
     /// 业务作用：构造一个可由 `fail_open` 覆盖的依赖故障。
     ///
-    /// 参数说明：`source` 是不含敏感数据的底层原因。
+    /// 参数说明：
+    /// - `source`：是不含敏感数据的底层原因。
     ///
     /// 返回：分类为 Dependency 的错误。
     pub(crate) fn dependency(source: impl Into<anyhow::Error>) -> Self {
@@ -239,7 +252,8 @@ impl ExtProcError {
 
     /// 业务作用：构造一个必须失败闭合的处理器协议错误。
     ///
-    /// 参数说明：`source` 描述错序、畸形或越权行为。
+    /// 参数说明：
+    /// - `source`：描述错序、畸形或越权行为。
     ///
     /// 返回：分类为 Protocol 的错误。
     pub(crate) fn protocol(source: impl Into<anyhow::Error>) -> Self {
@@ -251,7 +265,8 @@ impl ExtProcError {
 
     /// 业务作用：构造一个必须失败闭合的本地输入或资源越界错误。
     ///
-    /// 参数说明：`source` 描述输入拒绝原因。
+    /// 参数说明：
+    /// - `source`：描述输入拒绝原因。
     ///
     /// 返回：分类为 Input 的错误。
     pub(crate) fn input(source: impl Into<anyhow::Error>) -> Self {
@@ -263,7 +278,7 @@ impl ExtProcError {
 
     /// 业务作用：判断失败是否属于操作者明确允许放行的外部依赖故障。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：只有 Dependency 返回 true。
     pub(crate) fn may_fail_open(&self) -> bool {
@@ -274,9 +289,12 @@ impl ExtProcError {
 impl ExtProcPlan {
     /// 业务作用：把 route 的 External Processing 声明编译为资源有界、权限冻结的运行计划。
     ///
-    /// 参数说明：`cfg` 是 route 声明；`config_dir` 解析认证 SecretSource；`route_id` 只用于错误定位；
-    /// `frozen_identity_headers` 是本地认证已拥有、扩展服务不得修改的动态 header 集合；
-    /// `inference_endpoint_picker` 只为已经绑定 InferencePool 的控制器路由启用全双工 EPP 语义。
+    /// 参数说明：
+    /// - `cfg`：是 route 声明
+    /// - `config_dir`：解析认证 SecretSource
+    /// - `route_id`：只用于错误定位
+    /// - `frozen_identity_headers`：是本地认证已拥有、扩展服务不得修改的动态 header 集合
+    /// - `inference_endpoint_picker`：只为已经绑定 InferencePool 的控制器路由启用全双工 EPP 语义。
     ///
     /// 返回：配置自洽且制品带 `ext-proc` feature 时返回计划，否则拒绝候选快照。
     pub(crate) fn build(
@@ -340,7 +358,7 @@ impl ExtProcPlan {
             let authorization = if cfg.authorization.trim().is_empty() {
                 None
             } else {
-                let secret = crate::secret::resolve_text(
+                let secret = crate::security::secret::resolve_text(
                     cfg.authorization.as_str(),
                     config_dir,
                     &format!("route `{route_id}` ext_proc authorization"),
@@ -408,7 +426,7 @@ impl ExtProcPlan {
 
     /// 业务作用：在建流前同时取得 route 并发槽和 circuit 探测权威。
     ///
-    /// 参数说明：`self` 必须来自当前 route 快照的共享计划。
+    /// 参数说明: 无。
     ///
     /// 返回：容量可用且 circuit 允许时返回 RAII permit；否则返回可分类依赖故障。
     pub(crate) fn acquire(self: &Arc<Self>) -> Result<ExtProcPermit, ExtProcError> {
@@ -454,7 +472,7 @@ impl ExtProcPlan {
 
     /// 业务作用：判断当前 route 是否允许依赖故障绕过处理器。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：只反映显式配置，不改变 circuit 状态。
     pub(crate) fn fail_open(&self) -> bool {
@@ -463,7 +481,7 @@ impl ExtProcPlan {
 
     /// 业务作用：暴露已校验的扩展 service 目标，供普通 upstream 选择器复用。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：固定直连 origin 或 `lb://service`。
     pub(crate) fn upstream(&self) -> &str {
@@ -472,7 +490,7 @@ impl ExtProcPlan {
 
     /// 业务作用：提供标准 ExternalProcessor.Process 路径，禁止配置把流发往任意方法。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：Envoy v3 标准 gRPC method path。
     pub(crate) const fn process_path(&self) -> &'static str {
@@ -481,7 +499,7 @@ impl ExtProcPlan {
 
     /// 业务作用：为扩展连接注入独立 SecretSource 凭据，不暴露给业务请求。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：存在配置时返回敏感 HeaderValue 借用。
     pub(crate) fn authorization(&self) -> Option<&HeaderValue> {
@@ -490,7 +508,7 @@ impl ExtProcPlan {
 
     /// 业务作用：提供单 phase 响应 deadline。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：已校验非零时长。
     pub(crate) fn message_timeout(&self) -> Duration {
@@ -499,7 +517,7 @@ impl ExtProcPlan {
 
     /// 业务作用：提供整条扩展流总 deadline。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：不短于单 phase 的已校验时长。
     pub(crate) fn total_timeout(&self) -> Duration {
@@ -508,7 +526,7 @@ impl ExtProcPlan {
 
     /// 业务作用：向协议编解码层提供单消息与累计字节硬门。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：`(max_message_bytes, max_total_bytes)`。
     pub(crate) fn wire_limits(&self) -> (usize, usize) {
@@ -517,7 +535,7 @@ impl ExtProcPlan {
 
     /// 业务作用：限制请求或响应 body 进入扩展处理路径的累计字节。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：已校验 body 上限。
     pub(crate) fn max_body_bytes(&self) -> usize {
@@ -526,7 +544,7 @@ impl ExtProcPlan {
 
     /// 业务作用：暴露构建期冻结的相位选择，供请求状态机决定唯一消息顺序。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：request/response header、body 与 trailer 模式元组。
     pub(crate) fn phases(
@@ -551,7 +569,8 @@ impl ExtProcPlan {
 
     /// 业务作用：判断处理器返回的普通 header 是否落在当前路由的 mutation 权限内。
     ///
-    /// 参数说明：`name` 是已通过 HTTP 语法解析的 header 名。
+    /// 参数说明：
+    /// - `name`：是已通过 HTTP 语法解析的 header 名。
     ///
     /// 返回：普通路由只允许显式 allowlist；受控 InferencePool EPP 可回送非冻结请求头并重算 Content-Length。
     pub(crate) fn may_mutate_header(&self, name: &HeaderName) -> bool {
@@ -566,7 +585,7 @@ impl ExtProcPlan {
 
     /// 业务作用：标识标准 InferencePool EPP 的全双工 buffered request 契约。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：只有控制器生成并由 InferencePool 路由门复验的计划返回 true。
     pub(crate) fn pipelines_buffered_request_body(&self) -> bool {
@@ -575,7 +594,8 @@ impl ExtProcPlan {
 
     /// 业务作用：判断动态 metadata 顶层 namespace 是否允许写入当前请求上下文。
     ///
-    /// 参数说明：`namespace` 是处理器响应顶层键。
+    /// 参数说明：
+    /// - `namespace`：是处理器响应顶层键。
     ///
     /// 返回：显式 allowlist 命中时为 true。
     pub(crate) fn may_write_metadata(&self, namespace: &str) -> bool {
@@ -585,8 +605,9 @@ impl ExtProcPlan {
     #[cfg(feature = "ext-proc")]
     /// 业务作用：编码首个 request_headers 消息，并创建仍受 route permit 约束的请求会话。
     ///
-    /// 参数说明：`wire` 是普通 upstream 已建立的 gRPC transport；`permit` 持有并发和 circuit 权威；
-    /// `parts` 是经认证授权后的请求 head；`end_of_stream` 表示没有后续 body/trailer。
+    /// 参数说明：
+    /// - `wire`：普通上游已建立的 gRPC 传输。
+    /// - `permit`：会话存活期间持有的并发配额与熔断权威。
     ///
     /// 返回：首个消息已由 transport 发送时返回共享会话；本地编码越界返回 Input 错误。
     pub(crate) fn start_session(
@@ -613,8 +634,9 @@ impl ExtProcPlan {
 impl ExtProcWire {
     /// 业务作用：封装已建立的 gRPC request sender 与 response body，并初始化有界解帧状态。
     ///
-    /// 参数说明：`sender` 写入 HTTP/2 request DATA；`response_wait` 在上游 response head 到达后
-    /// 提供 DATA/trailers，不要求服务端先发 response head 才能发送首条业务消息。
+    /// 参数说明：
+    /// - `sender`：写入 HTTP/2 request DATA
+    /// - `response_wait`：在上游 response head 到达后 提供 DATA/trailers，不要求服务端先发 response head 才能发送首条业务消息。
     ///
     /// 返回：可按 protobuf 消息边界发送和接收的 wire。
     pub(crate) fn new(
@@ -632,7 +654,8 @@ impl ExtProcWire {
 
     /// 业务作用：发送一条已编码 protobuf 消息，并保留 HTTP/2 channel 背压。
     ///
-    /// 参数说明：`message` 是不含 gRPC 五字节 envelope 的 protobuf bytes。
+    /// 参数说明：
+    /// - `message`：是不含 gRPC 五字节 envelope 的 protobuf bytes。
     ///
     /// 返回：发送成功返回 envelope 字节数；request stream 已关闭时返回 Dependency 错误。
     async fn send(&mut self, message: Bytes) -> Result<usize, ExtProcError> {
@@ -655,7 +678,8 @@ impl ExtProcWire {
 
     /// 业务作用：读取恰好一条未压缩 gRPC response message，并验证 framing 与最终状态。
     ///
-    /// 参数说明：`max_message_bytes` 是当前 route 单消息硬门。
+    /// 参数说明：
+    /// - `max_message_bytes`：是当前 route 单消息硬门。
     ///
     /// 返回：成功返回 protobuf bytes 和 wire 字节数；压缩、超限、截断与非零状态分类失败。
     async fn receive(&mut self, max_message_bytes: usize) -> Result<(Bytes, usize), ExtProcError> {
@@ -740,7 +764,7 @@ impl ExtProcWire {
 
     /// 业务作用：关闭本请求发送方向，使处理器能观察正常半关闭并释放流状态。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：无返回值；response body 继续由 Drop 取消或读取最终状态。
     fn close_send(&mut self) {
@@ -752,7 +776,7 @@ impl ExtProcWire {
 impl ExtProcSession {
     /// 业务作用：判断会话是否因可放行依赖故障进入永久 bypass，后续相位不得再次访问处理器。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：已 bypass 返回 true。
     pub(crate) fn bypassed(&self) -> bool {
@@ -761,7 +785,8 @@ impl ExtProcSession {
 
     /// 业务作用：把依赖故障记入 circuit，并在显式 `fail_open` 时将当前请求切换为纯透传。
     ///
-    /// 参数说明：`error` 必须来自发送、超时或服务状态等可分类依赖失败。
+    /// 参数说明：
+    /// - `error`：必须来自发送、超时或服务状态等可分类依赖失败。
     ///
     /// 返回：允许绕过时返回 true；协议与输入错误或未配置放行时返回 false。
     pub(crate) fn apply_failure(&mut self, error: &ExtProcError) -> bool {
@@ -778,7 +803,11 @@ impl ExtProcSession {
 
     /// 业务作用：发送一个 HTTP phase 并只接受同 phase 的唯一标准响应。
     ///
-    /// 参数说明：`phase` 固定 oneof 类型；`head`、`body`、`trailers` 只使用与 phase 对应的一个输入。
+    /// 参数说明：
+    /// - `phase`：固定 oneof 类型
+    /// - `head`：只使用与 phase 对应的一个输入。
+    /// - `body`：只使用与 phase 对应的一个输入。
+    /// - `trailers`：只使用与 phase 对应的一个输入。
     ///
     /// 返回：有效响应返回原子动作；依赖、超时、错序、重复语义或越权 mutation 分类失败。
     pub(crate) async fn process(
@@ -798,8 +827,9 @@ impl ExtProcSession {
     /// 业务作用：按 Inference EPP 全双工合同连续发送 request headers 与 buffered body，
     /// 再按协议顺序接收两个响应，避免处理器等待完整调度输入时形成相位互锁。
     ///
-    /// 参数说明：`head` 是完整请求头及其 EoS 事实；`body` 是有界收集后的实体，只有非 EoS
-    /// 请求才会发送 body phase。
+    /// 参数说明：
+    /// - `head`：是完整请求头及其 EoS 事实
+    /// - `body`：是有界收集后的实体，只有非 EoS 请求才会发送 body phase。
     ///
     /// 返回：返回 header 动作和可选 body 动作；错序、超时、越权 mutation 或非 EPP 计划均失败。
     pub(crate) async fn process_pipelined_request(
@@ -834,10 +864,38 @@ impl ExtProcSession {
 
     /// 业务作用：编码并发送单个 External Processing phase，统一首消息模式声明和累计发送预算。
     ///
-    /// 参数说明：`phase` 与三类输入必须匹配，首条消息会携带冻结的 ProtocolConfiguration。
+    /// 参数说明：
+    /// - `phase`：当前 ProcessingRequest 相位。
+    /// - `head`：仅用于头部相位的请求或响应 head。
+    /// - `body`：仅用于正文相位的字节与结束状态。
+    /// - `trailers`：仅用于 trailer 相位的字段集合。
     ///
     /// 返回：消息在 deadline 内写入 HTTP/2 流时成功；编码、预算、连接或超时失败时分类返回。
     async fn send_phase(
+        &mut self,
+        phase: ExtProcPhase,
+        head: Option<(&Method, &Uri, &HeaderMap, bool)>,
+        body: Option<(&Bytes, bool)>,
+        trailers: Option<&HeaderMap>,
+    ) -> Result<(), ExtProcError> {
+        #[cfg(feature = "telemetry-otlp")]
+        let mut observed = crate::observability::metrics::governance::Exchange::new(false);
+        let result = self.send_phase_inner(phase, head, body, trailers).await;
+        #[cfg(feature = "telemetry-otlp")]
+        observed.finish(&result);
+        result
+    }
+
+    /// 业务作用：按原始相位状态机执行编码、发送和预算检查，完成值由外层统一观测。
+    ///
+    /// 参数说明：
+    /// - `phase`：是同一冻结请求的当前相位输入。
+    /// - `head`：是同一冻结请求的当前相位输入。
+    /// - `body`：是同一冻结请求的当前相位输入。
+    /// - `trailers`：是同一冻结请求的当前相位输入。
+    ///
+    /// 返回：发送成功或分类错误；取消直接释放网络等待。
+    async fn send_phase_inner(
         &mut self,
         phase: ExtProcPhase,
         head: Option<(&Method, &Uri, &HeaderMap, bool)>,
@@ -875,10 +933,29 @@ impl ExtProcSession {
     /// 业务作用：读取并提交当前预期 phase；普通处理器只接受一条响应，Inference EPP body
     /// 可按标准 `StreamedBodyResponse` 顺序返回多条分片，由此处在硬上限内合并后再原子交付。
     ///
-    /// 参数说明：`phase` 是状态机当前唯一允许的响应类型。
+    /// 参数说明：
+    /// - `phase`：是状态机当前唯一允许的响应类型。
     ///
     /// 返回：有效响应返回原子动作；超时、畸形、错序或越权响应分类失败。
     async fn receive_phase(&mut self, phase: ExtProcPhase) -> Result<ExtProcAction, ExtProcError> {
+        #[cfg(feature = "telemetry-otlp")]
+        let mut observed = crate::observability::metrics::governance::Exchange::new(true);
+        let result = self.receive_phase_inner(phase).await;
+        #[cfg(feature = "telemetry-otlp")]
+        observed.finish(&result);
+        result
+    }
+
+    /// 业务作用：聚合本相位的有界响应并提交处理器动作，不提前把部分响应交付下游。
+    ///
+    /// 参数说明：
+    /// - `phase`：是当前协议唯一允许的相位。
+    ///
+    /// 返回：完整动作或分类失败；外层观测同时覆盖取消。
+    async fn receive_phase_inner(
+        &mut self,
+        phase: ExtProcPhase,
+    ) -> Result<ExtProcAction, ExtProcError> {
         let mut streamed_body = BytesMut::new();
         loop {
             let action = self.receive_single_phase(phase).await?;
@@ -911,7 +988,8 @@ impl ExtProcSession {
 
     /// 业务作用：读取并校验一个 phase 对应的单条处理器响应，供 EPP body 多响应聚合复用。
     ///
-    /// 参数说明：`phase` 是当前唯一允许的响应 oneof 类型。
+    /// 参数说明：
+    /// - `phase`：是当前唯一允许的响应 oneof 类型。
     ///
     /// 返回：返回尚未记入 circuit 的原子动作；调用方完成整组响应后统一记账。
     async fn receive_single_phase(
@@ -957,7 +1035,7 @@ impl ExtProcSession {
 
     /// 业务作用：正常完成最后一个配置相位后半关闭 request stream。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：无返回值；不等待额外 ProcessingResponse，迟到或重复响应不会进入业务状态。
     pub(crate) fn finish(&mut self) {
@@ -968,7 +1046,8 @@ impl ExtProcSession {
 
     /// 业务作用：保存 streamed request body 阶段的即时响应，交由主请求任务替换尚未发送的上游结果。
     ///
-    /// 参数说明：`response` 已通过 status、header 权限和 body 上限复验。
+    /// 参数说明：
+    /// - `response`：已通过 status、header 权限和 body 上限复验。
     ///
     /// 返回：无返回值；后续重复即时响应按协议错序处理，不覆盖首个决定。
     pub(crate) fn set_pending_immediate(
@@ -987,7 +1066,7 @@ impl ExtProcSession {
 
     /// 业务作用：在同步 request phase 已直接返回即时响应时终止后续 request/response phase。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：无返回值；关闭发送方向并将会话标为不再访问处理器。
     pub(crate) fn finish_after_immediate(&mut self) {
@@ -997,7 +1076,7 @@ impl ExtProcSession {
 
     /// 业务作用：由主请求任务一次性取得 streamed phase 已裁决的即时响应。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：存在时移动返回并清空槽位。
     pub(crate) fn take_pending_immediate(&mut self) -> Option<Response<BoxBody>> {
@@ -1006,7 +1085,7 @@ impl ExtProcSession {
 
     /// 业务作用：导出当前请求已授权的动态 metadata，用于响应扩展和低敏观测消费者。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：共享会话内已验证 namespace 的克隆快照。
     pub(crate) fn metadata(&self) -> ExtProcMetadata {
@@ -1016,7 +1095,8 @@ impl ExtProcSession {
     /// 业务作用：把网关实际选中的上游 endpoint 写入 EPP 可见的标准 `envoy.lb` metadata，
     /// 使响应阶段核对真实承载者，而不是复述请求阶段的建议目标。
     ///
-    /// 参数说明：`endpoint` 是已经完成池成员校验并取得 reservation 的规范 authority。
+    /// 参数说明：
+    /// - `endpoint`：是已经完成池成员校验并取得 reservation 的规范 authority。
     ///
     /// 返回：endpoint 长度在协议硬门内时写入并成功；异常长度返回 Input 错误且不发送响应相位。
     pub(crate) fn set_destination_endpoint_served(
@@ -1044,7 +1124,8 @@ impl ExtProcSession {
 
     /// 业务作用：累计发往处理器的 wire 字节，阻止多相位请求绕过总传输预算。
     ///
-    /// 参数说明：`bytes` 是本次完整 gRPC envelope 字节数。
+    /// 参数说明：
+    /// - `bytes`：是本次完整 gRPC envelope 字节数。
     ///
     /// 返回：累计值仍在硬门内时成功；整数溢出或超限返回 Input 错误。
     fn reserve_sent(&mut self, bytes: usize) -> Result<(), ExtProcError> {
@@ -1060,7 +1141,8 @@ impl ExtProcSession {
 
     /// 业务作用：累计处理器响应 wire 字节，并与已发送字节共同执行整流预算。
     ///
-    /// 参数说明：`bytes` 是本次完整 gRPC envelope 字节数。
+    /// 参数说明：
+    /// - `bytes`：是本次完整 gRPC envelope 字节数。
     ///
     /// 返回：双向累计值仍在硬门内时成功；整数溢出或超限返回 Protocol 错误。
     fn reserve_received(&mut self, bytes: usize) -> Result<(), ExtProcError> {
@@ -1076,7 +1158,8 @@ impl ExtProcSession {
 
     /// 业务作用：只提交处理器获准写入的动态 metadata namespace，防止扩展伪造其它策略状态。
     ///
-    /// 参数说明：`metadata` 是当前 ProcessingResponse 携带的结构化增量。
+    /// 参数说明：
+    /// - `metadata`：是当前 ProcessingResponse 携带的结构化增量。
     ///
     /// 返回：全部 namespace 和值类型合法时原子并入会话；越权或类型错误返回 Protocol 错误。
     fn apply_metadata(
@@ -1111,7 +1194,7 @@ impl ExtProcSession {
 impl ExtProcChanges {
     /// 业务作用：构造没有任何副作用的 continue 结果。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：空 delta。
     fn empty() -> Self {
@@ -1126,7 +1209,8 @@ impl ExtProcChanges {
 
     /// 业务作用：把已完整校验的 header delta 一次性交付，避免解析失败泄漏半套 mutation。
     ///
-    /// 参数说明：`headers` 是当前请求或响应 head。
+    /// 参数说明：
+    /// - `headers`：是当前请求或响应 head。
     ///
     /// 返回：无返回值；所有操作已在响应解析阶段通过权限和语法复验。
     pub(crate) fn apply_headers(&self, headers: &mut HeaderMap) {
@@ -1155,7 +1239,8 @@ impl ExtProcChanges {
 
     /// 业务作用：取得已验证的 body replacement 或 clear 指令。
     ///
-    /// 参数说明：`original` 是当前 phase 的原始 body chunk。
+    /// 参数说明：
+    /// - `original`：是当前 phase 的原始 body chunk。
     ///
     /// 返回：clear 返回空 Bytes，replace 返回处理器 bytes，无 mutation 复用原始 Bytes。
     pub(crate) fn apply_body(&self, original: Bytes) -> Bytes {
@@ -1168,7 +1253,7 @@ impl ExtProcChanges {
 
     /// 业务作用：判断当前 delta 是否已经接管原始实体。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：存在 replacement 或 clear 指令时返回 true。
     pub(crate) fn replaces_body(&self) -> bool {
@@ -1179,7 +1264,7 @@ impl ExtProcChanges {
 impl ExtProcPermit {
     /// 业务作用：在处理器返回有效匹配响应后关闭半开态并清零连续失败。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：无返回值；只更新本 route circuit 状态。
     pub(crate) fn record_success(&mut self) {
@@ -1192,7 +1277,7 @@ impl ExtProcPermit {
 
     /// 业务作用：记录一次扩展依赖故障，并在阈值到达时阻止后续建流直到冷却结束。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：无返回值；不会把协议拒绝或客户端输入计入可放行 circuit。
     pub(crate) fn record_dependency_failure(&mut self) {
@@ -1209,7 +1294,7 @@ impl ExtProcPermit {
 impl Drop for ExtProcPermit {
     /// 业务作用：确保取消、panic 展开或提前返回不会让 half-open 探测权威永久悬挂。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：无返回值；并发槽由字段 Drop 自动归还。
     fn drop(&mut self) {
@@ -1221,7 +1306,8 @@ impl Drop for ExtProcPermit {
 
 /// 业务作用：验证 External Processing 目标只包含固定 origin 或命名 service，不接受动态 path/query。
 ///
-/// 参数说明：`target` 是 route 配置的扩展服务目标。
+/// 参数说明：
+/// - `target`：是 route 配置的扩展服务目标。
 ///
 /// 返回：成功返回去除尾斜杠的稳定目标；非法 scheme、userinfo、path、query 或 fragment 返回错误。
 fn compile_target(target: &str) -> Result<String> {
@@ -1255,7 +1341,8 @@ fn compile_target(target: &str) -> Result<String> {
 
 /// 业务作用：把 mutation header 字符串编译为唯一且无安全冻结项的权限集合。
 ///
-/// 参数说明：`raw` 是 route 显式 allowlist。
+/// 参数说明：
+/// - `raw`：是 route 显式 allowlist。
 ///
 /// 返回：全部名称合法且安全时返回集合；重复、越界或敏感头返回错误。
 fn compile_headers(raw: &[String]) -> Result<HashSet<HeaderName>> {
@@ -1278,7 +1365,8 @@ fn compile_headers(raw: &[String]) -> Result<HashSet<HeaderName>> {
 
 /// 业务作用：冻结路由、身份、连接语义与实体 framing，避免处理器通过 header mutation 越权。
 ///
-/// 参数说明：`name` 是已规范化的小写 HTTP header 名。
+/// 参数说明：
+/// - `name`：是已规范化的小写 HTTP header 名。
 ///
 /// 返回：属于 hop-by-hop、伪头、身份凭据、目标或 framing 时返回 true。
 fn forbidden_mutation_header(name: &HeaderName) -> bool {
@@ -1312,18 +1400,24 @@ fn forbidden_mutation_header(name: &HeaderName) -> bool {
 /// 业务作用：暴露 External Processing Authorization SecretSource 的本地文件依赖，使配置热更新
 /// 与当前 route 快照保持同一代。
 ///
-/// 参数说明：`config_dir` 是主配置目录；`cfg` 提供可选认证来源。
+/// 参数说明：
+/// - `config_dir`：是主配置目录
+/// - `cfg`：提供可选认证来源。
 ///
 /// 返回：文件型 SecretSource 返回规范依赖路径，其它来源返回 None。
 pub(crate) fn dependency_path(config_dir: &Path, cfg: &ExtProcCfg) -> Option<std::path::PathBuf> {
-    crate::secret::dependency_path(cfg.authorization.as_str(), config_dir)
+    crate::security::secret::dependency_path(cfg.authorization.as_str(), config_dir)
 }
 
 #[cfg(feature = "ext-proc")]
 /// 业务作用：把 HTTP phase 映射为 Envoy v3 `ProcessingRequest` 的唯一 oneof，并携带已授权 metadata。
 ///
-/// 参数说明：`phase` 决定唯一 payload；`head`、`body`、`trailers` 必须与 phase 精确对应；
-/// `metadata` 是前序响应积累的 namespace 快照。
+/// 参数说明：
+/// - `phase`：决定唯一 payload
+/// - `head`：必须与 phase 精确对应
+/// - `body`：必须与 phase 精确对应
+/// - `trailers`：必须与 phase 精确对应
+/// - `metadata`：是前序响应积累的 namespace 快照。
 ///
 /// 返回：输入组合正确时返回 protobuf 消息；调用错位或 header 编码失败返回 Input 错误。
 fn build_processing_request(
@@ -1397,7 +1491,8 @@ fn build_processing_request(
 #[cfg(feature = "ext-proc")]
 /// 业务作用：向处理器声明本 route 固定的 body 模式，禁止服务端自行扩大可见输入范围。
 ///
-/// 参数说明：`plan` 是候选快照已验证的 phase 计划。
+/// 参数说明：
+/// - `plan`：是候选快照已验证的 phase 计划。
 ///
 /// 返回：首条 ProcessingRequest 携带的标准 ProtocolConfiguration。
 fn protocol_configuration(plan: &ExtProcPlan) -> ProtocolConfiguration {
@@ -1420,7 +1515,9 @@ fn protocol_configuration(plan: &ExtProcPlan) -> ProtocolConfiguration {
 #[cfg(feature = "ext-proc")]
 /// 业务作用：把 HTTP head 编码为 Envoy HeaderMap，并补齐标准 request 伪头供互操作处理器读取。
 ///
-/// 参数说明：`request_line` 存在时提供 method/URI；`headers` 是当前业务 head。
+/// 参数说明：
+/// - `request_line`：存在时提供 method/URI
+/// - `headers`：是当前业务 head。
 ///
 /// 返回：所有值复制进单条 protobuf 消息；累计预算由外层编码后复验。
 fn encode_header_map(
@@ -1444,13 +1541,17 @@ fn encode_header_map(
     for (name, value) in headers {
         encoded.push(raw_header(name.as_str(), value.as_bytes()));
     }
-    Ok(ProtoHeaderMap { headers: encoded })
+    Ok(ProtoHeaderMap {
+        headers: encoded,
+    })
 }
 
 #[cfg(feature = "ext-proc")]
 /// 业务作用：以不损失非 UTF-8 值的 raw_value 形式编码标准 Envoy header。
 ///
-/// 参数说明：`name` 是已验证名称；`value` 是 HTTP header 原始字节。
+/// 参数说明：
+/// - `name`：是已验证名称
+/// - `value`：是 HTTP header 原始字节。
 ///
 /// 返回：只设置一种值编码的 protobuf header。
 fn raw_header(name: &str, value: &[u8]) -> ProtoHeaderValue {
@@ -1464,7 +1565,10 @@ fn raw_header(name: &str, value: &[u8]) -> ProtoHeaderValue {
 #[cfg(feature = "ext-proc")]
 /// 业务作用：验证 `ProcessingResponse` 的 oneof 与当前 phase 精确匹配，并编译全部 mutation。
 ///
-/// 参数说明：`plan` 提供权限白名单；`phase` 是当前等待态；`response` 是唯一收到的消息。
+/// 参数说明：
+/// - `plan`：提供权限白名单
+/// - `phase`：是当前等待态
+/// - `response`：是唯一收到的消息。
 ///
 /// 返回：匹配且全部 mutation 合法时返回原子动作；错序、空响应或越权行为返回 Protocol 错误。
 fn validate_processing_response(
@@ -1525,7 +1629,10 @@ fn validate_processing_response(
 #[cfg(feature = "ext-proc")]
 /// 业务作用：校验通用 phase 响应并把允许的头部和实体变更编译成单次原子提交。
 ///
-/// 参数说明：`plan` 提供权限与 body 模式；`phase` 固定当前状态；`response` 是处理器响应。
+/// 参数说明：
+/// - `plan`：提供权限与 body 模式
+/// - `phase`：固定当前状态
+/// - `response`：是处理器响应。
 ///
 /// 返回：指令和 mutation 均合法时返回 Continue；不支持、错相位或越权行为返回 Protocol 错误。
 fn validate_common_response(
@@ -1584,8 +1691,11 @@ fn validate_common_response(
 #[cfg(feature = "ext-proc")]
 /// 业务作用：复验处理器 header/body mutation 的权限、冲突、语法和资源上限。
 ///
-/// 参数说明：`plan` 提供不可变 allowlist；`mutation` 与 `body_mutation` 是单 phase 增量；
-/// `body_phase` 限定 streamed mutation 只能出现在实体相位。
+/// 参数说明：
+/// - `plan`：提供不可变 allowlist
+/// - `mutation`：是单 phase 增量
+/// - `body_mutation`：是单 phase 增量
+/// - `body_phase`：限定 streamed mutation 只能出现在实体相位。
 ///
 /// 返回：全部操作合法时返回尚未提交的 delta；任一操作非法时不交付任何部分变更。
 fn validate_header_changes(
@@ -1718,7 +1828,9 @@ fn validate_header_changes(
 #[cfg(feature = "ext-proc")]
 /// 业务作用：把 request phase 的 ImmediateResponse 转为有界本地响应并执行同一 mutation 门禁。
 ///
-/// 参数说明：`plan` 提供权限和实体预算；`response` 是处理器要求立即返回的响应。
+/// 参数说明：
+/// - `plan`：提供权限和实体预算
+/// - `response`：是处理器要求立即返回的响应。
 ///
 /// 返回：状态、头和 body 全部合法时返回 Immediate；否则返回 Protocol 错误。
 fn validate_immediate_response(
@@ -1755,7 +1867,9 @@ fn validate_immediate_response(
 #[cfg(feature = "ext-proc")]
 /// 业务作用：在分配 protobuf 缓冲区前执行单消息上限，防止扩展输入制造无界内存增长。
 ///
-/// 参数说明：`message` 是待编码请求；`max_message_bytes` 是 route 硬门。
+/// 参数说明：
+/// - `message`：是待编码请求
+/// - `max_message_bytes`：是 route 硬门。
 ///
 /// 返回：编码成功返回 protobuf bytes；预测或实际编码失败返回 Input 错误。
 fn encode_message<M: Message>(
@@ -1779,7 +1893,8 @@ fn encode_message<M: Message>(
 #[cfg(feature = "ext-proc")]
 /// 业务作用：为未压缩 protobuf 消息添加标准五字节 gRPC envelope。
 ///
-/// 参数说明：`message` 是 protobuf payload。
+/// 参数说明：
+/// - `message`：是 protobuf payload。
 ///
 /// 返回：长度可由 u32 表示时返回完整 DATA payload；否则返回 Input 错误。
 fn encode_grpc_frame(message: Bytes) -> Result<Bytes, ExtProcError> {
@@ -1796,7 +1911,8 @@ fn encode_grpc_frame(message: Bytes) -> Result<Bytes, ExtProcError> {
 #[cfg(feature = "ext-proc")]
 /// 业务作用：严格解析 gRPC 最终状态，避免缺失或畸形状态被当作成功流。
 ///
-/// 参数说明：`headers` 是 HTTP response initial headers 或 trailers。
+/// 参数说明：
+/// - `headers`：是 HTTP response initial headers 或 trailers。
 ///
 /// 返回：合法十进制状态码；缺失、非 ASCII 或非数字返回 Protocol 错误。
 pub(crate) fn parse_grpc_status(headers: &HeaderMap) -> Result<u32, ExtProcError> {
@@ -1815,7 +1931,9 @@ pub(crate) fn parse_grpc_status(headers: &HeaderMap) -> Result<u32, ExtProcError
 #[cfg(feature = "ext-proc")]
 /// 业务作用：按 gRPC 语义区分处理器明确拒绝/协议错误与可选依赖故障。
 ///
-/// 参数说明：`status` 是最终码；`empty_buffer` 表示没有残缺 envelope。
+/// 参数说明：
+/// - `status`：是最终码
+/// - `empty_buffer`：表示没有残缺 envelope。
 ///
 /// 返回：可供 fail_open 门准确决策的分类错误。
 pub(crate) fn classify_grpc_status(status: u32, empty_buffer: bool) -> ExtProcError {

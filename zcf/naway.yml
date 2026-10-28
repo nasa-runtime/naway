@@ -1,5 +1,5 @@
 # Naway 主配置(SCG 风格)。改这个文件,进程 notify 自动热加载;或 `naway -s reload` 手动触发。
-# 配置 schema 版本(架构规范 §6):便于长期演进期迁移;缺省按 v1 处理并告警。
+# 配置 schema 版本:便于长期演进期迁移;缺省按 v1 处理并告警。
 schema_version: 1
 
 server:
@@ -29,16 +29,16 @@ server:
   timeouts:
     upstream_ttfb_timeout_ms: 30000
     header_read_timeout_ms: 30000 # slowloris「只连不发头」防护;0=关闭
-    connection_timeout_ms: 0 # 连接总超时;0=关闭(避免误杀 SSE/h2 长流/大下载,§23)
+    connection_timeout_ms: 0 # 连接总超时;0=关闭(避免误杀 SSE/h2 长流/大下载)
     stream_idle_timeout_ms: 60000 # body/trailer 两帧之间最大空闲;0=关闭
     downstream_write_timeout_ms: 30000 # 下游停止读取导致 write Pending 的上限;0=关闭
     drain_timeout_ms: 30000
 
-# 管理/观测面(只绑内网,与数据面端口隔离):/healthz /readyz(+ 后续 /metrics、admin API)。见 §14.1。
+# 管理/观测面与数据面端口隔离，提供 /healthz、/readyz、/metrics 和 admin API。
 admin:
   listen: "127.0.0.1:18080"
   expose_metrics: true
-  # V4 管理面认证:生产暴露 /readyz、/metrics、/admin/** 前必须开启。
+  # 管理面认证:生产暴露 /readyz、/metrics、/admin/** 前必须开启。
   auth:
     enabled: false
     # secret 支持 env://NAME、file://path、k8s-file://path、vault-agent://path；旧 literal 兼容。
@@ -53,7 +53,7 @@ admin:
 access_log:
   enabled: true
   queue_size: 4096 # bounded try_send 队列;满了丢弃并计 gw_log_dropped_total
-  # V4 自定义 access log:支持 $status / ${status} 变量、条件日志和稳定采样。
+  # 自定义 access log:支持 $status / ${status} 变量、条件日志和稳定采样。
   # format: '$remote_addr "$method $path" $status $elapsed_ms $upstream'
   # if: "$status >= 500"
   # sample: 1.0
@@ -63,7 +63,7 @@ long_connections:
   drain_on_config_change: false
   drain_grace_ms: 0
 
-# V3 nginx set/map/变量系统。默认不开放任意 header/query,避免高基数或敏感字段误用。
+# nginx set/map/变量系统。默认不开放任意 header/query,避免高基数或敏感字段误用。
 variables:
   allow_headers: [] # 例如 ["X-Tenant"] 或 ["*"]
   allow_queries: [] # 例如 ["debug"] 或 ["*"]
@@ -108,7 +108,7 @@ discovery:
     stale_ttl_ms: 30000
     reconnect_backoff_ms: 1000
 
-# V4 统一配置来源:推荐单 dataId 原子 JSON bundle；空 bundle_data_id 保留旧三 dataId 兼容模式。
+# 统一配置来源:推荐单 dataId 原子 JSON bundle；空 bundle_data_id 保留旧三 dataId 兼容模式。
 config_source:
   nacos:
     enabled: false
@@ -127,7 +127,7 @@ config_source:
     materialized_dir: ".gateway-nacos-config"
     reconnect_backoff_ms: 1000
 
-# V3 运行态共享后端。默认 local 无外部依赖;集群共享 `limit_req` 时切 redis。
+# 运行态共享后端。默认 local 无外部依赖;集群共享 `limit_req` 时切 redis。
 runtime_state:
   store:
     backend: file # file|redis;黑名单等低频动态事实源复用它
@@ -159,25 +159,25 @@ runtime_state:
       namespace: "naway"
       profile: "RustV2"
 
-# V3 L4 stream TCP 起步:独立 TCP listener,不跑 HTTP/L7 filter。
+# L4 stream TCP 起步:独立 TCP listener,不跑 HTTP/L7 filter。
 # stream:
 #   listeners:
 #     - id: tcp-echo
 #       listen: "0.0.0.0:19000"
 #       upstream: "127.0.0.1:9000" # 也可写 "lb://demo",复用 upstreams.services 的 round_robin/least_conn/backup/down/Nacos 实例。
-#       # V4 stream SNI preread + 多 route:不终止 TLS,只读 ClientHello 后原样转发。
+#       # stream SNI preread + 多 route:不终止 TLS,只读 ClientHello 后原样转发。
 #       # preread: { ssl_preread: true, timeout_ms: 3000, max_bytes: 8192 }
 #       # routes:
 #       #   - { id: api, sni: "api.example.com", upstream: "127.0.0.1:9443" }
 #       #   - { id: default, default: true, upstream: "lb://demo" }
-#       # V4 stream 上游 PROXY protocol 透传:连接上游后先写真实客户端地址头。
+#       # stream 上游 PROXY protocol 透传:连接上游后先写真实客户端地址头。
 #       # proxy_protocol_to_upstream: { enabled: true, version: "v1" } # v1|v2
 #       connect_timeout_ms: 5000
 #       timeout_ms: 0
 
-# 接口守卫独立配置(相对本文件目录或绝对路径)。见 §8 / interface-guard.yml。
+# 接口守卫独立配置(相对本文件目录或绝对路径)。 / interface-guard.yml。
 interface_guard_file: "interface-guard.yml"
-# Sentinel 流量防护独立规则(相对本文件目录或绝对路径)。见 §10。
+# Sentinel 流量防护独立规则(相对本文件目录或绝对路径)。。
 sentinel_rules_file: "sentinel-rules.yml"
 
 # 静态上游目录;routes[].uri = "lb://demo" 时按 upstream 策略选择 healthy 实例(默认带权轮询)。
@@ -208,51 +208,51 @@ routes:
       - "Method=GET,POST"
     filters:
       - "StripPrefix=1" # 去掉 /api 再转发上游
-      # V3 limit_req:按真实客户端 IP 做令牌桶限流;backend=redis 时为集群共享总 QPS。
+      # limit_req:按真实客户端 IP 做令牌桶限流;backend=redis 时为集群共享总 QPS。
       # - "limit_req key=ip rate=100r/s burst=50 max_active_keys=100000 active_keys_fail=open"
-      # V3/V4 limit_conn:限制同一真实客户端 IP 同时占用的请求/长连接数;runtime_state.rate_limiter.backend=redis 时跨节点共享。
+      # limit_conn:限制同一真实客户端 IP 同时占用的请求/长连接数;runtime_state.rate_limiter.backend=redis 时跨节点共享。
       # - "limit_conn key=ip limit=100"
-      # V4 valid_referers:Referer 防盗链;支持 none、blocked、server_names、精确 host、*.example.com。
+      # valid_referers:Referer 防盗链;支持 none、blocked、server_names、精确 host、*.example.com。
       # - "valid_referers none blocked server_names *.example.com"
-      # V3 limit_except:route 命中后按方法返回 405,区别于 Method predicate 的 no-route。
+      # limit_except:route 命中后按方法返回 405,区别于 Method predicate 的 no-route。
       # - "limit_except GET,POST"
-      # V3 if 安全子集:只支持变量模板比较后 return 固定响应,不支持 rewrite 循环/脚本。
+      # if 安全子集:只支持变量模板比较后 return 固定响应,不支持 rewrite 循环/脚本。
       # - "if ${header.X-Mode} = block return 451 blocked"
-      # V4 auth_basic:route 级 HTTP Basic 鉴权,未认证请求 401 且不打上游。
+      # auth_basic:route 级 HTTP Basic 鉴权,未认证请求 401 且不打上游。
       # - "auth_basic user=admin password=secret realm=ops"
-      # V4 API-Key + satisfy:多认证策略组合,all=全满足,any=任一满足。
+      # API-Key + satisfy:多认证策略组合,all=全满足,any=任一满足。
       # - "satisfy any"
       # - "api_key header=X-Api-Key value=secret"
-      # V4 HMAC-SHA256:签 method + path/query + timestamp + nonce + allowlisted headers,不读取 body。
+      # HMAC-SHA256:签 method + path/query + timestamp + nonce + allowlisted headers,不读取 body。
       # - "hmac_auth secret=secret signature_header=X-Signature timestamp_header=X-Timestamp nonce_header=X-Nonce signed_headers=X-App"
-      # V4 JWT HS256:Bearer token 验签 + iss/aud/exp/nbf 基础校验;JWKS/OIDC 归增强。
+      # JWT HS256:Bearer token 验签 + iss/aud/exp/nbf 基础校验;JWKS/OIDC 归增强。
       # - "jwt_auth secret=jwt-secret issuer=gateway audience=api"
-      # V4 ext_authz/auth_request:head-only 外部鉴权;默认只转发 Authorization,不转发 body。
+      # ext_authz/auth_request:head-only 外部鉴权;默认只转发 Authorization,不转发 body。
       # - "ext_authz uri=lb://authz path=/check headers=Authorization upstream_headers=X-Auth-User timeout_ms=500 fail_open=off"
-      # V3 limit_rate:响应体流式限速;支持 k/m/g 后缀,after 表示前 N 字节不限速。
+      # limit_rate:响应体流式限速;支持 k/m/g 后缀,after 表示前 N 字节不限速。
       # - "LimitRate=1m,after=10m"
-      # V3 sub_filter:响应体流式替换,仅显式启用 route 生效;会移除 Content-Length。
+      # sub_filter:响应体流式替换,仅显式启用 route 生效;会移除 Content-Length。
       # - "sub_filter upstream gateway"
-      # V3/V4 error_page:上游/网关错误状态映射成固定响应或内部 reroute;internal route 外部不可直打。
+      # error_page:上游/网关错误状态映射成固定响应或内部 reroute;internal route 外部不可直打。
       # - "error_page statuses=500,502,503 status=200 body=fallback"
       # - "error_page statuses=500 reroute=/__error"
       # - "internal"
       # - "x_accel_redirect on"
       # - "proxy_intercept_errors off"
-      # V3 proxy_redirect:改写上游 Location/Refresh 响应头。
+      # proxy_redirect:改写上游 Location/Refresh 响应头。
       # - "proxy_redirect http://upstream.local /api"
-      # V3 proxy_cookie:改写 Set-Cookie 的 Domain/Path 属性。
+      # proxy_cookie:改写 Set-Cookie 的 Domain/Path 属性。
       # - "proxy_cookie_domain upstream.local example.com"
       # - "proxy_cookie_path /old /app"
       # - "proxy_cookie_flags sid secure httponly samesite=Lax"
-      # V3 proxy_pass_request_body:关闭时上游收到空 body,并剥离 Content-Length/Transfer-Encoding/Expect。
+      # proxy_pass_request_body:关闭时上游收到空 body,并剥离 Content-Length/Transfer-Encoding/Expect。
       # - "proxy_pass_request_body off"
-      # V4 mirror:fire-and-forget 发送影子请求;默认 body=off,不复制 streaming body;sample 支持 0.0..=1.0。
+      # mirror:fire-and-forget 发送影子请求;默认 body=off,不复制 streaming body;sample 支持 0.0..=1.0。
       # 显式 body=on 只收集有 Content-Length 且不超过 max_body_bytes 的小请求体。
       # - "mirror uri=lb://shadow sample=1.0 body=off"
       # - "mirror uri=lb://shadow sample=1.0 body=on max_body_bytes=64k"
 
-  # V3 静态/SPA route 后端示例:不走上游连接池,直接 tokio::fs 流式回写文件。
+  # 静态/SPA route 后端示例:不走上游连接池,直接 tokio::fs 流式回写文件。
   # - id: web
   #   predicates:
   #     - "Path=/**"

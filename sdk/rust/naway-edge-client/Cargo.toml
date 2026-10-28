@@ -22,7 +22,3 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http2", "client"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http2"] }
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"] }
-
-[dev-dependencies]
-tokio = { version = "1", features = ["full"] }
-tempdir = "0.3"

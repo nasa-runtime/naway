@@ -1,0 +1,374 @@
+syntax = "proto3";
+package naway.management.v1;
+
+// 节点身份来自 mTLS，消息中的身份必须与接收端配置的证书绑定一致。
+service NodeManagement {
+  rpc Open(OpenRequest) returns (OpenResponse);
+  rpc AuthenticateIssuer(IssuerChallenge) returns (IssuerProof);
+  rpc Report(ReportRequest) returns (ReportResponse);
+  rpc Catalog(CatalogRequest) returns (CatalogResponse);
+  rpc Sample(stream SampleRequest) returns (SampleResponse);
+  rpc ActionData(ActionDataRequest) returns (ActionDataResponse);
+  rpc ActionResult(ActionResultRequest) returns (ActionResultResponse);
+  rpc ReleaseResult(ReleaseResultRequest) returns (ReleaseResultResponse);
+}
+
+message OpenRequest {
+  string node_id = 1;
+  string boot_id = 2;
+}
+
+message OpenResponse {
+  bytes session = 1;
+}
+
+// 每次握手独立挑战；证明仅确认当前接收端身份，不授予任何节点动作权限。
+message IssuerChallenge {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  bytes challenge = 4;
+}
+
+message IssuerProof {
+  uint32 schema = 1;
+  string cluster_id = 2;
+  string issuer_node_id = 3;
+  string signature = 4;
+}
+
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  MODE_ADMIN = 1;
+  MODE_DATA = 2;
+  MODE_ALL_IN_ONE = 3;
+  MODE_SIDECAR = 4;
+}
+
+// 当前状态不携带请求、日志、秘密或配置正文；数量表示配置计划。
+message NodeFacts {
+  string node_id = 1;
+  string boot_id = 2;
+  Mode mode = 3;
+  bool ready = 4;
+  uint64 config_version = 5;
+  optional uint64 config_fingerprint = 6;
+  bool discovery_enabled = 7;
+  bool configuration_enabled = 8;
+  uint32 proxies = 9;
+  uint32 routes = 10;
+  uint32 services = 11;
+}
+
+message ReportRequest {
+  bytes session = 1;
+  uint64 sequence = 2;
+  NodeFacts facts = 3;
+  bool metrics_supported = 4;
+  bool metrics_enabled = 5;
+  bool baseline_supported = 6;
+  NodeBaseline node_baseline = 7;
+  PublicationObservation local_publication = 8;
+  bool actions_supported = 9;
+  bool actions_enabled = 10;
+}
+
+// 当前本地文件决定与业务就绪分开；没有历史、路径或恢复命令令牌。
+enum PublicationState {
+  PUBLICATION_STATE_UNSPECIFIED = 0;
+  PUBLICATION_STATE_UNSUPPORTED = 1;
+  PUBLICATION_STATE_DISABLED = 2;
+  PUBLICATION_STATE_UNINITIALIZED = 3;
+  PUBLICATION_STATE_UNAVAILABLE = 4;
+  PUBLICATION_STATE_PROTECTED = 5;
+  PUBLICATION_STATE_IDLE = 6;
+  PUBLICATION_STATE_PREPARING = 7;
+  PUBLICATION_STATE_FORWARD = 8;
+  PUBLICATION_STATE_BACKWARD = 9;
+}
+
+message PublicationStorage {
+  string cluster_id = 1;
+  string store_id = 2;
+  uint64 node_admission_epoch = 3;
+  uint64 revision = 4;
+  optional string operation_id = 5;
+}
+
+message PublicationObservation {
+  uint32 schema = 1;
+  PublicationState state = 2;
+  PublicationStorage storage = 3;
+}
+
+// 与同一报告的节点、启动身份和配置绑定；原文摘要不代替完整依赖及当前授权。
+message NodeBaseline {
+  uint32 schema = 1;
+  string cluster_id = 2;
+  string store_id = 3;
+  uint64 node_admission_epoch = 4;
+  bytes documents_sha256 = 5;
+}
+
+message ReportResponse {
+  uint64 accepted_sequence = 1;
+  uint32 metrics_interest_ms = 2;
+  ActionOffer action = 3;
+  ReleaseOffer release = 4;
+}
+
+// 命令没有 JSON 或候选正文，固定身份必须由双方重新派生并验证独立签名。
+enum ActionDomain {
+  ACTION_DOMAIN_UNSPECIFIED = 0;
+  ACTION_DOMAIN_GATEWAY = 1;
+  ACTION_DOMAIN_SENTINEL = 2;
+  ACTION_DOMAIN_INTERFACE_GUARD = 3;
+}
+
+enum ActionPhase {
+  ACTION_PHASE_UNSPECIFIED = 0;
+  ACTION_PHASE_EXECUTE = 1;
+  ACTION_PHASE_RESOLVE = 2;
+  ACTION_PHASE_COMPENSATE = 3;
+}
+
+message ActionIdentity {
+  string saga_id = 1;
+  string tenant_id = 2;
+  string workflow = 3;
+  uint32 definition_version = 4;
+  string definition_digest = 5;
+  string step = 6;
+  ActionPhase phase = 7;
+  uint32 attempt = 8;
+  string effect_id = 9;
+  string command_id = 10;
+  optional string recovery_operation_id = 11;
+}
+
+message ActionIntent {
+  string operation_id = 1;
+  uint64 proposal_epoch = 2;
+  uint32 target_index = 3;
+  uint32 target_count = 4;
+  ActionDomain domain = 5;
+  string node_id = 6;
+  string original_boot_id = 7;
+  NodeBaseline baseline = 8;
+  uint64 base_version = 9;
+  uint64 base_fingerprint = 10;
+  uint32 candidate_bytes = 11;
+  bytes candidate_sha256 = 12;
+  string scope = 13;
+  string creator = 14;
+  string reviewer = 15;
+  bytes authority_sha256 = 16;
+}
+
+// 当前 session 和接收 boot 只约束此次交付，不改变稳定业务意图。
+message ActionDelivery {
+  string issuer_node_id = 1;
+  string receiving_boot_id = 2;
+  uint64 fence = 3;
+  bytes session = 4;
+  uint64 issued_at_ms = 5;
+  uint64 expires_at_ms = 6;
+  // 只在 Resolve 中查询补偿效果，必须与该次投递签名一起验证。
+  bool resolve_compensation = 7;
+}
+
+message ActionOffer {
+  uint32 schema = 1;
+  ActionIdentity identity = 2;
+  ActionIntent intent = 3;
+  ActionDelivery delivery = 4;
+  string signature = 5;
+}
+
+// offer_id 是完整动作签名域的摘要，旧会话的正文不能用于另一投递。
+message ActionDataRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  string offer_id = 4;
+  uint32 offset = 5;
+}
+
+message ActionDataResponse {
+  string offer_id = 1;
+  uint32 offset = 2;
+  bytes body = 3;
+  bool eof = 4;
+}
+
+// Pending 与 Gone 不构成稳定效果，不能据此推进工作流或释放节点材料。
+enum ActionOutcome {
+  ACTION_OUTCOME_UNSPECIFIED = 0;
+  ACTION_OUTCOME_SUCCEEDED = 1;
+  ACTION_OUTCOME_REJECTED = 2;
+  ACTION_OUTCOME_HALTED = 3;
+  ACTION_OUTCOME_PENDING = 4;
+  ACTION_OUTCOME_GONE = 5;
+}
+
+enum ActionReason {
+  ACTION_REASON_UNSPECIFIED = 0;
+  ACTION_REASON_CANDIDATE_INVALID = 1;
+  ACTION_REASON_BASELINE_CHANGED = 2;
+  ACTION_REASON_PUBLICATION_CONFLICT = 3;
+  ACTION_REASON_AUTHORITY_CHANGED = 4;
+  ACTION_REASON_GATE_HALTED = 5;
+  ACTION_REASON_PREPARATION_INTERRUPTED = 6;
+  ACTION_REASON_EFFECT_NOT_ADMITTED = 7;
+}
+
+// 完整业务身份从发行端保留的 offer 派生，节点不能替换结果所属命令。
+message ActionResultRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  string offer_id = 4;
+  ActionOutcome outcome = 5;
+  ActionReason reason = 6;
+}
+
+message ActionResultResponse {
+  string accepted_offer_id = 1;
+}
+
+// 终态释放独立于工作流效果，只关闭原代际，不宣称配置仍然活动。
+enum ReleaseTerminal {
+  RELEASE_TERMINAL_UNSPECIFIED = 0;
+  RELEASE_TERMINAL_COMPLETED = 1;
+  RELEASE_TERMINAL_COMPENSATED = 2;
+}
+
+message ReleaseOffer {
+  uint32 schema = 1;
+  ActionIntent intent = 2;
+  string definition_digest = 3;
+  ReleaseTerminal terminal = 4;
+  ActionDelivery delivery = 5;
+  string signature = 6;
+}
+
+// 关闭事实必须精确匹配原释放；缺失字段或 closed=false 不构成确认。
+message ReleaseResultRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  string release_id = 4;
+  bytes intent_sha256 = 5;
+  string store_id = 6;
+  uint64 node_admission_epoch = 7;
+  bool closed = 8;
+}
+
+message ReleaseResultResponse {
+  string accepted_release_id = 1;
+}
+
+// 每次流只携带当前累计样本；完整摘要与EOF通过后才对观察者可见。
+message MetricLabel {
+  string key = 1;
+  string value = 2;
+}
+
+message MetricReading {
+  string name = 1;
+  repeated MetricLabel labels = 2;
+  oneof value {
+    uint64 counter = 3;
+    double gauge = 4;
+  }
+}
+
+message MetricCapability {
+  string name = 1;
+  bool enabled = 2;
+}
+
+message SampleHeader {
+  NodeFacts facts = 1;
+  uint64 sampled_at_ms = 2;
+  uint64 elapsed_ms = 3;
+  uint64 sampling_period_ms = 4;
+  uint64 age_ms = 5;
+  uint32 total = 6;
+  repeated uint64 bounds_ms = 7;
+  repeated uint64 buckets = 8;
+  uint64 sum_micros = 9;
+  repeated MetricCapability capabilities = 10;
+  optional bool route_capacity = 11;
+  uint32 route_total = 12;
+}
+
+// 入口事实随配置所有者变化；固定数组顺序由协议约定，不能携带任意客户维度。
+message RouteTraffic {
+  string proxy = 1;
+  string route = 2;
+  string workspace = 3;
+  uint64 requests = 4;
+  uint64 active = 5;
+  repeated uint64 responses = 6;
+  uint64 bytes = 7;
+  repeated uint64 outcomes = 8;
+  uint64 duration_micros = 9;
+  repeated uint64 buckets = 10;
+}
+
+message SampleRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  uint64 sample_id = 4;
+  bytes digest = 5;
+  uint32 offset = 6;
+  SampleHeader header = 7;
+  repeated MetricReading readings = 8;
+  repeated RouteTraffic routes = 9;
+}
+
+message SampleResponse {
+  uint64 accepted_sample_id = 1;
+}
+
+// 只传公开目录字段；完整分片集合验证后才替换当前目录。
+message CatalogEntry {
+  string kind = 1;
+  string id = 2;
+  string parent = 3;
+  string workspace = 4;
+  string tenant = 5;
+  string environment = 6;
+  string service = 7;
+  sint32 order = 8;
+  uint64 flags = 9;
+}
+
+// 工作区读取证明与同代对象目录一起发布，不能把旧权限用于新对象。
+message ScopeAuthority {
+  string workspace = 1;
+  bytes digest = 2;
+}
+
+message CatalogRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  uint64 config_version = 4;
+  optional uint64 config_fingerprint = 5;
+  bytes digest = 6;
+  uint32 total = 7;
+  uint32 offset = 8;
+  bool capacity = 9;
+  repeated CatalogEntry entries = 10;
+  bool scope_supported = 11;
+  bytes scope_digest = 12;
+  repeated ScopeAuthority scopes = 13;
+}
+
+message CatalogResponse {
+  uint32 next_offset = 1;
+  bool complete = 2;
+}

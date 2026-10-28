@@ -3,36 +3,58 @@ name = "naway"
 version = "0.1.0"
 edition = "2021"
 publish = false
+autotests = false
 authors = ["Naway contributors"]
 license = "Apache-2.0 OR MIT"
 description = "高性能、资源有界的 Rust 流量与业务网关，支持原生 gRPC 边缘散出与多种集群传输。"
 repository = "https://github.com/nasa-runtime/naway"
 homepage = "https://github.com/nasa-runtime/naway"
-documentation = "https://github.com/nasa-runtime/naway/tree/main/docs"
+documentation = "https://github.com/nasa-runtime/naway/tree/master/docs"
 readme = "README.md"
 keywords = ["gateway", "grpc", "reverse-proxy", "redis", "service-mesh"]
 categories = ["network-programming", "web-programming::http-server"]
+exclude = ["zcf/.gateway-config-history/**"]
 
 [features]
+# 跨管理节点共享候选与审批事实；关闭时不编译 PostgreSQL 或创建持久操作资源。
+admin-operations-pgsql = ["nasa/tx-pgsql", "nasa/idempotency-pgsql", "dep:sqlx"]
+# 集群工作流复用 NASA 唯一状态机，与提案共享同一 PostgreSQL 事务域。
+admin-operations-workflow-pgsql = ["admin-operations-pgsql", "nasa/saga-runtime-pgsql", "dep:nasaga-backend"]
+# 节点管理采用独立受管 mTLS gRPC，关闭时不编译生成协议或创建管理连接。
+admin-grpc = ["nasa/grpc", "dep:nagrpc", "dep:nagrpc-build"]
+# 节点持久动作目录的身份与独占 owner；不引入管理数据库。
+node-journal = ["admin-grpc"]
+# 节点配置命令只复用中性 Saga 身份合同，不装配管理数据库运行态。
+node-actions = ["node-journal", "nasa/saga", "dep:nasaga-runtime-core"]
+# 原生 ORCA 带外反馈复用 HTTP/2 上游传输，关闭时不启动订阅任务。
+upstream-orca = []
 default = []
-# Compile the real nacos-sdk transport through the nasa facade. Without this
-# feature the Nacos API is present, but enabling discovery at runtime fails fast.
+# 将明确支持的 Spring Cloud Gateway 声明编译为原生路由，不启动额外数据面执行器。
+scg-compat = []
+# 实例窗口统计与恢复探测；默认制品不携带窗口状态机，显式配置会拒绝构建候选。
+upstream-outlier = []
+# 仅为请求次数准入启用共享预扣与有期限的本地额度，不改变成本结算后端。
+rate-preallocation = ["redis-runtime"]
+# 通过 nasa 门面启用 Nacos SDK 传输；关闭时保留配置模型，启用运行时发现则拒绝启动。
 nacos-sdk = ["nasa/nacos-sdk"]
-# Enable Redis-backed runtime state primitives used by V3 Sentinel shared limiters.
+# 启用共享限流、熔断和动态状态需要的 Redis 原语。
 redis-runtime = ["nasa/redis"]
-# Enable the optional V5 native Kafka access-log sink through the nasa facade.
-# HTTP/Elasticsearch/Loki sinks do not require this feature.
+# 通过 nasa 门面启用 Kafka 访问日志出口；HTTP、Elasticsearch、Loki 出口无需此特性。
 log-kafka = ["nasa/kafka"]
-# V8 gRPC edge mode gate。覆盖统一契约、Subscribe/Publish/Push、静态或 Nacos relay、
+# gRPC edge 制品门。覆盖统一契约、Subscribe/Publish/Push、静态或 Nacos relay、
 # mTLS、SessionDirectory、interest auto 与 Redis 两类入口；未编此 feature 时，配置 edge
 # route/relay 会在快照构建期 fail-fast，普通 L7 路径不受影响。
 grpc-edge = []
 # HTTP/3/QUIC 独立制品门；关闭时不编译 QUIC/H3 transport，也不在 TCP/H2 热路径
 # 创建 UDP task。配置启用但制品未带本 feature 时必须在快照构建期 fail-fast。
 http3 = ["dep:h3", "dep:h3-datagram", "dep:h3-quinn", "dep:h3-webtransport", "dep:quinn", "dep:wtransport"]
-# V10 xDS v3 client 独立制品门；Envoy protobuf、ADS gRPC transport 与状态机只在该
+# xDS v3 client 独立制品门；Envoy protobuf、ADS gRPC transport 与状态机只在该
 # feature 中编译。默认 core 仍只解析并拒绝越权 xDS 配置，不携带 tonic/prost 代码。
 xds-client = ["dep:prost", "dep:prost-types", "dep:tonic", "dep:tonic-prost", "dep:tokio-stream"]
+# 命名 ECDS 只允许空 Router；不加载任意扩展代码，也不扩大其它资源的字段白名单。
+xds-client-extensions = ["xds-client"]
+# 独立管理服务端只投影已发布的原生快照；默认不编译 ADS 服务或绑定其监听端口。
+xds-server = ["dep:prost", "dep:prost-types", "dep:tonic", "dep:tonic-prost", "dep:tokio-stream"]
 # Descriptor 解析与动态 protobuf JSON 只进入显式制品；普通 native gRPC 转发不携带反射运行时。
 grpc-descriptor = ["dep:prost", "dep:prost-types", "dep:prost-reflect"]
 # 启用 Dubbo2 Hessian2 泛化调用 codec；关闭时不编译 Hessian2 数据面，相关配置在快照构建期拒绝。
@@ -58,25 +80,44 @@ ext-proc = ["dep:prost", "dep:prost-types"]
 gateway-api-experimental = []
 # Gateway API Inference Extension 通过标准 External Processing 协议调用 EPP；两个能力必须同制品交付。
 inference-gateway = ["ext-proc"]
+# Agent 协议只进入显式制品；默认配置解析后拒绝启用，不创建会话表或工具执行器。
+agent-protocols = ["ai-governance"]
+ai-governance = ["dep:naauthz"]
+# 三信号 OTLP 独立出口；默认制品保留原有 HTTP trace 与传播能力。
+telemetry-otlp = ["dep:opentelemetry-proto", "dep:prost", "dep:tonic", "dep:tonic-prost", "tonic/tls-native-roots"]
+# 多来源配置编译与有界后台读取；默认制品不创建 provider 任务。
+config-providers = ["nasa/redis", "dep:redis"]
+# CGI 记录协议分别编译；默认制品不携带相应 codec 或连接池。
+fastcgi = []
+uwsgi = []
+scgi = []
+# 显式 WebDAV 路由使用独立协议引擎和目录能力，不扩大普通静态服务的写权限。
+webdav = ["dep:dav-server", "dep:xattr", "dep:xmltree"]
+media-streaming = []
+lua-scripts = ["dep:mlua"]
 
 [dependencies]
 # —— 数据面(hyper 反向代理)——
 anyhow = "1"
 aes-gcm = "0.10"                     # 共享 TLS session ticket key 的 AES-256-GCM 认证加密
 arc-swap = "1"                        # 单快照原子换版(无感热更)
-axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2"] } # V5 admin server；路由声明/类型优先走 nasa::web 门面
-async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] } # V5 gzip/br 流式编解码；不聚合响应 body
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2"] } # admin server；路由声明/类型优先走 nasa::web 门面
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] } # gzip/br 流式编解码；保持请求与响应正文背压
 base64 = "0.22"                       # gRPC-Web text 与 Connect status details 的标准 Base64 envelope
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] } # OCSP freshness 使用带时区的验证时刻
-casbin = { version = "2.20.0", default-features = false, features = ["glob", "ip", "runtime-tokio"] } # V7 内嵌 RBAC/ABAC；模型/策略构建后只读
+casbin = { version = "2.20.0", default-features = false, features = ["glob", "ip", "runtime-tokio"] } # 内嵌 RBAC/ABAC；模型/策略构建后只读
 crossbeam-utils = "0.8"                # 热指标 CachePadded 条带计数，避免 Tokio worker 争用同一 cache line
 crossbeam-channel = "0.5"              # keyless TLS 使用可克隆 receiver 驱动固定 worker 池与有界排队
 cryptoki = { version = "0.12.0", optional = true } # 安全 PKCS#11 wrapper；动态 module 和 token 由部署显式选择
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"                         # 长流连接表分片并发；避免 gRPC 短流注册/注销争用单全局锁
+dav-server = { version = "0.11.0", optional = true, default-features = false } # DAV 方法、条件头与 multistatus 协议，不启用其通用本地文件系统
+cap-std = "4.0.3" # 配置发布与授权文件访问持有固定目录能力，不让临时文件路径扩大访问范围。
+xattr = { version = "1.6.1", optional = true } # DAV 自定义属性随文件持久化，通过已打开的文件描述符访问
+xmltree = { version = "0.12", optional = true } # DAV 标准接口的属性/owner 树；输入先经过独立 XML 预算和实体门禁
 ed25519-dalek = "2.2"                 # OPA bundle detached Ed25519 签名；激活前验证原始压缩字节
-flate2 = "1"                          # 解包标准 OPA tar.gz bundle；解压过程受独立字节硬门
+flate2 = { version = "1", features = ["zlib"] } # 有界归档与WebSocket解压；字典接口保留同消息DEFLATE段的连续历史
 globset = "0.4"                       # 接口守卫 path glob
 getrandom = "0.2"                     # WS client→upstream Close 帧按 RFC 6455 生成不可预测 mask
 http = "1"
@@ -92,80 +133,73 @@ h3-quinn = { version = "0.0.10", optional = true, features = ["tracing", "datagr
 h3-webtransport = { version = "0.1.2", optional = true } # WebTransport 下游 session 与 stream 编解码
 mimalloc = { version = "0.1.52", default-features = false }
 instant-acme = { version = "0.8.5", features = ["rcgen"] } # RFC 8555 HTTP-01/DNS-01 签发与续期
-jsonschema = { version = "0.48.1", default-features = false } # V5 build-time JSON Schema validator；关闭网络/文件 resolver，拒绝外部 $ref
+jsonschema = { version = "0.48.1", default-features = false } # build-time JSON Schema validator；关闭网络/文件 resolver，拒绝外部 $ref
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto", "use_pem"] } # RS256/ES256、PEM/JWKS 严格验签；远端 URL 只取 route 固定配置
 maxminddb = "0.30"                    # route GeoIP/ASN/匿名网络只读本地 MMDB 快照；候选构建期校验类型、大小与 freshness
 josekit = { version = "0.10.3", optional = true } # JWE compact RSA-OAEP-256 + A256GCM；只用于嵌套签名 JWT 解密
 ldap3 = { version = "0.12.1", optional = true, default-features = false, features = ["tls-rustls-aws-lc-rs"] } # LDAPv3/LDAPS/StartTLS 企业目录认证
 libc = "0.2"                          # `-s reload` 向运行进程发 SIGHUP
-naml = { version = "1.0.2", features = ["watch"] } # 分层配置、来源追踪、有界读取与精确热更新
+naml = { version = "2.0.2", features = ["watch"] } # 配置装配、外部 YAML 有界读写与精确热更新
+nagrpc = { version = "2.0.3", optional = true } # 受管预绑定与动态TLS能力，与nasa门面共享同一运行类型
+nasaga-runtime-core = { version = "2.0.1", optional = true, default-features = false } # 中性命令验真，不启用数据库或外部 transport
+nasaga-backend = { version = "2.0.0", optional = true, default-features = false } # 共享工作流的公开已提交投影，不引入第二套状态机
+nametrics-core = "2.0.0"             # 指标目录、结构化事实与公开序列预算
+naoutbox-core = "2.0.0"              # 用量事件身份与至少一次外部收据合同
+naauthz = { version = "2.0.0", optional = true } # 已验证 Agent 身份的 scope 授权
+nabudget = "2.0.0"                   # 显式协议与消息处理共用绝对 deadline 与取消树
 notify = "8.2"                        # TLS 证书文件观察；YAML 配置观察由 naml 负责
-opentelemetry = { version = "0.32", default-features = false, features = ["trace"] } # V5 W3C context + server/client span API
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] } # V5 head sampling + bounded batch processor
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] } # V5 OTLP/HTTP protobuf exporter
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] } # W3C context + server/client span API
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] } # head sampling + bounded batch processor
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] } # OTLP/HTTP protobuf exporter
+opentelemetry-proto = { version = "0.32", optional = true, default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "logs"] } # 标准三信号 protobuf 合同
 parking_lot = "0.12"                  # 上游 client cache 共享读快路径；短临界区不占 Tokio 异步锁
 percent-encoding = "2"                # OpenAPI path parameter percent-decode；不同于 query，不把 `+` 错当空格
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "blocking", "http2", "form", "json", "query"] } # 后台 HTTP、受控 callout 与有界表单/响应读取
-quinn = { version = "0.11.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] } # V9 QUIC/TLS 1.3 transport；与现有 aws-lc rustls provider 对齐
-prost = { version = "0.14.4", optional = true } # V10 只编码显式声明的 xDS v3 message surface
-prost-types = { version = "0.14.4", optional = true } # V10 DiscoveryResponse Any 与基础 wrapper
+# 仅补齐 nasa::redis 底层的 TLS feature，连接、命令与拓扑仍使用 nasa 门面。
+redis = { version = "1.4", optional = true, default-features = false, features = ["tokio-rustls-comp"] }
+quinn = { version = "0.11.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] } # QUIC/TLS 1.3 transport；与现有 aws-lc rustls provider 对齐
+prost = { version = "0.14.4", optional = true } # 只编码显式声明的 xDS v3 message surface
+prost-types = { version = "0.14.4", optional = true } # DiscoveryResponse Any 与基础 wrapper
 prost-reflect = { version = "0.16.5", optional = true, features = ["serde"] } # descriptor 编译与标准 protobuf JSON
 rustls-pemfile = "2"                  # TLS cert/key PEM 解析
 rustls-native-certs = "0.8"           # BackendTLSPolicy System CA 与显式 SAN 校验共用本机信任根
 rustls-webpki = "0.103"               # BackendTLSPolicy 显式 SAN 时独立执行证书链与用途校验
 saml-rs = { version = "0.3.0", optional = true } # 纯 Rust SAML SP、严格 XML Signature/反 wrapping 校验
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"                      # 配置 tree 与管理 API 的 serde_json::Value
-serde_yml = "0.0.12"                  # Console 语义编辑与三文档 dry-run 工作区
+sqlx = { version = "0.9", optional = true, default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate"] } # 与 NASA 命名事务共享 PostgreSQL 连接及迁移类型
 sha1 = "0.10"                          # OCSP CertID 按 RFC 6960 使用 SHA-1 标识 issuer
-sha2 = "0.10"                         # V5 cache key 增量摘要；避免把 Vary/header 原值写进 L1/Redis key
+sha2 = "0.10"                         # cache key 增量摘要；避免把 Vary/header 原值写进 L1/Redis key
 tar = "0.4"                           # 标准 OPA bundle archive；拒绝链接与路径穿越 entry
-socket2 = { version = "0.6", features = ["all"] } # V7 SO_REUSEPORT 两阶段 listener 热切换
+socket2 = { version = "0.6", features = ["all"] } # SO_REUSEPORT 两阶段 listener 热切换
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 time = { version = "0.3.53", features = ["formatting"] }
-tokio-stream = { version = "0.1.18", optional = true } # V10 有界 ADS request channel → tonic stream
+tokio-stream = { version = "0.1.18", optional = true } # 有界 ADS request channel → tonic stream
 tokio-rustls = "0.26"                 # TLS 监听 + ALPN
-tonic = { version = "0.14.6", optional = true, default-features = false, features = ["channel", "codegen", "tls-aws-lc"] } # V10 ADS bidi gRPC client；不编 router/server
-tonic-prost = { version = "0.14.6", optional = true } # V10 手写选择性 proto 的 Prost codec
+tonic = { version = "0.14.6", optional = true, default-features = false, features = ["channel", "codegen", "tls-aws-lc"] } # ADS channel 与协议编解码；管理端复用 Hyper，不启用 tonic transport server/router
+tonic-prost = { version = "0.14.6", optional = true } # 手写选择性 proto 的 Prost codec
 tower-service = "0.3"
 tower = { version = "0.5", optional = true, features = ["util"] } # SPIRE Workload API Unix socket connector
 tracing = "0.1"                       # 日志宏(info!/warn!/...);全局订阅初始化用 nasa::log
-tracing-opentelemetry = { version = "0.33", default-features = false } # V5 tracing/OTel 同栈桥接；与 opentelemetry 0.32 配套
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter"] } # 候选构建期验证日志级别，禁止无效声明静默生效
+tracing-opentelemetry = { version = "0.33", default-features = false } # tracing/OTel 同栈桥接；与 opentelemetry 0.32 配套
 tsp-ltv = { version = "0.3.1", default-features = false, features = ["ltv"] } # OCSP 签名、证书绑定和 freshness 校验
-form_urlencoded = "1"                 # V5 schema 慢路径 query percent-decoding；Cow 复用无转义片段
+form_urlencoded = "1"                 # schema 慢路径 query percent-decoding；Cow 复用无转义片段
 regex = "1"                           # Gateway API HTTPRoute header/query RegularExpression 构建期编译
+regex-syntax = "0.8"                  # AI 流式规则在构建期证明最大匹配长度，保证延迟发送窗口覆盖完整命中
 quick-xml = "0.41"                    # route 显式 WAF XML 慢路径；禁用 DTD/外部实体并执行节点预算
 regorus = { version = "0.10.1", optional = true, default-features = false, features = ["full-opa", "arc"] } # 显式 embedded OPA profile 的 Rego 解释器
 futures = "0.3"                       # 仅用于快照构建期驱动 Casbin 的字符串 adapter future
 x509-cert = { version = "0.2", features = ["pem"] } # OCSP 目标和 issuer 的严格 DER 解析
 x509-parser = "0.18"                  # 控制面解析证书 notAfter，避免无条件重复下单
-wasmtime = { version = "46.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] } # V7 Proxy-Wasm 沙箱；无 WASI/文件/网络权限
+wasmtime = { version = "46.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] } # Proxy-Wasm 沙箱；无 WASI/文件/网络权限
+mlua = { version = "0.12.2", optional = true, default-features = false, features = ["lua54", "vendored", "error-send"] } # 显式 Lua 沙箱；不提供系统 hostcall
 wtransport = { version = "0.7.1", optional = true, default-features = false, features = ["aws-lc-rs", "quinn"] } # WebTransport 真上游 client；关闭 http3 时不进入制品
 
 # —— 复用 nasa-runtime-rust 生态（YAML 直接使用 naml，日志走 nasa::log）——
-# 当前 path 用于联调尚未发布的 Nacos 首次 bundle API，version 仍锁定兼容基线。
-# 公开发布前必须先发布对应 nanacos/nasa 版本，再移除 path 并执行 cargo publish --dry-run；
-# 不能让 crates.io 制品依赖本机目录。V4 数据面 HMAC/JWT 验签复用 nasa::crypto。
-nasa = { version = "1.0.2", features = ["log", "base", "nacos", "crypto", "cache", "web"] }
+# Nacos、日志、缓存和 Web 通过同一公开门面版本接入；HMAC/JWT 验签复用 nasa::crypto。
+nasa = { version = "2.0.3", features = ["log", "base", "nacos", "crypto", "cache", "web"] }
 
-# 联调期把 nasa 依赖且尚未成套发布的 crate 统一到 sibling 源码，避免本地 `napp` 与 crates.io
-# 上较早的配置、指标合同混用。公开发布前必须恢复为完整的 registry 依赖并复核最终归档。
-[patch.crates-io]
-nanacos = { path = "../nasa-runtime-rust/nanacos" }
-napp = { path = "../nasa-runtime-rust/napp" }
-nabase = { path = "../nasa-runtime-rust/nabase" }
-macro-support = { path = "../nasa-runtime-rust/macro-support" }
-naml = { path = "../nasa-runtime-rust/naml" }
-nametrics-core = { path = "../nasa-runtime-rust/nametrics-core" }
-nasecret = { path = "../nasa-runtime-rust/nasecret" }
-naweb = { path = "../nasa-runtime-rust/naweb" }
-rest-discovery-nacos = { path = "../nasa-runtime-rust/rest-discovery-nacos" }
-
-[dev-dependencies]
-maxminddb-writer = "0.1.2"
-rcgen = "0.12"
-tokio = { version = "1", features = ["full", "test-util"] } # start_paused 时钟仅测试形态启用
-tonic = { version = "0.14.6", default-features = false, features = ["server", "channel", "codegen", "router"] }
-tonic-prost = "0.14.6"
-wat = "1"                            # V7 进程级 Proxy-Wasm 回归测试动态生成最小标准模块
+[build-dependencies]
+nagrpc-build = { version = "2.0.0", optional = true }

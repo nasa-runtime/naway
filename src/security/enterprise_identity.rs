@@ -52,11 +52,71 @@ pub(crate) enum EnterpriseAuthPolicy {
 #[cfg(not(any(feature = "enterprise-saml", feature = "enterprise-ldap")))]
 pub(crate) struct EnterpriseAuthPolicy;
 
+/// 进程级 SAML 防重放域；门户与数据面分别持有，热更新不能恢复已消费断言的权威。
+#[derive(Default)]
+pub(crate) struct PortalSamlReplay {
+    #[cfg(feature = "enterprise-saml")]
+    state: parking_lot::Mutex<std::collections::HashMap<String, SamlReplayEntry>>,
+}
+
+#[cfg(feature = "enterprise-saml")]
+struct SamlReplayEntry {
+    expires: std::time::SystemTime,
+    lease: Option<crate::control::ownership::state::Lease>,
+}
+
+impl EnterpriseAuthPolicy {
+    /// 业务作用：门户使用常驻 replay owner 验证 SAML，不随会话或配置代际重置已消费断言。
+    ///
+    /// 参数说明：
+    /// - `_parts`：为已限定的 ACS 输入
+    /// - `_response`：为已限定的 ACS 输入
+    /// - `_replay`：是管理进程唯一重放域。
+    ///
+    /// 返回：仅严格 SAML 验证通过时返回主体，其它协议和未编译制品拒绝。
+    pub(crate) fn authenticate_portal_saml(
+        &self,
+        _parts: &Parts,
+        _response: &str,
+        _replay: &PortalSamlReplay,
+    ) -> EnterpriseAuthResult {
+        #[cfg(feature = "enterprise-saml")]
+        {
+            match self {
+                Self::Saml(policy) => {
+                    policy.authenticate_with_replay(_parts, Some(_response), &_replay.state)
+                }
+                #[cfg(feature = "enterprise-ldap")]
+                Self::Ldap(_) => EnterpriseAuthResult::Rejected,
+            }
+        }
+        #[cfg(not(feature = "enterprise-saml"))]
+        {
+            EnterpriseAuthResult::Rejected
+        }
+    }
+}
+
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
 impl EnterpriseAuthPolicy {
+    /// 业务作用：提供已编译 SAML 接收端点，供门户将签名目标与实际独占回调绑定。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：SAML 返回固定 ACS；其它协议不提供 ACS。
+    pub(crate) fn saml_acs(&self) -> Option<&str> {
+        match self {
+            #[cfg(feature = "enterprise-saml")]
+            Self::Saml(policy) => Some(&policy.acs),
+            #[cfg(feature = "enterprise-ldap")]
+            Self::Ldap(_) => None,
+        }
+    }
     /// 业务作用：按已编译协议验证当前请求，统一返回缺失、拒绝或可信主体。
     ///
-    /// 参数说明：`parts` 是尚未接受外部授权 header 注入的请求 head。
+    /// 参数说明：
+    /// - `parts`：尚未接受外部授权头注入的原始请求 head。
+    /// - `_saml_response`：该认证分支不使用的 SAML 表单凭据。
     ///
     /// 返回：认证成功携带 consumer/身份头；凭据缺失与认证失败保持可区分状态。
     pub(crate) async fn authenticate(
@@ -106,9 +166,19 @@ impl EnterpriseAuthPolicy {
 
 #[cfg(not(any(feature = "enterprise-saml", feature = "enterprise-ldap")))]
 impl EnterpriseAuthPolicy {
+    /// 业务作用：未启用企业身份时不提供可用于门户绑定的 ACS。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：始终为 None。
+    pub(crate) fn saml_acs(&self) -> Option<&str> {
+        None
+    }
     /// 业务作用：为默认制品保留统一调用面；协议配置会在构建期拒绝，因此该路径不可到达。
     ///
-    /// 参数说明：`parts` 是请求 head，仅用于保持 feature 间签名一致。
+    /// 参数说明：
+    /// - `_parts`：未启用 feature 时保留的请求 head，不执行身份验证。
+    /// - `_saml_response`：未启用 feature 时保留的 SAML 表单凭据参数。
     ///
     /// 返回：始终返回拒绝，防止不可达状态意外放行。
     pub(crate) async fn authenticate(
@@ -140,7 +210,9 @@ impl EnterpriseAuthPolicy {
 
 /// 业务作用：解析 `saml_auth` route DSL，并在快照发布前验证 metadata 签名与 SP/IdP 绑定。
 ///
-/// 参数说明：`spec` 是 filter 原文，`config_dir` 是文件型来源相对目录。
+/// 参数说明：
+/// - `spec`：是 filter 原文
+/// - `config_dir`：是文件型来源相对目录。
 ///
 /// 返回：feature 启用且全部信任材料有效时返回策略；否则拒绝候选快照。
 pub(crate) fn parse_saml_auth(spec: &str, config_dir: &Path) -> Result<EnterpriseAuthPolicy> {
@@ -158,7 +230,9 @@ pub(crate) fn parse_saml_auth(spec: &str, config_dir: &Path) -> Result<Enterpris
 
 /// 业务作用：解析 `ldap_auth` route DSL，并锁定 TLS、bind、搜索模板与并发资源门。
 ///
-/// 参数说明：`spec` 是 filter 原文，`config_dir` 是 SecretSource 相对目录。
+/// 参数说明：
+/// - `spec`：是 filter 原文
+/// - `config_dir`：是 SecretSource 相对目录。
 ///
 /// 返回：feature 启用且配置安全时返回策略；否则拒绝候选快照。
 pub(crate) fn parse_ldap_auth(spec: &str, config_dir: &Path) -> Result<EnterpriseAuthPolicy> {
@@ -176,6 +250,7 @@ pub(crate) fn parse_ldap_auth(spec: &str, config_dir: &Path) -> Result<Enterpris
 
 #[cfg(feature = "enterprise-saml")]
 pub(crate) struct SamlPolicy {
+    acs: String,
     sp: saml_rs::Saml<saml_rs::Sp>,
     idp: saml_rs::IdpDescriptor,
     source_header: Option<HeaderName>,
@@ -183,7 +258,7 @@ pub(crate) struct SamlPolicy {
     owned_headers: Arc<Vec<HeaderName>>,
     clock_skew: saml_rs::ClockSkew,
     replay_ttl: Duration,
-    replay: parking_lot::Mutex<std::collections::HashMap<String, std::time::SystemTime>>,
+    replay: parking_lot::Mutex<std::collections::HashMap<String, SamlReplayEntry>>,
     max_assertion_bytes: usize,
 }
 
@@ -191,7 +266,9 @@ pub(crate) struct SamlPolicy {
 impl SamlPolicy {
     /// 业务作用：构建严格 SAML SP，metadata 必须由固定证书签名，入站 Response 与 Assertion 都必须签名。
     ///
-    /// 参数说明：`spec` 是 DSL 原文，`config_dir` 是 metadata/证书相对目录。
+    /// 参数说明：
+    /// - `spec`：是 DSL 原文
+    /// - `config_dir`：是 metadata/证书相对目录。
     ///
     /// 返回：返回不可变 SP/IdP 验证计划；缺失信任材料或弱配置返回错误。
     fn parse(spec: &str, config_dir: &Path) -> Result<Self> {
@@ -256,7 +333,7 @@ impl SamlPolicy {
             max_assertion_bytes,
             "SAML metadata",
         )?;
-        let certificate = crate::secret::resolve_text(
+        let certificate = crate::security::secret::resolve_text(
             metadata_certificate,
             config_dir,
             "SAML metadata signing certificate",
@@ -282,6 +359,7 @@ impl SamlPolicy {
         )
         .context("build strict SAML service provider")?;
         Ok(Self {
+            acs: acs.to_owned(),
             sp,
             idp,
             source_header,
@@ -301,11 +379,34 @@ impl SamlPolicy {
 
     /// 业务作用：验证 HTTP POST binding 形式的 SAMLResponse bearer，防重放后提取 NameID/属性。
     ///
-    /// 参数说明：`parts` 是请求 head，`saml_response` 是标准 HTTP-POST form 中有界提取的 Base64 值；
-    /// 显式 `header=` 兼容模式只读取固定 header 并忽略该参数。
+    /// 参数说明：
+    /// - `parts`：是请求 head
+    /// - `saml_response`：是标准 HTTP-POST form 中有界提取的 Base64 值； 显式 `header=` 兼容模式只读取固定 header 并忽略该参数。
     ///
     /// 返回：双签名、信任、audience/recipient/time/replay 全部通过才返回可信身份；其它情况拒绝。
     fn authenticate(&self, parts: &Parts, saml_response: Option<&str>) -> EnterpriseAuthResult {
+        let replay = parts.extensions.get::<Arc<PortalSamlReplay>>();
+        self.authenticate_with_replay(
+            parts,
+            saml_response,
+            replay.map_or(&self.replay, |replay| &replay.state),
+        )
+    }
+
+    /// 业务作用：共用严格签名和 audience 检查，并在发布身份前原子消费指定 owner 下的断言身份。
+    ///
+    /// 参数说明：
+    /// - `parts`：为固定 binding 输入
+    /// - `saml_response`：为固定 binding 输入
+    /// - `replay_state`：决定跨请求和配置的去重范围。
+    ///
+    /// 返回：签名、时间、目标和防重放全部通过才形成可信身份头，否则拒绝。
+    fn authenticate_with_replay(
+        &self,
+        parts: &Parts,
+        saml_response: Option<&str>,
+        replay_state: &parking_lot::Mutex<std::collections::HashMap<String, SamlReplayEntry>>,
+    ) -> EnterpriseAuthResult {
         use saml_rs::{BrowserInput, FormField, ReplayPolicy, SamlValidationContext, SsoResponse};
 
         let encoded = self.source_header.as_ref().map_or(saml_response, |header| {
@@ -321,8 +422,15 @@ impl SamlPolicy {
             return EnterpriseAuthResult::Rejected;
         }
         let mut replay = SharedSamlReplay {
-            state: &self.replay,
+            state: replay_state,
             max_entries: 100_000,
+            budget: parts
+                .extensions
+                .get::<crate::control::ownership::state::Budget>(),
+            scope: parts
+                .extensions
+                .get::<crate::control::ownership::Owner>()
+                .map(|owner| owner.namespace()),
         };
         let validation = SamlValidationContext::new(
             std::time::SystemTime::now(),
@@ -360,18 +468,30 @@ impl SamlPolicy {
             };
             headers.push((mapping.header.clone(), value));
         }
-        EnterpriseAuthResult::Authenticated { consumer, headers }
+        EnterpriseAuthResult::Authenticated {
+            consumer,
+            headers,
+        }
     }
 }
 
 #[cfg(feature = "enterprise-saml")]
 struct SharedSamlReplay<'a> {
-    state: &'a parking_lot::Mutex<std::collections::HashMap<String, std::time::SystemTime>>,
+    state: &'a parking_lot::Mutex<std::collections::HashMap<String, SamlReplayEntry>>,
     max_entries: usize,
+    budget: Option<&'a crate::control::ownership::state::Budget>,
+    scope: Option<String>,
 }
 
 #[cfg(feature = "enterprise-saml")]
 impl saml_rs::ReplayCache for SharedSamlReplay<'_> {
+    /// 业务作用：在身份发布前原子消费本域断言，并保留到有效期结束，容量不足不能驱逐有效证据。
+    ///
+    /// 参数说明：
+    /// - `key`：为验证库生成的断言身份
+    /// - `expires_at`：为其防重放截止时间。
+    ///
+    /// 返回：新断言且有名额时记录；重放或容量不足时拒绝认证。
     fn check_and_store(
         &mut self,
         key: saml_rs::ReplayKey,
@@ -379,17 +499,38 @@ impl saml_rs::ReplayCache for SharedSamlReplay<'_> {
     ) -> std::result::Result<(), saml_rs::SamlError> {
         let now = std::time::SystemTime::now();
         let mut state = self.state.lock();
-        state.retain(|_, expiry| *expiry > now);
-        let cache_key = key.cache_key();
+        state.retain(|_, entry| entry.expires > now);
+        let cache_key = self.scope.as_deref().map_or_else(
+            || key.cache_key(),
+            |scope| format!("{scope}:{}", key.cache_key()),
+        );
         if state.contains_key(&cache_key) {
-            return Err(saml_rs::SamlError::ReplayDetected { key: cache_key });
+            return Err(saml_rs::SamlError::ReplayDetected {
+                key: cache_key,
+            });
         }
-        if state.len() >= self.max_entries {
+        if self.budget.is_none()
+            && state.values().filter(|entry| entry.lease.is_none()).count() >= self.max_entries
+        {
             return Err(saml_rs::SamlError::Invalid(
                 "SAML replay cache capacity reached".to_owned(),
             ));
         }
-        state.insert(cache_key, expires_at);
+        // 不能以 fail-open 或驱逐其它域的重放证据腾出容量，否则有效断言可能再次被接受。
+        let lease = self
+            .budget
+            .map(|budget| budget.acquire())
+            .transpose()
+            .map_err(|_| {
+                saml_rs::SamlError::Invalid("SAML workspace state capacity reached".to_owned())
+            })?;
+        state.insert(
+            cache_key,
+            SamlReplayEntry {
+                expires: expires_at,
+                lease,
+            },
+        );
         Ok(())
     }
 }
@@ -414,7 +555,9 @@ pub(crate) struct LdapPolicy {
 impl LdapPolicy {
     /// 业务作用：编译 LDAP 目录认证计划，强制 LDAPS/StartTLS、服务 bind 与有界唯一用户搜索。
     ///
-    /// 参数说明：`spec` 是 DSL 原文，`config_dir` 是 bind secret/CA 相对目录。
+    /// 参数说明：
+    /// - `spec`：是 DSL 原文
+    /// - `config_dir`：是 bind secret/CA 相对目录。
     ///
     /// 返回：返回带连接并发池和固定搜索模板的策略；明文 LDAP、匿名 bind 或无界参数返回错误。
     fn parse(spec: &str, config_dir: &Path) -> Result<Self> {
@@ -440,12 +583,12 @@ impl LdapPolicy {
         if !(url.starts_with("ldaps://") || url.starts_with("ldap://") && starttls) {
             bail!("ldap_auth requires ldaps:// or ldap:// with starttls=true");
         }
-        let bind_dn = crate::secret::resolve_text(
+        let bind_dn = crate::security::secret::resolve_text(
             required_option(&options, "bind_dn", "ldap_auth")?,
             config_dir,
             "LDAP bind DN",
         )?;
-        let bind_password = crate::secret::resolve_text(
+        let bind_password = crate::security::secret::resolve_text(
             required_option(&options, "bind_password", "ldap_auth")?,
             config_dir,
             "LDAP bind password",
@@ -474,7 +617,8 @@ impl LdapPolicy {
             .set_conn_timeout(Duration::from_millis(timeout_ms))
             .set_starttls(starttls);
         if let Some(source) = option(&options, "ca_certificate") {
-            let pem = crate::secret::resolve_text(source, config_dir, "LDAP CA certificate")?;
+            let pem =
+                crate::security::secret::resolve_text(source, config_dir, "LDAP CA certificate")?;
             settings = settings.set_config(ldap_tls_config(&pem)?);
         }
         Ok(Self {
@@ -495,7 +639,8 @@ impl LdapPolicy {
 
     /// 业务作用：用 Basic 用户凭据执行服务 bind→唯一搜索→用户 bind，并复用已恢复服务身份的连接。
     ///
-    /// 参数说明：`parts` 是请求 head，用户名只经 RFC 4515 转义后进入固定 filter 占位符。
+    /// 参数说明：
+    /// - `parts`：是请求 head，用户名只经 RFC 4515 转义后进入固定 filter 占位符。
     ///
     /// 返回：唯一目录项且用户 bind 成功才返回可信主体；坏凭据或依赖/超时均拒绝。
     async fn authenticate(&self, parts: &Parts) -> EnterpriseAuthResult {
@@ -535,7 +680,9 @@ impl LdapPolicy {
 
     /// 业务作用：在单一总期限内完成 LDAP bind/search，并只把恢复为服务身份的连接放回池。
     ///
-    /// 参数说明：`username`/`password` 已通过请求级长度门，但仍属于不可信凭据。
+    /// 参数说明：
+    /// - `username`：已通过请求级长度门，但仍属于不可信凭据。
+    /// - `password`：已通过请求级长度门，但仍属于不可信凭据。
     ///
     /// 返回：目录认证结果；网络/协议错误返回失败且连接不复用。
     async fn authenticate_inner(
@@ -612,7 +759,10 @@ impl LdapPolicy {
             headers.push((mapping.header.clone(), value));
         }
         self.return_service_connection(ldap).await;
-        Ok(EnterpriseAuthResult::Authenticated { consumer, headers })
+        Ok(EnterpriseAuthResult::Authenticated {
+            consumer,
+            headers,
+        })
     }
 
     /// 业务作用：创建启用证书验证的 LDAP transport，并把 driver 生命周期绑定到最后一个 handle。
@@ -635,7 +785,8 @@ impl LdapPolicy {
 
     /// 业务作用：把用户 bind 后的连接重新绑定为固定服务身份，避免下一请求继承前一用户权威。
     ///
-    /// 参数说明：`ldap` 是本请求独占的连接 handle。
+    /// 参数说明：
+    /// - `ldap`：是本请求独占的连接 handle。
     ///
     /// 返回：无；恢复失败或池已满时直接丢弃连接，不发布半可信池状态。
     async fn return_service_connection(&self, mut ldap: ldap3::Ldap) {
@@ -661,7 +812,8 @@ struct IdentityMapping {
 
 /// 业务作用：解析企业身份属性到请求 header 的显式 allowlist，禁止覆盖凭据与传输控制字段。
 ///
-/// 参数说明：`raw` 是可选逗号分隔 `attribute:Header`。
+/// 参数说明：
+/// - `raw`：是可选逗号分隔 `attribute:Header`。
 ///
 /// 返回：返回 0..=16 条唯一映射；非法属性或安全敏感/重复 header 返回错误。
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
@@ -703,7 +855,8 @@ fn parse_identity_mappings(raw: Option<&str>) -> Result<Vec<IdentityMapping>> {
 
 /// 业务作用：把受信协议主体收敛为可用于配额/授权的有界 consumer。
 ///
-/// 参数说明：`value` 是已通过 SAML/LDAP 认证的主体文本。
+/// 参数说明：
+/// - `value`：是已通过 SAML/LDAP 认证的主体文本。
 ///
 /// 返回：合法非空文本返回共享字符串；控制字符或超长值返回 None。
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
@@ -717,7 +870,8 @@ fn bounded_identity(value: &str) -> Option<Arc<str>> {
 
 /// 业务作用：把受信属性转换为安全 HTTP header value，同时施加独立长度门。
 ///
-/// 参数说明：`value` 是协议验证后的单值属性。
+/// 参数说明：
+/// - `value`：是协议验证后的单值属性。
 ///
 /// 返回：非空有界可编码值返回 HeaderValue；其它情况返回 None。
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
@@ -730,7 +884,8 @@ fn bounded_header_value(value: &str) -> Option<HeaderValue> {
 #[cfg(feature = "enterprise-ldap")]
 /// 业务作用：从标准 Basic header 解码 LDAP 用户凭据，不接受多段、NUL 或非 UTF-8。
 ///
-/// 参数说明：`parts` 是下游请求 head。
+/// 参数说明：
+/// - `parts`：是下游请求 head。
 ///
 /// 返回：合法 `username:password` 返回拥有值；缺失/畸形返回 None。
 fn ldap_basic_credentials(parts: &Parts) -> Option<(String, String)> {
@@ -758,7 +913,8 @@ fn ldap_basic_credentials(parts: &Parts) -> Option<(String, String)> {
 #[cfg(feature = "enterprise-ldap")]
 /// 业务作用：按 RFC 4515 转义用户输入，确保 filter 占位符不能改变 LDAP 表达式结构。
 ///
-/// 参数说明：`value` 是未经信任的用户名。
+/// 参数说明：
+/// - `value`：是未经信任的用户名。
 ///
 /// 返回：返回只含安全字面量或 `\HH` 转义的 filter assertion value。
 fn escape_ldap_filter(value: &str) -> String {
@@ -779,7 +935,8 @@ fn escape_ldap_filter(value: &str) -> String {
 #[cfg(feature = "enterprise-ldap")]
 /// 业务作用：从固定 CA PEM 构造 LDAP rustls trust store，不回退到跳过证书验证。
 ///
-/// 参数说明：`pem` 是构建期 SecretSource 解析的 CA certificate bundle。
+/// 参数说明：
+/// - `pem`：是构建期 SecretSource 解析的 CA certificate bundle。
 ///
 /// 返回：至少一张 CA 成功导入时返回 ClientConfig；空或非法 bundle 返回错误。
 fn ldap_tls_config(pem: &str) -> Result<Arc<tokio_rustls::rustls::ClientConfig>> {
@@ -806,7 +963,9 @@ type Options = Vec<(String, String)>;
 
 /// 业务作用：解析空白分隔的 route `key=value` 选项，并拒绝重复键以消除配置歧义。
 ///
-/// 参数说明：`spec` 是 filter 原文，`command` 是应被剥离的指令名。
+/// 参数说明：
+/// - `spec`：是 filter 原文
+/// - `command`：是应被剥离的指令名。
 ///
 /// 返回：返回去引号后的唯一键值；位置参数、空值或重复键返回错误。
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
@@ -838,7 +997,10 @@ fn parse_options(spec: &str, command: &str) -> Result<Options> {
 
 /// 业务作用：对协议 DSL 执行未知键拒绝，避免拼写错误被静默忽略并削弱预期安全门。
 ///
-/// 参数说明：`options` 是已去重选项，`allowed` 是该协议固定键集，`command` 用于错误定位。
+/// 参数说明：
+/// - `options`：是已去重选项
+/// - `allowed`：是该协议固定键集
+/// - `command`：用于错误定位。
 ///
 /// 返回：所有键均受支持时成功；遇到未知键返回错误。
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
@@ -853,7 +1015,9 @@ fn validate_option_keys(options: &Options, allowed: &[&str], command: &str) -> R
 
 /// 业务作用：读取可选 DSL 字段，不对敏感值做日志格式化。
 ///
-/// 参数说明：`options` 是已去重选项，`key` 是固定配置键。
+/// 参数说明：
+/// - `options`：是已去重选项
+/// - `key`：是固定配置键。
 ///
 /// 返回：存在时返回借用值，否则 None。
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
@@ -865,7 +1029,10 @@ fn option<'a>(options: &'a Options, key: &str) -> Option<&'a str> {
 
 /// 业务作用：读取必需 DSL 字段，在构建期阻止不完整信任计划进入数据面。
 ///
-/// 参数说明：`options` 是选项，`key` 是必需键，`command` 用于错误定位。
+/// 参数说明：
+/// - `options`：是选项
+/// - `key`：是必需键
+/// - `command`：用于错误定位。
 ///
 /// 返回：字段存在返回借用值；缺失返回错误。
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
@@ -875,7 +1042,13 @@ fn required_option<'a>(options: &'a Options, key: &str, command: &str) -> Result
 
 /// 业务作用：解析带范围门的 u64 协议资源参数。
 ///
-/// 参数说明：`options`/`key` 定位字段，`default` 是缺省值，`min`/`max` 是硬边界，`command` 用于报错。
+/// 参数说明：
+/// - `options`：定位字段
+/// - `key`：定位字段
+/// - `default`：是缺省值
+/// - `min`：是硬边界
+/// - `max`：是硬边界
+/// - `command`：用于报错。
 ///
 /// 返回：范围内数值；格式或范围错误返回失败。
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
@@ -900,7 +1073,13 @@ fn parse_u64_option(
 
 /// 业务作用：解析带范围门的 usize 协议资源参数。
 ///
-/// 参数说明：与 `parse_u64_option` 相同，返回类型用于集合/字节容量。
+/// 参数说明：
+/// - `options`：已经解析的认证选项集合。
+/// - `key`：当前要读取的选项名。
+/// - `default`：未声明时采用的缺省容量。
+/// - `min`：允许的最小容量。
+/// - `max`：允许的最大容量。
+/// - `command`：用于低敏错误定位的固定指令名。
 ///
 /// 返回：范围内数值；格式或范围错误返回失败。
 #[cfg(any(feature = "enterprise-saml", feature = "enterprise-ldap"))]
@@ -926,7 +1105,13 @@ fn parse_usize_option(
 #[cfg(feature = "enterprise-saml")]
 /// 业务作用：解析带范围门的 i64 时钟偏差参数。
 ///
-/// 参数说明：`options`/`key` 定位字段，`default`/`min`/`max` 定义允许区间，`command` 用于报错。
+/// 参数说明：
+/// - `options`：定位字段
+/// - `key`：定位字段
+/// - `default`：定义允许区间
+/// - `min`：定义允许区间
+/// - `max`：定义允许区间
+/// - `command`：用于报错。
 ///
 /// 返回：范围内数值；格式或范围错误返回失败。
 fn parse_i64_option(
@@ -951,7 +1136,11 @@ fn parse_i64_option(
 #[cfg(feature = "enterprise-ldap")]
 /// 业务作用：解析显式布尔配置，禁止含糊真值造成 TLS 保护意外关闭。
 ///
-/// 参数说明：`options`/`key` 定位字段，`default` 是缺省值，`command` 用于报错。
+/// 参数说明：
+/// - `options`：定位字段
+/// - `key`：定位字段
+/// - `default`：是缺省值
+/// - `command`：用于报错。
 ///
 /// 返回：只接受 true/false/on/off/yes/no/1/0；其它文本返回错误。
 fn parse_bool_option(options: &Options, key: &str, default: bool, command: &str) -> Result<bool> {
@@ -980,7 +1169,11 @@ fn parse_bool_option(options: &Options, key: &str, default: bool, command: &str)
 #[cfg(feature = "enterprise-saml")]
 /// 业务作用：读取有界 UTF-8 metadata 文件，禁止把 XML 文档误当内联 DSL 或无界分配来源。
 ///
-/// 参数说明：`source` 必须是 file/k8s-file/vault-agent 引用，`config_dir` 是相对目录，`max_bytes` 是实体门，`label` 用于错误上下文。
+/// 参数说明：
+/// - `source`：必须是 file/k8s-file/vault-agent 引用
+/// - `config_dir`：是相对目录
+/// - `max_bytes`：是实体门
+/// - `label`：用于错误上下文。
 ///
 /// 返回：合法 UTF-8 文件内容；非文件来源、超限、NUL 或读取失败返回错误。
 fn read_file_source(
@@ -998,7 +1191,7 @@ fn read_file_source(
     } else {
         config_dir.join(raw)
     };
-    let bytes = crate::bounded_io::read_file(&path, max_bytes, label)?;
+    let bytes = crate::io::bounded_io::read_file(&path, max_bytes, label)?;
     if bytes.contains(&0) {
         bail!("{label} contains NUL");
     }

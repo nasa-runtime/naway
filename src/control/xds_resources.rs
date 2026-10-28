@@ -1,5 +1,8 @@
 //! CDS/RDS 选择性 protobuf surface、严格字段白名单与依赖 warming 状态机。
 
+#[cfg(feature = "xds-client-extensions")]
+pub(crate) mod extensions;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -14,9 +17,9 @@ use crate::config::{
     GatewaySnapshot, Http3RuntimeCfg, InMemoryTlsMaterial, ProxyProtocolRuntimeCfg, ProxyRuntime,
     TlsRuntimeCfg,
 };
+use crate::routing::variable::VariablePlan;
 use crate::routing::Router;
 use crate::upstream::{DynamicUpstreamStore, UpstreamDirectory, UpstreamInstance};
-use crate::variable::VariablePlan;
 
 pub(crate) const CDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 pub(crate) const RDS_TYPE_URL: &str =
@@ -39,7 +42,8 @@ pub(crate) struct XdsResourceExhausted(pub(crate) &'static str);
 impl std::fmt::Display for XdsResourceExhausted {
     /// 业务作用：向 NACK 输出固定低敏预算错误，避免回显 resource 内容或高基数名称。
     ///
-    /// 参数说明：`formatter` 是标准格式化目标。
+    /// 参数说明：
+    /// - `formatter`：是标准格式化目标。
     ///
     /// 返回：写入固定错误摘要的格式化结果。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,6 +121,9 @@ pub(crate) struct XdsListenerPlan {
     pub server_names: Vec<String>,
     /// HCM 通过 ADS RDS 引用的 RouteConfiguration.name。
     pub route_name: String,
+    /// 可选命名 ECDS 权威；缺少有效空 Router 时不得开放此 listener。
+    #[cfg(feature = "xds-client-extensions")]
+    pub extension_name: Option<String>,
     /// TLS/SDS 终止计划；None 表示明文 HTTP。
     pub tls: Option<XdsDownstreamTlsPlan>,
 }
@@ -152,7 +159,8 @@ pub(crate) enum XdsSecretPlan {
 impl std::fmt::Debug for XdsSecretPlan {
     /// 业务作用：只输出 SDS 材料类型与长度，禁止配置诊断意外泄露私钥或 CA 内容。
     ///
-    /// 参数说明：`formatter` 是标准格式化目标。
+    /// 参数说明：
+    /// - `formatter`：是标准格式化目标。
     ///
     /// 返回：不含任何 PEM 字节的调试摘要。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -165,7 +173,9 @@ impl std::fmt::Debug for XdsSecretPlan {
                 .field("certificate_chain_bytes", &certificate_chain.len())
                 .field("private_key_bytes", &private_key.len())
                 .finish(),
-            Self::ValidationContext { trusted_ca } => formatter
+            Self::ValidationContext {
+                trusted_ca,
+            } => formatter
                 .debug_struct("ValidationContext")
                 .field("trusted_ca_bytes", &trusted_ca.len())
                 .finish(),
@@ -193,12 +203,14 @@ pub(crate) struct XdsPolicySnapshot {
 pub(crate) enum XdsPolicyOutcome {
     /// 候选闭包完整，可交给 single-writer 构建并发布。
     Active(XdsPolicySnapshot),
-    /// 候选已 ACK/accepted，但缺少依赖；旧 active 必须继续服务。
+    /// 候选已 ACK/accepted，但缺少依赖；普通依赖保留 LKG，撤回的扩展权威必须先关闭。
     Warming {
         /// 缺失的 RDS table 或 CDS cluster，带资源域前缀。
         missing: BTreeSet<String>,
         /// 本轮 accepted candidate 的资源总数。
         resources: usize,
+        /// 仅撤销失去扩展权威的活动 listener，不发布尚未闭合的其它候选。
+        protection: Option<XdsPolicySnapshot>,
     },
 }
 
@@ -214,6 +226,8 @@ pub(crate) struct XdsPolicyCache {
     accepted_routes: BTreeMap<String, XdsRouteTablePlan>,
     accepted_endpoint_clusters: BTreeSet<String>,
     accepted_secrets: BTreeMap<String, XdsSecretPlan>,
+    #[cfg(feature = "xds-client-extensions")]
+    accepted_extensions: BTreeSet<String>,
     active: Option<XdsPolicySnapshot>,
     warming_since: Option<Instant>,
     warming_timeout_reported: bool,
@@ -221,9 +235,34 @@ pub(crate) struct XdsPolicyCache {
 }
 
 impl XdsPolicyCache {
+    /// 业务作用：从既有活动快照撤去失去扩展证明的 listener，不混入尚未闭合的候选路由。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：需要关闭入口时返回保护快照；未编译扩展、尚无活动态或证明仍完整时返回 None。
+    fn extension_protection(&self) -> Option<XdsPolicySnapshot> {
+        #[cfg(feature = "xds-client-extensions")]
+        if let Some(active) = &self.active {
+            let mut protected = active.clone();
+            // 即使其它资源仍在 warming，已撤回的执行权威也不能由 LKG 延长。
+            protected.listeners.retain(|_, listener| {
+                listener
+                    .extension_name
+                    .as_ref()
+                    .is_none_or(|name| self.accepted_extensions.contains(name))
+            });
+            if protected.listeners.len() != active.listeners.len() {
+                protected.generation = self.next_generation;
+                return Some(protected);
+            }
+        }
+        None
+    }
+
     /// 业务作用：创建尚未取得任何 CDS/RDS 的 fail-closed cache，并锁定 native listener 所需 RDS 名。
     ///
-    /// 参数说明：`required_route_tables` 是 xDS 拥有 route 域时每个 native proxy id。
+    /// 参数说明：
+    /// - `required_route_tables`：是 xDS 拥有 route 域时每个 native proxy id。
     ///
     /// 返回：accepted 为空、active 为空的 cache。
     pub(crate) fn new(required_route_tables: BTreeSet<String>) -> Self {
@@ -237,6 +276,8 @@ impl XdsPolicyCache {
             accepted_routes: BTreeMap::new(),
             accepted_endpoint_clusters: BTreeSet::new(),
             accepted_secrets: BTreeMap::new(),
+            #[cfg(feature = "xds-client-extensions")]
+            accepted_extensions: BTreeSet::new(),
             active: None,
             warming_since: None,
             warming_timeout_reported: false,
@@ -246,7 +287,7 @@ impl XdsPolicyCache {
 
     /// 业务作用：创建 LDS/SDS 全域由 xDS 拥有的 fail-closed cache，首个 LDS 证据前不得发布空拓扑。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：所有 accepted 域为空且 listener response 尚未观察的 cache。
     pub(crate) fn new_full_xds() -> Self {
@@ -260,6 +301,8 @@ impl XdsPolicyCache {
             accepted_routes: BTreeMap::new(),
             accepted_endpoint_clusters: BTreeSet::new(),
             accepted_secrets: BTreeMap::new(),
+            #[cfg(feature = "xds-client-extensions")]
+            accepted_extensions: BTreeSet::new(),
             active: None,
             warming_since: None,
             warming_timeout_reported: false,
@@ -269,7 +312,9 @@ impl XdsPolicyCache {
 
     /// 业务作用：以完整 LDS 替换 listener 候选，并原子派生 RDS/SDS 依赖名。
     ///
-    /// 参数说明：`listeners` 已完成 socket/filter/TLS 白名单；`now` 固定 warming 起点。
+    /// 参数说明：
+    /// - `listeners`：已完成 socket/filter/TLS 白名单
+    /// - `now`：固定 warming 起点。
     ///
     /// 返回：五域闭合时给出 active；否则列出缺失 RDS/CDS/EDS/SDS 证据并保留 LKG。
     pub(crate) fn accept_listeners(
@@ -295,6 +340,12 @@ impl XdsPolicyCache {
             .retain(|name, _| required_route_tables.contains(name));
         self.accepted_secrets
             .retain(|name, _| required_secrets.contains(name.as_str()));
+        #[cfg(feature = "xds-client-extensions")]
+        self.accepted_extensions.retain(|name| {
+            listeners
+                .values()
+                .any(|listener| listener.extension_name.as_ref() == Some(name))
+        });
         self.required_route_tables = required_route_tables;
         self.accepted_listeners = listeners;
         self.listeners_observed = true;
@@ -303,7 +354,9 @@ impl XdsPolicyCache {
 
     /// 业务作用：以完整 SDS 替换内存 secret 候选，再复验每个 TLS listener 的材料类型闭包。
     ///
-    /// 参数说明：`secrets` 的 PEM 仍只驻留内存；`now` 固定 warming 起点。
+    /// 参数说明：
+    /// - `secrets`：的 PEM 仍只驻留内存
+    /// - `now`：固定 warming 起点。
     ///
     /// 返回：全部 listener 依赖类型匹配时可能给出 active；缺失或错类型保持 warming/LKG。
     pub(crate) fn accept_secrets(
@@ -317,7 +370,9 @@ impl XdsPolicyCache {
 
     /// 业务作用：以完整 SotW CDS 替换 accepted cluster 集，再复验 RDS 依赖闭包。
     ///
-    /// 参数说明：`clusters` 必须在调用前完成整份 response 校验；`now` 固定 warming 起点。
+    /// 参数说明：
+    /// - `clusters`：必须在调用前完成整份 response 校验
+    /// - `now`：固定 warming 起点。
     ///
     /// 返回：依赖齐全时给出新 active generation；否则列出缺失依赖且保留旧 active。
     pub(crate) fn accept_clusters(
@@ -331,7 +386,9 @@ impl XdsPolicyCache {
 
     /// 业务作用：以完整 SotW RDS 替换 accepted route 集，再复验 native proxy 与 CDS 依赖。
     ///
-    /// 参数说明：`routes` 必须在调用前完成整份 response 校验；`now` 固定 warming 起点。
+    /// 参数说明：
+    /// - `routes`：必须在调用前完成整份 response 校验
+    /// - `now`：固定 warming 起点。
     ///
     /// 返回：依赖齐全时给出新 active generation；否则列出缺失依赖且保留旧 active。
     pub(crate) fn accept_routes(
@@ -345,8 +402,9 @@ impl XdsPolicyCache {
 
     /// 业务作用：登记一份 EDS SotW 已覆盖的 physical cluster 集，再复验 CDS/RDS/EDS 完整闭包。
     ///
-    /// 参数说明：`clusters` 是本轮显式订阅的 EDS 名全集；缺失 resource 已由 EDS 语义表示为空表；
-    /// `now` 固定 warming 起点。
+    /// 参数说明：
+    /// - `clusters`：是本轮显式订阅的 EDS 名全集；缺失 resource 已由 EDS 语义表示为空表
+    /// - `now`：固定 warming 起点。
     ///
     /// 返回：路由、cluster 与 endpoint 闭合时给出 active；否则保持旧 active 并列出缺失依赖。
     pub(crate) fn accept_endpoints(
@@ -360,7 +418,8 @@ impl XdsPolicyCache {
 
     /// 业务作用：CDS transport identity 变化后只保留仍可证明同语义的 EDS accepted 证据。
     ///
-    /// 参数说明：`retain` 是 cluster/service/protocol/timeout 全相同的 physical EDS 名集合。
+    /// 参数说明：
+    /// - `retain`：是 cluster/service/protocol/timeout 全相同的 physical EDS 名集合。
     ///
     /// 返回：无；失去证据的 cluster 下一次 reconcile 必须重新 warming，旧 active 不受影响。
     pub(crate) fn retain_endpoint_clusters(&mut self, retain: &BTreeSet<String>) {
@@ -370,7 +429,8 @@ impl XdsPolicyCache {
 
     /// 业务作用：给 ADS 接收循环提供当前 warming 周期的一次性超时唤醒点，避免无新 response 时永远不告警。
     ///
-    /// 参数说明：`timeout` 是 bootstrap 已校验的 warming 上限。
+    /// 参数说明：
+    /// - `timeout`：是 bootstrap 已校验的 warming 上限。
     ///
     /// 返回：尚未报告且仍在 warming 时返回单调时钟 deadline；其余状态返回 None。
     pub(crate) fn warming_deadline(&self, timeout: Duration) -> Option<Instant> {
@@ -382,7 +442,7 @@ impl XdsPolicyCache {
 
     /// 业务作用：消费当前 warming 周期的超时事件，防止接收循环在已过期 deadline 上空转和重复计数。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：首次消费当前周期时返回 true；不在 warming 或已经消费时返回 false。
     pub(crate) fn mark_warming_timeout_reported(&mut self) -> bool {
@@ -395,7 +455,8 @@ impl XdsPolicyCache {
 
     /// 业务作用：只在 required RDS 与所有 cluster 引用齐全时创建新 active generation。
     ///
-    /// 参数说明：`now` 用于首次进入当前 warming 周期时定锚。
+    /// 参数说明：
+    /// - `now`：用于首次进入当前 warming 周期时定锚。
     ///
     /// 返回：完整闭包或带精确缺失集合的 warming 状态。
     fn reconcile(&mut self, now: Instant) -> XdsPolicyOutcome {
@@ -432,17 +493,29 @@ impl XdsPolicyCache {
                 };
                 if !matches!(
                     self.accepted_secrets.get(&tls.certificate_secret),
-                    Some(XdsSecretPlan::TlsCertificate { .. })
+                    Some(XdsSecretPlan::TlsCertificate {
+                        ..
+                    })
                 ) {
                     missing.insert(format!("sds:certificate:{}", tls.certificate_secret));
                 }
                 if let Some(validation_secret) = &tls.validation_secret {
                     if !matches!(
                         self.accepted_secrets.get(validation_secret),
-                        Some(XdsSecretPlan::ValidationContext { .. })
+                        Some(XdsSecretPlan::ValidationContext {
+                            ..
+                        })
                     ) {
                         missing.insert(format!("sds:validation:{validation_secret}"));
                     }
+                }
+            }
+        }
+        #[cfg(feature = "xds-client-extensions")]
+        for listener in self.accepted_listeners.values() {
+            if let Some(name) = &listener.extension_name {
+                if !self.accepted_extensions.contains(name) {
+                    missing.insert(format!("ecds:{name}"));
                 }
             }
         }
@@ -453,6 +526,7 @@ impl XdsPolicyCache {
             }
             return XdsPolicyOutcome::Warming {
                 missing,
+                protection: self.extension_protection(),
                 resources: self
                     .accepted_listeners
                     .len()
@@ -509,9 +583,12 @@ impl XdsPolicyCache {
 
 /// 业务作用：把完整 CDS/RDS/EDS 依赖闭包编译成下一份原生 GatewaySnapshot 候选。
 ///
-/// 参数说明：`base` 提供 native 治理/bootstrap 域；`policy` 覆盖 xDS 拥有的
-/// listeners/routes/clusters/secrets；`endpoints` 是同一闭包的 EDS LKG；`version` 是 single-writer 分配的新版本；
-/// `cfg_path` 用于原生 Router/UpstreamDirectory 的路径边界校验。
+/// 参数说明：
+/// - `base`：提供 native 治理/bootstrap 域
+/// - `policy`：覆盖 xDS 拥有的 listeners/routes/clusters/secrets
+/// - `endpoints`：是同一闭包的 EDS LKG
+/// - `version`：是 single-writer 分配的新版本
+/// - `cfg_path`：用于原生 Router/UpstreamDirectory 的路径边界校验。
 ///
 /// 返回：全部 native 二次校验通过时返回候选快照；任一 DSL、服务或依赖失败时零发布。
 pub(crate) fn materialize_policy_snapshot(
@@ -539,6 +616,8 @@ pub(crate) fn materialize_policy_snapshot(
                 .map(|tls| materialize_listener_tls(listener, tls, &policy.secrets))
                 .transpose()?;
             proxies.push(ProxyRuntime {
+                #[cfg(feature = "xds-client-extensions")]
+                xds_extension_bound: listener.extension_name.is_some(),
                 id: listener.name.clone(),
                 listen: listener.listen.clone(),
                 plain_enabled: tls.is_none(),
@@ -579,6 +658,7 @@ pub(crate) fn materialize_policy_snapshot(
         proxies
     };
     proxies.sort_by(|left, right| left.id.cmp(&right.id));
+    crate::routing::traffic::validate_scopes(&proxies, &base.ownership)?;
     let default_router = proxies
         .first()
         .map(|proxy| proxy.router.clone())
@@ -599,7 +679,10 @@ pub(crate) fn materialize_policy_snapshot(
 
 /// 业务作用：把 LDS 的 SDS 名引用解析成只驻留当前 Snapshot 的 TLS 材料，拒绝类型错配或缺失依赖。
 ///
-/// 参数说明：`listener` 提供 socket/name；`tls` 是已验证引用；`secrets` 是同一 active generation。
+/// 参数说明：
+/// - `listener`：提供 socket/name
+/// - `tls`：是已验证引用
+/// - `secrets`：是同一 active generation。
 ///
 /// 返回：证书、私钥与可选客户端 CA 齐全时返回 TLS runtime；任何缺失保持旧 listener generation。
 fn materialize_listener_tls(
@@ -622,7 +705,9 @@ fn materialize_listener_tls(
         .validation_secret
         .as_ref()
         .map(|name| match secrets.get(name) {
-            Some(XdsSecretPlan::ValidationContext { trusted_ca }) => Ok(trusted_ca.clone()),
+            Some(XdsSecretPlan::ValidationContext {
+                trusted_ca,
+            }) => Ok(trusted_ca.clone()),
             _ => bail!(
                 "LDS listener `{}` is missing validation-context secret `{name}`",
                 listener.name
@@ -652,7 +737,10 @@ fn materialize_listener_tls(
 
 /// 业务作用：在 ADS ACK 前用原生 UpstreamDirectory 复验 CDS 服务策略，避免 warming 候选把编译错误延迟归因到其它 type。
 ///
-/// 参数说明：`base` 提供 discovery 边界；`clusters` 是本轮 CDS 全量候选；`cfg_path` 是路径基准。
+/// 参数说明：
+/// - `base`：提供 discovery 边界
+/// - `clusters`：是本轮 CDS 全量候选
+/// - `cfg_path`：是路径基准。
 ///
 /// 返回：原生服务配置可编译时成功；任一 source/protocol/LB 或路径约束失败时拒绝本轮 CDS。
 pub(crate) fn validate_cds_native(
@@ -665,7 +753,9 @@ pub(crate) fn validate_cds_native(
 
 /// 业务作用：在 ADS ACK 前用原生 Router 复验每份 RDS DSL，保证错误由产生它的 RDS response 立即 NACK。
 ///
-/// 参数说明：`routes` 是本轮 RDS 全量候选；`cfg_path` 是原生 filter/path 解析基准。
+/// 参数说明：
+/// - `routes`：是本轮 RDS 全量候选
+/// - `cfg_path`：是原生 filter/path 解析基准。
 ///
 /// 返回：全部 route table 可独立编译时成功；predicate/filter/weight 冲突时整份失败。
 pub(crate) fn validate_rds_native(
@@ -679,8 +769,11 @@ pub(crate) fn validate_rds_native(
 
 /// 业务作用：把已验证 CDS 计划与同代 endpoint 转成原生服务目录，供预检和最终原子物化共享完全相同的编译路径。
 ///
-/// 参数说明：`base` 提供 discovery；`clusters` 是 logical service 策略；`endpoints` 是同代实例；
-/// `cfg_path` 是原生路径边界。
+/// 参数说明：
+/// - `base`：提供 discovery
+/// - `clusters`：是 logical service 策略
+/// - `endpoints`：是同代实例
+/// - `cfg_path`：是原生路径边界。
 ///
 /// 返回：成功返回只读 UpstreamDirectory；配置反序列化或原生服务校验失败时返回错误。
 fn build_policy_upstreams(
@@ -730,7 +823,9 @@ fn build_policy_upstreams(
 
 /// 业务作用：把一份 RDS native 计划编译成请求热路径 Router，预检与最终发布共用同一语义门。
 ///
-/// 参数说明：`table` 是单个 native proxy 的 route table；`cfg_path` 提供 filter 文件边界。
+/// 参数说明：
+/// - `table`：是单个 native proxy 的 route table
+/// - `cfg_path`：提供 filter 文件边界。
 ///
 /// 返回：全部 route DSL 可执行时返回 Router；冲突、越界或不支持 filter 时返回错误。
 fn build_policy_router(table: &XdsRouteTablePlan, cfg_path: &Path) -> Result<Router> {
@@ -756,7 +851,9 @@ fn build_policy_router(table: &XdsRouteTablePlan, cfg_path: &Path) -> Result<Rou
 
 /// 业务作用：把完整 CDS SotW resources 转成 native cluster 计划，任一错误保持零副作用。
 ///
-/// 参数说明：`resources` 来自同一 DiscoveryResponse；`limits` 是 bootstrap 硬预算。
+/// 参数说明：
+/// - `resources`：来自同一 DiscoveryResponse
+/// - `limits`：是 bootstrap 硬预算。
 ///
 /// 返回：按 cluster name 排序的完整替换集；未知字段、扩展、重复资源或不精确语义返回错误。
 pub(crate) fn translate_cds_resources(
@@ -793,8 +890,10 @@ pub(crate) fn translate_cds_resources(
 
 /// 业务作用：把完整 RDS SotW resources 展开为 native route 计划并锁定允许的 proxy owner。
 ///
-/// 参数说明：`resources` 是同一 DiscoveryResponse；`allowed_route_tables` 是显式订阅的 native
-/// proxy id；`limits` 限制 resource 与 warming 展开规模。
+/// 参数说明：
+/// - `resources`：是同一 DiscoveryResponse
+/// - `allowed_route_tables`：是显式订阅的 native proxy id
+/// - `limits`：限制 resource 与 warming 展开规模。
 ///
 /// 返回：按 RouteConfiguration.name 排序的完整替换集；越权 table、未知字段或语义差异返回错误。
 pub(crate) fn translate_rds_resources(
@@ -835,7 +934,9 @@ pub(crate) fn translate_rds_resources(
 
 /// 业务作用：把完整 LDS resources 转成 Naway 单 TCP socket、单 HCM→RDS filter chain 计划。
 ///
-/// 参数说明：`resources` 来自同一 LDS response；`limits` 是 bootstrap 资源/字节硬预算。
+/// 参数说明：
+/// - `resources`：来自同一 LDS response
+/// - `limits`：是 bootstrap 资源/字节硬预算。
 ///
 /// 返回：按 listener name 排序的完整替换集；UDP/QUIC、listener filter、socket option、
 /// 多 filter chain 或未知扩展全部拒绝，避免静默执行成另一套拓扑。
@@ -869,7 +970,9 @@ pub(crate) fn translate_lds_resources(
 
 /// 业务作用：把完整 SDS resources 转成不实现序列化/明文调试的内存证书或 CA 计划。
 ///
-/// 参数说明：`resources` 来自同一 SDS response；`limits` 是 bootstrap 资源/字节硬预算。
+/// 参数说明：
+/// - `resources`：来自同一 SDS response
+/// - `limits`：是 bootstrap 资源/字节硬预算。
 ///
 /// 返回：仅 inline PEM TLS certificate 或 validation context 成功；文件、环境变量、generic
 /// secret、session ticket key 和任意扩展均拒绝。
@@ -939,7 +1042,8 @@ pub(crate) fn translate_sds_resources(
 
 /// 业务作用：把单个已白名单校验的 LDS Listener 映射为 native listener/RDS/SDS 引用。
 ///
-/// 参数说明：`listener` 只含 name/address/单 filter chain。
+/// 参数说明：
+/// - `listener`：只含 name/address/单 filter chain。
 ///
 /// 返回：TCP 地址、HCM RDS 和可选 downstream TLS 可精确执行时成功；语义分叉则失败。
 fn translate_listener(listener: Listener) -> Result<XdsListenerPlan> {
@@ -1021,23 +1125,24 @@ fn translate_listener(listener: Listener) -> Result<XdsListenerPlan> {
     );
     validate_resource_name(&rds.route_config_name, "LDS HCM route_config_name")?;
     anyhow::ensure!(
-        hcm.http_filters.len() == 1 && hcm.http_filters[0].name == "envoy.filters.http.router",
-        "LDS HCM requires exactly one envoy.filters.http.router filter"
+        hcm.http_filters.len() == 1,
+        "LDS HCM requires exactly one router filter"
     );
-    let router = hcm.http_filters[0]
-        .typed_config
-        .as_ref()
-        .context("LDS HCM router typed_config is required")?;
-    anyhow::ensure!(
-        router.type_url == ROUTER_FILTER_TYPE_URL && router.value.is_empty(),
-        "LDS HCM router filter must use an empty v3 Router config"
-    );
+    let filter = &hcm.http_filters[0];
+    #[cfg(feature = "xds-client-extensions")]
+    let extension_name = extensions::translate_filter(filter)?;
+    #[cfg(not(feature = "xds-client-extensions"))]
+    validate_static_router(filter)?;
     let tls = chain
         .transport_socket
         .map(translate_downstream_transport_socket)
         .transpose()?;
     if let Some(matcher) = &chain.filter_chain_match {
-        let expected_transport = if tls.is_some() { "tls" } else { "" };
+        let expected_transport = if tls.is_some() {
+            "tls"
+        } else {
+            ""
+        };
         anyhow::ensure!(
             matcher.transport_protocol == expected_transport,
             "LDS filter-chain transport_protocol must match TLS presence"
@@ -1058,13 +1163,38 @@ fn translate_listener(listener: Listener) -> Result<XdsListenerPlan> {
         listen,
         server_names,
         route_name: rds.route_config_name,
+        #[cfg(feature = "xds-client-extensions")]
+        extension_name,
         tls,
     })
 }
 
+/// 业务作用：确认静态 HTTP 终结器与本地既有 Router 完全等价，不忽略附加执行配置。
+///
+/// 参数说明：
+/// - `filter`：HCM 唯一的 HTTP filter。
+///
+/// 返回：标准名称和空 v3 Router 同时满足时成功，否则拒绝整个 listener。
+fn validate_static_router(filter: &HttpFilter) -> Result<()> {
+    anyhow::ensure!(
+        filter.name == "envoy.filters.http.router",
+        "LDS static filter must be envoy.filters.http.router"
+    );
+    let typed = filter
+        .typed_config
+        .as_ref()
+        .context("LDS Router typed_config is required")?;
+    anyhow::ensure!(
+        typed.type_url == ROUTER_FILTER_TYPE_URL && typed.value.is_empty(),
+        "LDS HCM router filter must use an empty v3 Router config"
+    );
+    Ok(())
+}
+
 /// 业务作用：解析 LDS TLS transport socket，并把证书/校验依赖严格收敛到当前 ADS 的 SDS 名。
 ///
-/// 参数说明：`socket` 是单 filter chain 的 transport_socket。
+/// 参数说明：
+/// - `socket`：是单 filter chain 的 transport_socket。
 ///
 /// 返回：一个证书 secret 与可选 validation secret；inline/file/provider 等路径失败。
 fn translate_downstream_transport_socket(socket: TransportSocket) -> Result<XdsDownstreamTlsPlan> {
@@ -1115,7 +1245,9 @@ fn translate_downstream_transport_socket(socket: TransportSocket) -> Result<XdsD
 
 /// 业务作用：校验一个 SDS 引用只指向当前 ADS，禁止 listener 自带远端或文件配置源。
 ///
-/// 参数说明：`secret` 是 CommonTlsContext 中的引用；`label` 用于低敏定位。
+/// 参数说明：
+/// - `secret`：是 CommonTlsContext 中的引用
+/// - `label`：用于低敏定位。
 ///
 /// 返回：合法稳定 secret 名；缺名或非 ADS ConfigSource 失败。
 fn translate_sds_reference(secret: &SdsSecretConfig, label: &str) -> Result<String> {
@@ -1135,7 +1267,9 @@ fn translate_sds_reference(secret: &SdsSecretConfig, label: &str) -> Result<Stri
 
 /// 业务作用：提取已通过 wire 白名单的 inline DataSource，不允许路径或环境变量进入执行层。
 ///
-/// 参数说明：`source` 是 SDS 内联 PEM；`label` 用于低敏错误。
+/// 参数说明：
+/// - `source`：是 SDS 内联 PEM
+/// - `label`：用于低敏错误。
 ///
 /// 返回：独占 PEM 字节；缺少 specifier 时失败。
 fn inline_data_source(source: &DataSource, label: &str) -> Result<Vec<u8>> {
@@ -1148,7 +1282,8 @@ fn inline_data_source(source: &DataSource, label: &str) -> Result<Vec<u8>> {
 
 /// 业务作用：把一个已验证 CDS Cluster 映射到当前可精确执行的 EDS/H1-H2/LB 子集。
 ///
-/// 参数说明：`cluster` 已通过 raw wire allowlist。
+/// 参数说明：
+/// - `cluster`：已通过 raw wire allowlist。
 ///
 /// 返回：精确 native 计划；非 EDS、自定义扩展、冲突协议或非法 duration 返回错误。
 fn translate_cluster(cluster: Cluster) -> Result<XdsClusterPlan> {
@@ -1218,7 +1353,8 @@ fn translate_cluster(cluster: Cluster) -> Result<XdsClusterPlan> {
 
 /// 业务作用：解析唯一允许的 Envoy upstream HTTP protocol typed extension，拒绝其它插件。
 ///
-/// 参数说明：`options` 是 Cluster.typed_extension_protocol_options map。
+/// 参数说明：
+/// - `options`：是 Cluster.typed_extension_protocol_options map。
 ///
 /// 返回：未声明时 None；显式 H1/H2 时返回对应协议；未知 key/type/字段返回错误。
 fn translate_typed_protocol_options(
@@ -1256,7 +1392,8 @@ fn translate_typed_protocol_options(
 
 /// 业务作用：按 virtual-host/domain/route 顺序展开 RDS，同时收集 CDS 依赖。
 ///
-/// 参数说明：`config` 已通过 raw allowlist 且名称已完成 owner 校验。
+/// 参数说明：
+/// - `config`：已通过 raw allowlist 且名称已完成 owner 校验。
 ///
 /// 返回：可交给 native Router 二次编译的计划；域名、route id 或 action 非法时失败。
 fn translate_route_configuration(config: RouteConfiguration) -> Result<XdsRouteTablePlan> {
@@ -1305,7 +1442,8 @@ fn translate_route_configuration(config: RouteConfiguration) -> Result<XdsRouteT
 
 /// 业务作用：在展开为全局 native route 前证明每个 domain 只属于一个 VirtualHost，保持 Envoy 先选 vhost、再选 route 的语义。
 ///
-/// 参数说明：`virtual_hosts` 是同一 RouteConfiguration 的完整有序集合。
+/// 参数说明：
+/// - `virtual_hosts`：是同一 RouteConfiguration 的完整有序集合。
 ///
 /// 返回：名称/domain 合法且跨 vhost 不相交时成功；重复或 wildcard 覆盖冲突时失败。
 fn validate_virtual_host_domains(virtual_hosts: &[VirtualHost]) -> Result<()> {
@@ -1339,7 +1477,8 @@ fn validate_virtual_host_domains(virtual_hosts: &[VirtualHost]) -> Result<()> {
 
 /// 业务作用：把已验证 domain 规范为 native Host matcher 的大小写与尾点语义，供所有权冲突判定。
 ///
-/// 参数说明：`domain` 已通过 [`validate_domain`]。
+/// 参数说明：
+/// - `domain`：已通过 [`validate_domain`]。
 ///
 /// 返回：小写且去除尾点的 exact、`*.suffix` 或 `*`。
 fn canonical_domain(domain: &str) -> String {
@@ -1348,7 +1487,9 @@ fn canonical_domain(domain: &str) -> String {
 
 /// 业务作用：判断两个 Envoy domain pattern 是否可能匹配同一 Host，阻止展开后跨 vhost 错误回退。
 ///
-/// 参数说明：`left`/`right` 是已规范化的 exact、leading wildcard 或全局 wildcard。
+/// 参数说明：
+/// - `left`：是已规范化的 exact、leading wildcard 或全局 wildcard。
+/// - `right`：是已规范化的 exact、leading wildcard 或全局 wildcard。
 ///
 /// 返回：存在任一共同可匹配 host 时返回 true。
 fn domains_overlap(left: &str, right: &str) -> bool {
@@ -1369,7 +1510,9 @@ fn domains_overlap(left: &str, right: &str) -> bool {
 
 /// 业务作用：精确判定 host 是否位于 wildcard suffix 下一层或更深，避免字符串后缀把 `badexample.com` 误算为子域。
 ///
-/// 参数说明：`host`/`suffix` 均为小写且无尾点的合法 DNS 名。
+/// 参数说明：
+/// - `host`：均为小写且无尾点的合法 DNS 名。
+/// - `suffix`：均为小写且无尾点的合法 DNS 名。
 ///
 /// 返回：`host` 在 `suffix` 前还有非空 label 和点分隔符时返回 true。
 fn host_is_below_suffix(host: &str, suffix: &str) -> bool {
@@ -1380,7 +1523,8 @@ fn host_is_below_suffix(host: &str, suffix: &str) -> bool {
 
 /// 业务作用：把 RDS path/header matcher 转成无语义损失的 native predicate 子集。
 ///
-/// 参数说明：`route_match` 只允许 exact/prefix、大小写敏感和 exact/presence header。
+/// 参数说明：
+/// - `route_match`：只允许 exact/prefix、大小写敏感和 exact/presence header。
 ///
 /// 返回：有序 predicate DSL；缺 path、反转 matcher 或无法精确表示的语义返回错误。
 fn translate_route_match(route_match: RouteMatch) -> Result<Vec<String>> {
@@ -1431,7 +1575,10 @@ fn translate_route_match(route_match: RouteMatch) -> Result<Vec<String>> {
 
 /// 业务作用：把 forward、weighted、redirect 与 direct-response action 展开为 native routes。
 ///
-/// 参数说明：`id`/`predicates` 是已经规范化的 route 身份与 matcher；`action` 是 RDS oneof。
+/// 参数说明：
+/// - `id`：是已经规范化的 route 身份与 matcher
+/// - `predicates`：是已经规范化的 route 身份与 matcher
+/// - `action`：是 RDS oneof。
 ///
 /// 返回：单 action 一条 route，weighted action 多条稳定 Weight route；未知或空 action 返回错误。
 fn translate_route_action(
@@ -1572,7 +1719,8 @@ fn translate_route_action(
 
 /// 业务作用：把 direct-response DataSource 限定为 UTF-8 inline 内容，禁止读取本机文件或环境变量。
 ///
-/// 参数说明：`source` 是 RDS DirectResponseAction.body。
+/// 参数说明：
+/// - `source`：是 RDS DirectResponseAction.body。
 ///
 /// 返回：inline string/UTF-8 bytes；filename、environment 或缺失 specifier 返回错误。
 fn translate_inline_data_source(source: DataSource) -> Result<String> {
@@ -1587,7 +1735,10 @@ fn translate_inline_data_source(source: DataSource) -> Result<String> {
 
 /// 业务作用：执行所有 xDS resource 共用的条数与单资源字节硬门。
 ///
-/// 参数说明：`resources` 是同 type SotW 全集；`limits` 是 bootstrap；`label` 用于 NACK。
+/// 参数说明：
+/// - `resources`：是同 type SotW 全集
+/// - `limits`：是 bootstrap
+/// - `label`：用于 NACK。
 ///
 /// 返回：预算内成功；超限返回可分类错误文本，调用方不得进入 decode/apply。
 fn ensure_resource_budget(resources: &[Any], limits: &XdsLimitsCfg, label: &str) -> Result<()> {
@@ -1615,7 +1766,9 @@ fn ensure_resource_budget(resources: &[Any], limits: &XdsLimitsCfg, label: &str)
 
 /// 业务作用：验证 xDS resource 名可安全用于 owner、route id 和 metrics 外的诊断文本。
 ///
-/// 参数说明：`value` 是 cluster/table/route 名；`field` 用于定位错误。
+/// 参数说明：
+/// - `value`：是 cluster/table/route 名
+/// - `field`：用于定位错误。
 ///
 /// 返回：1..=256 bytes 安全 ASCII 成功，其它值失败。
 fn validate_resource_name(value: &str, field: &str) -> Result<()> {
@@ -1634,7 +1787,8 @@ fn validate_resource_name(value: &str, field: &str) -> Result<()> {
 
 /// 业务作用：限制 RDS domain 到 native Host predicate 可精确表达的 exact/leading-wildcard 子集。
 ///
-/// 参数说明：`domain` 是 VirtualHost.domains 单项。
+/// 参数说明：
+/// - `domain`：是 VirtualHost.domains 单项。
 ///
 /// 返回：`*`、合法 exact host 或 `*.suffix` 成功；端口、控制字符和其它 wildcard 失败。
 fn validate_domain(domain: &str) -> Result<()> {
@@ -1674,7 +1828,8 @@ fn validate_domain(domain: &str) -> Result<()> {
 
 /// 业务作用：限制 RDS path 到 native exact/prefix matcher 的安全 origin-form 子集。
 ///
-/// 参数说明：`path` 是 RouteMatch 或固定 redirect path。
+/// 参数说明：
+/// - `path`：是 RouteMatch 或固定 redirect path。
 ///
 /// 返回：以 `/` 开头、无控制字符/fragment 且不超过 8192 bytes 时成功。
 fn validate_path(path: &str) -> Result<()> {
@@ -1690,7 +1845,8 @@ fn validate_path(path: &str) -> Result<()> {
 
 /// 业务作用：校验 matcher header 名并允许 Envoy 的 `:method` 伪头特例。
 ///
-/// 参数说明：`name` 是 HeaderMatcher.name。
+/// 参数说明：
+/// - `name`：是 HeaderMatcher.name。
 ///
 /// 返回：`:method` 或合法普通 HTTP header name 成功。
 fn validate_header_name(name: &str) -> Result<()> {
@@ -1704,7 +1860,8 @@ fn validate_header_name(name: &str) -> Result<()> {
 
 /// 业务作用：限制会进入 predicate 或 Location 的 RDS 字符串，阻断控制字符与内存放大。
 ///
-/// 参数说明：`value` 是 header matcher/value 或 redirect host。
+/// 参数说明：
+/// - `value`：是 header matcher/value 或 redirect host。
 ///
 /// 返回：1..=256 printable ASCII 成功，其它值失败。
 fn validate_header_value(value: &str) -> Result<()> {
@@ -1719,7 +1876,8 @@ fn validate_header_value(value: &str) -> Result<()> {
 
 /// 业务作用：把任意 route id 压缩成 native Weight group 的稳定安全 ASCII 标识。
 ///
-/// 参数说明：`id` 是已规范化展开 route id。
+/// 参数说明：
+/// - `id`：是已规范化展开 route id。
 ///
 /// 返回：最多 64 bytes 的确定性 FNV-1a 十六进制 group。
 fn stable_weight_group(id: &str) -> String {
@@ -1733,7 +1891,8 @@ fn stable_weight_group(id: &str) -> String {
 
 /// 业务作用：把 protobuf Duration 转成无溢出毫秒，并拒绝负数与非规范 nanos。
 ///
-/// 参数说明：`duration` 来自 CDS executable timeout。
+/// 参数说明：
+/// - `duration`：来自 CDS executable timeout。
 ///
 /// 返回：向上取整到毫秒的 u64；负数、nanos 越界或乘法溢出失败。
 fn proto_duration_ms(duration: &ProtoDuration) -> Result<u64> {
@@ -1761,7 +1920,9 @@ enum WireValue<'a> {
 
 /// 业务作用：零拷贝遍历 protobuf wire，阻止 prost 把未知 executable 字段静默丢弃。
 ///
-/// 参数说明：`bytes` 是完整 message；`visit` 校验每个字段的编号、类型和嵌套 surface。
+/// 参数说明：
+/// - `bytes`：是完整 message
+/// - `visit`：校验每个字段的编号、类型和嵌套 surface。
 ///
 /// 返回：完整消费且全部字段通过时成功；截断、溢出、group 或未知字段失败。
 fn walk_fields<'a>(
@@ -1796,7 +1957,8 @@ fn walk_fields<'a>(
 
 /// 业务作用：读取有十字节上限的 protobuf varint，防截断和移位溢出。
 ///
-/// 参数说明：`bytes` 会推进到 varint 之后。
+/// 参数说明：
+/// - `bytes`：会推进到 varint 之后。
 ///
 /// 返回：合法 u64；截断或第十字节溢出失败。
 fn take_varint(bytes: &mut &[u8]) -> Result<u64> {
@@ -1817,7 +1979,9 @@ fn take_varint(bytes: &mut &[u8]) -> Result<u64> {
 
 /// 业务作用：从 wire 输入借用固定长度片段，不复制 payload。
 ///
-/// 参数说明：`bytes` 会推进；`len` 来自已校验可转 usize 的 protobuf length。
+/// 参数说明：
+/// - `bytes`：会推进
+/// - `len`：来自已校验可转 usize 的 protobuf length。
 ///
 /// 返回：长度足够时返回借用切片，截断时失败。
 fn take_exact<'a>(bytes: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
@@ -1829,7 +1993,9 @@ fn take_exact<'a>(bytes: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
 
 /// 业务作用：断言当前 wire value 是 length-delimited，并返回嵌套 bytes。
 ///
-/// 参数说明：`value` 是 walker 输出；`field` 用于错误定位。
+/// 参数说明：
+/// - `value`：是 walker 输出
+/// - `field`：用于错误定位。
 ///
 /// 返回：Bytes variant 的借用内容；其它 wire type 失败。
 fn expect_bytes<'a>(value: WireValue<'a>, field: &str) -> Result<&'a [u8]> {
@@ -1843,7 +2009,9 @@ fn expect_bytes<'a>(value: WireValue<'a>, field: &str) -> Result<&'a [u8]> {
 
 /// 业务作用：断言当前 wire value 是 varint。
 ///
-/// 参数说明：`value` 是 walker 输出；`field` 用于错误定位。
+/// 参数说明：
+/// - `value`：是 walker 输出
+/// - `field`：用于错误定位。
 ///
 /// 返回：Varint 数值；其它 wire type 失败。
 fn expect_varint(value: WireValue<'_>, field: &str) -> Result<u64> {
@@ -1855,7 +2023,10 @@ fn expect_varint(value: WireValue<'_>, field: &str) -> Result<u64> {
 
 /// 业务作用：拒绝 protobuf singular 字段重复出现，避免 oneof/last-wins 语义被隐藏。
 ///
-/// 参数说明：`seen` 是当前 message 字段集；`field` 是编号；`name` 用于错误定位。
+/// 参数说明：
+/// - `seen`：是当前 message 字段集
+/// - `field`：是编号
+/// - `name`：用于错误定位。
 ///
 /// 返回：首次出现成功，重复失败。
 fn mark_singular(seen: &mut HashSet<u32>, field: u32, name: &str) -> Result<()> {
@@ -1865,7 +2036,8 @@ fn mark_singular(seen: &mut HashSet<u32>, field: u32, name: &str) -> Result<()> 
 
 /// 业务作用：验证 LDS Listener 仅包含 name、单 socket address 与 filter chains，拒绝所有内核/扩展副作用。
 ///
-/// 参数说明：`bytes` 是 Listener Any payload。
+/// 参数说明：
+/// - `bytes`：是 Listener Any payload。
 ///
 /// 返回：最小 TCP/HCM surface 合法时成功；UDP、QUIC、listener filter、socket option 等失败。
 fn validate_listener_wire(bytes: &[u8]) -> Result<()> {
@@ -1889,7 +2061,8 @@ fn validate_listener_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 LDS Address 只能选择 IP socket，禁止 pipe/internal address。
 ///
-/// 参数说明：`bytes` 是 core Address message。
+/// 参数说明：
+/// - `bytes`：是 core Address message。
 ///
 /// 返回：唯一 socket_address 成功；其它地址类型失败。
 fn validate_listener_address_wire(bytes: &[u8]) -> Result<()> {
@@ -1908,7 +2081,8 @@ fn validate_listener_address_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 LDS SocketAddress 只含 TCP protocol、IP literal 与 port_value。
 ///
-/// 参数说明：`bytes` 是 SocketAddress message。
+/// 参数说明：
+/// - `bytes`：是 SocketAddress message。
 ///
 /// 返回：字段形态合法时成功；named port/resolver/interface/namespace 等失败。
 fn validate_listener_socket_wire(bytes: &[u8]) -> Result<()> {
@@ -1932,7 +2106,8 @@ fn validate_listener_socket_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证单 LDS filter chain 只含匹配条件、network filters 与可选 TLS transport。
 ///
-/// 参数说明：`bytes` 是 FilterChain message。
+/// 参数说明：
+/// - `bytes`：是 FilterChain message。
 ///
 /// 返回：没有 metadata、PROXY protocol、on-demand 或扩展发现时成功。
 fn validate_filter_chain_wire(bytes: &[u8]) -> Result<()> {
@@ -1953,7 +2128,8 @@ fn validate_filter_chain_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：限制 filter-chain match 到 SNI、TLS transport 与固定 ALPN，避免 native matcher 语义缺失。
 ///
-/// 参数说明：`bytes` 是 FilterChainMatch message。
+/// 参数说明：
+/// - `bytes`：是 FilterChainMatch message。
 ///
 /// 返回：仅 fields 9/10/11 成功；IP/port/source 等匹配条件失败。
 fn validate_filter_chain_match_wire(bytes: &[u8]) -> Result<()> {
@@ -1971,7 +2147,8 @@ fn validate_filter_chain_match_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 network Filter 只能携带唯一 name 与 typed_config Any。
 ///
-/// 参数说明：`bytes` 是 Filter message。
+/// 参数说明：
+/// - `bytes`：是 Filter message。
 ///
 /// 返回：静态 typed extension 形态成功；ECDS/Struct/未知字段失败。
 fn validate_network_filter_wire(bytes: &[u8]) -> Result<()> {
@@ -1991,7 +2168,8 @@ fn validate_network_filter_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 HCM Any 并递归限制其 payload surface。
 ///
-/// 参数说明：`bytes` 是 HCM google.protobuf.Any。
+/// 参数说明：
+/// - `bytes`：是 HCM google.protobuf.Any。
 ///
 /// 返回：type/value 唯一且 payload 通过 HCM 白名单时成功。
 fn validate_hcm_any_wire(bytes: &[u8]) -> Result<()> {
@@ -2011,7 +2189,8 @@ fn validate_hcm_any_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 HCM 只含 AUTO codec、stat prefix、ADS RDS 与 router HTTP filter。
 ///
-/// 参数说明：`bytes` 是 HttpConnectionManager payload。
+/// 参数说明：
+/// - `bytes`：是 HttpConnectionManager payload。
 ///
 /// 返回：最小 HCM→RDS surface 成功；inline route、upgrade、tracing、header mutation 等失败。
 fn validate_hcm_wire(bytes: &[u8]) -> Result<()> {
@@ -2036,7 +2215,8 @@ fn validate_hcm_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 HCM RDS 只引用当前 ADS 与一个 route_config_name。
 ///
-/// 参数说明：`bytes` 是 HCM.Rds message。
+/// 参数说明：
+/// - `bytes`：是 HCM.Rds message。
 ///
 /// 返回：ADS ConfigSource/name 唯一时成功。
 fn validate_hcm_rds_wire(bytes: &[u8]) -> Result<()> {
@@ -2054,11 +2234,12 @@ fn validate_hcm_rds_wire(bytes: &[u8]) -> Result<()> {
     })
 }
 
-/// 业务作用：验证 HCM HTTP filter 只能携带 name 与静态 typed_config。
+/// 业务作用：验证 HCM HTTP filter 的唯一配置来源，避免 protobuf 解码覆盖互斥字段。
 ///
-/// 参数说明：`bytes` 是 HttpFilter message。
+/// 参数说明：
+/// - `bytes`：是 HttpFilter message。
 ///
-/// 返回：router filter 可解码形态成功；ECDS/disabled/matcher 等字段失败。
+/// 返回：静态配置或显式编译的命名 ECDS 成功；disabled/optional/matcher 等字段失败。
 fn validate_http_filter_wire(bytes: &[u8]) -> Result<()> {
     let mut singular = HashSet::new();
     walk_fields(bytes, |field, value| match field {
@@ -2068,7 +2249,14 @@ fn validate_http_filter_wire(bytes: &[u8]) -> Result<()> {
         }
         4 => {
             mark_singular(&mut singular, field, "HttpFilter.typed_config")?;
+            mark_singular(&mut singular, 0, "HttpFilter.config_type")?;
             validate_any_wire(expect_bytes(value, "HttpFilter.typed_config")?)
+        }
+        #[cfg(feature = "xds-client-extensions")]
+        5 => {
+            mark_singular(&mut singular, field, "HttpFilter.config_discovery")?;
+            mark_singular(&mut singular, 0, "HttpFilter.config_type")?;
+            extensions::validate_source_wire(expect_bytes(value, "HttpFilter.config_discovery")?)
         }
         other => bail!("unknown or unsupported HttpFilter field {other}"),
     })
@@ -2076,7 +2264,8 @@ fn validate_http_filter_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 transport socket 只含名称与 DownstreamTlsContext Any。
 ///
-/// 参数说明：`bytes` 是 TransportSocket message。
+/// 参数说明：
+/// - `bytes`：是 TransportSocket message。
 ///
 /// 返回：静态 TLS typed config 成功；其它扩展字段失败。
 fn validate_transport_socket_wire(bytes: &[u8]) -> Result<()> {
@@ -2096,7 +2285,8 @@ fn validate_transport_socket_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 DownstreamTlsContext Any，并递归校验 SDS 引用 surface。
 ///
-/// 参数说明：`bytes` 是 TLS google.protobuf.Any。
+/// 参数说明：
+/// - `bytes`：是 TLS google.protobuf.Any。
 ///
 /// 返回：type/value 唯一且 payload 合法时成功。
 fn validate_downstream_tls_any_wire(bytes: &[u8]) -> Result<()> {
@@ -2116,7 +2306,8 @@ fn validate_downstream_tls_any_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 DownstreamTlsContext 只含 common context 与 require-client-certificate。
 ///
-/// 参数说明：`bytes` 是 DownstreamTlsContext payload。
+/// 参数说明：
+/// - `bytes`：是 DownstreamTlsContext payload。
 ///
 /// 返回：session ticket、OCSP、SNI 强制等未映射字段缺席时成功。
 fn validate_downstream_tls_wire(bytes: &[u8]) -> Result<()> {
@@ -2144,7 +2335,8 @@ fn validate_downstream_tls_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 CommonTlsContext 仅以当前 ADS 引用证书/validation SDS，并使用固定 ALPN。
 ///
-/// 参数说明：`bytes` 是 CommonTlsContext message。
+/// 参数说明：
+/// - `bytes`：是 CommonTlsContext message。
 ///
 /// 返回：一个证书引用、可选 validation 引用和 ALPN 成功；inline/provider/combined context 失败。
 fn validate_common_tls_context_wire(bytes: &[u8]) -> Result<()> {
@@ -2162,7 +2354,8 @@ fn validate_common_tls_context_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 SdsSecretConfig 只含 secret 名与 ADS ConfigSource。
 ///
-/// 参数说明：`bytes` 是 SdsSecretConfig message。
+/// 参数说明：
+/// - `bytes`：是 SdsSecretConfig message。
 ///
 /// 返回：name/source 唯一且 source 为 ADS 时成功。
 fn validate_sds_reference_wire(bytes: &[u8]) -> Result<()> {
@@ -2182,7 +2375,8 @@ fn validate_sds_reference_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 SDS Secret 只包含 name 与 certificate/validation 二选一。
 ///
-/// 参数说明：`bytes` 是 Secret Any payload。
+/// 参数说明：
+/// - `bytes`：是 Secret Any payload。
 ///
 /// 返回：内联 TLS identity 或 CA surface 成功；ticket/generic secret 失败。
 fn validate_secret_wire(bytes: &[u8]) -> Result<()> {
@@ -2207,7 +2401,8 @@ fn validate_secret_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 SDS TlsCertificate 只有内联证书链与私钥。
 ///
-/// 参数说明：`bytes` 是 TlsCertificate message。
+/// 参数说明：
+/// - `bytes`：是 TlsCertificate message。
 ///
 /// 返回：两个 DataSource 通过 inline 白名单时成功；password/provider/OCSP 等失败。
 fn validate_tls_certificate_wire(bytes: &[u8]) -> Result<()> {
@@ -2223,7 +2418,8 @@ fn validate_tls_certificate_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 SDS CertificateValidationContext 只包含内联 trusted_ca。
 ///
-/// 参数说明：`bytes` 是 CertificateValidationContext message。
+/// 参数说明：
+/// - `bytes`：是 CertificateValidationContext message。
 ///
 /// 返回：唯一 trusted_ca 成功；SAN/hash/CRL/custom validator 等失败。
 fn validate_validation_context_wire(bytes: &[u8]) -> Result<()> {
@@ -2242,7 +2438,8 @@ fn validate_validation_context_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：严格验证 CDS Cluster 顶层 surface；所有未映射执行字段均 NACK。
 ///
-/// 参数说明：`bytes` 是 Cluster Any payload。
+/// 参数说明：
+/// - `bytes`：是 Cluster Any payload。
 ///
 /// 返回：仅 name/type/EDS config/connect timeout/LB/H2 protocol 字段成功。
 fn validate_cluster_wire(bytes: &[u8]) -> Result<()> {
@@ -2290,7 +2487,8 @@ fn validate_cluster_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 EDS cluster config 只引用当前 ADS stream 与可选安全 service name。
 ///
-/// 参数说明：`bytes` 是 EdsClusterConfig message。
+/// 参数说明：
+/// - `bytes`：是 EdsClusterConfig message。
 ///
 /// 返回：唯一 ConfigSource 与 service_name 字段成功，其它字段失败。
 fn validate_eds_cluster_config_wire(bytes: &[u8]) -> Result<()> {
@@ -2310,7 +2508,8 @@ fn validate_eds_cluster_config_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 ConfigSource 精确选择 ADS，不允许另一路径或远端 API 绕过 bootstrap authority。
 ///
-/// 参数说明：`bytes` 是 ConfigSource message。
+/// 参数说明：
+/// - `bytes`：是 ConfigSource message。
 ///
 /// 返回：唯一空 ADS marker 成功；其它 source/timeout/version 字段失败。
 fn validate_config_source_wire(bytes: &[u8]) -> Result<()> {
@@ -2333,7 +2532,8 @@ fn validate_config_source_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 Cluster typed protocol map entry 的 key/Any wire 形态。
 ///
-/// 参数说明：`bytes` 是 protobuf map entry。
+/// 参数说明：
+/// - `bytes`：是 protobuf map entry。
 ///
 /// 返回：唯一 key/value 成功并返回 UTF-8 key；重复、缺失或未知字段失败。
 fn validate_typed_protocol_map_entry(bytes: &[u8]) -> Result<String> {
@@ -2364,7 +2564,8 @@ fn validate_typed_protocol_map_entry(bytes: &[u8]) -> Result<String> {
 
 /// 业务作用：验证 google.protobuf.Any 只含唯一 type_url/value。
 ///
-/// 参数说明：`bytes` 是 Any message。
+/// 参数说明：
+/// - `bytes`：是 Any message。
 ///
 /// 返回：规范字段成功；重复或未知字段失败。
 fn validate_any_wire(bytes: &[u8]) -> Result<()> {
@@ -2380,7 +2581,8 @@ fn validate_any_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 typed HttpProtocolOptions 仅选择空 H1 或 H2 explicit config。
 ///
-/// 参数说明：`bytes` 是 HttpProtocolOptions Any payload。
+/// 参数说明：
+/// - `bytes`：是 HttpProtocolOptions Any payload。
 ///
 /// 返回：唯一 field 3 explicit config 成功；其它通用或扩展选项失败。
 fn validate_http_protocol_options_wire(bytes: &[u8]) -> Result<()> {
@@ -2399,7 +2601,8 @@ fn validate_http_protocol_options_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 explicit protocol oneof 只含一个空 H1/H2 options message。
 ///
-/// 参数说明：`bytes` 是 ExplicitHttpConfig message。
+/// 参数说明：
+/// - `bytes`：是 ExplicitHttpConfig message。
 ///
 /// 返回：field 1 或 2 恰好一个且为空时成功。
 fn validate_explicit_http_config_wire(bytes: &[u8]) -> Result<()> {
@@ -2422,7 +2625,8 @@ fn validate_explicit_http_config_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 protobuf Duration 只含 seconds/nanos 两个 singular varint。
 ///
-/// 参数说明：`bytes` 是 Duration message。
+/// 参数说明：
+/// - `bytes`：是 Duration message。
 ///
 /// 返回：已知字段无重复时成功；未知或错误 wire type 失败。
 fn validate_duration_wire(bytes: &[u8]) -> Result<()> {
@@ -2438,7 +2642,8 @@ fn validate_duration_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 RouteConfiguration 顶层只含 name 与 inline virtual_hosts。
 ///
-/// 参数说明：`bytes` 是 RDS Any payload。
+/// 参数说明：
+/// - `bytes`：是 RDS Any payload。
 ///
 /// 返回：allowlist 成功；VHDS、header mutation、插件和 metadata 等字段失败。
 fn validate_route_configuration_wire(bytes: &[u8]) -> Result<()> {
@@ -2458,7 +2663,8 @@ fn validate_route_configuration_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 VirtualHost 只含 name/domains/ordered routes。
 ///
-/// 参数说明：`bytes` 是单个 VirtualHost。
+/// 参数说明：
+/// - `bytes`：是单个 VirtualHost。
 ///
 /// 返回：allowlist 成功；TLS enforcement、matcher tree、filter config 和 mutation 失败。
 fn validate_virtual_host_wire(bytes: &[u8]) -> Result<()> {
@@ -2476,7 +2682,8 @@ fn validate_virtual_host_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 Route 只含 name/match 与一个 forward/redirect/direct action。
 ///
-/// 参数说明：`bytes` 是单个 Route。
+/// 参数说明：
+/// - `bytes`：是单个 Route。
 ///
 /// 返回：allowlist 成功；metadata/filter/mutation/tracing 等字段失败。
 fn validate_route_wire(bytes: &[u8]) -> Result<()> {
@@ -2508,7 +2715,8 @@ fn validate_route_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 RouteMatch 只含 exact/prefix、case-sensitive 与受限 headers。
 ///
-/// 参数说明：`bytes` 是 RouteMatch。
+/// 参数说明：
+/// - `bytes`：是 RouteMatch。
 ///
 /// 返回：allowlist 成功；regex/runtime/query/grpc/dynamic matcher 等字段失败。
 fn validate_route_match_wire(bytes: &[u8]) -> Result<()> {
@@ -2529,7 +2737,8 @@ fn validate_route_match_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 HeaderMatcher 只含 name 与 exact/presence oneof。
 ///
-/// 参数说明：`bytes` 是 HeaderMatcher。
+/// 参数说明：
+/// - `bytes`：是 HeaderMatcher。
 ///
 /// 返回：allowlist 成功；invert、regex/range/string matcher 等字段失败。
 fn validate_header_matcher_wire(bytes: &[u8]) -> Result<()> {
@@ -2553,7 +2762,8 @@ fn validate_header_matcher_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 forward action 只选择单 cluster 或 weighted clusters。
 ///
-/// 参数说明：`bytes` 是 RouteAction。
+/// 参数说明：
+/// - `bytes`：是 RouteAction。
 ///
 /// 返回：allowlist 成功；rewrite/timeout/retry/plugin 等尚未精确映射的字段失败。
 fn validate_route_action_wire(bytes: &[u8]) -> Result<()> {
@@ -2577,7 +2787,8 @@ fn validate_route_action_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 WeightedCluster 只含 name+weight 的 ordered cluster entries。
 ///
-/// 参数说明：`bytes` 是 WeightedCluster。
+/// 参数说明：
+/// - `bytes`：是 WeightedCluster。
 ///
 /// 返回：allowlist 成功；runtime key/total weight/header mutation 等字段失败。
 fn validate_weighted_clusters_wire(bytes: &[u8]) -> Result<()> {
@@ -2589,7 +2800,8 @@ fn validate_weighted_clusters_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证单个 ClusterWeight 只含 name 与 UInt32Value weight。
 ///
-/// 参数说明：`bytes` 是 ClusterWeight。
+/// 参数说明：
+/// - `bytes`：是 ClusterWeight。
 ///
 /// 返回：allowlist 成功；cluster header、metadata、mutation 和 typed config 失败。
 fn validate_cluster_weight_wire(bytes: &[u8]) -> Result<()> {
@@ -2609,7 +2821,8 @@ fn validate_cluster_weight_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 redirect action 仅含显式 scheme/host/port/fixed path/status/strip-query。
 ///
-/// 参数说明：`bytes` 是 RedirectAction。
+/// 参数说明：
+/// - `bytes`：是 RedirectAction。
 ///
 /// 返回：allowlist 成功；prefix/regex/https bool 等不能精确映射的字段失败。
 fn validate_redirect_action_wire(bytes: &[u8]) -> Result<()> {
@@ -2629,7 +2842,8 @@ fn validate_redirect_action_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 direct response 只含 status 与 inline DataSource body。
 ///
-/// 参数说明：`bytes` 是 DirectResponseAction。
+/// 参数说明：
+/// - `bytes`：是 DirectResponseAction。
 ///
 /// 返回：allowlist 成功；body format 或未知字段失败。
 fn validate_direct_response_wire(bytes: &[u8]) -> Result<()> {
@@ -2649,7 +2863,8 @@ fn validate_direct_response_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 DataSource 只能内联 bytes/string，禁止控制面要求读取节点文件或环境变量。
 ///
-/// 参数说明：`bytes` 是 DataSource message。
+/// 参数说明：
+/// - `bytes`：是 DataSource message。
 ///
 /// 返回：field 2 或 3 唯一出现时成功，其它字段失败。
 fn validate_data_source_wire(bytes: &[u8]) -> Result<()> {
@@ -2668,7 +2883,8 @@ fn validate_data_source_wire(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 BoolValue 只有唯一 value varint。
 ///
-/// 参数说明：`bytes` 是 google.protobuf.BoolValue。
+/// 参数说明：
+/// - `bytes`：是 google.protobuf.BoolValue。
 ///
 /// 返回：零或一个 value 成功；未知/重复字段失败。
 fn validate_bool_wrapper(bytes: &[u8]) -> Result<()> {
@@ -2677,7 +2893,8 @@ fn validate_bool_wrapper(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：验证 UInt32Value 只有唯一 value varint。
 ///
-/// 参数说明：`bytes` 是 google.protobuf.UInt32Value。
+/// 参数说明：
+/// - `bytes`：是 google.protobuf.UInt32Value。
 ///
 /// 返回：零或一个 value 成功；未知/重复字段失败。
 fn validate_u32_wrapper(bytes: &[u8]) -> Result<()> {
@@ -2686,7 +2903,9 @@ fn validate_u32_wrapper(bytes: &[u8]) -> Result<()> {
 
 /// 业务作用：复用 protobuf scalar wrapper 的严格字段门。
 ///
-/// 参数说明：`bytes` 是 wrapper message；`name` 用于错误定位。
+/// 参数说明：
+/// - `bytes`：是 wrapper message
+/// - `name`：用于错误定位。
 ///
 /// 返回：仅 field 1 varint 且不重复时成功。
 fn validate_scalar_wrapper(bytes: &[u8], name: &str) -> Result<()> {
@@ -2792,6 +3011,9 @@ struct HttpFilter {
     name: String,
     #[prost(message, optional, tag = "4")]
     typed_config: Option<Any>,
+    #[cfg(feature = "xds-client-extensions")]
+    #[prost(message, optional, tag = "5")]
+    config_discovery: Option<extensions::ExtensionConfigSource>,
 }
 
 #[derive(Clone, PartialEq, Message)]

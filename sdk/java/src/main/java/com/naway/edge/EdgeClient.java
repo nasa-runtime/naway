@@ -26,9 +26,9 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
- * Naway gRPC 边缘模式(V8)Java 客户端。
+ * Naway gRPC 边缘模式Java 客户端。
  *
- * <h2>先理解产品语义(架构规范 §25.2.2b)</h2>
+ * <h2>先理解产品语义</h2>
  * <ul>
  *   <li><b>at-most-once</b>:队满、peer 断线、节点重启、下游读得慢都允许丢消息,SDK 不重传;</li>
  *   <li><b>无离线堆积</b>:不在线时没有任何队列为你保存消息,重连也不补发;</li>
@@ -57,6 +57,10 @@ public final class EdgeClient {
         /**
          * 业务作用：构造一条带显式合并键的 Publish/PublishStream 消息。
          *
+         *
+         * 返回：保留非空数组引用；调用方在发送结束前不得修改数组，长度在发送前检查。
+         *
+         * 参数说明：
          * @param coalesceKey 1..=256 字节业务实体键
          * @param payload 业务 protobuf 字节
          */
@@ -74,7 +78,13 @@ public final class EdgeClient {
     private final MethodDescriptor<byte[], byte[]> publishStream;
 
     /**
-     * @param channel 使用方自建的 gRPC channel(明文 h2c 用 {@code usePlaintext()});
+     * 业务作用：用调用方管理的 Channel 与精确端点契约装配客户端，不自行创建或关闭传输连接。
+     *
+     *
+     * 返回：建立端点描述与客户端视图，不发起网络请求。
+     *
+     * 参数说明：
+     * @param channel 使用方自建的 gRPC channel(明文 h2c 用 {@code usePlaintext});
      *                交给使用方是为了让 TLS、名字解析、拦截器、连接池策略沿用其既有约定
      * @param config  端点契约:方法路径与三个 metadata 头名
      */
@@ -90,8 +100,10 @@ public final class EdgeClient {
     }
 
     /**
-     * 群播一条消息给 group 全体订阅者。
+     * 业务作用：群播一条消息给 group 全体订阅者。
      *
+     *
+     * 参数说明：
      * @param group   目标 group;能否发布由 {@code authz.publish_groups} 决定
      * @param payload 业务字节(<b>不含</b> gRPC 5 字节前缀,gRPC 栈负责分帧)
      * @return 群播回执;{@code accepted} 只表示入队份数,<b>不代表任何终端已收到</b>
@@ -107,6 +119,8 @@ public final class EdgeClient {
     /**
      * 业务作用：群播一条带合并键的消息，使 {@code latest_by_key} 队列按业务实体只保留最新状态。
      *
+     *
+     * 参数说明：
      * @param group 目标授权 group
      * @param coalesceKey 1..=256 字节合并键
      * @param payload 业务 protobuf 字节
@@ -121,8 +135,10 @@ public final class EdgeClient {
     }
 
     /**
-     * 定向单播给某 user 的全部在线 session。
+     * 业务作用：定向单播给某 user 的全部在线 session。
      *
+     *
+     * 参数说明：
      * @param targetUser 目标 user;能否 push 由 {@code authz.push_targets} 决定
      * @param payload    业务字节
      * @return 单播回执。目标完全不在线时 {@code accepted == 0},<b>这是正常结果不是错误</b>
@@ -137,6 +153,8 @@ public final class EdgeClient {
     /**
      * 业务作用：定向推送一条带合并键的消息，使目标会话 keyed 队列只保留最新状态。
      *
+     *
+     * 参数说明：
      * @param targetUser 目标授权 user
      * @param coalesceKey 1..=256 字节合并键
      * @param payload 业务 protobuf 字节
@@ -151,7 +169,7 @@ public final class EdgeClient {
     }
 
     /**
-     * 以 client-streaming 长流持续群播,返回<b>本段</b>的聚合回执。
+     * 业务作用：以 client-streaming 长流持续群播,返回<b>本段</b>的聚合回执。
      *
      * <p>与 unary Publish 的关键差别在 {@code messages}:<b>它不是恒 1</b>,而是网关本段
      * <b>实际处理的条数</b>。网关按 route 的四门(生命周期 / 累计消息数 / 每秒速率 /
@@ -161,6 +179,8 @@ public final class EdgeClient {
      * <p>速率门是<b>背压节流</b>不是丢弃:令牌不足时网关暂停读体并经 H2 流控传导回来,
      * 因此本调用可能变慢,但不会丢消息。
      *
+     *
+     * 参数说明：
      * @param group    目标 group;能否发布由 {@code authz.publish_groups} 决定
      * @param payloads 本段要发的业务字节序列,按顺序写出后 half-close
      * @return 本段聚合回执
@@ -178,6 +198,8 @@ public final class EdgeClient {
     /**
      * 业务作用：按 H2 flow-control 增量发送带 {@code coalesce_key} 的 PublishStream。
      *
+     *
+     * 参数说明：
      * @param group 目标授权 group
      * @param frames 本段 keyed 消息序列；只预检长度，不预编码整批 wire
      * @return 本段聚合回执
@@ -195,6 +217,8 @@ public final class EdgeClient {
     /**
      * 业务作用：共用 PublishStream 的预检、isReady 背压、取消和 summary 生命周期。
      *
+     *
+     * 参数说明：
      * @param group 目标授权 group
      * @param items 调用方原始序列，不复制 payload
      * @param validator 单项无分配预检
@@ -217,6 +241,15 @@ public final class EdgeClient {
         AtomicReference<ClientCallStreamObserver<byte[]>> requestRef = new AtomicReference<>();
         java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(1);
         ClientResponseObserver<byte[], byte[]> responses = new ClientResponseObserver<byte[], byte[]>() {
+            /**
+             * 业务作用：在发送首条消息前建立 HTTP/2 可写通知与请求控制句柄，使生产循环遵循背压。
+             *
+             *
+             * 返回：安装唤醒回调并开放本段发送；不提前缓存整段消息。
+             *
+             * 参数说明：
+             * @param requestStream 当前流的请求控制器，接收可写通知并提供取消入口。
+             */
             @Override
             public void beforeStart(ClientCallStreamObserver<byte[]> requestStream) {
                 // onReady 是 grpc-java 将 HTTP/2 flow-control 传回生产循环的唯一权威；
@@ -230,16 +263,42 @@ public final class EdgeClient {
                 started.countDown();
             }
 
+            /**
+             * 业务作用：接收本段发布回执并完成等待，不将入队计数解释为终端已收到。
+             *
+             *
+             * 返回：完成回执 future，后续完成信号不覆盖已到达的结果。
+             *
+             * 参数说明：
+             * @param value 对端返回的完整 PublishSummary message。
+             */
             @Override
             public void onNext(byte[] value) {
                 reply.complete(value);
             }
 
+            /**
+             * 业务作用：把对端失败传给发布等待方，停止把失败流当成可继续发送的会话。
+             *
+             *
+             * 返回：异常完成回执 future，调用方按失败路径停止发送。
+             *
+             * 参数说明：
+             * @param t 导致本段发布失败的对端错误。
+             */
             @Override
             public void onError(Throwable t) {
                 reply.completeExceptionally(t);
             }
 
+            /**
+             * 业务作用：拒绝没有回执正文就结束的 PublishStream，防止调用方永久等待。
+             *
+             *
+             * 返回：仅在尚无回执时异常完成 future；不覆盖已接收回执。
+             *
+             * 参数说明: 无。
+             */
             @Override
             public void onCompleted() {
                 // summary 已在 onNext 到达；若对端只给 trailer 未给 body，
@@ -285,6 +344,8 @@ public final class EdgeClient {
     /**
      * 业务作用：等待 grpc-java 宣布下一条消息可写，把 HTTP/2 flow-control 变成调用线程背压。
      *
+     *
+     * 参数说明：
      * @param requests 当前 client-streaming 请求控制器
      * @param readiness onReady 唤醒监视器
      * @param reply 对端完成/失败信号，避免已失败后继续等待
@@ -311,11 +372,13 @@ public final class EdgeClient {
     }
 
     /**
-     * 订阅 group,返回可迭代的消息流(<b>不含</b>自动重连)。
+     * 业务作用：订阅 group,返回可迭代的消息流(<b>不含</b>自动重连)。
      *
      * <p>迭代在流结束时正常终止,在网关关闭/节点 drain 时抛 {@link StatusRuntimeException}。
      * 需要长期在线请用 {@link #subscribeWithReconnect}。
      *
+     *
+     * 参数说明：
      * @param group 目标 group;能否订阅由 {@code authz.subscribe_groups} 决定
      * @return 业务消息迭代器,每项是一条完整 payload
      */
@@ -326,11 +389,27 @@ public final class EdgeClient {
                 withHeaders("subscribe", config.groupHeader, group),
                 subscribe, callOptions(), new byte[0]);
         return new Iterator<byte[]>() {
+            /**
+             * 业务作用：按底层 gRPC 流状态判断是否还有完整订阅消息，传播流错误。
+             *
+             *
+             * 返回：存在后续消息为 true，正常结束为 false，协议失败向调用方抛出。
+             *
+             * 参数说明: 无。
+             */
             @Override
             public boolean hasNext() {
                 return wire.hasNext();
             }
 
+            /**
+             * 业务作用：从下一条 FramePush 解出业务 payload，不向调用方暴露协议信封。
+             *
+             *
+             * 返回：完整业务 payload；空字段按 proto3 规则返回空数组，非法 envelope 抛出异常。
+             *
+             * 参数说明: 无。
+             */
             @Override
             public byte[] next() {
                 return decodeFramePush(wire.next());
@@ -339,16 +418,18 @@ public final class EdgeClient {
     }
 
     /**
-     * 订阅并在断线后按抖动退避自动重连。
+     * 业务作用：订阅并在断线后按指数退避自动重连。
      *
      * <p><b>重连不补发</b>:断流期间的消息就是丢了(at-most-once + 无离线堆积)。
      * 授权/身份类错误({@code PERMISSION_DENIED}/{@code UNAUTHENTICATED}/
      * {@code INVALID_ARGUMENT})<b>不重试</b>——重试多少次结果都一样,只会把真问题
      * 掩埋成"一直连不上"。
      *
+     *
+     * 参数说明：
      * @param group    目标 group
      * @param observer 回调;{@code onNext} 收消息,{@code onError} 只在不可重试错误时触发
-     * @return 可关闭句柄;调用 {@link Subscription#close()} 终止重连循环
+     * @return 可关闭句柄;调用 {@link Subscription#close} 终止重连循环
      */
     public Subscription subscribeWithReconnect(String group, StreamObserver<byte[]> observer) {
         AtomicBoolean closed = new AtomicBoolean(false);
@@ -387,7 +468,7 @@ public final class EdgeClient {
         worker.start();
         return () -> {
             if (closed.compareAndSet(false, true)) {
-                // WHY:只改 closed 无法唤醒阻塞在 Iterator.hasNext() 的 gRPC call，线程会
+                // 只改 closed 无法唤醒阻塞在 Iterator.hasNext 的 gRPC call，线程会
                 // 一直泄漏到对端主动断流。取消 Context 才会向当前 call 传播 CANCELLED。
                 context.cancel(null);
                 worker.interrupt();
@@ -397,13 +478,23 @@ public final class EdgeClient {
 
     /** 订阅句柄。 */
     public interface Subscription extends AutoCloseable {
+        /**
+         * 业务作用：停止订阅重连并取消当前阻塞的 gRPC 调用，释放后台线程。
+         *
+         *
+         * 返回：幂等关闭句柄；后台阻塞读取与重连等待被唤醒停止。
+         *
+         * 参数说明: 无。
+         */
         @Override
         void close();
     }
 
     /**
-     * 授权/身份类状态重试无意义,必须立刻上报。
+     * 业务作用：授权/身份类状态重试无意义,必须立刻上报。
      *
+     *
+     * 参数说明：
      * @param status gRPC 状态
      * @return true 表示不可重试
      */
@@ -415,10 +506,17 @@ public final class EdgeClient {
     }
 
     /**
-     * 返回一个会自动带上本次 action metadata 的 channel 视图。
+     * 业务作用：返回一个会自动带上本次 action metadata 的 channel 视图。
      *
      * <p>grpc-java 的 {@code ClientCalls} 不接受 per-call metadata,标准做法是用
      * {@link MetadataUtils} 拦截器附加。每次调用构造一个轻量 wrapper,不新建连接。
+     *
+     * 返回：共享原 Channel 的带 metadata 视图，不创建新连接。
+     *
+     * 参数说明：
+     * @param action 需要网关确认的 edge 动作。
+     * @param scopeHeader 承载 group 或 target 的头名。
+     * @param scope 已选择的目标 group 或 user。
      */
     private Channel withHeaders(String action, String scopeHeader, String scope) {
         Metadata metadata = new Metadata();
@@ -431,15 +529,39 @@ public final class EdgeClient {
                 channel, MetadataUtils.newAttachHeadersInterceptor(metadata));
     }
 
+    /**
+     * 业务作用：把配置头名编译为 ASCII gRPC metadata 键，拒绝非法名称。
+     *
+     *
+     * 返回：合法名称返回 metadata 键，非法名称抛出异常。
+     *
+     * 参数说明：
+     * @param name 配置中的 ASCII metadata 头名。
+     */
     private static Metadata.Key<String> key(String name) {
         return Metadata.Key.of(name, Metadata.ASCII_STRING_MARSHALLER);
     }
 
+    /**
+     * 业务作用：为每次调用施加同一入站消息字节上限，约束回执与订阅消息。
+     *
+     *
+     * 返回：携带配置入站消息上限的 CallOptions。
+     *
+     * 参数说明: 无。
+     */
     private CallOptions callOptions() {
         return CallOptions.DEFAULT.withMaxInboundMessageSize(config.maxMessageBytes);
     }
 
-    /** 按统一 proto 编码 `FramePush { bytes payload = 1; }`。 */
+    /**
+     * 业务作用：按统一 proto 编码 `FramePush { bytes payload = 1; }`。
+     *
+     * 返回：完整 FramePush protobuf 字节；超限时发送前抛出异常。
+     *
+     * 参数说明：
+     * @param payload 不含 gRPC 前缀的业务 protobuf 字节。
+     */
     byte[] encodeFramePush(byte[] payload) {
         return encodeFramePush(payload, null);
     }
@@ -447,6 +569,8 @@ public final class EdgeClient {
     /**
      * 业务作用：按统一 proto 编码 payload 与可选 {@code coalesce_key}，不依赖生成代码。
      *
+     *
+     * 参数说明：
      * @param payload 业务 protobuf 字节
      * @param coalesceKey 空缺或 1..=256 字节合并键
      * @return FramePush protobuf message 字节
@@ -469,6 +593,8 @@ public final class EdgeClient {
     /**
      * 业务作用：无分配校验 FramePush 精确 wire 长度，供整段预检与逐条编码共用。
      *
+     *
+     * 参数说明：
      * @param payloadLength 业务 payload 字节数
      * @param coalesceKey 空缺或 1..=256 字节合并键
      * @return FramePush protobuf message 字节数
@@ -493,7 +619,7 @@ public final class EdgeClient {
     }
 
     /**
-     * 从统一 FramePush protobuf message 取 field 1。
+     * 业务作用：从统一 FramePush protobuf message 取 field 1。
      *
      * <p>必须是<b>真正的字段遍历</b>而不是"断言第一个字节是 0x0a、且 payload 占满整条
      * message":那种写法会拒掉两类完全合法的输入——
@@ -504,6 +630,11 @@ public final class EdgeClient {
      *       protobuf 也不保证字段顺序,payload 可能出现在未知字段之后。</li>
      * </ol>
      * 拒掉它们等于把 FramePush 信封本来要解决的互通问题又造回来。
+     *
+     * 返回：唯一 payload 字段，省略字段时为空；重复字段、错误 wire type 或越界时拒绝。
+     *
+     * 参数说明：
+     * @param wire 受入站上限约束的完整 FramePush message。
      */
     byte[] decodeFramePush(byte[] wire) {
         if (wire.length > config.maxMessageBytes) {
@@ -540,7 +671,16 @@ public final class EdgeClient {
         return payload == null ? new byte[0] : payload;
     }
 
-    /** 跳过一个未知字段,返回新游标。 */
+    /**
+     * 业务作用：跳过一个未知字段,返回新游标。
+     *
+     * 返回：下一字段偏移；截断、溢出或不支持的 wire type 抛出异常。
+     *
+     * 参数说明：
+     * @param wire 受入站上限约束的完整 FramePush message。
+     * @param cursor 当前未知字段值的起始偏移。
+     * @param wireType protobuf 字段的 wire type。
+     */
     private static int skipProtobufField(byte[] wire, int cursor, int wireType) {
         int end;
         switch (wireType) {
@@ -570,6 +710,15 @@ public final class EdgeClient {
         return end;
     }
 
+    /**
+     * 业务作用：计算 protobuf 长度前缀所需字节数，用于发送前的无分配容量校验。
+     *
+     *
+     * 返回：非负长度的 varint 编码字节数。
+     *
+     * 参数说明：
+     * @param value 待编码的非负长度。
+     */
     private static int varintLength(int value) {
         int len = 1;
         while ((value & ~0x7f) != 0) {
@@ -579,6 +728,17 @@ public final class EdgeClient {
         return len;
     }
 
+    /**
+     * 业务作用：向已预留的 FramePush 缓冲区写入长度前缀，保持编码长度与预算一致。
+     *
+     *
+     * 返回：前缀写入后的下一偏移，输出缓冲区对应区间被更新。
+     *
+     * 参数说明：
+     * @param value 待编码的非负长度。
+     * @param out 已经按准确 wire 长度分配的输出缓冲区。
+     * @param cursor 长度前缀的起始偏移。
+     */
     private static int writeVarint(int value, byte[] out, int cursor) {
         while ((value & ~0x7f) != 0) {
             out[cursor++] = (byte) ((value & 0x7f) | 0x80);
@@ -588,6 +748,16 @@ public final class EdgeClient {
         return cursor;
     }
 
+    /**
+     * 业务作用：从 FramePush 读取有界 varint，截断或超长时拒绝协议消息。
+     *
+     *
+     * 返回：解码值与下一偏移；截断或超长抛出异常。
+     *
+     * 参数说明：
+     * @param body 完整 FramePush message。
+     * @param cursor 待解码 varint 的起始偏移。
+     */
     private static long[] readVarint(byte[] body, int cursor) {
         long value = 0;
         int shift = 0;
@@ -603,10 +773,16 @@ public final class EdgeClient {
     }
 
     /**
-     * 构造原始字节 method descriptor。
+     * 业务作用：构造原始字节 method descriptor。
      *
      * <p>不使用 protobuf marshaller:网关不解析业务 payload,SDK 也不该强迫使用方
      * 走某一种 protobuf 实现。
+     *
+     * 返回：移除路径前导斜杠的原始字节方法描述，不绑定生成的业务消息类型。
+     *
+     * 参数说明：
+     * @param type 方法的 unary 或 streaming 类型。
+     * @param fullPath 与网关路由一致的精确 gRPC 方法路径。
      */
     private static MethodDescriptor<byte[], byte[]> descriptor(
             MethodDescriptor.MethodType type, String fullPath) {
@@ -622,11 +798,29 @@ public final class EdgeClient {
 
     private static final MethodDescriptor.Marshaller<byte[]> BYTES_MARSHALLER =
             new MethodDescriptor.Marshaller<byte[]>() {
+                /**
+                 * 业务作用：将已编码的消息字节交给 gRPC 分帧，不再解释业务 payload。
+                 *
+                 *
+                 * 返回：不额外复制 payload 的消息输入流。
+                 *
+                 * 参数说明：
+                 * @param value 已经编码且完成大小校验的消息字节。
+                 */
                 @Override
                 public InputStream stream(byte[] value) {
                     return new java.io.ByteArrayInputStream(value);
                 }
 
+                /**
+                 * 业务作用：读取 gRPC 已分帧并受入站大小限制的消息，IO 失败时不返回部分实体。
+                 *
+                 *
+                 * 返回：完整消息字节；读取失败抛出异常而不交付部分正文。
+                 *
+                 * 参数说明：
+                 * @param stream 由 gRPC 提供的单条消息输入流。
+                 */
                 @Override
                 public byte[] parse(InputStream stream) {
                     try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {

@@ -12,7 +12,6 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
-use hmac::{Hmac, Mac};
 use http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
 use parking_lot::Mutex;
 use reqwest::{Client, Url};
@@ -71,7 +70,8 @@ pub(crate) struct RemoteSecretResolution {
 impl RemoteSecretResolution {
     /// 业务作用：按原始 `remote://` 引用取得已验证值，禁止调用方自行回退到引用文本。
     ///
-    /// 参数说明：`reference` 是配置中出现的完整远程引用。
+    /// 参数说明：
+    /// - `reference`：是配置中出现的完整远程引用。
     ///
     /// 返回：引用已在本轮解析时返回 secret，否则报告候选内部引用不闭合。
     pub(crate) fn get(&self, reference: &str) -> Result<&ResolvedRemoteSecret> {
@@ -105,7 +105,7 @@ struct PreparedProvider {
     retry_base: Duration,
     retry_max: Duration,
     max_response_bytes: usize,
-    envelope: Option<crate::external_crypto::ExternalEnvelopePlan>,
+    envelope: Option<crate::security::external_crypto::ExternalEnvelopePlan>,
 }
 
 #[derive(Clone)]
@@ -156,7 +156,8 @@ struct FetchedSecret {
 
 /// 业务作用：判断 SecretSource 是否要求远程 provider 解析。
 ///
-/// 参数说明：`raw` 是 credential 中的 SecretSource 文本。
+/// 参数说明：
+/// - `raw`：是 credential 中的 SecretSource 文本。
 ///
 /// 返回：仅 `remote://` 前缀返回 true。
 pub(crate) fn is_remote_reference(raw: &str) -> bool {
@@ -165,15 +166,18 @@ pub(crate) fn is_remote_reference(raw: &str) -> bool {
 
 /// 业务作用：并发有界地解析候选使用的全部远程 secret，并冻结统一刷新周期。
 ///
-/// 参数说明：`providers` 是 provider 目录；`references` 是去重前引用；`config_dir` 是本地认证
-/// SecretSource 的相对路径基准；`crypto_catalog` 提供 envelope 解密所需的共享密码 provider。
+/// 参数说明：
+/// - `providers`：是 provider 目录
+/// - `references`：是去重前引用
+/// - `config_dir`：是本地认证 SecretSource 的相对路径基准
+/// - `crypto_catalog`：提供 envelope 解密所需的共享密码 provider。
 ///
 /// 返回：所有远端响应、版本、lease 与陈旧期合法时返回完整映射；任一首次读取失败则拒绝候选。
 pub(crate) fn resolve_all(
     providers: &[RemoteSecretProviderCfg],
     references: impl IntoIterator<Item = String>,
     config_dir: &Path,
-    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
+    crypto_catalog: &crate::security::external_crypto::ExternalCryptoCatalog,
 ) -> Result<RemoteSecretResolution> {
     let unique = references
         .into_iter()
@@ -253,7 +257,9 @@ pub(crate) fn resolve_all(
 
 /// 业务作用：收集 provider 认证、CA 与 mTLS 文件依赖，使身份轮换触发统一候选重建。
 ///
-/// 参数说明：`providers` 是完整 provider 目录；`config_dir` 是相对路径基准。
+/// 参数说明：
+/// - `providers`：是完整 provider 目录
+/// - `config_dir`：是相对路径基准。
 ///
 /// 返回：返回不含 secret 内容的本地依赖路径列表。
 pub(crate) fn dependency_paths(
@@ -270,31 +276,36 @@ pub(crate) fn dependency_paths(
                 provider.client_private_key.as_str(),
             ];
             let adapter = match &provider.adapter {
-                RemoteSecretAdapterCfg::AwsSecretsManager { credentials, .. } => {
-                    Some(credentials.as_str())
-                }
+                RemoteSecretAdapterCfg::AwsSecretsManager {
+                    credentials,
+                    ..
+                } => Some(credentials.as_str()),
                 RemoteSecretAdapterCfg::GenericJson
-                | RemoteSecretAdapterCfg::AzureKeyVault { .. }
+                | RemoteSecretAdapterCfg::AzureKeyVault {
+                    ..
+                }
                 | RemoteSecretAdapterCfg::GcpSecretManager => None,
             };
             common
                 .into_iter()
                 .chain(adapter)
-                .filter_map(|value| crate::secret::dependency_path(value, config_dir))
+                .filter_map(|value| crate::security::secret::dependency_path(value, config_dir))
         })
         .collect()
 }
 
 /// 业务作用：把 provider 配置编译成固定 TLS、认证 header、JSON 契约和资源预算。
 ///
-/// 参数说明：`configs` 是声明目录；`config_dir` 是本地 SecretSource 路径基准；
-/// `crypto_catalog` 提供可被 envelope 引用的已校验密码 provider。
+/// 参数说明：
+/// - `configs`：是声明目录
+/// - `config_dir`：是本地 SecretSource 路径基准
+/// - `crypto_catalog`：提供可被 envelope 引用的已校验密码 provider。
 ///
 /// 返回：全部 provider 唯一且安全时返回按名称索引的不可变计划，否则拒绝候选。
 fn prepare_providers(
     configs: &[RemoteSecretProviderCfg],
     config_dir: &Path,
-    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
+    crypto_catalog: &crate::security::external_crypto::ExternalCryptoCatalog,
 ) -> Result<HashMap<String, Arc<PreparedProvider>>> {
     if configs.is_empty() || configs.len() > MAX_PROVIDERS {
         bail!("secret_providers count must be in 1..={MAX_PROVIDERS}");
@@ -310,7 +321,9 @@ fn prepare_providers(
         let envelope = config
             .envelope
             .as_ref()
-            .map(|reference| crate::external_crypto::build_envelope_plan(reference, crypto_catalog))
+            .map(|reference| {
+                crate::security::external_crypto::build_envelope_plan(reference, crypto_catalog)
+            })
             .transpose()?;
         let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -322,7 +335,7 @@ fn prepare_providers(
                 config_dir,
                 &format!("remote secret provider `{}` CA", config.name),
             )?;
-            let certificate = reqwest::Certificate::from_pem(pem.as_bytes())
+            let certificate = crate::tls::trust::http_ca(pem.as_bytes())
                 .context("remote secret provider CA is invalid")?;
             builder = builder.add_root_certificate(certificate);
         }
@@ -385,7 +398,8 @@ fn prepare_providers(
 
 /// 业务作用：验证 provider 的时间、响应体和退避预算不会产生无界等待或永不过期值。
 ///
-/// 参数说明：`config` 是单一 provider 声明。
+/// 参数说明：
+/// - `config`：是单一 provider 声明。
 ///
 /// 返回：全部数值处于安全范围且刷新早于陈旧截止点时成功，否则返回错误。
 fn validate_provider_limits(config: &RemoteSecretProviderCfg) -> Result<()> {
@@ -418,7 +432,8 @@ fn validate_provider_limits(config: &RemoteSecretProviderCfg) -> Result<()> {
 
 /// 业务作用：约束原生云适配器的认证形态和字段边界，使统一 provider 生命周期不会被 wire 差异绕过。
 ///
-/// 参数说明：`config` 是单一 provider 声明。
+/// 参数说明：
+/// - `config`：是单一 provider 声明。
 ///
 /// 返回：适配器专属字段、认证来源和通用 JSON Pointer 无歧义时成功，否则拒绝候选。
 fn validate_adapter_contract(config: &RemoteSecretProviderCfg) -> Result<()> {
@@ -459,7 +474,9 @@ fn validate_adapter_contract(config: &RemoteSecretProviderCfg) -> Result<()> {
                 bail!("AWS Secrets Manager uses SigV4 and cannot declare HTTP authorization");
             }
         }
-        RemoteSecretAdapterCfg::AzureKeyVault { api_version } => {
+        RemoteSecretAdapterCfg::AzureKeyVault {
+            api_version,
+        } => {
             validate_bearer_adapter(config, "Azure Key Vault")?;
             if api_version.is_empty()
                 || api_version.len() > 32
@@ -479,12 +496,16 @@ fn validate_adapter_contract(config: &RemoteSecretProviderCfg) -> Result<()> {
 
 /// 业务作用：要求 OAuth 型云适配器只能把本地 workload token 放进标准 Bearer header。
 ///
-/// 参数说明：`config` 是 provider 声明；`provider_name` 是低敏错误标签。
+/// 参数说明：
+/// - `config`：是 provider 声明
+/// - `provider_name`：是低敏错误标签。
 ///
 /// 返回：认证来源、header 和前缀符合固定 OAuth 契约时成功，否则拒绝候选。
 fn validate_bearer_adapter(config: &RemoteSecretProviderCfg, provider_name: &str) -> Result<()> {
     if config.authorization.is_empty()
-        || config.authorization_header.to_ascii_lowercase() != "authorization"
+        || !config
+            .authorization_header
+            .eq_ignore_ascii_case("authorization")
         || config.authorization_prefix != "Bearer "
     {
         bail!("{provider_name} requires a local authorization SecretSource with `Bearer ` prefix");
@@ -494,7 +515,9 @@ fn validate_bearer_adapter(config: &RemoteSecretProviderCfg, provider_name: &str
 
 /// 业务作用：把云适配器的本地身份材料编译成不可记录的请求签名计划。
 ///
-/// 参数说明：`config` 是已通过字段复验的 provider；`config_dir` 是 SecretSource 路径基准。
+/// 参数说明：
+/// - `config`：是已通过字段复验的 provider
+/// - `config_dir`：是 SecretSource 路径基准。
 ///
 /// 返回：身份仍在有效期内时返回适配器计划；凭据缺失、过期或格式错误时拒绝候选。
 fn prepare_adapter(config: &RemoteSecretProviderCfg, config_dir: &Path) -> Result<PreparedAdapter> {
@@ -530,18 +553,19 @@ fn prepare_adapter(config: &RemoteSecretProviderCfg, config_dir: &Path) -> Resul
                 session_token,
             })
         }
-        RemoteSecretAdapterCfg::AzureKeyVault { api_version } => {
-            Ok(PreparedAdapter::AzureKeyVault {
-                api_version: Arc::from(api_version.as_str()),
-            })
-        }
+        RemoteSecretAdapterCfg::AzureKeyVault {
+            api_version,
+        } => Ok(PreparedAdapter::AzureKeyVault {
+            api_version: Arc::from(api_version.as_str()),
+        }),
         RemoteSecretAdapterCfg::GcpSecretManager => Ok(PreparedAdapter::GcpSecretManager),
     }
 }
 
 /// 业务作用：限制 AWS 临时凭据字段，避免空值、控制字符或异常长度进入 SigV4 canonical request。
 ///
-/// 参数说明：`credentials` 是本地容器凭据文档。
+/// 参数说明：
+/// - `credentials`：是本地容器凭据文档。
 ///
 /// 返回：access key、secret key 与 session token 都是有界单行值时成功。
 fn validate_aws_credential_text(credentials: &AwsContainerCredentials) -> Result<()> {
@@ -566,7 +590,8 @@ fn validate_aws_credential_text(credentials: &AwsContainerCredentials) -> Result
 
 /// 业务作用：固定 provider API origin 和 path 前缀，防 secret 标识改变 scheme、authority 或 query。
 ///
-/// 参数说明：`raw` 是 provider endpoint。
+/// 参数说明：
+/// - `raw`：是 provider endpoint。
 ///
 /// 返回：无凭据、query、fragment 的 HTTPS URL 成功，否则拒绝候选。
 fn validate_endpoint(raw: &str) -> Result<Url> {
@@ -585,7 +610,9 @@ fn validate_endpoint(raw: &str) -> Result<Url> {
 
 /// 业务作用：解析 provider 认证 SecretSource，并把最终 HTTP 值标为 sensitive。
 ///
-/// 参数说明：`config` 提供 header、前缀和来源；`config_dir` 是相对路径基准。
+/// 参数说明：
+/// - `config`：提供 header、前缀和来源
+/// - `config_dir`：是相对路径基准。
 ///
 /// 返回：未配置认证时为空；合法认证返回不可记录的 header 对，否则拒绝候选。
 fn build_authorization(
@@ -631,19 +658,23 @@ fn build_authorization(
 
 /// 业务作用：解析 provider 自身的 bootstrap 身份，并禁止递归远程依赖形成不可终止的信任环。
 ///
-/// 参数说明：`raw` 是本地 SecretSource；`config_dir` 是路径基准；`field` 是低敏错误标签。
+/// 参数说明：
+/// - `raw`：是本地 SecretSource
+/// - `config_dir`：是路径基准
+/// - `field`：是低敏错误标签。
 ///
 /// 返回：本地来源可读取时返回文本；`remote://` 或读取失败时拒绝候选。
 fn resolve_bootstrap_secret(raw: &str, config_dir: &Path, field: &str) -> Result<String> {
     if is_remote_reference(raw) {
         bail!("{field} cannot use a recursive remote SecretSource");
     }
-    crate::secret::resolve_text(raw, config_dir, field)
+    crate::security::secret::resolve_text(raw, config_dir, field)
 }
 
 /// 业务作用：解析 `remote://provider/path`，并禁止空段、父目录和可造成 URL 歧义的字符。
 ///
-/// 参数说明：`raw` 是完整远程引用。
+/// 参数说明：
+/// - `raw`：是完整远程引用。
 ///
 /// 返回：返回 provider 名与受限相对 secret path；非法引用返回错误。
 fn parse_reference(raw: &str) -> Result<(&str, &str)> {
@@ -671,7 +702,9 @@ fn parse_reference(raw: &str) -> Result<(&str, &str)> {
 
 /// 业务作用：验证 provider 名为可稳定引用且不会污染日志字段的低敏标识符。
 ///
-/// 参数说明：`value` 是待验证名称；`field` 是不含 secret 的错误标签。
+/// 参数说明：
+/// - `value`：是待验证名称
+/// - `field`：是不含 secret 的错误标签。
 ///
 /// 返回：安全 ASCII 标识符成功，否则返回错误。
 fn validate_identifier(value: &str, field: &str) -> Result<()> {
@@ -688,7 +721,9 @@ fn validate_identifier(value: &str, field: &str) -> Result<()> {
 
 /// 业务作用：验证 JSON Pointer 有界且语法明确，避免把空根或非法转义当作 secret 字段。
 ///
-/// 参数说明：`pointer` 是配置值；`field` 是错误标签。
+/// 参数说明：
+/// - `pointer`：是配置值
+/// - `field`：是错误标签。
 ///
 /// 返回：合法非空 JSON Pointer 成功，否则返回错误。
 fn validate_pointer(pointer: &str, field: &str) -> Result<()> {
@@ -714,7 +749,9 @@ fn validate_pointer(pointer: &str, field: &str) -> Result<()> {
 
 /// 业务作用：在退避、版本单调与 LKG 门禁下解析一个远程引用。
 ///
-/// 参数说明：`provider` 是不可变连接计划；`secret_path` 是受限相对路径。
+/// 参数说明：
+/// - `provider`：是不可变连接计划
+/// - `secret_path`：是受限相对路径。
 ///
 /// 返回：新值或仍在有效期内的缓存值；版本回退、同版异值和过期依赖均失败闭合。
 async fn resolve_one(
@@ -796,7 +833,10 @@ async fn resolve_one(
 
 /// 业务作用：provider 读取失败时执行有界指数退避，并仅在旧值仍满足 lease/陈旧期时回退。
 ///
-/// 参数说明：`provider` 提供退避边界；`cache_key` 标识事实源；`error` 不含响应 body。
+/// 参数说明：
+/// - `provider`：提供退避边界
+/// - `cache_key`：标识事实源
+/// - `error`：不含响应 body。
 ///
 /// 返回：仍有效 LKG 返回成功；没有缓存或缓存过期时返回原依赖错误。
 fn fallback_after_failure(
@@ -835,7 +875,9 @@ fn fallback_after_failure(
 
 /// 业务作用：向固定 provider URL 发起一次有 deadline、有界且不跟随重定向的 JSON 读取。
 ///
-/// 参数说明：`provider` 固定 TLS/认证/响应契约；`secret_path` 是已经过语法约束的对象标识。
+/// 参数说明：
+/// - `provider`：固定 TLS/认证/响应契约
+/// - `secret_path`：是已经过语法约束的对象标识。
 ///
 /// 返回：HTTP、媒体类型、JSON、值、版本与 lease 全部合法时返回候选值，否则返回低敏错误。
 async fn fetch(provider: &PreparedProvider, secret_path: &str) -> Result<FetchedSecret> {
@@ -875,7 +917,9 @@ async fn fetch(provider: &PreparedProvider, secret_path: &str) -> Result<Fetched
 
 /// 业务作用：按适配器构造固定方法、URL、认证和请求体，云 API 差异不能绕开公共 HTTPS client。
 ///
-/// 参数说明：`provider` 是不可变连接计划；`secret_path` 是远程对象标识。
+/// 参数说明：
+/// - `provider`：是不可变连接计划
+/// - `secret_path`：是远程对象标识。
 ///
 /// 返回：返回尚未发送的 reqwest 请求；路径、云资源名或签名材料不合法时拒绝。
 fn build_provider_request(
@@ -897,8 +941,10 @@ fn build_provider_request(
             session_token,
         } => {
             validate_aws_secret_id(secret_path)?;
-            let body = serde_json::to_vec(&serde_json::json!({ "SecretId": secret_path }))
-                .context("encode AWS Secrets Manager request")?;
+            let body = serde_json::to_vec(&serde_json::json!({
+                "SecretId": secret_path
+            }))
+            .context("encode AWS Secrets Manager request")?;
             sign_aws_request(
                 provider.client.post(provider.endpoint.clone()),
                 &provider.endpoint,
@@ -911,7 +957,9 @@ fn build_provider_request(
             )
             .map(|request| request.body(body))
         }
-        PreparedAdapter::AzureKeyVault { api_version } => {
+        PreparedAdapter::AzureKeyVault {
+            api_version,
+        } => {
             let (name, version) = validate_azure_secret_path(secret_path)?;
             let mut url = provider.endpoint.clone();
             {
@@ -947,7 +995,9 @@ fn build_provider_request(
 
 /// 业务作用：把公共认证值附加到已确定 origin 的云请求，保持凭据为 sensitive header。
 ///
-/// 参数说明：`provider` 提供可选认证；`request` 是尚未发送的固定目标请求。
+/// 参数说明：
+/// - `provider`：提供可选认证
+/// - `request`：是尚未发送的固定目标请求。
 ///
 /// 返回：返回附加认证后的请求；未配置认证时保持原请求。
 fn add_provider_authorization(
@@ -962,7 +1012,9 @@ fn add_provider_authorization(
 
 /// 业务作用：把受限相对路径逐段追加到固定 endpoint，禁止对象标识改变 origin 或 query。
 ///
-/// 参数说明：`endpoint` 是已验证 HTTPS 前缀；`secret_path` 是分段对象标识。
+/// 参数说明：
+/// - `endpoint`：是已验证 HTTPS 前缀
+/// - `secret_path`：是分段对象标识。
 ///
 /// 返回：返回保持原 origin 的 URL；不能承载 path 时返回错误。
 fn append_path(endpoint: &Url, secret_path: &str) -> Result<Url> {
@@ -981,25 +1033,33 @@ fn append_path(endpoint: &Url, secret_path: &str) -> Result<Url> {
 
 /// 业务作用：限制云 adapter 的响应媒体类型，同时兼容 AWS 的标准 JSON wire 类型。
 ///
-/// 参数说明：`adapter` 是已编译适配器；`media_type` 是去除参数后的响应类型。
+/// 参数说明：
+/// - `adapter`：是已编译适配器
+/// - `media_type`：是去除参数后的响应类型。
 ///
 /// 返回：该适配器可按 JSON 解析时返回 true。
 fn adapter_accepts_media_type(adapter: &PreparedAdapter, media_type: &str) -> bool {
     media_type == "application/json"
         || media_type.ends_with("+json")
-        || matches!(adapter, PreparedAdapter::AwsSecretsManager { .. })
+        || matches!(adapter, PreparedAdapter::AwsSecretsManager {
+            ..
+        })
             && media_type == "application/x-amz-json-1.1"
 }
 
 /// 业务作用：把通用或云原生响应收敛成统一文本值、单调版本与可选 lease。
 ///
-/// 参数说明：`provider` 提供适配器及通用 Pointer；`document` 是有界 JSON 响应。
+/// 参数说明：
+/// - `provider`：提供适配器及通用 Pointer
+/// - `document`：是有界 JSON 响应。
 ///
 /// 返回：值、版本和 lease 完整合法时返回统一结果，否则拒绝本轮候选。
 fn parse_provider_document(provider: &PreparedProvider, document: &Value) -> Result<FetchedSecret> {
     match &provider.adapter {
         PreparedAdapter::GenericJson => parse_generic_document(provider, document),
-        PreparedAdapter::AwsSecretsManager { .. } => {
+        PreparedAdapter::AwsSecretsManager {
+            ..
+        } => {
             let raw = if let Some(value) = document.get("SecretString").and_then(Value::as_str) {
                 value.to_owned()
             } else {
@@ -1025,7 +1085,9 @@ fn parse_provider_document(provider: &PreparedProvider, document: &Value) -> Res
                 lease: None,
             })
         }
-        PreparedAdapter::AzureKeyVault { .. } => {
+        PreparedAdapter::AzureKeyVault {
+            ..
+        } => {
             let value = document
                 .get("value")
                 .and_then(Value::as_str)
@@ -1071,7 +1133,9 @@ fn parse_provider_document(provider: &PreparedProvider, document: &Value) -> Res
 
 /// 业务作用：解析通用 JSON Pointer 契约，并维持原有 lease 与刷新周期约束。
 ///
-/// 参数说明：`provider` 提供 Pointer 和刷新边界；`document` 是有界 JSON 响应。
+/// 参数说明：
+/// - `provider`：提供 Pointer 和刷新边界
+/// - `document`：是有界 JSON 响应。
 ///
 /// 返回：值、单调 u64 版本及可选有效 lease。
 fn parse_generic_document(provider: &PreparedProvider, document: &Value) -> Result<FetchedSecret> {
@@ -1111,7 +1175,8 @@ fn parse_generic_document(provider: &PreparedProvider, document: &Value) -> Resu
 
 /// 业务作用：验证 AWS SecretId 的文本边界，避免控制字符或超长名称进入签名请求体。
 ///
-/// 参数说明：`secret_id` 是 `remote://` 引用中 provider 后的对象名。
+/// 参数说明：
+/// - `secret_id`：是 `remote://` 引用中 provider 后的对象名。
 ///
 /// 返回：由安全 ASCII 路径段组成时成功，否则拒绝请求。
 fn validate_aws_secret_id(secret_id: &str) -> Result<()> {
@@ -1132,7 +1197,8 @@ fn validate_aws_secret_id(secret_id: &str) -> Result<()> {
 
 /// 业务作用：把 Azure secret 引用限制为名称和可选不可变版本，不能注入额外 REST path。
 ///
-/// 参数说明：`path` 是 provider 后的对象路径。
+/// 参数说明：
+/// - `path`：是 provider 后的对象路径。
 ///
 /// 返回：返回已验证 name 与可选 version；段数或字符不符合 Key Vault 契约时失败。
 fn validate_azure_secret_path(path: &str) -> Result<(&str, Option<&str>)> {
@@ -1153,7 +1219,8 @@ fn validate_azure_secret_path(path: &str) -> Result<(&str, Option<&str>)> {
 
 /// 业务作用：要求 Google Secret 引用完整声明 project、secret 与 version，禁止访问其它 API resource。
 ///
-/// 参数说明：`path` 是 provider 后的对象路径。
+/// 参数说明：
+/// - `path`：是 provider 后的对象路径。
 ///
 /// 返回：形如 `projects/<id>/secrets/<id>/versions/<number|latest>` 时成功。
 fn validate_gcp_secret_path(path: &str) -> Result<()> {
@@ -1183,7 +1250,9 @@ fn validate_gcp_secret_path(path: &str) -> Result<()> {
 
 /// 业务作用：把云 API 的 epoch 数值转换为可执行单调比较的微秒版本。
 ///
-/// 参数说明：`value` 是 JSON 数值；`field` 是不含 secret 的错误标签。
+/// 参数说明：
+/// - `value`：是 JSON 数值
+/// - `field`：是不含 secret 的错误标签。
 ///
 /// 返回：正数且在 u64 微秒范围内时返回版本，否则拒绝响应。
 fn epoch_number_to_micros(value: &Value, field: &str) -> Result<u64> {
@@ -1200,8 +1269,15 @@ fn epoch_number_to_micros(value: &Value, field: &str) -> Result<u64> {
 
 /// 业务作用：为 AWS Secrets Manager 请求生成完整 SigV4 header，绑定方法、目标、body、region 与临时凭据。
 ///
-/// 参数说明：`request` 是固定 endpoint 的 POST；`url` 是同一目标；`region`、access key、secret key
-/// 与 session token 来自本地容器凭据；`body` 是精确 JSON 字节；`now` 是签名时刻。
+/// 参数说明：
+/// - `request`：向固定 endpoint 发送的 POST 请求。
+/// - `url`：与请求一致的签名目标 URL。
+/// - `region`：本地容器凭据限定的 AWS region。
+/// - `access_key_id`：本地凭据中的 access key ID。
+/// - `secret_access_key`：本地凭据中的 secret access key。
+/// - `session_token`：本地凭据中的可选 session token。
+/// - `body`：即将发送的精确 JSON 字节。
+/// - `now`：本次签名使用的时间。
 ///
 /// 返回：签名成功返回带敏感认证 header 的请求；时间、host 或 HMAC 初始化失败时拒绝。
 #[allow(clippy::too_many_arguments)]
@@ -1215,101 +1291,27 @@ fn sign_aws_request(
     body: &[u8],
     now: DateTime<Utc>,
 ) -> Result<reqwest::RequestBuilder> {
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date = now.format("%Y%m%d").to_string();
-    let host = canonical_url_host(url)?;
-    let payload_hash = sha256_hex(body);
-    let token = session_token
-        .to_str()
-        .context("AWS session token is not valid text")?;
-    let canonical_headers = format!(
-        "content-type:application/x-amz-json-1.1\nhost:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\nx-amz-security-token:{token}\nx-amz-target:secretsmanager.GetSecretValue\n"
-    );
-    let signed_headers =
-        "content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token;x-amz-target";
-    let canonical_uri = if url.path().is_empty() {
-        "/"
-    } else {
-        url.path()
-    };
-    let canonical_request =
-        format!("POST\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
-    let scope = format!("{date}/{region}/secretsmanager/aws4_request");
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-        sha256_hex(canonical_request.as_bytes())
-    );
-    let mut initial = b"AWS4".to_vec();
-    initial.extend_from_slice(secret_access_key);
-    let date_key = hmac_sha256(&initial, date.as_bytes())?;
-    let region_key = hmac_sha256(&date_key, region.as_bytes())?;
-    let service_key = hmac_sha256(&region_key, b"secretsmanager")?;
-    let signing_key = hmac_sha256(&service_key, b"aws4_request")?;
-    let signature = hex_bytes(&hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
-    let mut authorization = HeaderValue::from_str(&format!(
-        "AWS4-HMAC-SHA256 Credential={access_key_id}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
-    ))
-    .context("AWS SigV4 authorization header is invalid")?;
-    authorization.set_sensitive(true);
-    Ok(request
-        .header(CONTENT_TYPE, "application/x-amz-json-1.1")
-        .header("x-amz-content-sha256", payload_hash)
-        .header("x-amz-date", amz_date)
-        .header("x-amz-security-token", session_token.clone())
-        .header("x-amz-target", "secretsmanager.GetSecretValue")
-        .header("authorization", authorization))
-}
-
-/// 业务作用：生成 SigV4 canonical `host`，显式保留非默认端口并正确包裹 IPv6 literal。
-///
-/// 参数说明：`url` 是已验证 HTTPS endpoint。
-///
-/// 返回：返回不含 scheme/path 的 host header 值；host 缺失时失败。
-fn canonical_url_host(url: &Url) -> Result<String> {
-    let raw = url.host_str().context("AWS endpoint has no host")?;
-    let host = if raw.contains(':') {
-        format!("[{raw}]")
-    } else {
-        raw.to_owned()
-    };
-    Ok(match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host,
-    })
-}
-
-/// 业务作用：执行一次 HMAC-SHA256，供 SigV4 分层派生签名密钥。
-///
-/// 参数说明：`key` 是本层密钥；`data` 是本层绑定内容。
-///
-/// 返回：返回固定 32 字节 MAC；HMAC 初始化失败时返回错误。
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32]> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).context("initialize AWS SigV4 HMAC")?;
-    mac.update(data);
-    Ok(mac.finalize().into_bytes().into())
-}
-
-/// 业务作用：生成 SHA-256 小写十六进制文本，供 SigV4 canonical request 使用。
-///
-/// 参数说明：`bytes` 是待摘要的公开请求结构或 payload。
-///
-/// 返回：返回 64 字符十六进制摘要。
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex_bytes(&Sha256::digest(bytes))
-}
-
-/// 业务作用：把固定字节编码成无分隔符的小写十六进制，保持 AWS wire 表示稳定。
-///
-/// 参数说明：`bytes` 是摘要或 MAC。
-///
-/// 返回：返回两倍字节长度的 ASCII 文本。
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    super::aws_json::sign(
+        request,
+        url,
+        super::aws_json::Scope {
+            region,
+            operation: super::aws_json::Operation::SecretValue,
+        },
+        super::aws_json::Credentials {
+            access_key_id,
+            secret_access_key,
+            session_token: Some(session_token),
+        },
+        body,
+        now,
+    )
 }
 
 /// 业务作用：限制远端 secret 值并统一处理文本挂载常见的单个结尾换行。
 ///
-/// 参数说明：`raw` 是 JSON 中的 secret 字符串。
+/// 参数说明：
+/// - `raw`：是 JSON 中的 secret 字符串。
 ///
 /// 返回：非空、无 NUL、有界值成功，否则拒绝 provider 响应。
 fn validate_secret_value(raw: &str) -> Result<String> {
@@ -1329,7 +1331,9 @@ fn validate_secret_value(raw: &str) -> Result<String> {
 
 /// 业务作用：生成不暴露 provider 路径的进程内缓存键，同时隔离 endpoint 和响应契约变更。
 ///
-/// 参数说明：`provider` 是已编译计划；`secret_path` 是远端对象标识。
+/// 参数说明：
+/// - `provider`：是已编译计划
+/// - `secret_path`：是远端对象标识。
 ///
 /// 返回：返回 SHA-256 十六进制键，不包含 secret 值。
 fn cache_key(provider: &PreparedProvider, secret_path: &str) -> String {
@@ -1355,7 +1359,9 @@ fn cache_key(provider: &PreparedProvider, secret_path: &str) -> String {
             digest.update([0]);
             digest.update(access_key_id.as_bytes());
         }
-        PreparedAdapter::AzureKeyVault { api_version } => {
+        PreparedAdapter::AzureKeyVault {
+            api_version,
+        } => {
             digest.update(b"azure_key_vault");
             digest.update([0]);
             digest.update(api_version.as_bytes());

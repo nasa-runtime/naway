@@ -50,7 +50,7 @@ pub(crate) enum GeoIpDecision {
 impl GeoIpDecision {
     /// 业务作用：把 GeoIP 固定决策归并为请求是否可以继续的安全门结果。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：普通允许或显式 fail-open 结果返回 true，其余拒绝结果返回 false。
     pub(crate) const fn allowed(self) -> bool {
@@ -62,7 +62,7 @@ impl GeoIpDecision {
 
     /// 业务作用：为低敏日志提供不含 IP、国家或 ASN 的固定原因。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回编译期固定原因字符串，可安全进入日志字段。
     pub(crate) const fn reason(self) -> &'static str {
@@ -118,7 +118,8 @@ enum AnonymousTrait {
 impl AnonymousTrait {
     /// 业务作用：解析配置中的匿名网络 trait，拒绝拼写错误导致策略静默缺失。
     ///
-    /// 参数说明：`value` 是配置声明的 trait 名。
+    /// 参数说明：
+    /// - `value`：是配置声明的 trait 名。
     ///
     /// 返回：已知名称返回固定 trait；未知名称返回 `None`。
     fn from_name(value: &str) -> Option<Self> {
@@ -135,7 +136,8 @@ impl AnonymousTrait {
 
     /// 业务作用：从已解码 Anonymous-IP record 读取本 trait 的三态值。
     ///
-    /// 参数说明：`record` 是当前客户端地址对应的只读 MMDB record。
+    /// 参数说明：
+    /// - `record`：是当前客户端地址对应的只读 MMDB record。
     ///
     /// 返回：数据库明确记录时返回 true/false；字段缺失返回 `None` 并触发未命中策略。
     fn value(self, record: &geoip2::AnonymousIp) -> Option<bool> {
@@ -359,7 +361,8 @@ impl GeoIpPolicy {
 
     /// 业务作用：按客户端权威 IP 执行国家、ASN 与匿名网络策略，不信任客户端自报 header。
     ///
-    /// 参数说明：`ip` 是已由 listener trusted-proxy 规则确定的真实客户端地址。
+    /// 参数说明：
+    /// - `ip`：是已由 listener trusted-proxy 规则确定的真实客户端地址。
     ///
     /// 返回：返回固定允许/拒绝结果；未命中、查询错误和过期均保留各自可观测终态。
     pub(crate) fn evaluate(&self, ip: IpAddr) -> GeoIpDecision {
@@ -410,7 +413,7 @@ impl GeoIpPolicy {
 
     /// 业务作用：把数据库无记录稳定映射到配置声明的 fail-open/closed 结果。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回 `NotFoundAllowed` 或 `NotFoundDenied`。
     const fn not_found_decision(&self) -> GeoIpDecision {
@@ -422,7 +425,7 @@ impl GeoIpPolicy {
 
     /// 业务作用：把 MMDB 查询/解码错误稳定映射到配置声明的 fail-open/closed 结果。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回 `LookupErrorAllowed` 或 `LookupErrorDenied`。
     const fn lookup_error_decision(&self) -> GeoIpDecision {
@@ -447,7 +450,8 @@ enum DatabaseKind {
 impl DatabaseKind {
     /// 业务作用：核对 MMDB metadata 类型与配置用途，避免用错误 schema 解码后静默放行。
     ///
-    /// 参数说明：`database_type` 是 MMDB metadata 的原始类型字符串。
+    /// 参数说明：
+    /// - `database_type`：是 MMDB metadata 的原始类型字符串。
     ///
     /// 返回：类型可用于当前规则域时返回 true。
     fn accepts(self, database_type: &str) -> bool {
@@ -464,7 +468,7 @@ impl DatabaseKind {
 
     /// 业务作用：为数据库类型错误提供稳定配置字段语义。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回当前用途的人类可读固定名称。
     const fn name(self) -> &'static str {
@@ -478,7 +482,9 @@ impl DatabaseKind {
 
 /// 业务作用：把 route GeoIP 文件声明转换为 watcher 依赖路径。
 ///
-/// 参数说明：`config_dir` 是主配置目录；`cfg` 是 route GeoIP 声明。
+/// 参数说明：
+/// - `config_dir`：是主配置目录
+/// - `cfg`：是 route GeoIP 声明。
 ///
 /// 返回：返回已声明数据库的绝对或基于配置目录解析的路径，不读取文件内容。
 pub(crate) fn dependency_paths(config_dir: &Path, cfg: &GeoIpCfg) -> Vec<PathBuf> {
@@ -495,7 +501,9 @@ pub(crate) fn dependency_paths(config_dir: &Path, cfg: &GeoIpCfg) -> Vec<PathBuf
 
 /// 业务作用：解析相对 MMDB 路径而不改变用户声明的 watcher 身份。
 ///
-/// 参数说明：`config_dir` 是主配置目录；`configured_path` 是配置值。
+/// 参数说明：
+/// - `config_dir`：是主配置目录
+/// - `configured_path`：是配置值。
 ///
 /// 返回：绝对路径原样返回，相对路径拼接到配置目录。
 fn resolve_path(config_dir: &Path, configured_path: &str) -> PathBuf {
@@ -509,7 +517,9 @@ fn resolve_path(config_dir: &Path, configured_path: &str) -> PathBuf {
 
 /// 业务作用：解析 GeoIP 的二元失败动作。
 ///
-/// 参数说明：`field` 用于错误定位；`value` 是配置动作。
+/// 参数说明：
+/// - `field`：用于错误定位
+/// - `value`：是配置动作。
 ///
 /// 返回：`allow|deny` 返回固定动作，其它值返回构建错误。
 fn parse_binary_action(field: &str, value: &str) -> Result<BinaryAction> {
@@ -522,7 +532,9 @@ fn parse_binary_action(field: &str, value: &str) -> Result<BinaryAction> {
 
 /// 业务作用：规范化并验证国家代码集合，阻止大小写或重复配置产生歧义。
 ///
-/// 参数说明：`field` 用于错误定位；`values` 是配置国家代码。
+/// 参数说明：
+/// - `field`：用于错误定位
+/// - `values`：是配置国家代码。
 ///
 /// 返回：合法 ISO alpha-2 代码返回去重集合；非法、重复或超限返回错误。
 fn normalize_countries(field: &str, values: &[String]) -> Result<HashSet<String>> {
@@ -544,7 +556,9 @@ fn normalize_countries(field: &str, values: &[String]) -> Result<HashSet<String>
 
 /// 业务作用：验证 ASN 集合并拒绝保留值、重复值和超量配置。
 ///
-/// 参数说明：`field` 用于错误定位；`values` 是配置 ASN。
+/// 参数说明：
+/// - `field`：用于错误定位
+/// - `values`：是配置 ASN。
 ///
 /// 返回：合法 ASN 返回去重集合；0、重复或超限返回错误。
 fn normalize_asns(field: &str, values: &[u32]) -> Result<HashSet<u32>> {
@@ -565,7 +579,8 @@ fn normalize_asns(field: &str, values: &[u32]) -> Result<HashSet<u32>> {
 
 /// 业务作用：解析匿名网络 trait 并限制固定集合，防止未知字段被静默忽略。
 ///
-/// 参数说明：`values` 是要拒绝的 trait 名。
+/// 参数说明：
+/// - `values`：是要拒绝的 trait 名。
 ///
 /// 返回：合法且不重复时返回固定集合；未知或重复名称返回错误。
 fn normalize_anonymous_traits(values: &[String]) -> Result<HashSet<AnonymousTrait>> {
@@ -583,7 +598,10 @@ fn normalize_anonymous_traits(values: &[String]) -> Result<HashSet<AnonymousTrai
 
 /// 业务作用：拒绝 allowlist 与 denylist 的同值冲突，避免规则优先级依赖实现细节。
 ///
-/// 参数说明：`kind` 用于错误定位；`allowed` 与 `denied` 是已规范化集合。
+/// 参数说明：
+/// - `kind`：用于错误定位
+/// - `allowed`：是已规范化集合。
+/// - `denied`：是已规范化集合。
 ///
 /// 返回：无交集返回成功；存在交集返回构建错误。
 fn reject_overlap<'a, T>(
@@ -602,7 +620,10 @@ where
 
 /// 业务作用：确保数据库声明与实际启用规则一一对应，避免无效文件或缺失数据源被静默接受。
 ///
-/// 参数说明：`field` 是数据库配置键；`path` 是可选值；`required` 表示对应规则是否存在。
+/// 参数说明：
+/// - `field`：是数据库配置键
+/// - `path`：是可选值
+/// - `required`：表示对应规则是否存在。
 ///
 /// 返回：规则与文件同时存在或同时缺失时成功；不一致时返回错误。
 fn validate_database_presence(field: &str, path: Option<&str>, required: bool) -> Result<()> {
@@ -615,8 +636,11 @@ fn validate_database_presence(field: &str, path: Option<&str>, required: bool) -
 
 /// 业务作用：通过共享目录加载可选数据库并核对 metadata 数据类型。
 ///
-/// 参数说明：`catalog` 是候选共享目录；`config_dir` 是路径基准；`path` 是可选文件；
-/// `kind` 是规则要求的数据库用途。
+/// 参数说明：
+/// - `catalog`：是候选共享目录
+/// - `config_dir`：是路径基准
+/// - `path`：是可选文件
+/// - `kind`：是规则要求的数据库用途。
 ///
 /// 返回：未声明返回 `None`；类型与内容有效返回共享数据库；错误返回候选构建失败。
 fn load_typed_database(
@@ -641,7 +665,9 @@ fn load_typed_database(
 
 /// 业务作用：根据 MMDB build epoch 判断 snapshot 是否超过 route freshness 窗口。
 ///
-/// 参数说明：`database` 是已解析快照；`max_age_secs` 是 route 最大允许年龄。
+/// 参数说明：
+/// - `database`：是已解析快照
+/// - `max_age_secs`：是 route 最大允许年龄。
 ///
 /// 返回：超过年龄返回 true；未来时间在容差内按新鲜处理，超出容差返回构建错误。
 fn database_is_stale(database: &DatabaseSnapshot, max_age_secs: u64) -> Result<bool> {
@@ -654,7 +680,9 @@ fn database_is_stale(database: &DatabaseSnapshot, max_age_secs: u64) -> Result<b
 
 /// 业务作用：从 Country/City/Enterprise MMDB 提取权威国家代码。
 ///
-/// 参数说明：`database` 是已验证用途的快照；`ip` 是权威客户端地址。
+/// 参数说明：
+/// - `database`：是已验证用途的快照
+/// - `ip`：是权威客户端地址。
 ///
 /// 返回：有记录返回大写 alpha-2 代码，无数据返回 `None`，查询或解码错误返回 `Err`。
 fn lookup_country(
@@ -683,7 +711,9 @@ fn lookup_country(
 
 /// 业务作用：从 ASN MMDB 提取权威 Autonomous System Number。
 ///
-/// 参数说明：`database` 是已验证用途的快照；`ip` 是权威客户端地址。
+/// 参数说明：
+/// - `database`：是已验证用途的快照
+/// - `ip`：是权威客户端地址。
 ///
 /// 返回：有记录返回非零 ASN，无数据返回 `None`，查询或解码错误返回 `Err`。
 fn lookup_asn(database: &DatabaseSnapshot, ip: IpAddr) -> std::result::Result<Option<u32>, ()> {
@@ -694,7 +724,9 @@ fn lookup_asn(database: &DatabaseSnapshot, ip: IpAddr) -> std::result::Result<Op
 
 /// 业务作用：从 Anonymous-IP MMDB 解码匿名网络 trait record。
 ///
-/// 参数说明：`database` 是已验证用途的快照；`ip` 是权威客户端地址。
+/// 参数说明：
+/// - `database`：是已验证用途的快照
+/// - `ip`：是权威客户端地址。
 ///
 /// 返回：有记录返回固定字段对象，无数据返回 `None`，查询或解码错误返回 `Err`。
 fn lookup_anonymous(

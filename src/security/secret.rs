@@ -11,9 +11,9 @@ use anyhow::{Context, Result};
 /// 单个文本 secret 的构建期上限，防止错误挂载大文件撑高候选快照内存。
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 
-/// 解析一个文本 SecretSource。
+/// 业务作用：解析一个文本 SecretSource。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: literal 或带 scheme 的来源引用。
 /// - `config_dir`: 相对 file source 的基准目录。
 /// - `field`: 仅用于错误上下文，绝不包含 secret 内容。
@@ -35,7 +35,7 @@ pub fn resolve_text(raw: &str, config_dir: &Path, field: &str) -> Result<String>
             let path = resolve_path(config_dir, path);
             // 统一有界助手先固定同一文件句柄，再最多读取 MAX+1；既防大文件预分配，也避免
             // metadata 检查与真正打开之间被替换。数据面只持有下面验证后的 String。
-            let bytes = crate::bounded_io::read_file(
+            let bytes = crate::io::bounded_io::read_file(
                 &path,
                 MAX_SECRET_BYTES,
                 &format!("{field} SecretSource"),
@@ -47,7 +47,7 @@ pub fn resolve_text(raw: &str, config_dir: &Path, field: &str) -> Result<String>
     validate(raw.as_bytes().to_vec(), field)
 }
 
-/// 如果值是文件型 SecretSource，返回其解析后依赖路径；env/literal/旧明文返回 None。
+/// 业务作用：如果值是文件型 SecretSource，返回其解析后依赖路径；env/literal/旧明文返回 None。
 ///
 /// reload 控制面用该函数建立独立 watcher 与指纹，数据面仍只持有已解析值。
 pub(crate) fn dependency_path(raw: &str, config_dir: &Path) -> Option<PathBuf> {
@@ -58,7 +58,7 @@ pub(crate) fn dependency_path(raw: &str, config_dir: &Path) -> Option<PathBuf> {
         .map(|path| resolve_path(config_dir, path))
 }
 
-/// 从 route filter DSL 里收集文件型 secret 依赖。该 DSL 本身以空白分 token，因此这里
+/// 业务作用：从 route filter DSL 里收集文件型 secret 依赖。该 DSL 本身以空白分 token，因此这里
 /// 与构建期 parser 保持同样的 `key=value`/单层引号语义，不会把 secret 内容记录到日志。
 pub(crate) fn filter_dependency_paths(spec: &str, config_dir: &Path) -> Vec<PathBuf> {
     spec.split_whitespace()
@@ -81,6 +81,7 @@ pub(crate) fn filter_dependency_paths(spec: &str, config_dir: &Path) -> Vec<Path
         .collect()
 }
 
+/// 业务作用：按配置目录解析文件型 SecretSource，数据面不接收任意秘密文件路径。
 fn resolve_path(config_dir: &Path, raw: &str) -> PathBuf {
     let path = Path::new(raw);
     if path.is_absolute() {
@@ -90,6 +91,7 @@ fn resolve_path(config_dir: &Path, raw: &str) -> PathBuf {
     }
 }
 
+/// 业务作用：检查解析后的秘密值是否满足非空和文本边界，非法凭据不能进入活动配置。
 fn validate(mut bytes: Vec<u8>, field: &str) -> Result<String> {
     anyhow::ensure!(
         bytes.len() <= MAX_SECRET_BYTES,

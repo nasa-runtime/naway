@@ -1,13 +1,13 @@
 //! 认证相关的轻量工具。
 //!
-//! V4 先服务 HTTP Basic、Bearer token 与 API-Key 这类不需要 body 的认证方式;这些校验必须能在上游前短路,
+//! 先服务 HTTP Basic、Bearer token 与 API-Key 这类不需要 body 的认证方式;这些校验必须能在上游前短路,
 //! 避免破坏数据面零拷贝/少拷贝路径。
 
 use http::HeaderMap;
 
-/// 常量时间字节串比较,避免凭据校验出现明显早停时序差异。
+/// 业务作用：常量时间字节串比较,避免凭据校验出现明显早停时序差异。
 ///
-/// # 参数
+/// 参数说明：
 /// - `left`: 左侧字节串。
 /// - `right`: 右侧字节串。
 pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -20,9 +20,9 @@ pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-/// 判断 `Authorization: Basic ...` 是否匹配期望的 `user:password` 字节串。
+/// 业务作用：判断 `Authorization: Basic ...` 是否匹配期望的 `user:password` 字节串。
 ///
-/// # 参数
+/// 参数说明：
 /// - `headers`: 请求头集合。
 /// - `expected`: 构建期拼好的 `user:password` 字节串。
 pub fn basic_authorization_matches(headers: &HeaderMap, expected: &[u8]) -> bool {
@@ -48,9 +48,9 @@ pub fn basic_authorization_matches(headers: &HeaderMap, expected: &[u8]) -> bool
     constant_time_eq(decoded.as_slice(), expected)
 }
 
-/// 判断 `Authorization: Bearer ...` 是否匹配期望 token。
+/// 业务作用：判断 `Authorization: Bearer ...` 是否匹配期望 token。
 ///
-/// # 参数
+/// 参数说明：
 /// - `headers`: 请求头集合。
 /// - `expected`: 构建期保存的 token 字节串。
 pub fn bearer_authorization_matches(headers: &HeaderMap, expected: &[u8]) -> bool {
@@ -73,17 +73,17 @@ pub fn bearer_authorization_matches(headers: &HeaderMap, expected: &[u8]) -> boo
     constant_time_eq(token.trim().as_bytes(), expected)
 }
 
-/// 生成 header quoted-string 可用的值。
+/// 业务作用：生成 header quoted-string 可用的值。
 ///
-/// # 参数
+/// 参数说明：
 /// - `value`: 原始 header 参数值。
 pub fn escape_header_quote(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// 解码 Basic Auth 使用的 base64 字符串。
+/// 业务作用：解码 Basic Auth 使用的 base64 字符串。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: `Authorization: Basic` 后的 base64 载荷。
 fn decode_base64(raw: &str) -> Option<Vec<u8>> {
     let clean = raw.trim();
@@ -124,9 +124,9 @@ fn decode_base64(raw: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 取 base64 字符的 6-bit 值。
+/// 业务作用：取 base64 字符的 6-bit 值。
 ///
-/// # 参数
+/// 参数说明：
 /// - `byte`: base64 字符。
 fn base64_value(byte: u8) -> Option<u8> {
     match byte {

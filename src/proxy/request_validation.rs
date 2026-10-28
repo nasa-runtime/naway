@@ -1,6 +1,6 @@
-//! V5 路由级 OpenAPI / JSON Schema 请求校验。
+//! 路由级 OpenAPI / JSON Schema 请求校验。
 //!
-//! 该能力被明确归入 `架构规范` 的 slow path：只有 route 显式配置后才构造 JSON
+//! 该能力被明确归入 `` 的 slow path：只有 route 显式配置后才构造 JSON
 //! envelope 或读取 body。schema 在快照构建时编译成只读 validator，请求阶段只借用 head；
 //! body 必须有硬上限，校验后复用同一份 [`Bytes`] 交给上游。
 
@@ -32,7 +32,7 @@ pub(crate) struct RequestValidationPlan {
     body: Option<jsonschema::Validator>,
     /// body 是否必须非空。
     body_required: bool,
-    /// body 聚合硬上限；只有 `body.is_some()` 时非零。
+    /// body 聚合硬上限；只有 `body.is_some` 时非零。
     max_body_bytes: u64,
     /// OpenAPI 声明的 JSON media types；显式 body schema 固定接受 JSON / `+json`。
     body_media_types: Vec<String>,
@@ -106,7 +106,7 @@ pub(super) enum ValidationOutcome {
 }
 
 impl RequestValidationPlan {
-    /// 从 route 配置构建并编译校验器。
+    /// 业务作用：从 route 配置构建并编译校验器。
     ///
     /// 文件路径相对主配置目录解析；所有外部 `$ref` 在 build-then-swap 阶段拒绝，避免
     /// reload 后的数据面触发网络或文件 resolver。
@@ -220,12 +220,12 @@ impl RequestValidationPlan {
         })
     }
 
-    /// 是否会读取 request body。用于构建期排除 body 未纳入 key 的公共响应缓存组合。
+    /// 业务作用：是否会读取 request body。用于构建期排除 body 未纳入 key 的公共响应缓存组合。
     pub(crate) fn validates_body(&self) -> bool {
         self.body.is_some()
     }
 
-    /// 校验请求 head，并在确有 body schema 时有界收集/校验 body。
+    /// 业务作用：校验请求 head，并在确有 body schema 时有界收集/校验 body。
     ///
     /// 默认 route 不会调用本函数。配置了 head-only schema 时 `ForwardBody` 原样返回；配置
     /// body schema 时才发生一次必要的聚合，返回值继续持有同一引用计数字节块。
@@ -291,7 +291,7 @@ impl RequestValidationPlan {
     }
 }
 
-/// 从 inline/file 二选一来源读取 schema。
+/// 业务作用：从 inline/file 二选一来源读取 schema。
 fn load_schema_source(
     inline: Option<&Value>,
     file: Option<&str>,
@@ -316,7 +316,7 @@ fn load_schema_source(
         .map(Some)
 }
 
-/// 使用 nasa YAML loader 读取 JSON/YAML Value，与网关配置的占位符/格式行为保持一致。
+/// 业务作用：使用 nasa YAML loader 读取 JSON/YAML Value，与网关配置的占位符/格式行为保持一致。
 fn load_value(path: &Path) -> Result<Value> {
     loader(path)
         .preserve_unresolved_placeholders(true)
@@ -324,6 +324,7 @@ fn load_value(path: &Path) -> Result<Value> {
         .with_context(|| format!("load schema document {}", path.display()))
 }
 
+/// 业务作用：在配置目录基准下定位 schema，禁止请求决定本地文件读取目标。
 fn resolve_schema_path(config_dir: &Path, file: &str) -> std::path::PathBuf {
     let path = Path::new(file);
     if path.is_absolute() {
@@ -333,13 +334,14 @@ fn resolve_schema_path(config_dir: &Path, file: &str) -> std::path::PathBuf {
     }
 }
 
-/// 编译 validator，并显式禁止外部引用。
+/// 业务作用：编译 validator，并显式禁止外部引用。
 fn compile_validator(schema: Value, label: &str) -> Result<jsonschema::Validator> {
     reject_external_refs(&schema, label)?;
     jsonschema::validator_for(&schema)
         .map_err(|error| anyhow::anyhow!("compile {label} JSON Schema: {error}"))
 }
 
+/// 业务作用：拒绝 schema 中的外部引用，构建期校验不能触发任意网络或文件读取。
 fn reject_external_refs(value: &Value, label: &str) -> Result<()> {
     match value {
         Value::Object(object) => {
@@ -373,6 +375,7 @@ struct OpenApiOperationSelector<'a> {
 }
 
 impl OpenApiOperationSelector<'_> {
+    /// 业务作用：按已编译的 OpenAPI 路径模板判定请求，保持参数片段与字面片段的区别。
     fn matches(&self, path: &str, method: &str, operation: &Value) -> bool {
         self.operation_id.is_some_and(|operation_id| {
             operation.get("operationId").and_then(Value::as_str) == Some(operation_id)
@@ -382,6 +385,7 @@ impl OpenApiOperationSelector<'_> {
                 .is_some_and(|expected| expected.eq_ignore_ascii_case(method))
     }
 
+    /// 业务作用：提供验证失败的固定来源分类，不把参数原值暴露为错误标签。
     fn label(&self) -> String {
         self.operation_id.map_or_else(
             || {
@@ -396,7 +400,7 @@ impl OpenApiOperationSelector<'_> {
     }
 }
 
-/// 返回 `(head, body_schema, body_required, JSON media types)`。
+/// 业务作用：返回 `(head, body_schema, body_required, JSON media types)`。
 fn compile_openapi_operation(
     document: &Value,
     selector: OpenApiOperationSelector<'_>,
@@ -488,12 +492,17 @@ fn compile_openapi_operation(
     let head_schema = json!({
         "type": "object",
         "properties": {
-            "method": {"const": method.to_ascii_uppercase()},
-            "path": {"type": "string"},
+            "method": {
+                "const": method.to_ascii_uppercase()
+            },
+            "path": {
+                "type": "string"
+            },
             "query": object_schema(query_properties, query_required, false),
             "headers": object_schema(header_properties, header_required, true),
             "path_params": object_schema(path_properties, path_required, false)
-            ,"cookies": object_schema(cookie_properties, cookie_required, false)
+            ,
+            "cookies": object_schema(cookie_properties, cookie_required, false)
         },
         "required": ["method", "path", "query", "headers", "path_params", "cookies"],
         "additionalProperties": false,
@@ -516,6 +525,7 @@ fn compile_openapi_operation(
     })
 }
 
+/// 业务作用：构造请求参数验证所需的 JSON 对象 schema，统一处理必填与属性约束。
 fn object_schema(properties: Map<String, Value>, required: Vec<Value>, allow_extra: bool) -> Value {
     json!({
         "type": "object",
@@ -525,7 +535,7 @@ fn object_schema(properties: Map<String, Value>, required: Vec<Value>, allow_ext
     })
 }
 
-/// OpenAPI 参数先只收集位置/名字/解码策略；schema 在第二遍查找，避免复制进 runtime plan。
+/// 业务作用：OpenAPI 参数先只收集位置/名字/解码策略；schema 在第二遍查找，避免复制进 runtime plan。
 fn append_openapi_parameters(
     document: &Value,
     values: &Value,
@@ -574,7 +584,7 @@ fn append_openapi_parameters(
     Ok(())
 }
 
-/// 重新查找该 parameter 的 schema/required。operation 参数优先于 path-item 参数。
+/// 业务作用：重新查找该 parameter 的 schema/required。operation 参数优先于 path-item 参数。
 fn openapi_parameter_schema(
     document: &Value,
     operation: &Value,
@@ -624,6 +634,7 @@ fn openapi_parameter_schema(
     )
 }
 
+/// 业务作用：冻结 OpenAPI 参数的解码方式，拒绝运行时无法准确执行的序列化声明。
 fn parameter_decode(parameter: &Map<String, Value>, schema: &Value) -> Result<ParameterDecode> {
     let schema_type = schema
         .get("type")
@@ -648,6 +659,7 @@ fn parameter_decode(parameter: &Map<String, Value>, schema: &Value) -> Result<Pa
     }
 }
 
+/// 业务作用：识别可支持的标量类型，使请求参数转换与 schema 的实际类型一致。
 fn scalar_kind(schema: &Value) -> Result<ScalarKind> {
     match schema
         .get("type")
@@ -664,6 +676,7 @@ fn scalar_kind(schema: &Value) -> Result<ScalarKind> {
     }
 }
 
+/// 业务作用：提取选定 operation 的实体合同，只接受明确支持的媒体类型与 schema。
 fn openapi_request_body(
     document: &Value,
     operation: &Value,
@@ -714,6 +727,7 @@ fn openapi_request_body(
     ))
 }
 
+/// 业务作用：解析本地引用并要求结果为对象，拒绝类型不符或无法解析的合同。
 fn resolve_local_object<'a>(
     document: &'a Value,
     value: &'a Value,
@@ -724,6 +738,7 @@ fn resolve_local_object<'a>(
         .with_context(|| format!("OpenAPI {label} must be an object"))
 }
 
+/// 业务作用：解析文档内部引用，禁止越出当前 schema 文档的信任范围。
 fn resolve_local_value<'a>(
     document: &'a Value,
     value: &'a Value,
@@ -740,6 +755,7 @@ fn resolve_local_value<'a>(
         .with_context(|| format!("OpenAPI {label} unresolved reference `{reference}`"))
 }
 
+/// 业务作用：为当前校验模式构造有限的请求头部实例，不读取正文。
 fn build_head_instance(parts: &Parts, mode: &HeadMode) -> std::result::Result<Value, &'static str> {
     match mode {
         HeadMode::Raw => build_raw_head_instance(parts),
@@ -747,6 +763,7 @@ fn build_head_instance(parts: &Parts, mode: &HeadMode) -> std::result::Result<Va
     }
 }
 
+/// 业务作用：按原始头部合同形成验证输入，保留 HTTP 头与查询参数的明确分组。
 fn build_raw_head_instance(parts: &Parts) -> std::result::Result<Value, &'static str> {
     let query = raw_query_values(parts)?;
     let mut headers = Map::new();
@@ -769,6 +786,7 @@ fn build_raw_head_instance(parts: &Parts) -> std::result::Result<Value, &'static
     }))
 }
 
+/// 业务作用：按 OpenAPI operation 收集并解码参数，缺失或转换失败时拒绝。
 fn build_openapi_head_instance(
     parts: &Parts,
     plan: &OpenApiHeadPlan,
@@ -837,7 +855,8 @@ fn build_openapi_head_instance(
 
 /// 业务作用：按 OpenAPI cookie `form` 序列化规则读取全部 Cookie header，保留同名值顺序并严格解码。
 ///
-/// 参数说明：`parts` 是下游请求 head。
+/// 参数说明：
+/// - `parts`：是下游请求 head。
 ///
 /// 返回：合法 cookie 组成 name→values；缺少等号、非法 percent 编码、UTF-8 或控制字符返回 400 类错误。
 fn parsed_cookie_pairs(
@@ -881,7 +900,8 @@ fn parsed_cookie_pairs(
 
 /// 业务作用：拒绝不完整 `%XX`，避免宽松解码让校验值与上游解释不同。
 ///
-/// 参数说明：`value` 是尚未解码的 cookie name 或 value。
+/// 参数说明：
+/// - `value`：是尚未解码的 cookie name 或 value。
 ///
 /// 返回：每个 `%` 后都恰有两个十六进制字符时返回 true。
 fn valid_percent_encoding(value: &str) -> bool {
@@ -903,6 +923,7 @@ fn valid_percent_encoding(value: &str) -> bool {
     true
 }
 
+/// 业务作用：提取同名查询参数的全部原始值，保持重复参数的顺序与多值语义。
 fn raw_query_values(parts: &Parts) -> std::result::Result<Map<String, Value>, &'static str> {
     let pairs = parsed_query_pairs(parts)?;
     Ok(pairs
@@ -916,6 +937,7 @@ fn raw_query_values(parts: &Parts) -> std::result::Result<Map<String, Value>, &'
         .collect())
 }
 
+/// 业务作用：按表单规则解析查询串，避免重复解码改变参数含义。
 fn parsed_query_pairs(
     parts: &Parts,
 ) -> std::result::Result<HashMap<String, Vec<String>>, &'static str> {
@@ -934,6 +956,7 @@ fn parsed_query_pairs(
     Ok(values)
 }
 
+/// 业务作用：从已匹配路径模板提取参数片段，不把未匹配路径当作有效 operation。
 fn extract_path_parameters(
     template: &str,
     actual: &str,
@@ -962,6 +985,7 @@ fn extract_path_parameters(
     Ok(values)
 }
 
+/// 业务作用：按已编译序列化方式转换参数，非法表示不能静默降级为字符串。
 fn decode_parameter(
     values: &[String],
     decode: &ParameterDecode,
@@ -995,6 +1019,7 @@ fn decode_parameter(
     }
 }
 
+/// 业务作用：把文本转换成 schema 声明的标量类型，转换失败阻止请求进入上游。
 fn decode_scalar(value: &str, kind: ScalarKind) -> std::result::Result<Value, &'static str> {
     match kind {
         ScalarKind::String => Ok(Value::String(value.to_string())),
@@ -1016,6 +1041,7 @@ fn decode_scalar(value: &str, kind: ScalarKind) -> std::result::Result<Value, &'
     }
 }
 
+/// 业务作用：读取可验证的正文声明长度，为聚合前的字节门提供依据。
 fn content_length(parts: &Parts) -> Option<u64> {
     parts
         .headers
@@ -1024,6 +1050,7 @@ fn content_length(parts: &Parts) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
+/// 业务作用：判定当前请求是否使用支持的 JSON 媒体类型，避免错误解释其它正文格式。
 fn request_media_type_is_json(parts: &Parts, allowed: &[String]) -> bool {
     let Some(content_type) = parts
         .headers
@@ -1044,6 +1071,7 @@ fn request_media_type_is_json(parts: &Parts, allowed: &[String]) -> bool {
         || (allowed == ["application/json"] && media_type_is_json(media_type.as_str()))
 }
 
+/// 业务作用：识别标准 JSON 及结构化 JSON 后缀，忽略不影响类型判断的参数部分。
 fn media_type_is_json(media_type: &str) -> bool {
     let media_type = media_type.to_ascii_lowercase();
     media_type == "application/json"
@@ -1066,7 +1094,8 @@ pub(crate) struct CollectedBody {
 impl CollectedBody {
     /// 业务作用：用已检查或遮蔽后的同方向实体替换聚合字节，同时保留原始 trailers。
     ///
-    /// 参数说明：`bytes` 是受资源上限保护的新实体。
+    /// 参数说明：
+    /// - `bytes`：是受资源上限保护的新实体。
     ///
     /// 返回：返回可由统一 buffered body 重放的聚合对象。
     pub(crate) fn replace_bytes(mut self, bytes: Bytes) -> Self {
@@ -1076,7 +1105,7 @@ impl CollectedBody {
 
     /// 业务作用：判断聚合实体是否携带 trailers，供不支持 trailers 的协议转换拒绝歧义输入。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：存在至少一组 trailers 时返回 true。
     pub(crate) fn has_trailers(&self) -> bool {
@@ -1094,6 +1123,7 @@ impl hyper::body::Body for BufferedRequestBody {
     type Data = Bytes;
     type Error = BoxError;
 
+    /// 业务作用：按下游轮询推进正文流，把数据、trailers、失败和结束状态交给统一 HTTP 管线。
     fn poll_frame(
         mut self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
@@ -1110,10 +1140,12 @@ impl hyper::body::Body for BufferedRequestBody {
         std::task::Poll::Ready(None)
     }
 
+    /// 业务作用：向 HTTP 编码层报告流是否已经结束，避免省略尚未发送的正文或 trailers。
     fn is_end_stream(&self) -> bool {
         self.bytes.as_ref().is_none_or(Bytes::is_empty) && self.trailers.is_none()
     }
 
+    /// 业务作用：向 HTTP 编码层提供剩余实体长度约束，供帧传输选择定长或流式编码。
     fn size_hint(&self) -> hyper::body::SizeHint {
         let mut hint = hyper::body::SizeHint::new();
         hint.set_exact(self.bytes.as_ref().map_or(0, |bytes| bytes.len() as u64));
@@ -1121,6 +1153,7 @@ impl hyper::body::Body for BufferedRequestBody {
     }
 }
 
+/// 业务作用：把已验证正文和 trailers 重建为可转发流，避免校验消费正文后丢失业务输入。
 pub(crate) fn buffered_body(collected: CollectedBody) -> BoxBody {
     BufferedRequestBody {
         bytes: Some(collected.bytes),
@@ -1129,7 +1162,7 @@ pub(crate) fn buffered_body(collected: CollectedBody) -> BoxBody {
     .boxed()
 }
 
-/// 有界聚合 body，并对常见单 frame body 保持零拷贝。
+/// 业务作用：有界聚合 body，并对常见单 frame body 保持零拷贝。
 pub(crate) async fn collect_bounded(
     body: ForwardBody,
     max_body_bytes: u64,
@@ -1184,5 +1217,8 @@ pub(crate) async fn collect_bounded(
         Some(buffer) => buffer.freeze(),
         None => first.unwrap_or_default(),
     };
-    Ok(CollectedBody { bytes, trailers })
+    Ok(CollectedBody {
+        bytes,
+        trailers,
+    })
 }

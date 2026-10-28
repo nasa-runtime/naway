@@ -24,7 +24,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncSeekExt, ReadBuf};
 
 use crate::config::model::StaticServeCfg;
-use crate::variable::{EvalContext, ValueTemplate, VariablePlan};
+use crate::routing::variable::{EvalContext, ValueTemplate, VariablePlan};
 use crate::{full_body, text_status, BoxBody, BoxError};
 
 const DEFAULT_TYPE: &str = "application/octet-stream";
@@ -55,15 +55,19 @@ pub struct StaticServe {
     etag: bool,
     /// 是否支持单段 HTTP Range。
     range: bool,
+    #[cfg(feature = "media-streaming")]
+    media: Option<std::sync::Arc<super::media::Plan>>,
 }
 
 impl StaticServe {
-    /// 从配置构建静态后端。
+    /// 业务作用：在发布前解析固定静态根、文件选择模板与响应头，不允许配置指向非目录目标。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `cfg`: `serve.static` 配置块。
     /// - `config_dir`: `gateway.yml` 所在目录,用于解析相对 root。
     /// - `variables`: 全局变量计划,用于编译 `try_files` 模板。
+    ///
+    /// 返回：可执行的只读静态计划；路径、模板或响应头无效则拒绝候选。
     pub fn build(
         cfg: &StaticServeCfg,
         config_dir: &Path,
@@ -136,12 +140,39 @@ impl StaticServe {
             allow_dotfiles: cfg.allow_dotfiles,
             etag: cfg.etag,
             range: cfg.range,
+            #[cfg(feature = "media-streaming")]
+            media: None,
         })
     }
 
-    /// 根据请求返回静态文件响应。
+    /// 业务作用：把显式媒体配置绑定到已经规范化的静态根；普通静态路由不建立解析状态。
     ///
-    /// # 参数
+    /// 参数说明：
+    /// - `cfg`：当前路由的容器和预算配置。
+    ///
+    /// 返回：静态后端持有同根跨快照的只读媒体计划，配置非法则拒绝候选。
+    #[cfg(feature = "media-streaming")]
+    pub(crate) fn enable_media(&mut self, cfg: &crate::config::media::MediaCfg) -> Result<()> {
+        self.media = Some(std::sync::Arc::new(super::media::Plan::build(
+            cfg,
+            &self.canonical_root,
+        )?));
+        Ok(())
+    }
+
+    /// 业务作用：向路由管理摘要提供媒体配置指纹，不输出本地文件根。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：显式媒体计划的低敏摘要，普通静态后端没有该摘要。
+    #[cfg(feature = "media-streaming")]
+    pub(crate) fn media_semantic(&self) -> Option<serde_json::Value> {
+        self.media.as_ref().map(|plan| plan.semantic())
+    }
+
+    /// 业务作用：根据请求返回静态文件响应。
+    ///
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     /// - `variables`: route 使用的变量计划。
     /// - `eval_ctx`: 本请求变量求值上下文。
@@ -165,9 +196,9 @@ impl StaticServe {
         }
     }
 
-    /// 依次执行 `try_files`,找到第一个可服务文件。
+    /// 业务作用：依次执行 `try_files`,找到第一个可服务文件。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     /// - `variables`: route 使用的变量计划。
     /// - `eval_ctx`: 本请求变量求值上下文。
@@ -187,9 +218,9 @@ impl StaticServe {
         Ok(None)
     }
 
-    /// 解析单个 `try_files` 候选。
+    /// 业务作用：解析单个 `try_files` 候选。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head,用于 `${uri}` 兜底为空时回退。
     /// - `candidate`: 渲染后的候选路径。
     async fn resolve_candidate(
@@ -254,9 +285,9 @@ impl StaticServe {
         Ok(None)
     }
 
-    /// 把 root-relative 候选路径安全拼到 root 下。
+    /// 业务作用：把 root-relative 候选路径安全拼到 root 下。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `candidate`: `try_files` 渲染后的候选路径。
     fn safe_join(&self, candidate: &str) -> std::result::Result<PathBuf, StaticServeError> {
         let mut out = self.root.clone();
@@ -279,9 +310,9 @@ impl StaticServe {
         Ok(out)
     }
 
-    /// 校验 canonical path 未逃出 root。
+    /// 业务作用：校验 canonical path 未逃出 root。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `path`: 已 canonicalize 的候选路径。
     fn ensure_inside_root(&self, path: &Path) -> std::result::Result<(), StaticServeError> {
         if path.starts_with(&self.canonical_root) {
@@ -291,13 +322,25 @@ impl StaticServe {
         }
     }
 
-    /// 生成文件响应。
+    /// 业务作用：生成只读文件响应；显式媒体先选择表示，避免使用原文件 ETag 错误命中裁剪片段。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     /// - `file`: 已解析且校验安全的静态文件。
+    ///
+    /// 返回：媒体片段、原文件整段/Range 或明确拒绝；普通静态路由保持原条件语义。
     async fn file_response(&self, parts: &Parts, file: StaticFile) -> Response<BoxBody> {
-        let etag = if self.etag { Some(file.etag()) } else { None };
+        #[cfg(feature = "media-streaming")]
+        if let Some(plan) = &self.media {
+            if let Some(response) = plan.serve(parts, &file.path, file.len, file.modified).await {
+                return response;
+            }
+        }
+        let etag = if self.etag {
+            Some(file.etag())
+        } else {
+            None
+        };
         let last_modified = file.modified.and_then(http_date);
         if etag
             .as_deref()
@@ -392,9 +435,9 @@ impl StaticServe {
         }
     }
 
-    /// 根据扩展名返回 Content-Type。
+    /// 业务作用：根据扩展名返回 Content-Type。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `path`: 文件路径。
     fn content_type(&self, path: &Path) -> http::HeaderValue {
         let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
@@ -427,9 +470,9 @@ struct ByteRange {
     end: u64,
 }
 
-/// 解析请求中的单段 `Range: bytes=...`。
+/// 业务作用：解析请求中的单段 `Range: bytes=...`。
 ///
-/// # 参数
+/// 参数说明：
 /// - `parts`: 下游请求 head。
 /// - `len`: 文件总长度。
 fn parse_byte_range(parts: &Parts, len: u64) -> RangeSelection {
@@ -478,12 +521,15 @@ fn parse_byte_range(parts: &Parts, len: u64) -> RangeSelection {
     if start >= len || start > end {
         return RangeSelection::Unsatisfiable;
     }
-    RangeSelection::Partial(ByteRange { start, end })
+    RangeSelection::Partial(ByteRange {
+        start,
+        end,
+    })
 }
 
-/// 判断 If-Range 是否允许本次 Range 生效。
+/// 业务作用：判断 If-Range 是否允许本次 Range 生效。
 ///
-/// # 参数
+/// 参数说明：
 /// - `parts`: 下游请求 head。
 /// - `etag`: 当前文件 ETag。
 /// - `last_modified`: 当前文件 Last-Modified 文本。
@@ -504,9 +550,9 @@ fn range_allowed_by_if_range(
         || last_modified.map(|value| raw == value).unwrap_or(false)
 }
 
-/// 构造 416 Range Not Satisfiable。
+/// 业务作用：构造 416 Range Not Satisfiable。
 ///
-/// # 参数
+/// 参数说明：
 /// - `len`: 文件总长度。
 /// - `etag`: 当前文件 ETag。
 /// - `last_modified`: 当前文件 Last-Modified 文本。
@@ -542,7 +588,7 @@ struct StaticFile {
 }
 
 impl StaticFile {
-    /// 生成弱 ETag。
+    /// 业务作用：生成弱 ETag。
     fn etag(&self) -> String {
         let modified = self
             .modified
@@ -565,6 +611,7 @@ impl Body for FileBody {
     type Data = Bytes;
     type Error = BoxError;
 
+    /// 业务作用：按下游轮询推进正文流，把数据、trailers、失败和结束状态交给统一 HTTP 管线。
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -597,10 +644,12 @@ impl Body for FileBody {
         Poll::Ready(Some(Ok(Frame::data(buf.freeze()))))
     }
 
+    /// 业务作用：向 HTTP 编码层报告流是否已经结束，避免省略尚未发送的正文或 trailers。
     fn is_end_stream(&self) -> bool {
         self.remaining == 0
     }
 
+    /// 业务作用：向 HTTP 编码层提供剩余实体长度约束，供帧传输选择定长或流式编码。
     fn size_hint(&self) -> SizeHint {
         let mut hint = SizeHint::new();
         hint.set_exact(self.remaining);
@@ -616,9 +665,9 @@ enum StaticServeError {
     Io(std::io::Error),
 }
 
-/// 解析 root 路径。
+/// 业务作用：解析 root 路径。
 ///
-/// # 参数
+/// 参数说明：
 /// - `config_dir`: `gateway.yml` 所在目录。
 /// - `root`: 配置中的 root。
 fn resolve_root(config_dir: &Path, root: &str) -> PathBuf {
@@ -630,9 +679,9 @@ fn resolve_root(config_dir: &Path, root: &str) -> PathBuf {
     }
 }
 
-/// canonicalize 一个已存在路径,不存在则返回 None。
+/// 业务作用：canonicalize 一个已存在路径,不存在则返回 None。
 ///
-/// # 参数
+/// 参数说明：
 /// - `path`: 待 canonicalize 路径。
 async fn canonicalize_existing(
     path: &Path,
@@ -644,9 +693,9 @@ async fn canonicalize_existing(
     }
 }
 
-/// 校验目录索引文件名不包含路径穿越。
+/// 业务作用：校验目录索引文件名不包含路径穿越。
 ///
-/// # 参数
+/// 参数说明：
 /// - `name`: 配置中的 index 文件名。
 fn validate_index_name(name: &str) -> Result<()> {
     if name.trim().is_empty()
@@ -660,9 +709,9 @@ fn validate_index_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// 解析 nginx `expires` 常用时长。
+/// 业务作用：解析 nginx `expires` 常用时长。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 配置值,如 `3600`、`1h`、`7d`、`off`。
 fn parse_expires_seconds(raw: &str) -> Result<Option<u64>> {
     let raw = raw.trim();
@@ -682,9 +731,9 @@ fn parse_expires_seconds(raw: &str) -> Result<Option<u64>> {
     Ok(Some(value.saturating_mul(multiplier)))
 }
 
-/// 规范化静态 MIME 扩展名。
+/// 业务作用：规范化静态 MIME 扩展名。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: `serve.static.types` 中的扩展名 key,可带前导点。
 fn normalize_ext(raw: &str) -> Result<String> {
     let ext = raw.trim().trim_start_matches('.').to_ascii_lowercase();
@@ -698,9 +747,9 @@ fn normalize_ext(raw: &str) -> Result<String> {
     Ok(ext)
 }
 
-/// 校验相对路径不包含点文件/点目录。
+/// 业务作用：校验相对路径不包含点文件/点目录。
 ///
-/// # 参数
+/// 参数说明：
 /// - `relative`: 已确认在 root 内的相对路径。
 fn ensure_no_dot_component(relative: &Path) -> std::result::Result<(), StaticServeError> {
     for component in relative.components() {
@@ -713,9 +762,9 @@ fn ensure_no_dot_component(relative: &Path) -> std::result::Result<(), StaticSer
     Ok(())
 }
 
-/// 判断 If-None-Match 是否命中当前 ETag。
+/// 业务作用：判断 If-None-Match 是否命中当前 ETag。
 ///
-/// # 参数
+/// 参数说明：
 /// - `parts`: 下游请求 head。
 /// - `etag`: 当前文件 ETag。
 fn request_etag_matches(parts: &Parts, etag: &str) -> bool {
@@ -731,9 +780,9 @@ fn request_etag_matches(parts: &Parts, etag: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 判断 If-Modified-Since 是否命中当前文件修改时间。
+/// 业务作用：判断 If-Modified-Since 是否命中当前文件修改时间。
 ///
-/// # 参数
+/// 参数说明：
 /// - `parts`: 下游请求 head。
 /// - `modified`: 当前文件修改时间。
 fn request_not_modified_since(parts: &Parts, modified: Option<SystemTime>) -> bool {
@@ -756,9 +805,9 @@ fn request_not_modified_since(parts: &Parts, modified: Option<SystemTime>) -> bo
     modified_secs <= since_secs
 }
 
-/// 构造 304 Not Modified 响应。
+/// 业务作用：构造 304 Not Modified 响应。
 ///
-/// # 参数
+/// 参数说明：
 /// - `etag`: 当前文件 ETag。
 /// - `modified`: 当前文件修改时间。
 fn not_modified(etag: Option<&str>, modified: Option<SystemTime>) -> Response<BoxBody> {
@@ -774,14 +823,14 @@ fn not_modified(etag: Option<&str>, modified: Option<SystemTime>) -> Response<Bo
         .expect("build static 304 response")
 }
 
-/// 构造空 body。
+/// 业务作用：构造空 body。
 fn empty_body() -> BoxBody {
     full_body(Bytes::new())
 }
 
-/// 根据扩展名返回主流 MIME。
+/// 业务作用：根据扩展名返回主流 MIME。
 ///
-/// # 参数
+/// 参数说明：
 /// - `ext`: 文件扩展名。
 fn content_type_for_ext(ext: &str) -> Option<&'static str> {
     match ext.to_ascii_lowercase().as_str() {
@@ -805,9 +854,9 @@ fn content_type_for_ext(ext: &str) -> Option<&'static str> {
     }
 }
 
-/// 把 SystemTime 格式化成 HTTP-date。
+/// 业务作用：把 SystemTime 格式化成 HTTP-date。
 ///
-/// # 参数
+/// 参数说明：
 /// - `time`: 系统时间。
 fn http_date(time: SystemTime) -> Option<String> {
     let duration = time.duration_since(UNIX_EPOCH).ok()?;
@@ -824,9 +873,9 @@ fn http_date(time: SystemTime) -> Option<String> {
     ))
 }
 
-/// 解析 IMF-fixdate HTTP-date。
+/// 业务作用：解析 IMF-fixdate HTTP-date。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: HTTP-date 文本,如 `Wed, 21 Oct 2015 07:28:00 GMT`。
 fn parse_http_date(raw: &str) -> Option<SystemTime> {
     let parts = raw.split_whitespace().collect::<Vec<_>>();
@@ -858,27 +907,40 @@ fn parse_http_date(raw: &str) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_secs(secs))
 }
 
-/// Unix epoch 天数转公历年月日。
+/// 业务作用：Unix epoch 天数转公历年月日。
 ///
-/// # 参数
+/// 参数说明：
 /// - `days`: 自 1970-01-01 起的天数。
 fn civil_from_days(days: i64) -> (i32, usize, usize) {
     let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let era = if z >= 0 {
+        z
+    } else {
+        z - 146_096
+    } / 146_097;
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let mut year = yoe as i32 + era as i32 * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    year += if month <= 2 { 1 } else { 0 };
+    let month = mp
+        + if mp < 10 {
+            3
+        } else {
+            -9
+        };
+    year += if month <= 2 {
+        1
+    } else {
+        0
+    };
     (year, month as usize, day as usize)
 }
 
-/// 公历年月日转 Unix epoch 天数。
+/// 业务作用：公历年月日转 Unix epoch 天数。
 ///
-/// # 参数
+/// 参数说明：
 /// - `year`: 公历年。
 /// - `month`: 1..=12。
 /// - `day`: 1..=31。
@@ -887,10 +949,24 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
         return None;
     }
     let year = i64::from(year) - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let era = if year >= 0 {
+        year
+    } else {
+        year - 399
+    } / 400;
     let yoe = year - era * 400;
     let month = i64::from(month);
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doy = (153
+        * (month
+            + if month > 2 {
+                -3
+            } else {
+                9
+            })
+        + 2)
+        / 5
+        + i64::from(day)
+        - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     Some(era * 146_097 + doe - 719_468)
 }

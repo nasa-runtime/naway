@@ -10,12 +10,12 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// 网关对下游应答统一用的 Body 类型(既能装静态字节,也能装上游流式响应)。
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
 
-/// 把一段字节包成 `BoxBody`(静态响应用:接口守卫 / 404 / 502 等)。
+/// 业务作用：把一段字节包成 `BoxBody`(静态响应用:接口守卫 / 404 / 502 等)。
 pub fn full_body(data: Bytes) -> BoxBody {
     Full::new(data).map_err(|never| match never {}).boxed()
 }
 
-/// 造一个纯文本状态响应(网关自身产生的短路应答)。
+/// 业务作用：造一个纯文本状态响应(网关自身产生的短路应答)。
 pub fn text_status(code: u16, msg: &str) -> Response<BoxBody> {
     Response::builder()
         .status(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))

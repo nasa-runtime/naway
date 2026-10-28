@@ -1,6 +1,6 @@
-//! V5 access-log 多 sink 投递。
+//! access-log 多 sink 投递。
 //!
-//! 数据面不直接调用本模块：[`crate::access_log::AccessLogger`] 先在共享 bounded queue 中
+//! 数据面不直接调用本模块：[`crate::observability::access_log::AccessLogger`] 先在共享 bounded queue 中
 //! 采样并把记录序列化一次，再用 `Arc<LogEnvelope>` fan-out。每个 sink 拥有独立 channel、
 //! batch deadline 和 I/O timeout；任一远端卡住只会填满并丢弃自己的队列。
 
@@ -16,9 +16,9 @@ use http::header::{HeaderName, HeaderValue};
 use http::HeaderMap;
 use tokio::sync::mpsc;
 
-use crate::access_log::{log_record, AccessRecord};
 use crate::config::model::{AccessLogSinkCfg, AccessLogSinkKind};
-use crate::metrics::Metrics;
+use crate::observability::access_log::{log_record, AccessRecord};
+use crate::observability::metrics::Metrics;
 
 /// 配置允许的 sink 数量硬上限。它同时约束 fan-out 次数和 metrics sink label 基数。
 const MAX_LOG_SINKS: usize = 16;
@@ -74,7 +74,7 @@ pub(crate) struct SpawnedLogSinks {
 }
 
 impl LogSinkSender {
-    /// 非阻塞 fan-out；满载或单条过大只归因并丢弃当前 sink。
+    /// 业务作用：非阻塞 fan-out；满载或单条过大只归因并丢弃当前 sink。
     pub(crate) fn try_send(&self, event: Arc<LogEnvelope>) {
         if event.json.len() > self.max_event_bytes {
             self.metrics
@@ -90,19 +90,21 @@ impl LogSinkSender {
 
 /// 可插拔 sink 契约。异步 future 只在该 sink 的后台 worker 被 poll，永不进入数据面 task。
 trait LogSink: Send + Sync {
-    /// 投递一批共享 envelope。
+    /// 业务作用：投递一批共享 envelope。
     fn send_batch<'a>(
         &'a self,
         batch: &'a [Arc<LogEnvelope>],
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
-    /// drain 完成后的 backend 关闭/flush。
+    /// 业务作用：drain 完成后的 backend 关闭/flush。
     fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async {
+            Ok(())
+        })
     }
 }
 
-/// 校验/解析所有 sink 配置。空列表兼容旧配置，生成一个本地 tracing sink。
+/// 业务作用：校验/解析所有 sink 配置。空列表兼容旧配置，生成一个本地 tracing sink。
 pub(crate) fn build_sink_specs(
     cfgs: &[AccessLogSinkCfg],
     config_dir: &Path,
@@ -191,7 +193,7 @@ pub(crate) fn build_sink_specs(
                     name
                 );
             }
-            let value = crate::secret::resolve_text(
+            let value = crate::security::secret::resolve_text(
                 raw_value,
                 config_dir,
                 &format!("access_log.sinks.{}.headers.{name}", cfg.id),
@@ -226,6 +228,7 @@ pub(crate) fn build_sink_specs(
     Ok(specs.into())
 }
 
+/// 业务作用：约束日志出口标识，使观测维度和后台任务身份保持稳定且有界。
 fn validate_sink_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 64
@@ -238,6 +241,7 @@ fn validate_sink_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：拒绝与出口类型不匹配的配置字段，避免配置成功却静默忽略安全参数。
 fn validate_kind_fields(cfg: &AccessLogSinkCfg) -> Result<()> {
     match cfg.kind {
         AccessLogSinkKind::Tracing => {
@@ -309,6 +313,7 @@ fn validate_kind_fields(cfg: &AccessLogSinkCfg) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：验证固定日志 HTTP 目的地，不允许请求数据选择外发地址。
 fn validate_http_endpoint(id: &str, endpoint: &str) -> Result<()> {
     let uri: http::Uri = endpoint
         .parse()
@@ -319,6 +324,7 @@ fn validate_http_endpoint(id: &str, endpoint: &str) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：校验 Kafka 主题与相关标识，阻止非法或过长名称进入后台生产者。
 fn validate_kafka_name(label: &str, value: &str, id: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 249
@@ -331,6 +337,7 @@ fn validate_kafka_name(label: &str, value: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：识别日志外发不能覆盖的协议控制头，维持固定传输合同。
 fn is_forbidden_sink_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -338,7 +345,7 @@ fn is_forbidden_sink_header(name: &HeaderName) -> bool {
     )
 }
 
-/// 启动所有 sink worker。每项先完成本地 client 构造；任一配置/客户端错误会让进程启动失败。
+/// 业务作用：启动所有 sink worker。每项先完成本地 client 构造；任一配置/客户端错误会让进程启动失败。
 pub(crate) fn spawn_sink_workers(
     specs: &[LogSinkSpec],
     metrics: Arc<Metrics>,
@@ -362,9 +369,13 @@ pub(crate) fn spawn_sink_workers(
             metrics: metrics.clone(),
         });
     }
-    Ok(SpawnedLogSinks { senders, workers })
+    Ok(SpawnedLogSinks {
+        senders,
+        workers,
+    })
 }
 
+/// 业务作用：按已验证的出口类型构建后台发送器，未编译的能力明确拒绝。
 fn build_backend(spec: &LogSinkSpec) -> Result<Arc<dyn LogSink>> {
     match spec.kind {
         AccessLogSinkKind::Tracing => Ok(Arc::new(TracingLogSink)),
@@ -392,6 +403,7 @@ fn build_backend(spec: &LogSinkSpec) -> Result<Arc<dyn LogSink>> {
     }
 }
 
+/// 业务作用：消费有界日志队列并批量发送，依赖慢或失败时不阻塞业务请求线程。
 async fn run_sink_worker(
     spec: LogSinkSpec,
     backend: Arc<dyn LogSink>,
@@ -443,6 +455,7 @@ async fn run_sink_worker(
 struct TracingLogSink;
 
 impl LogSink for TracingLogSink {
+    /// 业务作用：将一批日志发送到固定出口，统一执行超时和失败统计而不重入业务管线。
     fn send_batch<'a>(
         &'a self,
         batch: &'a [Arc<LogEnvelope>],
@@ -469,6 +482,7 @@ struct HttpLogSink {
 }
 
 impl LogSink for HttpLogSink {
+    /// 业务作用：将一批日志发送到固定出口，统一执行超时和失败统计而不重入业务管线。
     fn send_batch<'a>(
         &'a self,
         batch: &'a [Arc<LogEnvelope>],
@@ -486,8 +500,7 @@ impl LogSink for HttpLogSink {
                     encode_loki_payload(batch, sink.as_ref())?,
                 ),
             };
-            // `Bytes` clone only increments its refcount; reqwest owns it until the background
-            // request completes. The combined batch allocation is the one necessary wire encoding.
+            // `Bytes` 克隆只增加引用计数，后台请求完成前由 reqwest 持有；批次合并只承担一次必要编码。
             let mut response = self
                 .client
                 .post(self.endpoint.as_ref())
@@ -499,10 +512,8 @@ impl LogSink for HttpLogSink {
             if !response.status().is_success() {
                 bail!("access log HTTP endpoint returned {}", response.status());
             }
-            // Drain a bounded response so keep-alive can be reused. Elasticsearch bulk can return
-            // HTTP 200 with per-item failures, therefore its `errors` bit is part of delivery
-            // success. A malicious/misconfigured endpoint cannot make the log worker collect an
-            // unbounded response.
+            // 有界读完响应以复用连接。Elasticsearch bulk 的 HTTP 200 仍可能包含逐项失败，
+            // 必须同时检查 errors；响应硬上限防止异常端点让日志工作任务无界聚合。
             const MAX_SINK_RESPONSE_BYTES: usize = 64 * 1024;
             if response
                 .content_length()
@@ -539,6 +550,7 @@ struct ElasticsearchBulkResult {
     errors: bool,
 }
 
+/// 业务作用：把日志批次编码为标准 JSON 数组，不改变单条事件内容。
 fn encode_json_array(batch: &[Arc<LogEnvelope>]) -> Bytes {
     let content_len = batch.iter().map(|event| event.json.len()).sum::<usize>();
     let mut out =
@@ -554,6 +566,7 @@ fn encode_json_array(batch: &[Arc<LogEnvelope>]) -> Bytes {
     out.freeze()
 }
 
+/// 业务作用：生成 Elasticsearch Bulk 的动作行和文档行，保持批次协议边界。
 fn encode_elasticsearch_bulk(batch: &[Arc<LogEnvelope>], index: &str) -> Bytes {
     // index 已限制为安全 ASCII，不需要每条调用 JSON serializer；action line 只构造一次并复用。
     let action = format!("{{\"index\":{{\"_index\":\"{index}\"}}}}\n");
@@ -592,6 +605,7 @@ struct LokiLabels<'a> {
     sink: &'a str,
 }
 
+/// 业务作用：把日志事件按固定标签构造成 Loki push 载荷，不引入请求级高基数标签。
 fn encode_loki_payload(batch: &[Arc<LogEnvelope>], sink: &str) -> Result<Bytes> {
     let values = batch
         .iter()
@@ -623,6 +637,7 @@ struct KafkaLogSink {
 
 #[cfg(feature = "log-kafka")]
 impl LogSink for KafkaLogSink {
+    /// 业务作用：将一批日志发送到固定出口，统一执行超时和失败统计而不重入业务管线。
     fn send_batch<'a>(
         &'a self,
         batch: &'a [Arc<LogEnvelope>],
@@ -641,6 +656,7 @@ impl LogSink for KafkaLogSink {
         })
     }
 
+    /// 业务作用：在关闭日志出口时结束生产者并等待已有发送工作，避免继续接受新批次。
     fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             self.runtime
@@ -651,6 +667,7 @@ impl LogSink for KafkaLogSink {
     }
 }
 
+/// 业务作用：按固定配置构建 Kafka 日志生产者，缺少制品能力时拒绝该出口。
 #[cfg(feature = "log-kafka")]
 fn build_kafka_backend(spec: &LogSinkSpec) -> Result<Arc<dyn LogSink>> {
     use std::collections::BTreeMap;
@@ -697,6 +714,7 @@ fn build_kafka_backend(spec: &LogSinkSpec) -> Result<Arc<dyn LogSink>> {
     }))
 }
 
+/// 业务作用：按固定配置构建 Kafka 日志生产者，缺少制品能力时拒绝该出口。
 #[cfg(not(feature = "log-kafka"))]
 fn build_kafka_backend(_spec: &LogSinkSpec) -> Result<Arc<dyn LogSink>> {
     bail!("Kafka access log sink requires gateway feature `log-kafka`")

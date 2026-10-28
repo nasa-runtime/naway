@@ -18,8 +18,8 @@ use http::request::Parts;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use sha2::Sha256;
 
-use crate::auth::constant_time_eq;
 use crate::config::model::CsrfCfg;
+use crate::security::auth::constant_time_eq;
 
 const MAX_METHODS: usize = 16;
 const MAX_ALLOWED_ORIGINS: usize = 64;
@@ -49,7 +49,7 @@ pub(crate) enum CsrfDecision {
 impl CsrfDecision {
     /// 业务作用：判断固定 CSRF 决策是否应阻断状态变更请求。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：来源或 token 失败返回 true；安全方法与验证通过返回 false。
     pub(crate) const fn denied(self) -> bool {
@@ -61,7 +61,7 @@ impl CsrfDecision {
 
     /// 业务作用：为低敏日志提供不含来源、cookie 或 token 的固定原因。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回编译期固定原因字符串。
     pub(crate) const fn reason(self) -> &'static str {
@@ -80,7 +80,9 @@ enum TokenMode {
     /// header 与 host-only cookie 携带相同随机 token。
     DoubleSubmit,
     /// header 与 cookie 携带相同、由网关 HMAC 签名的有时效 token。
-    Signed { secret: Vec<u8> },
+    Signed {
+        secret: Vec<u8>,
+    },
 }
 
 /// 快照内不可变的 route CSRF 策略。
@@ -101,7 +103,9 @@ pub(crate) struct CsrfPolicy {
 impl CsrfPolicy {
     /// 业务作用：编译 CSRF 来源与 token 契约，并在快照发布前解析可选签名 SecretSource。
     ///
-    /// 参数说明：`cfg` 是 route CSRF 声明；`config_dir` 是 SecretSource 相对路径基准。
+    /// 参数说明：
+    /// - `cfg`：是 route CSRF 声明
+    /// - `config_dir`：是 SecretSource 相对路径基准。
     ///
     /// 返回：方法、origin、cookie/header、token 模式和时效均合法时返回不可变策略；
     /// 弱 secret、歧义来源或危险 header 配置会拒绝候选。
@@ -144,7 +148,7 @@ impl CsrfPolicy {
                 if cfg.token_secret.is_empty() {
                     bail!("csrf.token_secret is required in signed mode");
                 }
-                let secret = crate::secret::resolve_text(
+                let secret = crate::security::secret::resolve_text(
                     cfg.token_secret.as_str(),
                     config_dir,
                     "csrf token secret",
@@ -177,8 +181,10 @@ impl CsrfPolicy {
 
     /// 业务作用：对状态变更请求执行来源与 token 双门禁，不读取请求 body。
     ///
-    /// 参数说明：`parts` 是请求 head；`downstream_scheme` 是 listener 确定的 `http|https`；
-    /// `route_id` 绑定服务端签名 token 的 route 作用域。
+    /// 参数说明：
+    /// - `parts`：是请求 head
+    /// - `downstream_scheme`：是 listener 确定的 `http|https`
+    /// - `route_id`：绑定服务端签名 token 的 route 作用域。
     ///
     /// 返回：返回固定允许或拒绝原因；缺失与无效 token 分开观测，但都在 enforce 下故障关闭。
     pub(crate) fn evaluate(
@@ -213,7 +219,9 @@ impl CsrfPolicy {
         }
         let valid = match &self.mode {
             TokenMode::DoubleSubmit => decode_nonce(header_token).is_some(),
-            TokenMode::Signed { secret } => self.verify_signed(header_token, route_id, secret),
+            TokenMode::Signed {
+                secret,
+            } => self.verify_signed(header_token, route_id, secret),
         };
         if valid {
             CsrfDecision::Allowed
@@ -224,7 +232,9 @@ impl CsrfPolicy {
 
     /// 业务作用：为成功的安全方法响应签发新 CSRF token，并禁止共享缓存存储每客户端 token。
     ///
-    /// 参数说明：`headers` 是最终响应 header；`route_id` 绑定签名作用域。
+    /// 参数说明：
+    /// - `headers`：是最终响应 header
+    /// - `route_id`：绑定签名作用域。
     ///
     /// 返回：随机数、时间或 header 构造成功时写入 token header、host-only cookie 与
     /// `Cache-Control: private, no-store`；失败返回错误且调用方应故障关闭响应。
@@ -238,7 +248,9 @@ impl CsrfPolicy {
         let nonce = URL_SAFE_NO_PAD.encode(nonce);
         let token = match &self.mode {
             TokenMode::DoubleSubmit => nonce,
-            TokenMode::Signed { secret } => {
+            TokenMode::Signed {
+                secret,
+            } => {
                 let timestamp = now_epoch()?;
                 let payload = format!("{timestamp}.{nonce}");
                 let signature = sign_token(payload.as_bytes(), route_id, secret)?;
@@ -266,7 +278,9 @@ impl CsrfPolicy {
 
     /// 业务作用：判断当前安全方法响应是否应签发 token，避免错误响应和状态变更响应产生凭据。
     ///
-    /// 参数说明：`method` 是原始请求方法；`status` 是最终响应状态。
+    /// 参数说明：
+    /// - `method`：是原始请求方法
+    /// - `status`：是最终响应状态。
     ///
     /// 返回：显式开启、方法不受保护且响应为成功或重定向时返回 true。
     pub(crate) fn should_issue(&self, method: &Method, status: StatusCode) -> bool {
@@ -277,7 +291,7 @@ impl CsrfPolicy {
 
     /// 业务作用：判断拒绝决策是否只记录而不改变业务响应。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：配置为 `monitor` 时返回 true。
     pub(crate) const fn monitor(&self) -> bool {
@@ -286,7 +300,9 @@ impl CsrfPolicy {
 
     /// 业务作用：验证请求来源是否满足显式 origin allowlist 或同源约束。
     ///
-    /// 参数说明：`parts` 是请求 head；`downstream_scheme` 是 listener 确定的 scheme。
+    /// 参数说明：
+    /// - `parts`：是请求 head
+    /// - `downstream_scheme`：是 listener 确定的 scheme。
     ///
     /// 返回：来源可验证且被允许时返回 true；歧义、`null`、跨源或缺失默认返回 false。
     fn origin_allowed(&self, parts: &Parts, downstream_scheme: &str) -> bool {
@@ -318,8 +334,10 @@ impl CsrfPolicy {
 
     /// 业务作用：复验 route 绑定、带时效的服务端签名 token。
     ///
-    /// 参数说明：`token` 是 header/cookie 已常量时间对等的值；`route_id` 是签名作用域；
-    /// `secret` 是构建期解析的 HMAC secret。
+    /// 参数说明：
+    /// - `token`：是 header/cookie 已常量时间对等的值
+    /// - `route_id`：是签名作用域
+    /// - `secret`：是构建期解析的 HMAC secret。
     ///
     /// 返回：格式、nonce、时效与 HMAC 全部有效时返回 true，任何异常返回 false。
     fn verify_signed(&self, token: &str, route_id: &str, secret: &[u8]) -> bool {
@@ -360,12 +378,14 @@ impl CsrfPolicy {
 
 /// 业务作用：返回 signed CSRF SecretSource 的文件依赖，供 watcher 与指纹同源轮换。
 ///
-/// 参数说明：`config_dir` 是相对路径基准；`cfg` 是 route CSRF 声明。
+/// 参数说明：
+/// - `config_dir`：是相对路径基准
+/// - `cfg`：是 route CSRF 声明。
 ///
 /// 返回：signed 文件型 secret 返回单路径；其它来源或模式返回空列表。
 pub(crate) fn dependency_paths(config_dir: &Path, cfg: &CsrfCfg) -> Vec<PathBuf> {
     (cfg.token_mode == "signed")
-        .then(|| crate::secret::dependency_path(cfg.token_secret.as_str(), config_dir))
+        .then(|| crate::security::secret::dependency_path(cfg.token_secret.as_str(), config_dir))
         .flatten()
         .into_iter()
         .collect()
@@ -383,7 +403,8 @@ enum CookieLookup<'a> {
 
 /// 业务作用：解析受保护方法集合并拒绝安全方法、重复值和过量配置。
 ///
-/// 参数说明：`values` 是配置方法名。
+/// 参数说明：
+/// - `values`：是配置方法名。
 ///
 /// 返回：合法状态变更方法返回集合；空、重复、非法或安全方法返回错误。
 fn parse_methods(values: &[String]) -> Result<HashSet<Method>> {
@@ -411,7 +432,8 @@ fn parse_methods(values: &[String]) -> Result<HashSet<Method>> {
 
 /// 业务作用：规范化来源 allowlist，并把动态同源规则与精确来源分开冻结。
 ///
-/// 参数说明：`values` 是 `same-origin` 或精确 `scheme://authority` 列表。
+/// 参数说明：
+/// - `values`：是 `same-origin` 或精确 `scheme://authority` 列表。
 ///
 /// 返回：规则合法且不重复时返回同源开关和规范来源集合，否则返回错误。
 fn parse_allowed_origins(values: &[String]) -> Result<(bool, HashSet<String>)> {
@@ -439,7 +461,8 @@ fn parse_allowed_origins(values: &[String]) -> Result<(bool, HashSet<String>)> {
 
 /// 业务作用：把浏览器 Origin 严格规范为 `scheme://authority`，拒绝 `null`、路径和凭据。
 ///
-/// 参数说明：`value` 是 Origin header 或配置值。
+/// 参数说明：
+/// - `value`：是 Origin header 或配置值。
 ///
 /// 返回：合法 HTTP(S) origin 返回规范字符串；其它形态返回错误。
 fn normalize_origin(value: &str) -> std::result::Result<String, ()> {
@@ -461,7 +484,8 @@ fn normalize_origin(value: &str) -> std::result::Result<String, ()> {
 
 /// 业务作用：从绝对 Referer URI 只提取 origin，丢弃 path/query 以避免敏感 URL 进入策略状态。
 ///
-/// 参数说明：`value` 是 Referer header。
+/// 参数说明：
+/// - `value`：是 Referer header。
 ///
 /// 返回：合法 HTTP(S) 绝对 URI 返回规范 origin，否则返回错误。
 fn origin_from_referer(value: &str) -> std::result::Result<String, ()> {
@@ -474,7 +498,9 @@ fn origin_from_referer(value: &str) -> std::result::Result<String, ()> {
 
 /// 业务作用：从已验证 listener scheme 与请求 authority 构造当前请求的同源比较值。
 ///
-/// 参数说明：`parts` 是请求 head；`downstream_scheme` 只能来自 listener 事实。
+/// 参数说明：
+/// - `parts`：是请求 head
+/// - `downstream_scheme`：只能来自 listener 事实。
 ///
 /// 返回：authority 单值合法时返回规范 origin；缺失或非法返回 `None`。
 fn request_origin(parts: &Parts, downstream_scheme: &str) -> Option<String> {
@@ -488,7 +514,9 @@ fn request_origin(parts: &Parts, downstream_scheme: &str) -> Option<String> {
 
 /// 业务作用：规范 HTTP(S) scheme、大小写主机、IPv6 括号与默认端口，保证同源比较语义稳定。
 ///
-/// 参数说明：`scheme` 是协议；`raw_authority` 是不含路径的 authority。
+/// 参数说明：
+/// - `scheme`：是协议
+/// - `raw_authority`：是不含路径的 authority。
 ///
 /// 返回：合法且不含 userinfo 时返回规范 origin；其它输入返回错误。
 fn canonical_origin(scheme: &str, raw_authority: &str) -> std::result::Result<String, ()> {
@@ -525,7 +553,9 @@ fn canonical_origin(scheme: &str, raw_authority: &str) -> std::result::Result<St
 
 /// 业务作用：从一个或多个 Cookie header 中查找唯一目标 cookie，拒绝重复覆盖语义。
 ///
-/// 参数说明：`headers` 是请求 header；`name` 是已验证的 host-only cookie 名。
+/// 参数说明：
+/// - `headers`：是请求 header
+/// - `name`：是已验证的 host-only cookie 名。
 ///
 /// 返回：未找到、无效或唯一值三态结果。
 fn find_cookie<'a>(headers: &'a HeaderMap, name: &str) -> CookieLookup<'a> {
@@ -548,7 +578,9 @@ fn find_cookie<'a>(headers: &'a HeaderMap, name: &str) -> CookieLookup<'a> {
 
 /// 业务作用：读取严格单值非空 UTF-8 header，防止重复值改变来源或 token 语义。
 ///
-/// 参数说明：`headers` 是请求 header；`name` 是已验证名称。
+/// 参数说明：
+/// - `headers`：是请求 header
+/// - `name`：是已验证名称。
 ///
 /// 返回：恰有一个非空 UTF-8 值时返回该值，其它情况返回 `None`。
 fn strict_text_header<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
@@ -562,7 +594,8 @@ fn strict_text_header<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&
 
 /// 业务作用：验证 double-submit 或 signed token 的 nonce 具备固定 256-bit 编码形态。
 ///
-/// 参数说明：`value` 是 Base64URL 无填充 nonce。
+/// 参数说明：
+/// - `value`：是 Base64URL 无填充 nonce。
 ///
 /// 返回：解码后恰为 32 字节时返回字节，否则返回 `None`。
 fn decode_nonce(value: &str) -> Option<Vec<u8>> {
@@ -574,7 +607,10 @@ fn decode_nonce(value: &str) -> Option<Vec<u8>> {
 
 /// 业务作用：为服务端 CSRF token 生成绑定 route 的 HMAC-SHA256 签名。
 ///
-/// 参数说明：`payload` 是规范 `timestamp.nonce`；`route_id` 是签名作用域；`secret` 是已解析密钥。
+/// 参数说明：
+/// - `payload`：是规范 `timestamp.nonce`
+/// - `route_id`：是签名作用域
+/// - `secret`：是已解析密钥。
 ///
 /// 返回：HMAC 初始化成功时返回固定 32 字节签名，否则返回错误。
 fn sign_token(payload: &[u8], route_id: &str, secret: &[u8]) -> Result<[u8; 32]> {
@@ -587,7 +623,7 @@ fn sign_token(payload: &[u8], route_id: &str, secret: &[u8]) -> Result<[u8; 32]>
 
 /// 业务作用：读取当前 Unix 秒供 signed token 签发与时效复验。
 ///
-/// 参数说明：无。
+/// 参数说明: 无。
 ///
 /// 返回：系统时间不早于 Unix epoch 时返回秒数，否则返回错误。
 fn now_epoch() -> Result<u64> {
@@ -599,7 +635,8 @@ fn now_epoch() -> Result<u64> {
 
 /// 业务作用：验证 cookie 名字符集，防止分隔符注入响应 header。
 ///
-/// 参数说明：`byte` 是 cookie 名的单个 ASCII 字节。
+/// 参数说明：
+/// - `byte`：是 cookie 名的单个 ASCII 字节。
 ///
 /// 返回：RFC token 安全集合内返回 true。
 const fn is_cookie_name_byte(byte: u8) -> bool {

@@ -1,9 +1,28 @@
 //! 配置加载编排 + 运行期不可变快照。
 //!
-//! `GatewaySnapshot` 是一次请求要读的全部配置的不可变快照,由 `ArcSwap` 原子换版(无感热更,架构规范 §7)。
+//! `GatewaySnapshot` 是一次请求要读的全部配置的不可变快照,由 `ArcSwap` 原子换版(无感热更)。
 
 pub mod bootstrap;
+pub(crate) mod candidate;
+pub(crate) mod source_identity;
+pub use candidate::load_candidate_snapshot;
+pub(crate) mod centers;
+pub mod cgi;
+pub(crate) mod document;
+pub mod layers;
+pub mod management;
+pub mod media;
 pub mod model;
+pub(crate) mod monitor;
+pub mod operations;
+pub mod providers;
+pub mod scg;
+pub mod scripts;
+mod sentinel;
+use sentinel::{load_sentinel_rules, SentinelRouteFilters};
+pub mod telemetry;
+pub mod webdav;
+pub mod xds_server;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -18,14 +37,14 @@ use naml::{LoadedYml, YmlLoader, YmlLocalSources};
 use serde::Serialize;
 use sha2::Digest as _;
 
-use crate::access_log::AccessLogRuntime;
-use crate::guard::InterfaceGuard;
-use crate::net::{self, Cidr};
-use crate::proxy_protocol::ProxyProtocolWriteVersion;
+use crate::io::net::{self, Cidr};
+use crate::observability::access_log::AccessLogRuntime;
+use crate::protocols::proxy_protocol::ProxyProtocolWriteVersion;
+use crate::routing::variable::VariablePlan;
 use crate::routing::Router;
+use crate::security::guard::InterfaceGuard;
 use crate::tls::{build_upstream_tls_profile, UpstreamTlsProfile};
 use crate::upstream::{DynamicUpstreamStore, UpstreamDirectory};
-use crate::variable::VariablePlan;
 use model::{
     AcmeCfg, AdminAction, AdminApprovalCfg, AdminCfg, AdminResource, AdminRole, AdminRolloutCfg,
     ConfigSourceCfg, ControlPlaneCfg, ControlPlaneModeCfg, DiscoveryCfg, GatewayConfig, GuardFile,
@@ -46,7 +65,9 @@ pub(crate) struct ConfigWatchPlan {
 impl ConfigWatchPlan {
     /// 业务作用：冻结一次成功配置构建对应的 naml 来源与应用附加依赖，供发布前精确对账 watcher。
     ///
-    /// 参数说明：`sources` 来自同一次 tracked load；`dependencies` 来自已展开并校验的候选配置。
+    /// 参数说明：
+    /// - `sources`：来自同一次 tracked load
+    /// - `dependencies`：来自已展开并校验的候选配置。
     ///
     /// 返回：可随候选快照传递、不会再从磁盘重新推导的观察计划。
     fn new(sources: YmlLocalSources, dependencies: Vec<PathBuf>) -> Self {
@@ -58,7 +79,7 @@ impl ConfigWatchPlan {
 
     /// 业务作用：向 naml watcher 提供与候选加载完全一致的本地来源。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：主配置、活动 profile 和 profile 监听候选的只读来源事实。
     pub(crate) fn sources(&self) -> &YmlLocalSources {
@@ -67,7 +88,7 @@ impl ConfigWatchPlan {
 
     /// 业务作用：向 naml watcher 提供配置模型声明的精确附加文件集合。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：已排序去重的 guard、规则、Secret、schema、snippet 等依赖路径。
     pub(crate) fn dependencies(&self) -> &[PathBuf] {
@@ -78,14 +99,31 @@ impl ConfigWatchPlan {
 /// 一次请求要读的全部配置的不可变快照；换版通过构建新值并由 `ArcSwap` 原子替换指针完成。
 #[derive(Clone)]
 pub struct GatewaySnapshot {
+    /// 与路由同代的实际 Sentinel 规则，只供控制面比较，不在请求路径重新求值。
+    pub(crate) sentinel_rules: Arc<model::SentinelFile>,
+    /// 已验证的进程日志启动声明；候选构建不打开日志文件。
+    pub process_log: crate::observability::logging::LogPlan,
+    /// 与原生路由原子发布的下游 xDS 投影，未启用制品时不存在该资源域。
+    #[cfg(feature = "xds-server")]
+    pub xds_server: Option<Arc<crate::control::xds_server::Plan>>,
+    /// 与已验证候选同代的对象归属、跨域引用和工作区授权图。
+    pub ownership: Arc<crate::control::ownership::OwnershipCatalog>,
+    /// 来源水位、期限与物化声明属于本快照，不能独立于路由发布。
+    #[cfg(feature = "config-providers")]
+    pub(crate) providers: Option<Arc<crate::control::providers::Snapshot>>,
     /// 单调递增的成功配置版本。
     pub version: u64,
-    /// 已上线配置集指纹，用作集群收敛判据。与 admin `GET /api/config/current` 的 ETag
-    /// 不同:那是"当前磁盘文件"的指纹(编辑基线),这里是"这份快照构建时读到的配置集"的指纹。
-    /// 构建期算不出时为 None(不阻断上线,只让该节点在集群视图里显示为未知)。
+    /// 已上线配置集指纹，覆盖构建时的主文档及依赖；管理编辑基线也使用活动快照的归档。
+    /// 隔离管理候选或构建期无法取得可靠值时为 None，不以另一份原文的指纹冒充当前输入。
     pub config_fingerprint: Option<u64>,
+    /// 原子 Nacos 三文档的原始摘要；只证明输入身份，不代替完整依赖与权限验证。
+    pub config_bundle_digest: Option<String>,
+    /// 本次实际读取的三份base原文身份，不代替profile、依赖和授权复验。
+    pub(crate) document_identity: Option<source_identity::Identity>,
     /// 构建本快照的主配置来源；远程 secret 定时刷新必须复用同一物化候选而非猜测 bootstrap。
     pub(crate) source_config_path: Arc<PathBuf>,
+    /// 本次完整合并后的真实文档位置；管理发布不能用活动配置重算候选规则目标。
+    pub(crate) document_paths: candidate::Paths,
     /// 配置 schema 版本，用于兼容性判断、迁移和告警。
     pub schema_version: u32,
     /// 主数据面监听地址；拓扑变化由 listener supervisor 在快照发布前 prepare 并在发布后换代。
@@ -96,6 +134,13 @@ pub struct GatewaySnapshot {
     pub admin_listen: String,
     /// 是否在管理面暴露 `/metrics`。
     pub expose_metrics: bool,
+    /// 同代监控采样与有限静态成员计划，关闭后不发起监控外连。
+    pub(crate) admin_monitor: Arc<monitor::Plan>,
+    /// 独立持久管理权威；数据请求不读取或等待此计划。
+    pub admin_operations: Option<Arc<operations::Plan>>,
+    /// 仅已验证的管理身份与目标可以进入接收和主动报告任务。
+    #[cfg(feature = "admin-grpc")]
+    pub(crate) admin_management: Option<Arc<crate::admin::management::Plan>>,
     /// 管理面自身认证策略。随配置快照热更新,但不影响 admin listener 绑定。
     pub admin_auth: AdminAuthRuntimeCfg,
     /// 管理操作审计 bootstrap 计划；writer/client 在进程启动时创建。
@@ -120,6 +165,8 @@ pub struct GatewaySnapshot {
     pub access_log: AccessLogRuntime,
     /// OpenTelemetry bootstrap 配置。运行期 exporter 常驻，不在请求热路径重建。
     pub telemetry: model::TelemetryCfg,
+    #[cfg(feature = "telemetry-otlp")]
+    pub(crate) telemetry_sampling: Arc<crate::observability::telemetry::sampling::SamplingCatalog>,
     /// 热重载 worker 的有界队列/去抖参数；启动时固定，不进入数据面热路径。
     pub reload: model::ReloadCfg,
     /// 与本快照同一次 tracked load 生成的本地文件观察计划。
@@ -140,16 +187,22 @@ pub struct GatewaySnapshot {
     pub interface_guard: Arc<InterfaceGuard>,
     /// 已构建的静态/动态上游目录；实例快照内部用 `Arc` 共享。
     pub upstreams: Arc<UpstreamDirectory>,
-    /// V2-B 多入口代理。旧 `server.listen + routes` 会兼容成一个 `default` proxy。
+    /// 多入口代理。旧 `server.listen + routes` 会兼容成一个 `default` proxy。
     pub proxies: Arc<Vec<ProxyRuntime>>,
-    /// V3 L4 stream TCP listener 列表。
+    /// L4 stream TCP listener 列表。
     pub stream_listeners: Arc<Vec<StreamRuntime>>,
-    /// V7 开发者门户/API 目录；OpenAPI 文档和 operation 摘要均随快照原子换版。
-    pub developer_portal: Arc<crate::developer_portal::DeveloperPortalRuntime>,
+    /// 开发者门户/API 目录；OpenAPI 文档和 operation 摘要均随快照原子换版。
+    pub developer_portal: Arc<crate::portal::DeveloperPortalRuntime>,
+    /// 与认证和产品目录同代的层级授权、额度和上下文策略。
+    pub scoped_policies: Arc<crate::security::scopes::ScopeCatalog>,
+    /// 候选阶段验证的外部计量传输计划，不持有后台任务。
+    pub usage_meter: crate::portal::meter::MeterPlan,
+    /// 独立流量事件的启动期传输计划，不依赖产品或应用订阅。
+    pub traffic_meter: crate::observability::meter::MeterPlan,
     /// 与 route 模板同版的变量执行计划；数据面和管理面路由推演共用同一语义。
     pub variables: Arc<VariablePlan>,
     /// gRPC 边缘模式集群中继计划；None = 未配置或显式单机，不绑定 relay 端口、不建 peer 连接。
-    pub grpc_edge_cluster: Option<Arc<crate::grpc_edge::GrpcEdgeClusterPlan>>,
+    pub grpc_edge_cluster: Option<Arc<crate::edge::config::GrpcEdgeClusterPlan>>,
 }
 
 /// 管理面展示/干跑使用的快照摘要。
@@ -171,14 +224,17 @@ pub struct GatewaySnapshotSummary {
     pub proxies: usize,
     /// L4 stream listener 数。
     pub stream_listeners: usize,
-    /// V8:启用 gRPC 边缘模式的 route 总数(0 = 纯 L7 透传)。
+    /// 启用 gRPC 边缘模式的 route 总数(0 = 纯 L7 透传)。
     pub grpc_edge_routes: usize,
-    /// V8:是否配置了边缘集群中继面。
+    /// 是否配置了边缘集群中继面。
     pub grpc_edge_cluster: bool,
     /// 启用 descriptor 转码的 route 数；0 表示普通 native gRPC 零反射计划。
     pub grpc_transcoding_routes: usize,
     /// 所有 descriptor route 白名单内的 RPC 数，不暴露高基数 method 名称。
     pub grpc_transcoding_methods: usize,
+    /// 已发布批领边界，不包含 Redis 地址、凭据或维度身份。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_preallocation: Option<model::RatePreallocationCfg>,
 }
 
 /// 单个 TLS listener 的运行期配置；路径已相对主配置解析，域名等字符串已构建期规范化。
@@ -191,9 +247,10 @@ pub struct TlsRuntimeCfg {
     /// 默认 PEM 私钥文件；ACME 成功后原子替换它。
     pub key_file: PathBuf,
     /// 外部 signer 计划；存在时握手私钥操作只允许走远程 provider。
-    pub(crate) private_key_provider: Option<crate::external_crypto::ExternalPrivateKeyPlan>,
+    pub(crate) private_key_provider:
+        Option<crate::security::external_crypto::ExternalPrivateKeyPlan>,
     /// SPIRE Workload API 动态身份来源；存在时文件证书、外部 signer 与 SNI 身份均为空。
-    pub(crate) spire: Option<Arc<crate::spire::SpireTlsSource>>,
+    pub(crate) spire: Option<Arc<crate::tls::spire::SpireTlsSource>>,
     /// cert/key pair 的单一原子指针；存在时 TLS loader/watcher 只消费其指向的完整版本。
     pub keypair_manifest_file: Option<PathBuf>,
     /// SNI 多证书：运行期已解析路径与小写化 server_names；空值只使用默认身份。
@@ -381,7 +438,7 @@ pub enum AcmeDns01ProviderRuntime {
     },
 }
 
-/// mTLS 运行期配置(§19)。
+/// mTLS 运行期配置。
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClientAuthRuntime {
     /// true = require(握手必须出示合法客户端证书);false = optional(出示才校验)。
@@ -450,7 +507,8 @@ pub struct ClientCertificateOcspRuntime {
 impl PartialEq for ClientCertificateOcspRuntime {
     /// 业务作用：比较会改变握手安全语义的配置，不让运行缓存内容制造 listener 拓扑抖动。
     ///
-    /// 参数说明：`other` 是候选运行策略。
+    /// 参数说明：
+    /// - `other`：是候选运行策略。
     ///
     /// 返回：所有声明式门限和模式一致时为 true；缓存及当前 permit 不参与配置等价。
     fn eq(&self, other: &Self) -> bool {
@@ -509,7 +567,8 @@ pub struct SniCertRuntime {
     /// 与证书匹配的 PEM 私钥。
     pub key_file: PathBuf,
     /// 该身份的外部 signer；存在时不得读取本地私钥。
-    pub(crate) private_key_provider: Option<crate::external_crypto::ExternalPrivateKeyPlan>,
+    pub(crate) private_key_provider:
+        Option<crate::security::external_crypto::ExternalPrivateKeyPlan>,
     /// 该证书专属的 OCSP staple 来源与 freshness 门禁。
     pub ocsp_stapling: Option<OcspStaplingRuntime>,
 }
@@ -532,6 +591,9 @@ pub struct ProxyProtocolRuntimeCfg {
 #[derive(Clone)]
 /// 已完成校验、可直接驱动数据面的代理运行时快照。
 pub struct ProxyRuntime {
+    /// 动态终结器必须在当前快照中仍具备权威；旧物理连接不能代替已撤回的 ECDS 证明。
+    #[cfg(feature = "xds-client-extensions")]
+    pub(crate) xds_extension_bound: bool,
     /// 稳定代理标识。
     pub id: String,
     /// 明文监听地址。
@@ -554,9 +616,9 @@ pub struct ProxyRuntime {
     pub limits: ServerLimitsCfg,
     /// 各阶段超时策略。
     pub timeouts: TimeoutCfg,
-    /// HTTP→HTTPS 跳转(§19):Some 时,明文入口一律 3xx 跳到 TLS 端口。构建期从 tls.listen 端口派生。
+    /// HTTP→HTTPS 跳转:Some 时,明文入口一律 3xx 跳到 TLS 端口。构建期从 tls.listen 端口派生。
     pub redirect_https: Option<RedirectHttps>,
-    /// HSTS 头预编译值(§19):Some(如 `max-age=31536000`)时,TLS 响应带 Strict-Transport-Security。
+    /// HSTS 头预编译值:Some(如 `max-age=31536000`)时,TLS 响应带 Strict-Transport-Security。
     pub hsts_header: Option<http::HeaderValue>,
     /// 路由表快照。
     pub router: Arc<Router>,
@@ -571,7 +633,7 @@ pub struct GatewayListenerRuntime {
     pub hostname: Option<Arc<str>>,
 }
 
-/// HTTP→HTTPS 跳转运行期(§19):明文入口收到请求即跳到本 proxy 的 TLS 端口。
+/// HTTP→HTTPS 跳转运行期:明文入口收到请求即跳到本 proxy 的 TLS 端口。
 #[derive(Clone)]
 pub struct RedirectHttps {
     /// 跳转目标端口(取自本 proxy 的 TLS 监听端口)。
@@ -641,7 +703,7 @@ pub struct AdminAuditRuntimeCfg {
 }
 
 impl AdminAuditRuntimeCfg {
-    /// 比较会占用进程级资源、因而只能重启切换的审计 bootstrap 配置。
+    /// 业务作用：比较会占用进程级资源、因而只能重启切换的审计 bootstrap 配置。
     ///
     /// 审计关闭时，`file` 仍会基于各自配置目录解析为绝对路径，但没有文件被打开、密钥被
     /// 使用或 worker 被创建。把这些休眠字段纳入比较，会让 Nacos 物化目录天然不同的等价
@@ -653,16 +715,16 @@ impl AdminAuditRuntimeCfg {
 }
 
 impl AdminPrincipalRuntime {
-    /// 判断主体是否拥有一项确切权限。
+    /// 业务作用：判断主体是否拥有一项确切权限。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `resource`: API 所属固定资源域。
     /// - `action`: API 的风险动作；emergency-kill 不会被普通 write 隐式包含。
     pub fn allows(&self, resource: AdminResource, action: AdminAction) -> bool {
         self.permissions & permission_bit(resource, action) != 0
     }
 
-    /// 返回只含授权位的 Copy 值，供请求身份脱离 ArcSwap guard；不会复制任何凭据字节。
+    /// 业务作用：返回只含授权位的 Copy 值，供请求身份脱离 ArcSwap guard；不会复制任何凭据字节。
     pub(crate) const fn permission_bits(&self) -> u128 {
         self.permissions
     }
@@ -689,10 +751,10 @@ pub struct StreamRuntime {
     pub preread: StreamPrereadRuntime,
     /// 显式启用的 MQTT 协议治理计划；未开 feature 时该字段不进入制品。
     #[cfg(feature = "mqtt-governance")]
-    pub mqtt: Option<Arc<crate::mqtt::MqttPolicy>>,
+    pub mqtt: Option<Arc<crate::protocols::mqtt::MqttPolicy>>,
     /// 显式启用的 Kafka 协议治理计划；未开 feature 时该字段不进入制品。
     #[cfg(feature = "kafka-governance")]
-    pub kafka: Option<Arc<crate::kafka::KafkaPolicy>>,
+    pub kafka: Option<Arc<crate::protocols::kafka::KafkaPolicy>>,
     /// stream route 列表。旧版单 upstream 会被编译成一条 default route。
     pub routes: Arc<Vec<StreamRouteRuntime>>,
     /// PROXY protocol v1/v2 解析策略。
@@ -751,27 +813,43 @@ pub struct StreamRouteRuntime {
 /// 构建期固定的 L4 socket 协议。
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum StreamProtocolRuntime {
-    /// Ordered byte stream over TCP, optionally wrapped by downstream/upstream TLS.
+    /// TCP 有序字节流，可分别启用下游或上游 TLS。
     Tcp,
-    /// Datagram proxy with a bounded per-peer session table.
+    /// 数据报代理；按对端维护有界会话表。
     Udp,
 }
 
 /// 构建期校验后的 UDP session table 资源预算。
 #[derive(Clone, Copy)]
 pub struct StreamUdpRuntime {
-    /// Milliseconds without a downstream datagram before a peer session is evicted.
+    /// 对端连续未发送下游数据报达到此毫秒数后回收会话。
     pub idle_timeout_ms: u64,
-    /// Hard cap for simultaneously tracked downstream peers on this listener.
+    /// 当前监听器同时登记的下游对端数硬上限。
     pub max_sessions: usize,
-    /// Per-session bounded response queue; full queues drop datagrams instead of blocking peers.
+    /// 每会话有界响应队列；满额丢弃数据报，不阻塞其它对端。
     pub queue_capacity: usize,
-    /// Maximum accepted datagram size in either direction; larger datagrams are discarded.
+    /// 双向可接收的数据报字节上限，超限丢弃。
     pub max_datagram_bytes: usize,
 }
 
 impl ProxyRuntime {
-    /// 直连对端 `ip` 是否为可信前置代理(据此决定是否采信其转发的真实客户端 IP / trace,review L6)。
+    /// 业务作用：区分允许按连接代排空的普通入口与必须持有当前扩展证明的动态入口。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：普通 listener 删除后允许已建连接继续排空；ECDS 入口删除后禁止发起新请求。
+    pub(crate) fn allows_removed_listener_drain(&self) -> bool {
+        #[cfg(feature = "xds-client-extensions")]
+        {
+            !self.xds_extension_bound
+        }
+        #[cfg(not(feature = "xds-client-extensions"))]
+        {
+            true
+        }
+    }
+
+    /// 业务作用：直连对端 `ip` 是否为可信前置代理(据此决定是否采信其转发的真实客户端 IP / trace)。
     /// PROXY protocol 已解析出 `real_peer` 的连接视为独立的可信来源,由调用方另行判定。
     pub fn is_trusted_peer(&self, ip: std::net::IpAddr) -> bool {
         net::any_contains(&self.trusted_proxies, ip)
@@ -779,12 +857,12 @@ impl ProxyRuntime {
 }
 
 impl GatewaySnapshot {
-    /// 按入口 id 找当前版本的 proxy 配置。
+    /// 业务作用：按入口 id 找当前版本的 proxy 配置。
     pub fn proxy(&self, id: &str) -> Option<&ProxyRuntime> {
         self.proxies.iter().find(|proxy| proxy.id == id)
     }
 
-    /// 生成当前快照的低基数摘要,供 Admin dry-run 和状态展示使用。
+    /// 业务作用：生成当前快照的低基数摘要,供 Admin dry-run 和状态展示使用。
     pub fn summary(&self) -> GatewaySnapshotSummary {
         let (grpc_transcoding_routes, grpc_transcoding_methods) = self
             .proxies
@@ -809,10 +887,11 @@ impl GatewaySnapshot {
             grpc_edge_cluster: self.grpc_edge_cluster.is_some(),
             grpc_transcoding_routes,
             grpc_transcoding_methods,
+            rate_preallocation: self.runtime_state.rate_limiter.local_preallocation,
         }
     }
 
-    /// 启动期已绑定的 listener 拓扑。热更时这些字段变更必须拒绝,避免快照与真实 socket 错位。
+    /// 业务作用：启动期已绑定的 listener 拓扑。热更时这些字段变更必须拒绝,避免快照与真实 socket 错位。
     pub fn listen_topology(&self) -> Vec<ProxyListenTopology> {
         self.proxies
             .iter()
@@ -859,10 +938,14 @@ impl GatewaySnapshot {
     /// 业务作用：校验 service-mesh sidecar profile 的业务 listener 只绑定 loopback，
     /// 防止启动或热更把原本仅供本 Pod/主机访问的代理端口暴露到外部网络。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
-    /// 返回：所有 HTTP/TLS/HTTP3/L4 listener 都是 loopback 时成功，否则返回定位到 listener 的错误。
+    /// 返回：所有 HTTP/TLS/HTTP3/L4 和显式 xDS 管理监听都是 loopback 时成功，否则拒绝部署。
     pub fn validate_sidecar_listeners(&self) -> Result<()> {
+        #[cfg(feature = "xds-server")]
+        if let Some(server) = &self.xds_server {
+            validate_sidecar_listen("xds-server", &server.listen.to_string())?;
+        }
         for topology in self.listen_topology() {
             validate_sidecar_listen(&topology.id, &topology.listen)?;
             if let Some(tls) = topology.tls.as_ref() {
@@ -875,7 +958,9 @@ impl GatewaySnapshot {
 
 /// 业务作用：验证一个 sidecar 数据面 socket 地址不会监听非本机接口。
 ///
-/// 参数说明：`listener_id` 用于错误定位；`listen` 是必须可解析为 `SocketAddr` 的监听地址。
+/// 参数说明：
+/// - `listener_id`：用于错误定位
+/// - `listen`：是必须可解析为 `SocketAddr` 的监听地址。
 ///
 /// 返回：地址是 IPv4/IPv6 loopback 时成功；解析失败或地址可被外部访问时失败。
 fn validate_sidecar_listen(listener_id: &str, listen: &str) -> Result<()> {
@@ -913,6 +998,7 @@ pub struct ProxyListenTopology {
 }
 
 impl PartialEq for TlsRuntimeCfg {
+    /// 业务作用：比较监听入口的协议接入约束，用于判断配置热更是否需要重建入口资源。
     fn eq(&self, other: &Self) -> bool {
         self.listen == other.listen
             && self.cert_file == other.cert_file
@@ -935,7 +1021,7 @@ impl Eq for TlsRuntimeCfg {}
 /// 与 `SUPPORTED` 分开：未来 `SUPPORTED` 升到 2 后，缺省的老配置仍按 **v1** 走 v1→v2 迁移，
 /// 而不是被误当成最新版绕过迁移逻辑。
 const DEFAULT_SCHEMA_VERSION: u32 = 1;
-/// 当前支持的最高配置 schema 版本。新增破坏性配置格式时 +1,并在 `resolve_schema_version` 里实现迁移/拒绝(§6)。
+/// 当前支持的最高配置 schema 版本。新增破坏性配置格式时 +1,并在 `resolve_schema_version` 里实现迁移/拒绝。
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 /// reload 指纹单文件硬上限。它覆盖主配置、OpenAPI/schema、WASM 与 SecretSource 依赖；
 /// 各构建器仍执行更严格的业务上限，这里先防 watcher 因敌意大文件产生无界分配。
@@ -954,7 +1040,9 @@ const MAX_RUNTIME_DURATION_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
 
 /// 业务作用：从本地主配置构建新的不可变运行快照，并为动态上游使用独立事实源。
 ///
-/// 参数说明：`cfg_path` 是主配置路径；`version` 是仅在成功发布后才生效的候选版本。
+/// 参数说明：
+/// - `cfg_path`：是主配置路径
+/// - `version`：是仅在成功发布后才生效的候选版本。
 ///
 /// 返回：配置、profile 和全部依赖均可构建时返回快照；任一步失败返回错误且调用方保留旧快照。
 pub fn load_snapshot(cfg_path: &Path, version: u64) -> Result<GatewaySnapshot> {
@@ -963,7 +1051,10 @@ pub fn load_snapshot(cfg_path: &Path, version: u64) -> Result<GatewaySnapshot> {
 
 /// 业务作用：在单一构建事务中加载主配置、profile 与附加文件，并编译路由、安全规则和上游目录。
 ///
-/// 参数说明：`cfg_path` 是主配置路径；`version` 是候选版本；`dynamic_upstreams` 是跨换版常驻的发现事实源。
+/// 参数说明：
+/// - `cfg_path`：是主配置路径
+/// - `version`：是候选版本
+/// - `dynamic_upstreams`：是跨换版常驻的发现事实源。
 ///
 /// 返回：完整候选及其同源 watcher 计划；任一来源读取、解析或语义校验失败时返回错误且不产生快照。
 pub fn load_snapshot_with_dynamic(
@@ -971,82 +1062,204 @@ pub fn load_snapshot_with_dynamic(
     version: u64,
     dynamic_upstreams: Arc<DynamicUpstreamStore>,
 ) -> Result<GatewaySnapshot> {
-    let loaded = load_gateway_config_tracked(cfg_path)?;
-    build_snapshot_from_config(
+    load_snapshot_input(
         cfg_path,
+        version,
+        dynamic_upstreams,
+        #[cfg(feature = "config-providers")]
+        crate::control::providers::Input::default(),
+    )
+}
+
+/// 业务作用：为已有动态来源状态建立完整构建事务入口，来源观测不能绕过本地文件与权限校验。
+///
+/// 参数说明：
+/// - `cfg_path`：是候选权威
+/// - `version`：是候选权威
+/// - `dynamic_upstreams`：是候选权威
+/// - `input`：是已发布来源目录与可选新观测。
+///
+/// 返回：完整候选，不发布数据面；任一门禁失败均保留调用方的旧状态。
+#[cfg(feature = "config-providers")]
+pub(crate) fn load_snapshot_with_providers(
+    cfg_path: &Path,
+    version: u64,
+    dynamic_upstreams: Arc<DynamicUpstreamStore>,
+    input: crate::control::providers::Input,
+) -> Result<GatewaySnapshot> {
+    load_snapshot_input(cfg_path, version, dynamic_upstreams, input)
+}
+
+/// 业务作用：加载同源本地文档并把可选来源证据交给唯一语义构建器。
+///
+/// 参数说明：
+/// - `cfg_path`：主配置路径。
+/// - `version`：候选快照版本。
+/// - `dynamic_upstreams`：共享动态实例目录。
+/// - `input`：显式来源观测与控制面输入。
+///
+/// 返回：完整快照或拒绝原因，函数自身不开放路由。
+fn load_snapshot_input(
+    cfg_path: &Path,
+    version: u64,
+    dynamic_upstreams: Arc<DynamicUpstreamStore>,
+    #[cfg(feature = "config-providers")] input: crate::control::providers::Input,
+) -> Result<GatewaySnapshot> {
+    let main = source_identity::Document::read(cfg_path)?;
+    let loaded = load_gateway_config_tracked(cfg_path)?;
+    let documents = candidate::Documents {
+        gateway: cfg_path,
+        sidecars: None,
+    };
+    let identity = source_identity::Prepared::new(
+        candidate::Paths::new(cfg_path, &loaded.value),
+        documents,
+        main,
+    )?;
+    let snapshot = build_snapshot_from_config(
+        cfg_path,
+        documents,
         version,
         dynamic_upstreams,
         loaded.value,
         loaded.sources,
-    )
-}
-
-/// 业务作用：从有界临时候选构建 dry-run 快照，同时保持 profile 和相对依赖以真实主配置为权威根。
-///
-/// 参数说明：`cfg_path` 是真实主配置；`candidate_path` 是控制面临时候选；`version` 是 dry-run 版本。
-///
-/// 返回：候选与全部依赖可完整构建时返回快照；读取超限、变量未解析或语义非法时返回错误且不覆盖真实文件。
-pub fn load_candidate_snapshot(
-    cfg_path: &Path,
-    candidate_path: &Path,
-    version: u64,
-) -> Result<GatewaySnapshot> {
-    let dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = cfg_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("gateway");
-    let profile_pattern = dir.join(format!("{stem}-{{profile}}"));
-    let loaded: LoadedYml<GatewayConfig> = YmlLoader::standard()
-        .base_file(candidate_path)
-        .profile_file_pattern(profile_pattern.to_string_lossy().to_string())
-        .max_file_bytes(MAX_FINGERPRINT_FILE_BYTES)
-        .preserve_unresolved_placeholders(true)
-        .load_tracked()
-        .with_context(|| format!("load candidate config {}", candidate_path.display()))?;
-    let mut cfg = loaded.value;
-    expand_config_snippets(&mut cfg, cfg_path, candidate_path)?;
-    build_snapshot_from_config(
-        cfg_path,
-        version,
-        DynamicUpstreamStore::new(),
-        cfg,
-        loaded.sources,
-    )
+        #[cfg(feature = "config-providers")]
+        input,
+    )?;
+    identity.finish(snapshot)
 }
 
 /// 业务作用：把已解析配置与同目录 guard、规则和 secret 编译为不可变快照，并冻结同源观察计划。
 ///
-/// 参数说明：`cfg_path` 是相对路径根；`version` 是候选版本；`dynamic_upstreams` 是发现事实源；
-/// `cfg` 是完成分层合并的配置；`sources` 是同一次 naml tracked load 返回的本地来源。
+/// 参数说明：
+/// - `cfg_path`：是相对路径根
+/// - `documents`：是本次实际读取的主文档与可选规则 base。
+/// - `version`：是候选版本
+/// - `dynamic_upstreams`：是发现事实源
+/// - `cfg`：是完成分层合并的配置
+/// - `sources`：是同一次 naml tracked load 返回的本地来源。 启用动态配置来源时
+/// - `provider_input`：提供同代来源目录与待验证的新观测。
 ///
 /// 返回：全部运行态计划和资源预算合法时返回快照；任一依赖或安全门失败时返回错误。
 fn build_snapshot_from_config(
     cfg_path: &Path,
+    documents: candidate::Documents<'_>,
     version: u64,
     dynamic_upstreams: Arc<DynamicUpstreamStore>,
     mut cfg: GatewayConfig,
     sources: YmlLocalSources,
+    #[cfg(feature = "config-providers")] provider_input: crate::control::providers::Input,
 ) -> Result<GatewaySnapshot> {
+    centers::apply(&mut cfg)?;
     let schema_version = resolve_schema_version(cfg.schema_version, "gateway.yml")?;
+    let process_log = crate::observability::logging::LogPlan::build(cfg.log.take())?;
     let config_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
-    let crypto_catalog = crate::external_crypto::build_catalog(config_dir, &cfg.crypto_providers)
-        .context("build external crypto providers")?;
-    crate::kubernetes_routes::apply_generated_routes(&mut cfg, config_dir)
+    #[cfg(feature = "scg-compat")]
+    scg::apply(&mut cfg, config_dir)?;
+    // 先检查配置权威和引用边界，再解析远程凭据或编译扩展，拒绝的候选不能借构建触发外呼。
+    crate::control::ownership::OwnershipCatalog::build(&cfg)?;
+    #[cfg(not(feature = "config-providers"))]
+    anyhow::ensure!(
+        !cfg.providers.enabled && cfg.providers.sources.is_empty(),
+        "configuration providers require config-providers feature"
+    );
+    #[cfg(feature = "config-providers")]
+    let providers = provider_input.prepare(&mut cfg, config_dir)?;
+    let crypto_catalog =
+        crate::security::external_crypto::build_catalog(config_dir, &cfg.crypto_providers)
+            .context("build external crypto providers")?;
+    crate::control::kubernetes::apply_generated_routes(&mut cfg, config_dir)
         .context("merge Kubernetes generated routes")?;
     let developer_portal =
-        crate::developer_portal::DeveloperPortalRuntime::build_and_apply(&mut cfg, config_dir)
+        crate::portal::DeveloperPortalRuntime::build_and_apply(&mut cfg, config_dir)
             .context("build developer portal and generated OpenAPI routes")?;
-    let remote_secret_refresh_ms =
-        crate::upstream_credential::resolve_references(&mut cfg, config_dir, &crypto_catalog)
-            .context("resolve upstream credential references")?;
+    let scoped_policies = crate::security::scopes::ScopeCatalog::build_and_apply(&mut cfg)
+        .context("build scoped policies")?;
+    // 自动目录与静态策略物化后再次验证，派生对象也不能绕过配额和跨域引用图。
+    let ownership = crate::control::ownership::OwnershipCatalog::build(&cfg)?;
+    cgi::validate_services(&cfg)?;
+    webdav::validate_routes(&cfg, config_dir)?;
+    let usage_meter =
+        crate::portal::meter::MeterPlan::build(cfg.usage_plans.meter.as_ref(), config_dir)?;
+    let traffic_meter = crate::observability::meter::MeterPlan::build(
+        cfg.runtime_state.traffic_meter.as_ref(),
+        config_dir,
+    )?;
+    // 配置明确要求持久事件时不可静默降级到只有内存额度，完整候选必须具备对应 sink。
+    anyhow::ensure!(
+        traffic_meter.enabled()
+            || !cfg
+                .routes
+                .iter()
+                .chain(cfg.proxies.iter().flat_map(|proxy| proxy.routes.iter()))
+                .any(|route| route
+                    .traffic_limit
+                    .as_ref()
+                    .is_some_and(|policy| policy.events)),
+        "traffic_limit.events requires runtime_state.traffic_meter"
+    );
+    anyhow::ensure!(
+        !usage_meter.enabled() || developer_portal.management.is_some(),
+        "usage meter requires managed product/application attribution"
+    );
+    let remote_secret_refresh_ms = crate::security::upstream_credential::resolve_references(
+        &mut cfg,
+        config_dir,
+        &crypto_catalog,
+    )
+    .context("resolve upstream credential references")?;
     validate_control_plane(&mut cfg.control_plane, &cfg.upstreams, config_dir)
         .context("validate control_plane.xds bootstrap")?;
     validate_xds_owned_native_domains(&cfg)
         .context("validate control_plane.xds native domain isolation")?;
     let secret_files = collect_secret_dependencies(&cfg, config_dir);
     let admin_auth = build_admin_auth(&cfg.admin, config_dir).context("build admin auth/RBAC")?;
+    let admin_monitor = monitor::build(&cfg.admin.monitor, &admin_auth)?;
+    let admin_operations = operations::Plan::build(&cfg.admin.operations, &admin_auth, config_dir)?;
+    #[cfg(not(feature = "admin-grpc"))]
+    anyhow::ensure!(
+        !cfg.admin.management.enabled,
+        "admin.management requires the admin-grpc feature"
+    );
+    #[cfg(feature = "admin-grpc")]
+    let admin_management =
+        crate::admin::management::Plan::build(&cfg.admin.management, config_dir)?;
+    #[cfg(feature = "admin-grpc")]
+    anyhow::ensure!(
+        !cfg.admin.management.enabled
+            || cfg.admin.management.receiver.is_none()
+            || admin_auth.enabled,
+        "management receiver requires admin.auth.enabled=true"
+    );
     let admin_audit = build_admin_audit(&cfg.admin, config_dir).context("build admin audit")?;
+    anyhow::ensure!(
+        !admin_operations
+            .as_ref()
+            .is_some_and(|plan| plan.config.execution.enabled)
+            || (admin_audit.enabled && admin_audit.fsync),
+        "admin.operations.execution requires audit enabled and fsync"
+    );
+    #[cfg(feature = "node-actions")]
+    anyhow::ensure!(
+        !admin_operations
+            .as_ref()
+            .is_some_and(|plan| plan.config.execution.enabled)
+            || admin_management
+                .as_ref()
+                .is_some_and(|plan| plan.can_issue(&cfg.admin.operations.cluster_id)),
+        "admin.operations.execution requires a matching management issuer"
+    );
+    #[cfg(feature = "admin-grpc")]
+    anyhow::ensure!(
+        !admin_management
+            .as_ref()
+            .is_some_and(|plan| plan.actions_enabled)
+            || (admin_auth.enabled
+                && admin_auth.rbac_enabled
+                && admin_audit.enabled
+                && !cfg.config_source.nacos.enabled),
+        "management reporter actions require authenticated RBAC, audit and local file source"
+    );
     validate_admin_rollout(
         &cfg.admin.rollout,
         &cfg.config_source,
@@ -1055,8 +1268,13 @@ fn build_snapshot_from_config(
         &admin_audit,
     )
     .context("validate admin rollout")?;
-    validate_admin_approval(&cfg.admin.approval, &admin_auth, &admin_audit)
-        .context("validate admin approval")?;
+    validate_admin_approval(
+        &cfg.admin.approval,
+        &admin_auth,
+        &admin_audit,
+        ownership.enabled(),
+    )
+    .context("validate admin approval")?;
     anyhow::ensure!(
         (1024..=16 * 1024 * 1024).contains(&cfg.admin.max_config_body_bytes),
         "admin.max_config_body_bytes must be within 1024..=16777216"
@@ -1074,9 +1292,33 @@ fn build_snapshot_from_config(
     validate_admin_exposure(&cfg.admin.listen, &admin_auth)?;
     let access_log =
         AccessLogRuntime::build(&cfg.access_log, config_dir).context("build access log")?;
-    crate::telemetry::validate_config(&cfg.telemetry).context("validate telemetry")?;
-    let (guard, guard_sources) = load_interface_guard(cfg_path, &cfg.interface_guard_file)?;
-    let (sentinel, sentinel_sources) = load_sentinel_rules(cfg_path, &cfg.sentinel_rules_file)?;
+    crate::observability::telemetry::validate_config(&cfg.telemetry)
+        .context("validate telemetry")?;
+    if cfg
+        .telemetry
+        .multi_signal
+        .as_ref()
+        .is_some_and(|multi| multi.traffic_tap)
+    {
+        // 诊断不是普通配置读能力；必须有独立双主体写权限和已启用持久审计。
+        anyhow::ensure!(admin_auth.enabled && admin_auth.rbac_enabled && admin_audit.enabled
+            && admin_auth.principals.iter().filter(|principal| principal.allows(model::AdminResource::Diagnostics, model::AdminAction::Write)).count() >= 2,
+            "traffic_tap requires authenticated RBAC, durable audit and two diagnostics write principals");
+    }
+    #[cfg(feature = "telemetry-otlp")]
+    let telemetry_sampling =
+        crate::observability::telemetry::sampling::SamplingCatalog::build(&cfg, &ownership)?;
+    // 主 profile 和环境已确定真实声明；候选 base 另行绑定，不能重新读回活动规则而漏验待发布正文。
+    let (guard, guard_sources) = load_interface_guard(
+        cfg_path,
+        &cfg.interface_guard_file,
+        documents.sidecars.map(|paths| paths.guard),
+    )?;
+    let (sentinel, sentinel_sources) = load_sentinel_rules(
+        cfg_path,
+        &cfg.sentinel_rules_file,
+        documents.sidecars.map(|paths| paths.sentinel),
+    )?;
     let config_watch = ConfigWatchPlan::new(
         sources,
         config_watch_dependencies(
@@ -1125,7 +1367,41 @@ fn build_snapshot_from_config(
             default_proxy.timeouts,
         )
     };
-    crate::http_cache::validate_runtime_config(&cfg.runtime_state.http_cache)
+    crate::routing::traffic::validate_scopes(&proxies, &ownership)?;
+    #[cfg(feature = "redis-runtime")]
+    if proxies.iter().any(|proxy| {
+        proxy.router.routes().iter().any(|route| {
+            route
+                .traffic_limit
+                .as_ref()
+                .is_some_and(|policy| policy.redis_backend)
+        })
+    }) {
+        anyhow::ensure!(
+            cfg.runtime_state
+                .rate_limiter
+                .backend
+                .trim()
+                .eq_ignore_ascii_case("redis"),
+            "traffic_limit backend=redis requires runtime_state.rate_limiter.backend=redis"
+        );
+    }
+    cfg.runtime_state.rate_limiter.validate_preallocation()?;
+    if cfg.runtime_state.rate_limiter.local_preallocation.is_some() {
+        // 完整原生路由与 Sentinel 翻译使用相同数值门，坏规则不得等发布后再由数据面拒绝。
+        for proxy in &proxies {
+            for route in proxy.router.routes() {
+                for policy in &route.limit_req {
+                    model::RatePreallocationCfg::validate_rule(
+                        policy.limit,
+                        policy.window,
+                        policy.burst,
+                    )?;
+                }
+            }
+        }
+    }
+    crate::cache::http::validate_runtime_config(&cfg.runtime_state.http_cache)
         .context("validate runtime_state.http_cache")?;
     validate_early_data_runtime(&proxies, &cfg.runtime_state)
         .context("validate HTTP/3 early-data runtime state")?;
@@ -1160,23 +1436,45 @@ fn build_snapshot_from_config(
         cfg_path,
     )
     .context("build upstream directory")?;
-    // V8 边缘集群中继:值校验 + feature 门都在构建期完成,坏配置保留旧快照。
+    #[cfg(feature = "xds-server")]
+    let xds_server = crate::control::xds_server::Plan::build(
+        &cfg,
+        config_dir,
+        &ownership,
+        guard.rule_count() != 0 || !sentinel.by_route.is_empty(),
+    )?;
+    // 边缘集群中继的值校验与 feature 门在构建期完成，坏配置保留旧快照。
     // 必须在 cfg.discovery 被 move 前读取 nacos 启用位。
     let nacos_enabled = cfg.discovery.nacos.enabled;
-    let grpc_edge_cluster = crate::grpc_edge::GrpcEdgeClusterPlan::build(
+    let grpc_edge_cluster = crate::edge::config::GrpcEdgeClusterPlan::build(
         cfg.grpc_edge_cluster.as_ref(),
         nacos_enabled,
         config_dir,
     )
     .context("build grpc_edge_cluster")?
     .map(Arc::new);
-    let discovery = crate::discovery::build_runtime_config(cfg.discovery, config_dir)
+    let document_paths = candidate::Paths::new(cfg_path, &cfg);
+    let discovery = crate::upstream::discovery::build_runtime_config(cfg.discovery, config_dir)
         .context("build discovery runtime config")?;
     Ok(GatewaySnapshot {
+        sentinel_rules: sentinel.rules,
+        process_log,
+        #[cfg(feature = "xds-server")]
+        xds_server,
+        ownership,
+        #[cfg(feature = "config-providers")]
+        providers,
         version,
-        // 指纹覆盖主配置及其依赖;失败不阻断上线(集群视图显示未知即可)。
-        config_fingerprint: config_fingerprint(cfg_path).ok(),
+        // 隔离候选不拥有活动文件集身份；借用真实目录指纹会把另一份原文误标为本次候选。
+        config_fingerprint: if documents.gateway == cfg_path && documents.sidecars.is_none() {
+            config_fingerprint(cfg_path).ok()
+        } else {
+            None
+        },
+        config_bundle_digest: None,
+        document_identity: None,
         source_config_path: Arc::new(cfg_path.to_path_buf()),
+        document_paths,
         schema_version,
         listen: proxies
             .first()
@@ -1185,6 +1483,10 @@ fn build_snapshot_from_config(
         tls: proxies.first().and_then(|proxy| proxy.tls.clone()),
         admin_listen: cfg.admin.listen,
         expose_metrics: cfg.admin.expose_metrics,
+        admin_monitor,
+        admin_operations,
+        #[cfg(feature = "admin-grpc")]
+        admin_management,
         admin_auth,
         admin_audit,
         admin_rollout: cfg.admin.rollout,
@@ -1197,6 +1499,8 @@ fn build_snapshot_from_config(
         runtime_state: cfg.runtime_state,
         access_log,
         telemetry: cfg.telemetry,
+        #[cfg(feature = "telemetry-otlp")]
+        telemetry_sampling,
         reload: cfg.reload,
         config_watch,
         long_connections: cfg.long_connections,
@@ -1210,6 +1514,9 @@ fn build_snapshot_from_config(
         proxies: Arc::new(proxies),
         stream_listeners: Arc::new(stream_listeners),
         developer_portal,
+        scoped_policies,
+        usage_meter,
+        traffic_meter,
         variables,
         grpc_edge_cluster,
     })
@@ -1218,8 +1525,9 @@ fn build_snapshot_from_config(
 /// 业务作用：用真实 runtime-state 配置复核 HTTP/3 0-RTT 的跨节点防重放声明，
 /// 防止一个独立布尔开关冒充已安装的共享账本。
 ///
-/// 参数说明：`proxies` 是已编译 listener 计划；`runtime_state` 是同一候选的
-/// ReplayGuard 后端与故障策略。
+/// 参数说明：
+/// - `proxies`：是已编译 listener 计划
+/// - `runtime_state`：是同一候选的 ReplayGuard 后端与故障策略。
 ///
 /// 返回：单节点使用本地账本成功；多节点仅在 Redis 且 fail-closed 时成功；
 /// 声明与真实后端不一致时拒绝候选快照。
@@ -1266,8 +1574,10 @@ fn validate_early_data_runtime(
 /// 业务作用：在任何 ADS socket/task 创建前锁定本地 trust root、Node identity、资源预算与
 /// 单一 owner，避免未编 feature、明文远端或 native/xDS 双写进入运行期。
 ///
-/// 参数说明：`control_plane` 是待规范化的 bootstrap；`upstreams` 用于核对 `source: xds`；
-/// `config_dir` 是证书文件的相对路径基准。
+/// 参数说明：
+/// - `control_plane`：是待规范化的 bootstrap
+/// - `upstreams`：用于核对 `source: xds`
+/// - `config_dir`：是证书文件的相对路径基准。
 ///
 /// 返回：合法配置原地规范化文件路径并返回成功；任何越权、未支持阶段或资源风险均 fail closed。
 fn validate_control_plane(
@@ -1511,7 +1821,8 @@ fn validate_control_plane(
 
 /// 业务作用：在构建路由/上游前复验 xDS owner 域没有 native 影子声明，阻止双写或 reload 覆盖。
 ///
-/// 参数说明：`cfg` 已完成 generated routes 合并与 xDS bootstrap 校验。
+/// 参数说明：
+/// - `cfg`：已完成 generated routes 合并与 xDS bootstrap 校验。
 ///
 /// 返回：CDS/RDS profile 的 native routes/upstreams 全空时成功；任何影子声明都拒绝整份快照。
 fn validate_xds_owned_native_domains(cfg: &GatewayConfig) -> Result<()> {
@@ -1543,7 +1854,8 @@ fn validate_xds_owned_native_domains(cfg: &GatewayConfig) -> Result<()> {
 ///
 /// 业务作用：只给测试/开发回环端点开放明文 ADS，防止误把生产 xDS 身份暴露到网络。
 ///
-/// 参数说明：`url` 是已解析且含 host 的 xDS server URI。
+/// 参数说明：
+/// - `url`：是已解析且含 host 的 xDS server URI。
 ///
 /// 返回：localhost 或 loopback IP 返回 true；其它 host 返回 false。
 fn xds_server_is_loopback(url: &reqwest::Url) -> bool {
@@ -1560,7 +1872,9 @@ fn xds_server_is_loopback(url: &reqwest::Url) -> bool {
 ///
 /// 业务作用：限制 Node/cluster/metadata 的长度和字符集，避免秘密、控制字符或高熵任意环境值外泄。
 ///
-/// 参数说明：`value` 是标识原值；`field` 用于返回可定位错误。
+/// 参数说明：
+/// - `value`：是标识原值
+/// - `field`：用于返回可定位错误。
 ///
 /// 返回：1..=256 bytes 且仅含安全 ASCII 字符时成功，否则拒绝配置。
 fn validate_xds_identity(value: &str, field: &str) -> Result<()> {
@@ -1579,7 +1893,10 @@ fn validate_xds_identity(value: &str, field: &str) -> Result<()> {
 ///
 /// 业务作用：在启动 transport 前固定证书路径与 1 MiB 上限，拒绝目录、缺失文件和超大 secret。
 ///
-/// 参数说明：`raw` 是配置路径；`config_dir` 是相对基准；`field` 用于错误定位。
+/// 参数说明：
+/// - `raw`：是配置路径
+/// - `config_dir`：是相对基准
+/// - `field`：用于错误定位。
 ///
 /// 返回：成功时返回绝对或规范相对 PathBuf 字符串；失败时不创建任何网络资源。
 fn normalize_xds_pem_file(raw: &str, config_dir: &Path, field: &str) -> Result<String> {
@@ -1604,7 +1921,9 @@ fn normalize_xds_pem_file(raw: &str, config_dir: &Path, field: &str) -> Result<S
 ///
 /// 业务作用：统一接受 `ms/s/m/h` 并在 checked arithmetic 下转换，避免溢出 timer 或不同模块口径漂移。
 ///
-/// 参数说明：`raw` 是 duration；`field` 用于返回可定位错误。
+/// 参数说明：
+/// - `raw`：是 duration
+/// - `field`：用于返回可定位错误。
 ///
 /// 返回：成功时返回毫秒；空值、未知单位、零值和溢出返回错误。
 fn parse_xds_duration_ms(raw: &str, field: &str) -> Result<u64> {
@@ -1631,7 +1950,9 @@ fn parse_xds_duration_ms(raw: &str, field: &str) -> Result<u64> {
 
 /// 业务作用：构建管理面运行期认证策略，并在发布前拒绝匿名跨节点抓取或缺少 Cluster/Read 主体的配置。
 ///
-/// 参数说明：`cfg` 是完整 admin 认证/RBAC 配置；`config_dir` 是 SecretSource 相对路径基准。
+/// 参数说明：
+/// - `cfg`：是完整 admin 认证/RBAC 配置
+/// - `config_dir`：是 SecretSource 相对路径基准。
 ///
 /// 返回：认证、来源门与主体权限全部合法时返回不可变运行态；矛盾配置或密钥解析失败时拒绝候选快照。
 fn build_admin_auth(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuthRuntimeCfg> {
@@ -1677,8 +1998,11 @@ fn build_admin_auth(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuthRuntim
     let bearer_token = if auth.bearer_token.is_empty() {
         None
     } else {
-        let token =
-            crate::secret::resolve_text(&auth.bearer_token, config_dir, "admin.auth.bearer_token")?;
+        let token = crate::security::secret::resolve_text(
+            &auth.bearer_token,
+            config_dir,
+            "admin.auth.bearer_token",
+        )?;
         validate_auth_secret("admin.auth.bearer_token", &token)?;
         Some(token.into_bytes())
     };
@@ -1686,7 +2010,7 @@ fn build_admin_auth(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuthRuntim
         (true, true) => None,
         (false, false) => {
             validate_basic_user("admin.auth.basic_user", &auth.basic_user)?;
-            let password = crate::secret::resolve_text(
+            let password = crate::security::secret::resolve_text(
                 &auth.basic_password,
                 config_dir,
                 "admin.auth.basic_password",
@@ -1728,9 +2052,9 @@ fn build_admin_auth(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuthRuntim
     })
 }
 
-/// 校验并解析管理审计配置；RBAC 模式强制启用审计，防止高危动作无留痕。
+/// 业务作用：校验并解析管理审计配置；RBAC 模式强制启用审计，防止高危动作无留痕。
 ///
-/// # 参数
+/// 参数说明：
 /// - `cfg`: 完整 admin 配置。
 /// - `config_dir`: 相对 spool/SecretSource 路径基准。
 fn build_admin_audit(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuditRuntimeCfg> {
@@ -1767,8 +2091,11 @@ fn build_admin_audit(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuditRunt
             bail!("admin.audit.file must be a regular file");
         }
     }
-    let signing_key =
-        crate::secret::resolve_text(&audit.signing_key, config_dir, "admin.audit.signing_key")?;
+    let signing_key = crate::security::secret::resolve_text(
+        &audit.signing_key,
+        config_dir,
+        "admin.audit.signing_key",
+    )?;
     if !(32..=64 * 1024).contains(&signing_key.len()) {
         bail!("admin.audit.signing_key must resolve to 32..=65536 bytes");
     }
@@ -1804,7 +2131,7 @@ fn build_admin_audit(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuditRunt
         if endpoint.is_none() {
             bail!("admin.audit.authorization requires endpoint");
         }
-        let value = crate::secret::resolve_text(
+        let value = crate::security::secret::resolve_text(
             &audit.authorization,
             config_dir,
             "admin.audit.authorization",
@@ -1829,7 +2156,12 @@ fn build_admin_audit(cfg: &AdminCfg, config_dir: &Path) -> Result<AdminAuditRunt
 
 /// 业务作用：校验集群渐进发布的批次、观察窗和健康阈值，避免控制面进入永不完成或无门槛放量状态。
 ///
-/// 参数说明：`cfg` 是 rollout 声明；`source`/`discovery` 提供原子配置与成员事实；`auth`/`audit` 提供抓取授权与持久审计门禁。
+/// 参数说明：
+/// - `cfg`：是 rollout 声明
+/// - `source`：提供原子配置与成员事实
+/// - `discovery`：提供原子配置与成员事实
+/// - `auth`：提供抓取授权与持久审计门禁。
+/// - `audit`：提供抓取授权与持久审计门禁。
 ///
 /// 返回：全部资源与阈值可安全执行时成功；非法选择器、窗口或浮点值返回构建错误。
 fn validate_admin_rollout(
@@ -1913,13 +2245,18 @@ fn validate_admin_rollout(
 /// 业务作用：校验 maker-checker 的资源边界、容量、时效与双主体授权，避免启用后无人可审批或候选
 /// 无限滞留。
 ///
-/// 参数说明：`cfg` 是审批策略；`auth` 是已编译主体权限；`audit` 是持久审计事实。
+/// 参数说明：
+/// - `cfg`：是审批策略
+/// - `auth`：是已编译主体权限
+/// - `audit`：是持久审计事实
+/// - `workspace_approvals`：表示有独立角色与容量约束的工作区审批域。
 ///
 /// 返回：策略可安全执行时成功；资源越界、重复、预算非法或任一资源不足两名写主体时拒绝候选。
 fn validate_admin_approval(
     cfg: &AdminApprovalCfg,
     auth: &AdminAuthRuntimeCfg,
     audit: &AdminAuditRuntimeCfg,
+    workspace_approvals: bool,
 ) -> Result<()> {
     anyhow::ensure!(
         (30..=86_400).contains(&cfg.ttl_seconds),
@@ -1946,7 +2283,7 @@ fn validate_admin_approval(
     }
     if cfg.enabled {
         anyhow::ensure!(
-            !cfg.resources.is_empty(),
+            !cfg.resources.is_empty() || workspace_approvals,
             "admin.approval.enabled requires at least one resource"
         );
         anyhow::ensure!(
@@ -1972,9 +2309,9 @@ fn validate_admin_approval(
     Ok(())
 }
 
-/// 解析 RBAC principal SecretSource，并把角色/授权编译成固定权限位图。
+/// 业务作用：解析 RBAC principal SecretSource，并把角色/授权编译成固定权限位图。
 ///
-/// # 参数
+/// 参数说明：
 /// - `cfg`: 完整 admin 配置；同时用于检测 RBAC 是否启用。
 /// - `config_dir`: SecretSource 相对路径基准。
 fn build_admin_principals(
@@ -2013,7 +2350,8 @@ fn build_admin_principals(
             None
         } else {
             let field = format!("admin.rbac.principals.{}.bearer_token", principal.id);
-            let token = crate::secret::resolve_text(&principal.bearer_token, config_dir, &field)?;
+            let token =
+                crate::security::secret::resolve_text(&principal.bearer_token, config_dir, &field)?;
             validate_auth_secret(&field, &token)?;
             Some(token.into_bytes())
         };
@@ -2027,7 +2365,7 @@ fn build_admin_principals(
                 validate_basic_user(&user_field, &principal.basic_user)?;
                 let password_field =
                     format!("admin.rbac.principals.{}.basic_password", principal.id);
-                let password = crate::secret::resolve_text(
+                let password = crate::security::secret::resolve_text(
                     &principal.basic_password,
                     config_dir,
                     &password_field,
@@ -2087,22 +2425,29 @@ fn build_admin_principals(
     Ok(principals.into())
 }
 
-/// 向权限位图加入一个内置角色模板。
+/// 业务作用：编译内置管理职责，流量诊断不随普通只读角色隐式授权。
 ///
-/// # 参数
-/// - `permissions`: 当前主体权限位图，函数原地追加权限并集。
-/// - `role`: 架构内置角色。
+/// 参数说明：
+/// - `permissions`：是权限位图
+/// - `role`：是固定角色模板。
+///
+/// 返回：追加该职责允许的权限；非 admin 的诊断权限必须显式声明 grant。
 fn add_role_permissions(permissions: &mut u128, role: AdminRole) {
     let mut allow = |resource, action| *permissions |= permission_bit(resource, action);
     match role {
+        AdminRole::Workspace => {}
         AdminRole::Viewer => {
             for resource in AdminResource::ALL {
-                allow(resource, AdminAction::Read);
+                if resource != AdminResource::Diagnostics {
+                    allow(resource, AdminAction::Read);
+                }
             }
         }
         AdminRole::Operator => {
             for resource in AdminResource::ALL {
-                allow(resource, AdminAction::Read);
+                if resource != AdminResource::Diagnostics {
+                    allow(resource, AdminAction::Read);
+                }
             }
             for resource in [
                 AdminResource::Config,
@@ -2115,7 +2460,9 @@ fn add_role_permissions(permissions: &mut u128, role: AdminRole) {
         }
         AdminRole::SecuritySre => {
             for resource in AdminResource::ALL {
-                allow(resource, AdminAction::Read);
+                if resource != AdminResource::Diagnostics {
+                    allow(resource, AdminAction::Read);
+                }
             }
             for resource in [AdminResource::InterfaceGuard, AdminResource::Acl] {
                 allow(resource, AdminAction::Write);
@@ -2138,12 +2485,18 @@ fn add_role_permissions(permissions: &mut u128, role: AdminRole) {
     }
 }
 
-/// 生成一个固定权限 bit；13×5=65，使用 `u128` 留出演进余量且避免请求时 HashMap 查询。
+/// 业务作用：把固定资源和动作映射到授权位，避免请求时动态查询权限表。
+///
+/// 参数说明：
+/// - `resource`：是已解析枚举。
+/// - `action`：是已解析枚举。
+///
+/// 返回：u128 中唯一授权位，当前十四个资源各占五位。
 const fn permission_bit(resource: AdminResource, action: AdminAction) -> u128 {
     1_u128 << (resource.index() * AdminAction::COUNT + action.index())
 }
 
-/// 从 Origin 或 Referer URI 提取规范化的 `scheme://authority`。
+/// 业务作用：从 Origin 或 Referer URI 提取规范化的 `scheme://authority`。
 pub(crate) fn normalize_http_origin(raw: &str) -> Result<String> {
     let uri: http::Uri = raw.trim().parse().context("parse HTTP origin URI")?;
     let scheme = uri
@@ -2164,7 +2517,7 @@ pub(crate) fn normalize_http_origin(raw: &str) -> Result<String> {
     ))
 }
 
-/// 管理面若绑定到非回环地址，必须显式启用认证，避免默认配置误暴露控制面。
+/// 业务作用：管理面若绑定到非回环地址，必须显式启用认证，避免默认配置误暴露控制面。
 fn validate_admin_exposure(listen: &str, auth: &AdminAuthRuntimeCfg) -> Result<()> {
     let address: std::net::SocketAddr = listen
         .parse()
@@ -2177,9 +2530,9 @@ fn validate_admin_exposure(listen: &str, auth: &AdminAuthRuntimeCfg) -> Result<(
     Ok(())
 }
 
-/// 校验认证用户名。
+/// 业务作用：校验认证用户名。
 ///
-/// # 参数
+/// 参数说明：
 /// - `field`: 字段名,用于错误上下文。
 /// - `value`: 用户名。
 fn validate_basic_user(field: &str, value: &str) -> Result<()> {
@@ -2189,9 +2542,9 @@ fn validate_basic_user(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// 校验认证 secret/realm 文本。
+/// 业务作用：校验认证 secret/realm 文本。
 ///
-/// # 参数
+/// 参数说明：
 /// - `field`: 字段名,用于错误上下文。
 /// - `value`: 待校验文本。
 fn validate_auth_secret(field: &str, value: &str) -> Result<()> {
@@ -2204,15 +2557,17 @@ fn validate_auth_secret(field: &str, value: &str) -> Result<()> {
 /// 业务作用：把 L4 listener 配置编译为不可变运行时，并在发布快照前拒绝
 /// 协议/profile/feature 不匹配与越界资源预算。
 ///
-/// 参数说明：`cfg` 是顶层 stream 配置；`cfg_path` 为 TLS 等相对文件提供可信基目录；
-/// `crypto_catalog` 提供 stream TLS 外部私钥引用所需的共享签名 provider。
+/// 参数说明：
+/// - `cfg`：是顶层 stream 配置
+/// - `cfg_path`：为 TLS 等相对文件提供可信基目录
+/// - `crypto_catalog`：提供 stream TLS 外部私钥引用所需的共享签名 provider。
 ///
 /// 返回：全部 listener 都通过门禁时返回 runtime 列表；任一 listener 无效时返回错误，
 /// 旧快照不受影响。
 fn build_stream_listeners(
     cfg: &StreamCfg,
     cfg_path: &Path,
-    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
+    crypto_catalog: &crate::security::external_crypto::ExternalCryptoCatalog,
 ) -> Result<Vec<StreamRuntime>> {
     let mut out = Vec::with_capacity(cfg.listeners.len());
     let mut ids = HashSet::new();
@@ -2340,7 +2695,7 @@ fn build_stream_listeners(
                 listener.id
             );
             Some(Arc::new(
-                crate::mqtt::MqttPolicy::build(&listener.mqtt)
+                crate::protocols::mqtt::MqttPolicy::build(&listener.mqtt)
                     .with_context(|| format!("stream `{}` MQTT governance", listener.id))?,
             ))
         } else {
@@ -2371,7 +2726,7 @@ fn build_stream_listeners(
                 listener.id
             );
             Some(Arc::new(
-                crate::kafka::KafkaPolicy::build(&listener.kafka)
+                crate::protocols::kafka::KafkaPolicy::build(&listener.kafka)
                     .with_context(|| format!("stream `{}` Kafka governance", listener.id))?,
             ))
         } else {
@@ -2464,7 +2819,9 @@ fn build_stream_listeners(
 /// 业务作用：构建单个 stream listener 的路由表，并区分旧版单上游、显式多路由和
 /// 全连接拒绝三种互斥形态，防止空配置意外开放默认转发。
 ///
-/// 参数说明：`listener` 是 stream listener 原始配置；`cfg_path` 为上游 TLS 文件提供可信基目录。
+/// 参数说明：
+/// - `listener`：是 stream listener 原始配置
+/// - `cfg_path`：为上游 TLS 文件提供可信基目录。
 ///
 /// 返回：配置形态与路由约束均合法时返回运行时路由；冲突、重复或缺少安全默认路由时返回错误。
 fn build_stream_routes(
@@ -2603,15 +2960,18 @@ fn build_stream_routes(
 /// 业务作用：把 stream TLS 终止配置编译为与 L7 共用的 rustls server runtime，
 /// 保持默认身份、SNI 身份和客户端认证策略一致。
 ///
-/// 参数说明：`cfg_path` 是路径信任根；`listener` 提供业务身份；`tls` 是待编译配置；
-/// `crypto_catalog` 提供外部私钥引用所需的共享签名 provider。
+/// 参数说明：
+/// - `cfg_path`：是路径信任根
+/// - `listener`：提供业务身份
+/// - `tls`：是待编译配置
+/// - `crypto_catalog`：提供外部私钥引用所需的共享签名 provider。
 ///
 /// 返回：配置完整时返回可热换 TLS runtime；认证模式或路径语义无效时返回错误。
 fn build_stream_server_tls(
     cfg_path: &Path,
     listener: &model::StreamListenerCfg,
     tls: &model::StreamTlsCfg,
-    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
+    crypto_catalog: &crate::security::external_crypto::ExternalCryptoCatalog,
 ) -> Result<TlsRuntimeCfg> {
     let client_auth = tls
         .client_auth
@@ -2623,7 +2983,7 @@ fn build_stream_server_tls(
     let spire = tls
         .spire
         .as_ref()
-        .map(crate::spire::build_source)
+        .map(crate::tls::spire::build_source)
         .transpose()?;
     let (key_file, private_key_provider) = if spire.is_some() {
         anyhow::ensure!(tls.cert_file.trim().is_empty() && tls.key_file.trim().is_empty() && tls.private_key_provider.is_none() && tls.certs.is_empty() && tls.session_tickets.is_none(), "listener `{}` SPIRE identity cannot be combined with file certificate, external signer, SNI identities, or session tickets", listener.id);
@@ -2696,8 +3056,12 @@ fn build_stream_server_tls(
 
 /// 业务作用：把本地私钥路径与外部 signer 引用收敛成互斥的单一 TLS 私钥来源。
 ///
-/// 参数说明：`cfg_path` 是相对路径基准；`owner` 标识 listener；`key_file` 与 `reference`
-/// 是候选来源；`crypto_catalog` 提供本快照共享的远程 provider。
+/// 参数说明：
+/// - `cfg_path`：是相对路径基准
+/// - `owner`：标识 listener
+/// - `key_file`：是候选来源
+/// - `reference`：是候选来源
+/// - `crypto_catalog`：提供本快照共享的远程 provider。
 ///
 /// 返回：恰好声明一种来源时返回规范路径或外部签名计划；缺失、同时声明或引用无效时失败。
 fn build_tls_private_key(
@@ -2705,10 +3069,10 @@ fn build_tls_private_key(
     owner: &str,
     key_file: &str,
     reference: Option<&model::ExternalPrivateKeyCfg>,
-    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
+    crypto_catalog: &crate::security::external_crypto::ExternalCryptoCatalog,
 ) -> Result<(
     PathBuf,
-    Option<crate::external_crypto::ExternalPrivateKeyPlan>,
+    Option<crate::security::external_crypto::ExternalPrivateKeyPlan>,
 )> {
     let has_local_key = !key_file.trim().is_empty();
     anyhow::ensure!(
@@ -2718,7 +3082,7 @@ fn build_tls_private_key(
     if let Some(reference) = reference {
         return Ok((
             PathBuf::new(),
-            Some(crate::external_crypto::build_private_key_plan(
+            Some(crate::security::external_crypto::build_private_key_plan(
                 reference,
                 crypto_catalog,
             )?),
@@ -2729,8 +3093,11 @@ fn build_tls_private_key(
 
 /// 业务作用：把 HTTP/stream 共用的客户端证书认证与 CRL 失败策略编译为单一运行契约。
 ///
-/// 参数说明：`cfg_path` 是路径基准；`owner` 是 listener 标识；`auth` 是 mTLS 声明；
-/// `spire_bundles` 表示客户端信任根是否来自当前 SPIRE 完整响应。
+/// 参数说明：
+/// - `cfg_path`：是路径基准
+/// - `owner`：是 listener 标识
+/// - `auth`：是 mTLS 声明
+/// - `spire_bundles`：表示客户端信任根是否来自当前 SPIRE 完整响应。
 ///
 /// 返回：认证和吊销模式自洽时返回规范路径；未知模式、缺 CRL 或不安全组合拒绝候选。
 fn build_client_auth_runtime(
@@ -2848,7 +3215,8 @@ fn build_client_auth_runtime(
 
 /// 业务作用：规范化并验证 SPIFFE ID，拒绝 userinfo、port、query、fragment 和路径歧义。
 ///
-/// 参数说明：`raw` 是控制面声明或证书 URI SAN。
+/// 参数说明：
+/// - `raw`：是控制面声明或证书 URI SAN。
 ///
 /// 返回：合法时返回规范 SPIFFE ID 与 trust domain；不符合 SPIFFE URI 约束时失败。
 pub(crate) fn normalize_spiffe_id(raw: &str) -> Result<(String, String)> {
@@ -2899,7 +3267,8 @@ pub(crate) fn normalize_spiffe_id(raw: &str) -> Result<(String, String)> {
 
 /// 业务作用：验证并小写化 SPIFFE trust domain，供证书身份按边界精确授权。
 ///
-/// 参数说明：`raw` 是不带 scheme 和 path 的 trust domain。
+/// 参数说明：
+/// - `raw`：是不带 scheme 和 path 的 trust domain。
 ///
 /// 返回：合法域名返回小写值；带 URI 其它部分或非法 label 时失败。
 pub(crate) fn normalize_spiffe_trust_domain(raw: &str) -> Result<String> {
@@ -2913,7 +3282,9 @@ pub(crate) fn normalize_spiffe_trust_domain(raw: &str) -> Result<String> {
 
 /// 业务作用：编译客户端证书在线 OCSP 的失败模式、freshness、缓存和并发硬门。
 ///
-/// 参数说明：`owner` 标识 listener；`cfg` 是待校验的在线吊销策略。
+/// 参数说明：
+/// - `owner`：标识 listener
+/// - `cfg`：是待校验的在线吊销策略。
 ///
 /// 返回：全部预算有界时返回空缓存运行态；未知模式或无界预算拒绝候选。
 fn build_client_ocsp_runtime(
@@ -2970,7 +3341,10 @@ fn build_client_ocsp_runtime(
 
 /// 业务作用：解析共享 session ticket key，冻结签发顺序并拒绝弱密钥或无界重叠代。
 ///
-/// 参数说明：`cfg_path` 是 SecretSource 基准；`owner` 是 listener 标识；`cfg` 是 ticket 声明。
+/// 参数说明：
+/// - `cfg_path`：是 SecretSource 基准
+/// - `owner`：是 listener 标识
+/// - `cfg`：是 ticket 声明。
 ///
 /// 返回：1..=4 个唯一 AES-256 key 与有界 lifetime 成功，否则拒绝候选且不回退随机本机 key。
 fn build_session_ticket_runtime(
@@ -2988,7 +3362,8 @@ fn build_session_ticket_runtime(
     let mut keys = Vec::with_capacity(cfg.keys.len());
     let mut seen = HashSet::new();
     for source in &cfg.keys {
-        let encoded = crate::secret::resolve_text(source, config_dir, "TLS session ticket key")?;
+        let encoded =
+            crate::security::secret::resolve_text(source, config_dir, "TLS session ticket key")?;
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded.as_bytes())
             .context("TLS session ticket key is not valid Base64")?;
@@ -3009,7 +3384,10 @@ fn build_session_ticket_runtime(
 
 /// 业务作用：把服务端 OCSP staple 声明编译为证书身份专属的文件与 freshness 契约。
 ///
-/// 参数说明：`cfg_path` 是路径基准；`owner` 标识 listener；`cfg` 是待校验策略。
+/// 参数说明：
+/// - `cfg_path`：是路径基准
+/// - `owner`：标识 listener
+/// - `cfg`：是待校验策略。
 ///
 /// 返回：模式、时钟偏差和最大年龄均有界时返回运行配置，否则拒绝候选快照。
 fn build_ocsp_stapling_runtime(
@@ -3059,7 +3437,7 @@ fn build_ocsp_stapling_runtime(
     })
 }
 
-/// 构建 route 级 stream 上游 TLS/mTLS profile。`lb://` 由 service 配置持有 profile，
+/// 业务作用：构建 route 级 stream 上游 TLS/mTLS profile。`lb://` 由 service 配置持有 profile，
 /// 防止同一实例身份在 L7/L4 间使用两套证书策略却共享健康键。
 fn build_stream_upstream_tls(
     cfg_path: &Path,
@@ -3098,9 +3476,9 @@ fn build_stream_upstream_tls(
     .map(Some)
 }
 
-/// 编译 stream 发往上游的 PROXY protocol 配置。
+/// 业务作用：编译 stream 发往上游的 PROXY protocol 配置。
 ///
-/// # 参数
+/// 参数说明：
 /// - `cfg`: yml 中的 `proxy_protocol_to_upstream`。
 fn build_stream_proxy_protocol_to_upstream(
     cfg: &model::StreamProxyProtocolUpstreamCfg,
@@ -3121,9 +3499,9 @@ fn build_stream_proxy_protocol_to_upstream(
     })
 }
 
-/// 规范化 stream 上游目标。
+/// 业务作用：规范化 stream 上游目标。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: `host:port`、`tcp://host:port` 或 `lb://service`。
 fn normalize_stream_upstream(raw: &str) -> Result<String> {
     let raw = raw.trim();
@@ -3145,9 +3523,9 @@ fn normalize_stream_upstream(raw: &str) -> Result<String> {
     Ok(authority.as_str().to_owned())
 }
 
-/// 校验 stream `lb://service` 的服务名语法。
+/// 业务作用：校验 stream `lb://service` 的服务名语法。
 ///
-/// # 参数
+/// 参数说明：
 /// - `service`: `lb://` 后面的逻辑服务名。
 fn validate_stream_lb_service(service: &str) -> Result<()> {
     let service = service.trim();
@@ -3161,9 +3539,9 @@ fn validate_stream_lb_service(service: &str) -> Result<()> {
     Ok(())
 }
 
-/// 规范化 SNI 匹配值。
+/// 业务作用：规范化 SNI 匹配值。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 配置中的 SNI host。
 fn normalize_sni(raw: &str) -> Result<String> {
     let sni = raw.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -3181,8 +3559,13 @@ fn normalize_sni(raw: &str) -> Result<String> {
 /// 业务作用：把旧式单入口或多入口配置统一编译为数据面 listener 运行计划，并对 CONNECT
 /// 自访问地址和 Sentinel 路由归属做全局校验。
 ///
-/// 参数说明：`cfg_path` 提供相对路径基准；`cfg` 是完整候选；`sentinel`、`variables` 与
-/// `usage_plans` 是已编译共享依赖；`crypto_catalog` 提供各 listener 共用的外部密码 provider。
+/// 参数说明：
+/// - `cfg_path`：提供相对路径基准
+/// - `cfg`：是完整候选
+/// - `sentinel`：是已编译共享依赖
+/// - `variables`：是已编译共享依赖
+/// - `usage_plans`：是已编译共享依赖
+/// - `crypto_catalog`：提供各 listener 共用的外部密码 provider。
 ///
 /// 返回：全部入口、路由及跨入口拓扑合法时返回运行计划；任一配置非法时拒绝候选快照。
 fn build_proxies(
@@ -3191,7 +3574,7 @@ fn build_proxies(
     sentinel: &SentinelRouteFilters,
     variables: Arc<VariablePlan>,
     usage_plans: Arc<crate::routing::UsagePlanCatalog>,
-    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
+    crypto_catalog: &crate::security::external_crypto::ExternalCryptoCatalog,
 ) -> Result<Vec<ProxyRuntime>> {
     let mut proxies = Vec::new();
     let mut sentinel_matched_routes = HashSet::new();
@@ -3241,12 +3624,13 @@ struct ProxyBuildContext<'a> {
     /// 已被入口消费的 Sentinel route id，构建完成后用于发现悬空规则。
     sentinel_matched_routes: &'a mut HashSet<String>,
     /// 当前候选快照共享的外部密码 provider 目录。
-    crypto_catalog: &'a crate::external_crypto::ExternalCryptoCatalog,
+    crypto_catalog: &'a crate::security::external_crypto::ExternalCryptoCatalog,
 }
 
 /// 业务作用：收集候选快照中的全部数据面、TLS 与管理面监听地址，作为 CONNECT 自访问门禁。
 ///
-/// 参数说明：`cfg` 是已经完成基础字段校验的网关配置。
+/// 参数说明：
+/// - `cfg`：是已经完成基础字段校验的网关配置。
 ///
 /// 返回：地址均可解析时返回去重后的监听集合；任一地址非法时拒绝候选快照。
 fn collect_forward_proxy_self_addrs(cfg: &GatewayConfig) -> Result<Vec<std::net::SocketAddr>> {
@@ -3281,8 +3665,12 @@ fn collect_forward_proxy_self_addrs(cfg: &GatewayConfig) -> Result<Vec<std::net:
 
 /// 业务作用：把兼容形态的 `server + routes` 映射为名为 `default` 的统一 proxy 运行计划。
 ///
-/// 参数说明：`context` 保存路径基准、CONNECT 自访问地址与 Sentinel 归属记录；`server`
-/// 和 `routes` 是旧式入口；`variables` 与 `usage_plans` 是已编译共享依赖。
+/// 参数说明：
+/// - `context`：保存路径基准、CONNECT 自访问地址与 Sentinel 归属记录
+/// - `server`：是旧式入口
+/// - `routes`：是旧式入口
+/// - `variables`：是已编译共享依赖。
+/// - `usage_plans`：是已编译共享依赖。
 ///
 /// 返回：映射及全部门禁通过时返回运行计划；配置冲突或资源越界时返回错误。
 fn build_legacy_proxy(
@@ -3320,8 +3708,11 @@ fn build_legacy_proxy(
 
 /// 业务作用：编译一个显式 proxy 入口，并把全局共享依赖和 CONNECT 自访问门禁注入其路由器。
 ///
-/// 参数说明：`context` 保存路径基准、监听地址和 Sentinel 归属记录；`proxy` 是单入口配置；
-/// `variables` 与 `usage_plans` 是已编译共享依赖。
+/// 参数说明：
+/// - `context`：保存路径基准、监听地址和 Sentinel 归属记录
+/// - `proxy`：是单入口配置
+/// - `variables`：是已编译共享依赖。
+/// - `usage_plans`：是已编译共享依赖。
 ///
 /// 返回：入口、TLS、HTTP/3、路由与资源预算全部合法时返回运行计划，否则拒绝候选。
 fn build_proxy(
@@ -3356,9 +3747,9 @@ fn build_proxy(
     )
 }
 
-/// 校验并编译一个 TLS listener 的 ACME 配置。
+/// 业务作用：校验并编译一个 TLS listener 的 ACME 配置。
 ///
-/// # 参数
+/// 参数说明：
 /// - `cfg_path`: 主配置路径，用于解析 account secret 相对路径。
 /// - `proxy_id`: 错误上下文中的 proxy 标识。
 /// - `cfg`: yml 反序列化得到的 ACME 配置。
@@ -3426,7 +3817,7 @@ fn build_acme_runtime(cfg_path: &Path, proxy_id: &str, cfg: &AcmeCfg) -> Result<
         .filter(|path| !path.is_empty())
         .map(|path| resolve_relative(cfg_path, path));
     if let Some(path) = &directory_ca_file {
-        crate::bounded_io::read_file(path, 4 * 1024 * 1024, "ACME directory CA")?;
+        crate::io::bounded_io::read_file(path, 4 * 1024 * 1024, "ACME directory CA")?;
     }
     if cfg.check_interval_ms == 0
         || cfg.retry_backoff_ms == 0
@@ -3520,7 +3911,7 @@ fn build_acme_runtime(cfg_path: &Path, proxy_id: &str, cfg: &AcmeCfg) -> Result<
                         "cloudflare_zone_id",
                         &dns.cloudflare_zone_id,
                     )?;
-                    let api_token = crate::secret::resolve_text(
+                    let api_token = crate::security::secret::resolve_text(
                         &dns.cloudflare_api_token,
                         config_dir,
                         "ACME Cloudflare API token",
@@ -3545,7 +3936,7 @@ fn build_acme_runtime(cfg_path: &Path, proxy_id: &str, cfg: &AcmeCfg) -> Result<
                         "rfc2136_tsig_key_name",
                         &dns.rfc2136_tsig_key_name,
                     )?;
-                    let encoded = crate::secret::resolve_text(
+                    let encoded = crate::security::secret::resolve_text(
                         &dns.rfc2136_tsig_secret,
                         config_dir,
                         "ACME RFC2136 TSIG secret",
@@ -3572,7 +3963,7 @@ fn build_acme_runtime(cfg_path: &Path, proxy_id: &str, cfg: &AcmeCfg) -> Result<
                     )?;
                     validate_acme_vault_path(proxy_id, "vault_present_path", &dns.vault_present_path)?;
                     validate_acme_vault_path(proxy_id, "vault_cleanup_path", &dns.vault_cleanup_path)?;
-                    let token = crate::secret::resolve_text(
+                    let token = crate::security::secret::resolve_text(
                         &dns.vault_token,
                         config_dir,
                         "ACME Vault token",
@@ -3659,7 +4050,10 @@ fn build_acme_runtime(cfg_path: &Path, proxy_id: &str, cfg: &AcmeCfg) -> Result<
 
 /// 业务作用：校验内建 ACME HTTP provider 的固定 authority，阻止凭据被明文传输或经 URL 注入外带。
 ///
-/// 参数说明：`proxy_id`/`field` 定位配置；`raw` 是待固定的 endpoint。
+/// 参数说明：
+/// - `proxy_id`：定位配置
+/// - `field`：定位配置
+/// - `raw`：是待固定的 endpoint。
 ///
 /// 返回：仅无 userinfo/query/fragment 的 HTTPS 绝对 URL 成功，其它输入拒绝候选快照。
 fn validate_acme_https_endpoint(proxy_id: &str, field: &str, raw: &str) -> Result<()> {
@@ -3679,7 +4073,10 @@ fn validate_acme_https_endpoint(proxy_id: &str, field: &str, raw: &str) -> Resul
 
 /// 业务作用：限制会进入 Cloudflare URL path 的租户标识，避免路径重解释与无界日志字段。
 ///
-/// 参数说明：`proxy_id`/`field` 定位配置；`raw` 是单个 path component。
+/// 参数说明：
+/// - `proxy_id`：定位配置
+/// - `field`：定位配置
+/// - `raw`：是单个 path component。
 ///
 /// 返回：1..=128 个安全 ASCII 字符时成功，否则拒绝配置。
 fn validate_acme_provider_component(proxy_id: &str, field: &str, raw: &str) -> Result<()> {
@@ -3697,7 +4094,10 @@ fn validate_acme_provider_component(proxy_id: &str, field: &str, raw: &str) -> R
 
 /// 业务作用：规范化 RFC2136 zone/key name，使 UPDATE 和 TSIG MAC 使用唯一 wire 表示。
 ///
-/// 参数说明：`proxy_id`/`field` 定位配置；`raw` 是 DNS name。
+/// 参数说明：
+/// - `proxy_id`：定位配置
+/// - `field`：定位配置
+/// - `raw`：是 DNS name。
 ///
 /// 返回：合法有界 DNS name 的小写无尾点形式；空 label、过长 label 或非法字符失败。
 fn normalize_acme_dns_name(proxy_id: &str, field: &str, raw: &str) -> Result<String> {
@@ -3719,7 +4119,10 @@ fn normalize_acme_dns_name(proxy_id: &str, field: &str, raw: &str) -> Result<Str
 
 /// 业务作用：限制 Vault action path 只能停留在已配置 HTTPS authority 内。
 ///
-/// 参数说明：`proxy_id`/`field` 定位配置；`raw` 是相对 API path。
+/// 参数说明：
+/// - `proxy_id`：定位配置
+/// - `field`：定位配置
+/// - `raw`：是相对 API path。
 ///
 /// 返回：非空、无 traversal/query/fragment 的有界相对路径成功，否则拒绝。
 fn validate_acme_vault_path(proxy_id: &str, field: &str, raw: &str) -> Result<()> {
@@ -3740,7 +4143,9 @@ fn validate_acme_vault_path(proxy_id: &str, field: &str, raw: &str) -> Result<()
 /// 业务作用：编译 Gateway API HTTPS 逻辑 listener 选择表，保证 SNI 与 Host 比较使用
 /// 唯一、规范化且确定的权威边界。
 ///
-/// 参数说明：`proxy_id` 标识错误归属；`listeners` 是控制面生成的 listener 身份与 hostname。
+/// 参数说明：
+/// - `proxy_id`：标识错误归属
+/// - `listeners`：是控制面生成的 listener 身份与 hostname。
 ///
 /// 返回：配置唯一且 hostname 合法时返回运行期表；重复身份、重复 hostname 或非法通配时拒绝配置。
 fn build_gateway_listener_runtime(
@@ -3792,15 +4197,34 @@ fn build_gateway_listener_runtime(
 /// 业务作用：在单一事务中完成一个 proxy 的监听、TLS、HTTP/3、路由与响应安全策略编译，
 /// 防止某一子计划通过后被单独发布。
 ///
-/// 参数说明：`cfg_path` 是相对路径基准；`id`、监听与协议参数描述入口；`routes` 及共享依赖
-/// 描述业务路由；`self_addrs` 是 CONNECT 禁止回连的本机监听集合；
-/// `sentinel_matched_routes` 记录规则归属；`crypto_catalog` 提供 TLS 外部私钥所需的共享签名
-/// provider。
+/// 参数说明：
+/// - `cfg_path`：相对路径解析基准。
+/// - `crypto_catalog`：TLS 外部私钥使用的共享签名 provider 目录。
+/// - `id`：入口唯一标识。
+/// - `listen`：监听地址。
+/// - `plain_enabled`：是否开放明文 HTTP 入口。
+/// - `tls`：TLS 入口策略。
+/// - `http3`：HTTP/3 入口策略。
+/// - `server_names`：入口允许的服务域名。
+/// - `gateway_listeners`：Gateway API listener 约束。
+/// - `trusted_proxies`：允许提供转发身份的可信代理网段。
+/// - `proxy_protocol`：PROXY protocol 接入策略。
+/// - `limits`：入口资源上限。
+/// - `timeouts`：入口超时策略。
+/// - `routes`：候选业务路由集合。
+/// - `redirect_https`：是否将明文请求重定向至 HTTPS。
+/// - `redirect_https_status`：HTTPS 重定向状态码。
+/// - `hsts_max_age`：HSTS 有效期秒数。
+/// - `sentinel`：Sentinel 限流与并发规则。
+/// - `variables`：构建期编译的变量计划。
+/// - `usage_plans`：consumer 用量套餐目录。
+/// - `self_addrs`：CONNECT 禁止回连的本机监听集合。
+/// - `sentinel_matched_routes`：已被 Sentinel 规则引用的 route 集合。
 ///
 /// 返回：全部配置通过安全与资源门禁时返回不可变运行计划；任何失败均返回错误且不产生半成品。
 fn build_proxy_from_parts(
     cfg_path: &Path,
-    crypto_catalog: &crate::external_crypto::ExternalCryptoCatalog,
+    crypto_catalog: &crate::security::external_crypto::ExternalCryptoCatalog,
     id: &str,
     listen: &str,
     plain_enabled: bool,
@@ -3851,7 +4275,7 @@ fn build_proxy_from_parts(
             let spire = tls
                 .spire
                 .as_ref()
-                .map(crate::spire::build_source)
+                .map(crate::tls::spire::build_source)
                 .transpose()?;
             let (key_file, private_key_provider) = if spire.is_some() {
                 anyhow::ensure!(tls.cert_file.trim().is_empty() && tls.key_file.trim().is_empty() && tls.private_key_provider.is_none() && tls.certs.is_empty() && tls.keypair_manifest_file.is_none() && tls.acme.is_none() && tls.ocsp_stapling.is_none() && tls.session_tickets.is_none(), "proxy `{id}` SPIRE identity cannot be combined with file certificate, external signer, SNI, manifest, ACME, OCSP staple, or session tickets");
@@ -3934,7 +4358,7 @@ fn build_proxy_from_parts(
             .with_context(|| format!("invalid proxy `{id}` tls.listen `{}`", tls.listen))?;
     }
     let http3 = build_http3_runtime(id, http3, tls.as_ref(), proxy_protocol, limits)?;
-    // HTTP→HTTPS 跳转(§19):派生跳转目标端口 = 本 proxy 的 TLS 监听端口;无 tls 却配 redirect_https → 坏配置拒上线。
+    // HTTP→HTTPS 跳转:派生跳转目标端口 = 本 proxy 的 TLS 监听端口;无 tls 却配 redirect_https → 坏配置拒上线。
     let redirect_https = if redirect_https {
         let tls = tls.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -3952,11 +4376,14 @@ fn build_proxy_from_parts(
                 anyhow::bail!("proxy `{id}` redirect_https_status must be 301 or 308, got {other}")
             }
         };
-        Some(RedirectHttps { to_port, status })
+        Some(RedirectHttps {
+            to_port,
+            status,
+        })
     } else {
         None
     };
-    // HSTS 头预编译(§19):max-age 是数字,拼出的 header 值恒合法。
+    // HSTS 头预编译:max-age 是数字,拼出的 header 值恒合法。
     let hsts_header = if hsts_max_age > 0 {
         Some(
             http::HeaderValue::from_str(&format!("max-age={hsts_max_age}"))
@@ -4009,6 +4436,8 @@ fn build_proxy_from_parts(
         }
     );
     Ok(ProxyRuntime {
+        #[cfg(feature = "xds-client-extensions")]
+        xds_extension_bound: false,
         id: id.to_string(),
         listen: listen.to_string(),
         plain_enabled,
@@ -4018,7 +4447,7 @@ fn build_proxy_from_parts(
         gateway_listeners: Arc::new(gateway_listeners),
         proxy_protocol: build_proxy_protocol(proxy_protocol)
             .with_context(|| format!("proxy `{id}` proxy_protocol"))?,
-        // 可信前置代理网段构建期解析成 Cidr(review L6),非法即拒配置。
+        // 可信前置代理网段构建期解析成 Cidr,非法即拒配置。
         trusted_proxies: Arc::new(
             net::parse_cidrs(trusted_proxies)
                 .with_context(|| format!("proxy `{id}` trusted_proxies"))?,
@@ -4036,8 +4465,12 @@ fn build_proxy_from_parts(
 /// 业务作用：在绑定 UDP socket 前拒绝缺 TLS、缺编译 feature、0-RTT、PROXY protocol 语义
 /// 分叉和无界预算，确保坏候选不会进入 listener two-phase prepare。
 ///
-/// 参数说明：`proxy_id` 用于错误定位；`cfg` 是声明配置；`tls` 是已规范化 TLS 身份；
-/// `proxy_protocol` 是 TCP 前置代理策略；`limits` 是同 proxy 的全局请求资源上限。
+/// 参数说明：
+/// - `proxy_id`：用于错误定位
+/// - `cfg`：是声明配置
+/// - `tls`：是已规范化 TLS 身份
+/// - `proxy_protocol`：是 TCP 前置代理策略
+/// - `limits`：是同 proxy 的全局请求资源上限。
 ///
 /// 返回：关闭时返回零值计划；启用且所有安全门通过时返回可直接构造 QUIC transport 的计划，
 /// 任一门失败则拒绝整个候选快照并保留 last-known-good。
@@ -4054,7 +4487,7 @@ fn build_http3_runtime(
     let declared = cfg
         .capabilities
         .iter()
-        .map(|raw| crate::masque::Capability::parse(raw))
+        .map(|raw| crate::protocols::masque::Capability::parse(raw))
         .collect::<Result<Vec<_>>>()
         .with_context(|| format!("proxy `{proxy_id}` http3.capabilities"))?;
     if !declared.is_empty() {
@@ -4064,10 +4497,13 @@ fn build_http3_runtime(
         );
         for capability in &declared {
             // 这些能力只在 HTTP/3 传输上成立,在 TCP 形态没有等价物。
-            crate::masque::check_support(*capability, crate::masque::Transport::Http3)
-                .with_context(|| format!("proxy `{proxy_id}` http3.capabilities"))?;
+            crate::protocols::masque::check_support(
+                *capability,
+                crate::protocols::masque::Transport::Http3,
+            )
+            .with_context(|| format!("proxy `{proxy_id}` http3.capabilities"))?;
         }
-        if declared.contains(&crate::masque::Capability::EarlyData) {
+        if declared.contains(&crate::protocols::masque::Capability::EarlyData) {
             // 0-RTT 的重放防护在多节点下依赖共享缓存;缺失时必须失败闭合,
             // 否则每个节点都把同一份 early data 判为「首次」,防护实际为零。
             anyhow::ensure!(
@@ -4077,10 +4513,10 @@ fn build_http3_runtime(
         }
     }
 
-    let connect_udp = declared.contains(&crate::masque::Capability::ConnectUdp);
-    let datagram = declared.contains(&crate::masque::Capability::Datagram);
-    let webtransport = declared.contains(&crate::masque::Capability::WebTransport);
-    let early_data = declared.contains(&crate::masque::Capability::EarlyData);
+    let connect_udp = declared.contains(&crate::protocols::masque::Capability::ConnectUdp);
+    let datagram = declared.contains(&crate::protocols::masque::Capability::Datagram);
+    let webtransport = declared.contains(&crate::protocols::masque::Capability::WebTransport);
+    let early_data = declared.contains(&crate::protocols::masque::Capability::EarlyData);
     let distinct_capabilities = usize::from(connect_udp)
         + usize::from(datagram)
         + usize::from(webtransport)
@@ -4220,9 +4656,9 @@ fn build_http3_runtime(
             "proxy `{proxy_id}` http3.max_datagram_queue must be within 1..=4096"
         );
         anyhow::ensure!(
-            (1..=crate::masque::MAX_DATAGRAM_PAYLOAD).contains(&cfg.max_datagram_bytes),
+            (1..=crate::protocols::masque::MAX_DATAGRAM_PAYLOAD).contains(&cfg.max_datagram_bytes),
             "proxy `{proxy_id}` http3.max_datagram_bytes must be within 1..={} ",
-            crate::masque::MAX_DATAGRAM_PAYLOAD
+            crate::protocols::masque::MAX_DATAGRAM_PAYLOAD
         );
         anyhow::ensure!(
             cfg.max_datagram_queue.saturating_mul(cfg.max_datagram_bytes) <= 16 * 1024 * 1024,
@@ -4294,6 +4730,7 @@ fn build_http3_runtime(
     }
 }
 
+/// 业务作用：在快照构建期拒绝超出运行时可表达范围的超时配置。
 fn validate_timeout_cfg(proxy_id: &str, timeouts: &TimeoutCfg) -> Result<()> {
     for (field, value) in [
         (
@@ -4326,6 +4763,7 @@ fn validate_timeout_cfg(proxy_id: &str, timeouts: &TimeoutCfg) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：校验入口资源的硬上限，避免零值、溢出或不可执行预算进入数据面。
 fn validate_server_limits(proxy_id: &str, limits: &ServerLimitsCfg) -> Result<()> {
     anyhow::ensure!(
         limits.max_connections <= 10_000_000,
@@ -4393,11 +4831,13 @@ fn validate_server_limits(proxy_id: &str, limits: &ServerLimitsCfg) -> Result<()
     Ok(())
 }
 
+/// 业务作用：验证可关闭的时限声明，保持零值与有效持续时间的明确区别。
 fn validate_optional_duration(field: &str, value: u64, max: u64) -> Result<()> {
     anyhow::ensure!(value <= max, "{field} must be 0..={max}");
     Ok(())
 }
 
+/// 业务作用：把 Sentinel 规则编译进候选路由，使独立规则文件仍受统一路由构建和发布约束。
 fn routes_with_sentinel(
     routes: &[model::RouteCfg],
     sentinel: &SentinelRouteFilters,
@@ -4416,6 +4856,7 @@ fn routes_with_sentinel(
         .collect()
 }
 
+/// 业务作用：冻结 PROXY protocol 接入版本与可信来源，不能由未受信连接自报客户端身份。
 fn build_proxy_protocol(cfg: &ProxyProtocolCfg) -> Result<ProxyProtocolRuntimeCfg> {
     let allow_v1 =
         cfg.versions.is_empty() || cfg.versions.iter().any(|v| v.eq_ignore_ascii_case("v1"));
@@ -4439,12 +4880,13 @@ fn build_proxy_protocol(cfg: &ProxyProtocolCfg) -> Result<ProxyProtocolRuntimeCf
         enabled: cfg.enabled,
         allow_v1,
         allow_v2,
-        // 构建期把 accept_from 解析成 Cidr(替代原先每连接 parse 一次字符串)。
+        // 构建期把 accept_from 解析成 Cidr，使接入检查只读取已验证的地址范围。
         accept_from: Arc::new(net::parse_cidrs(&cfg.accept_from).context("accept_from")?),
         timeout_ms: cfg.timeout_ms,
     })
 }
 
+/// 业务作用：拒绝重复或冲突的监听拓扑，避免两个逻辑入口竞争同一接入权威。
 fn ensure_unique_proxy_topology(proxies: &[ProxyRuntime]) -> Result<()> {
     let mut ids = std::collections::HashSet::with_capacity(proxies.len());
     let mut listens = std::collections::HashSet::with_capacity(proxies.len() * 2);
@@ -4464,7 +4906,7 @@ fn ensure_unique_proxy_topology(proxies: &[ProxyRuntime]) -> Result<()> {
     Ok(())
 }
 
-/// 解析并校验配置 schema 版本(§6):
+/// 业务作用：解析并校验配置 schema 版本:
 /// - 缺省 / `0` → 视作 **`DEFAULT_SCHEMA_VERSION`(v1)** 并告警(不阻塞老配置,但提醒显式声明,便于长期迁移);
 /// - 高于当前支持版本 → **拒绝**(不带病解析未知格式,交由调用方保留旧快照);
 /// - 其它显式低版本原样返回,后续由迁移逻辑处理。
@@ -4490,7 +4932,8 @@ fn resolve_schema_version(raw: Option<u32>, file: &str) -> Result<u32> {
 
 /// 业务作用：加载主配置并完成 profile、环境变量、占位符和 snippet 展开，供控制面读取强类型候选。
 ///
-/// 参数说明：`cfg_path` 是本轮主配置路径，也是全部相对依赖的权威根。
+/// 参数说明：
+/// - `cfg_path`：是本轮主配置路径，也是全部相对依赖的权威根。
 ///
 /// 返回：所有来源和 snippet 合法时返回强类型配置；读取超限、解析或展开失败时返回错误。
 pub(crate) fn load_gateway_config(cfg_path: &Path) -> Result<GatewayConfig> {
@@ -4499,7 +4942,8 @@ pub(crate) fn load_gateway_config(cfg_path: &Path) -> Result<GatewayConfig> {
 
 /// 业务作用：在加载 Naway 主配置的同时保留 naml 解析出的真实本地来源，供指纹和 watcher 同源复用。
 ///
-/// 参数说明：`cfg_path` 是本轮主配置路径，也是全部相对依赖的权威根。
+/// 参数说明：
+/// - `cfg_path`：是本轮主配置路径，也是全部相对依赖的权威根。
 ///
 /// 返回：强类型配置和本轮实际来源同时成功时返回；失败时不暴露部分配置或部分来源。
 fn load_gateway_config_tracked(cfg_path: &Path) -> Result<LoadedYml<GatewayConfig>> {
@@ -4511,6 +4955,7 @@ fn load_gateway_config_tracked(cfg_path: &Path) -> Result<LoadedYml<GatewayConfi
         .load_tracked()
         .with_context(|| format!("load gateway config {}", cfg_path.display()))?;
     expand_config_snippets(&mut loaded.value, cfg_path, cfg_path)?;
+    centers::apply(&mut loaded.value)?;
     Ok(loaded)
 }
 
@@ -4521,7 +4966,10 @@ struct SnippetDefinition {
 
 /// 业务作用：加载并展开主配置的可复用 filter snippet，使后续 Router 只接收普通确定性 DSL。
 ///
-/// 参数说明：`cfg` 是已完成 profile/env 合并的候选；`base_path` 固定相对路径根；`source_path` 用于根定义溯源。
+/// 参数说明：
+/// - `cfg`：是已完成 profile/env 合并的候选
+/// - `base_path`：固定相对路径根
+/// - `source_path`：用于根定义溯源。
 ///
 /// 返回：全部 import、依赖与 route 引用合法时原地替换 filters；循环、重复展开、越界路径或资源超限返回错误。
 fn expand_config_snippets(
@@ -4550,19 +4998,43 @@ fn expand_config_snippets(
     snippet_files.sort();
     cfg.snippet_files = snippet_files;
     for route in &mut cfg.routes {
+        route.resolved_snippets = route
+            .filters
+            .iter()
+            .filter_map(|filter| parse_snippet_reference(filter).transpose())
+            .map(|name| name.map(str::to_owned))
+            .collect::<Result<_>>()?;
         route.filters = expand_route_filters(&route.id, &route.filters, &definitions)?;
     }
     for proxy in &mut cfg.proxies {
         for route in &mut proxy.routes {
+            route.resolved_snippets = route
+                .filters
+                .iter()
+                .filter_map(|filter| parse_snippet_reference(filter).transpose())
+                .map(|name| name.map(str::to_owned))
+                .collect::<Result<_>>()?;
             route.filters = expand_route_filters(&route.id, &route.filters, &definitions)?;
         }
     }
+    // 展开只消除数据面的解释工作，声明与引用仍须留给后续权限图和派生路由验证。
+    cfg.snippets.definitions = definitions
+        .into_iter()
+        .map(|(name, definition)| (name, definition.config))
+        .collect();
     Ok(())
 }
 
 /// 业务作用：递归读取一个 snippet scope，并把定义连同源文件登记到单一候选 registry。
 ///
-/// 参数说明：`scope` 含当前定义/import；`current_dir` 是本文件目录；`root` 是不可越过的主配置目录。
+/// 参数说明：
+/// - `scope`：当前文件的定义与 import 声明。
+/// - `current_dir`：当前文件所在目录。
+/// - `root`：不可越过的主配置目录。
+/// - `source`：用于来源追踪的当前配置文件。
+/// - `depth`：当前 import 递归深度。
+/// - `imported`：已经导入的文件集合，用于阻止重复和循环。
+/// - `definitions`：候选内累计的 snippet 定义目录。
 ///
 /// 返回：定义成功登记；重复文件/名称、循环、非法路径或容量超限返回错误。
 #[allow(clippy::too_many_arguments)]
@@ -4647,8 +5119,9 @@ fn collect_snippet_scope(
         if imported.len() > MAX_SNIPPET_IMPORTS {
             bail!("snippet imports exceed {MAX_SNIPPET_IMPORTS}");
         }
-        let bytes = crate::bounded_io::read_file(&path, MAX_SNIPPET_FILE_BYTES, "snippet import")?;
-        let imported_scope: SnippetsCfg = serde_yml::from_slice(&bytes)
+        let bytes =
+            crate::io::bounded_io::read_file(&path, MAX_SNIPPET_FILE_BYTES, "snippet import")?;
+        let imported_scope: SnippetsCfg = document::decode(&bytes, MAX_SNIPPET_FILE_BYTES)
             .with_context(|| format!("parse snippet import {}", path.display()))?;
         let directory = path.parent().unwrap_or(root);
         collect_snippet_scope(
@@ -4666,7 +5139,8 @@ fn collect_snippet_scope(
 
 /// 业务作用：校验 snippet 名可安全进入 route DSL 引用和低敏错误上下文。
 ///
-/// 参数说明：`name` 是定义或引用名。
+/// 参数说明：
+/// - `name`：是定义或引用名。
 ///
 /// 返回：1..=128 字节的 ASCII 标识成功，其它返回错误。
 fn validate_snippet_name(name: &str) -> Result<()> {
@@ -4683,7 +5157,10 @@ fn validate_snippet_name(name: &str) -> Result<()> {
 
 /// 业务作用：把一条 route 的 snippet 引用按声明顺序展开为普通 filters，并阻止同一片段重复生效。
 ///
-/// 参数说明：`route_id` 用于错误定位；`filters` 是 route 原声明；`definitions` 是带来源 registry。
+/// 参数说明：
+/// - `route_id`：用于错误定位
+/// - `filters`：是 route 原声明
+/// - `definitions`：是带来源 registry。
 ///
 /// 返回：有界、无引用的 filter 列表；未知、循环、菱形重复或展开超限返回错误。
 fn expand_route_filters(
@@ -4714,7 +5191,13 @@ fn expand_route_filters(
 
 /// 业务作用：递归展开单个命名片段，使用 active/expanded 两套集合区分循环与重复应用。
 ///
-/// 参数说明：route/name 确定引用；registry 提供来源；其余集合与 output 属于当前 route 展开事务。
+/// 参数说明：
+/// - `route_id`：正在展开的 route 标识。
+/// - `name`：当前引用的 snippet 名称。
+/// - `definitions`：已读取且校验过来源的定义目录。
+/// - `active`：当前递归栈，用于阻止循环引用。
+/// - `expanded`：已经展开的条目数，用于限制候选规模。
+/// - `output`：本 route 事务内的过滤器输出。
 ///
 /// 返回：成功把依赖和 filters 追加到 output；失败不发布候选快照。
 fn expand_named_snippet(
@@ -4762,10 +5245,11 @@ fn expand_named_snippet(
 
 /// 业务作用：识别 route filter 位置唯一合法的 snippet 引用语法，不把相似普通指令误展开。
 ///
-/// 参数说明：`filter` 是一条原始 filter DSL。
+/// 参数说明：
+/// - `filter`：是一条原始 filter DSL。
 ///
 /// 返回：`snippet <name>`/`use_snippet <name>` 返回名称；普通 filter 返回 None；畸形引用返回错误。
-fn parse_snippet_reference(filter: &str) -> Result<Option<&str>> {
+pub(crate) fn parse_snippet_reference(filter: &str) -> Result<Option<&str>> {
     let mut tokens = filter.split_whitespace();
     let Some(command) = tokens.next() else {
         return Ok(None);
@@ -4782,7 +5266,9 @@ fn parse_snippet_reference(filter: &str) -> Result<Option<&str>> {
 
 /// 业务作用：限制单 route 展开后的 filter 数量与文本总量，防止小引用图放大候选内存与构建成本。
 ///
-/// 参数说明：`route_id` 用于错误定位；`filters` 是当前已展开前缀。
+/// 参数说明：
+/// - `route_id`：用于错误定位
+/// - `filters`：是当前已展开前缀。
 ///
 /// 返回：预算内成功；数量或累计字节超限返回错误。
 fn enforce_expanded_snippet_budget(route_id: &str, filters: &[String]) -> Result<()> {
@@ -4799,21 +5285,25 @@ fn enforce_expanded_snippet_budget(route_id: &str, filters: &[String]) -> Result
 
 /// 业务作用：加载并编译接口禁用规则，同时保留其基础文件和 profile 候选供统一 watcher 使用。
 ///
-/// 参数说明：`main_cfg` 是相对路径根；`guard_file` 是主配置声明的守卫文件。
+/// 参数说明：
+/// - `main_cfg`：是相对路径根
+/// - `guard_file`：是主配置声明的守卫文件。
+/// - `candidate`：显式文档集的隔离 base，profile 仍由真实守卫路径派生。
 ///
 /// 返回：schema 与规则合法时返回运行态守卫及同次 naml 来源；缺失、超限或语义非法时返回错误。
 fn load_interface_guard(
     main_cfg: &Path,
     guard_file: &str,
+    candidate: Option<&Path>,
 ) -> Result<(InterfaceGuard, YmlLocalSources)> {
     let path = resolve_relative(main_cfg, guard_file);
-    if !path.exists() {
+    if !candidate.unwrap_or(&path).exists() {
         anyhow::bail!(
             "interface guard file {} does not exist; create an empty guard file or fix `interface_guard_file`",
             path.display()
         );
     }
-    let loaded: LoadedYml<GuardFile> = loader(&path)
+    let loaded: LoadedYml<GuardFile> = candidate::loader(&path, candidate)
         .load_tracked()
         .with_context(|| format!("load interface guard {}", path.display()))?;
     // 守卫文件独立复验 schema；未知新格式必须拒绝，不能把未理解的规则当成空保护发布。
@@ -4823,157 +5313,10 @@ fn load_interface_guard(
     Ok((guard, loaded.sources))
 }
 
-/// 业务作用：保存 Sentinel 文件编译后的 route→filter 索引，并在进入 Router 前校验引用完整性。
-struct SentinelRouteFilters {
-    /// route id 到按声明顺序编译出的限流和熔断 filter。
-    by_route: HashMap<String, Vec<String>>,
-}
-
-impl SentinelRouteFilters {
-    /// 业务作用：拒绝引用不存在 route 的 Sentinel 规则，避免运维误以为保护策略已经生效。
-    ///
-    /// 参数说明：`matched` 是本轮全部真实 route id。
-    ///
-    /// 返回：所有规则均命中时成功；任一悬空引用返回错误并阻止候选发布。
-    fn ensure_all_matched(&self, matched: &HashSet<String>) -> Result<()> {
-        for route in self.by_route.keys() {
-            if !matched.contains(route) {
-                anyhow::bail!("sentinel flow rule references missing route `{route}`");
-            }
-        }
-        Ok(())
-    }
-}
-
-/// 业务作用：加载 Sentinel 路由规则并编译为确定性 filter，同时保留其 profile 观察候选。
-///
-/// 参数说明：`main_cfg` 是相对路径根；`sentinel_file` 是主配置声明的规则文件。
-///
-/// 返回：schema、标识和规则合法时返回编译结果及 naml 来源；缺失、超限或非法时返回错误。
-fn load_sentinel_rules(
-    main_cfg: &Path,
-    sentinel_file: &str,
-) -> Result<(SentinelRouteFilters, YmlLocalSources)> {
-    let path = resolve_relative(main_cfg, sentinel_file);
-    if !path.exists() {
-        anyhow::bail!(
-            "sentinel rules file {} does not exist; create an empty sentinel rules file or fix `sentinel_rules_file`",
-            path.display()
-        );
-    }
-    let loaded: LoadedYml<SentinelFile> = loader(&path)
-        .load_tracked()
-        .with_context(|| format!("load sentinel rules {}", path.display()))?;
-    let SentinelFile {
-        schema_version,
-        flow,
-        degrade,
-    } = loaded.value;
-    resolve_schema_version(schema_version, "sentinel-rules.yml")?;
-    let mut by_route: HashMap<String, Vec<String>> = HashMap::new();
-    for rule in flow {
-        if !rule.enabled {
-            continue;
-        }
-        validate_sentinel_token("sentinel flow id", &rule.id)?;
-        validate_sentinel_token("sentinel flow route", &rule.route)?;
-        validate_sentinel_token("sentinel flow key", &rule.key)?;
-        let filter = match (rule.rate.as_ref(), rule.limit) {
-            (Some(rate), None) => {
-                validate_sentinel_token("sentinel flow rate", rate)?;
-                if rule.max_active_keys == 0 {
-                    anyhow::bail!(
-                        "sentinel flow `{}` max_active_keys must be positive",
-                        rule.id
-                    );
-                }
-                let active_keys_fail = match rule.active_keys_fail.as_str() {
-                    "open" | "closed" => rule.active_keys_fail.as_str(),
-                    other => anyhow::bail!(
-                        "sentinel flow `{}` active_keys_fail expects open|closed, got `{other}`",
-                        rule.id
-                    ),
-                };
-                format!(
-                    "limit_req key={} rate={} burst={} max_active_keys={} active_keys_fail={}",
-                    rule.key, rate, rule.burst, rule.max_active_keys, active_keys_fail
-                )
-            }
-            (None, Some(limit)) => {
-                if limit == 0 {
-                    anyhow::bail!("sentinel flow `{}` limit must be positive", rule.id);
-                }
-                format!("limit_conn key={} limit={limit}", rule.key)
-            }
-            (Some(_), Some(_)) => anyhow::bail!(
-                "sentinel flow `{}` must configure either `rate` or `limit`, not both",
-                rule.id
-            ),
-            (None, None) => anyhow::bail!(
-                "sentinel flow `{}` must configure `rate`(limit_req) or `limit`(limit_conn)",
-                rule.id
-            ),
-        };
-        by_route.entry(rule.route).or_default().push(filter);
-    }
-    for rule in degrade {
-        if !rule.enabled {
-            continue;
-        }
-        validate_sentinel_token("sentinel degrade id", &rule.id)?;
-        validate_sentinel_token("sentinel degrade route", &rule.route)?;
-        if rule.failure_threshold == 0
-            || rule.window_ms == 0
-            || rule.min_requests == 0
-            || rule.break_ms == 0
-        {
-            anyhow::bail!(
-                "sentinel degrade `{}` failure_threshold/window_ms/min_requests/break_ms must be positive",
-                rule.id
-            );
-        }
-        http::StatusCode::from_u16(rule.fallback_status).with_context(|| {
-            format!(
-                "sentinel degrade `{}` invalid fallback_status `{}`",
-                rule.id, rule.fallback_status
-            )
-        })?;
-        if rule.fallback_body.trim().is_empty() {
-            anyhow::bail!(
-                "sentinel degrade `{}` fallback_body must be non-empty",
-                rule.id
-            );
-        }
-        let filter = format!(
-            "circuit_breaker id={} failure_threshold={} window_ms={} min_requests={} break_ms={} fallback_status={} fallback_body={}",
-            rule.id,
-            rule.failure_threshold,
-            rule.window_ms,
-            rule.min_requests,
-            rule.break_ms,
-            rule.fallback_status,
-            rule.fallback_body.replace(' ', "_")
-        );
-        by_route.entry(rule.route).or_default().push(filter);
-    }
-    Ok((SentinelRouteFilters { by_route }, loaded.sources))
-}
-
-/// 业务作用：校验 Sentinel DSL 的单 token 字段，避免空值或空白字符改变后续指令分词语义。
-///
-/// 参数说明：`label` 用于指出非法字段；`value` 是待进入 filter DSL 的原始值。
-///
-/// 返回：非空且不含空白字符时成功，否则返回错误并阻止候选发布。
-fn validate_sentinel_token(label: &str, value: &str) -> Result<()> {
-    if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
-        anyhow::bail!("{label} `{value}` must be non-empty and contain no whitespace");
-    }
-    Ok(())
-}
-
 /// 业务作用：为任一 Naway YAML 文件构造统一的 naml 加载器，固定 profile 派生和单文件读取上限。
 ///
-/// 参数说明：`path` 是主文件；profile 名按该文件 stem 派生，避免不同配置文件串用 profile。
+/// 参数说明：
+/// - `path`：是主文件；profile 名按该文件 stem 派生，避免不同配置文件串用 profile。
 ///
 /// 返回：配置了主文件、profile pattern 和 32 MiB 单文件硬门的加载器。
 pub(crate) fn loader(path: &Path) -> YmlLoader {
@@ -4991,7 +5334,9 @@ pub(crate) fn loader(path: &Path) -> YmlLoader {
 
 /// 业务作用：以主配置目录解析声明式文件引用，同时保留显式绝对路径的部署语义。
 ///
-/// 参数说明：`main_cfg` 是相对路径根；`rel` 是配置中声明的文件路径。
+/// 参数说明：
+/// - `main_cfg`：是相对路径根
+/// - `rel`：是配置中声明的文件路径。
 ///
 /// 返回：绝对路径原样返回，相对路径返回与主配置父目录拼接后的路径。
 pub(crate) fn resolve_relative(main_cfg: &Path, rel: &str) -> PathBuf {
@@ -5008,7 +5353,8 @@ pub(crate) fn resolve_relative(main_cfg: &Path, rel: &str) -> PathBuf {
 
 /// 业务作用：计算本轮有效配置文件内容指纹，供 reload 去重和集群配置收敛比较。
 ///
-/// 参数说明：`main_cfg` 是主配置路径；活动 profile 由同一次 naml tracked load 决定。
+/// 参数说明：
+/// - `main_cfg`：是主配置路径；活动 profile 由同一次 naml tracked load 决定。
 ///
 /// 返回：主配置、活动 profile 和声明式依赖均可有界读取时返回内容哈希；任一来源失败时返回错误。
 pub(crate) fn config_fingerprint(main_cfg: &Path) -> Result<u64> {
@@ -5022,7 +5368,7 @@ pub(crate) fn config_fingerprint(main_cfg: &Path) -> Result<u64> {
     let sentinel_path = resolve_relative(main_cfg, &cfg.sentinel_rules_file);
     hash_yml_sources(&mut hasher, &loader(&sentinel_path).local_sources()?)?;
     let config_dir = main_cfg.parent().unwrap_or_else(|| Path::new("."));
-    if let Some(path) = crate::kubernetes_routes::generated_dependency(&cfg, config_dir) {
+    if let Some(path) = crate::control::kubernetes::generated_dependency(&cfg, config_dir) {
         hash_optional_config_file(&mut hasher, &path)?;
     }
     for secret_file in collect_secret_dependencies(&cfg, config_dir) {
@@ -5032,7 +5378,7 @@ pub(crate) fn config_fingerprint(main_cfg: &Path) -> Result<u64> {
         hash_config_file_with_limit(
             &mut hasher,
             &geoip_file,
-            crate::geoip::MAX_DATABASE_BYTES,
+            crate::security::geoip::MAX_DATABASE_BYTES,
             "GeoIP database",
         )?;
     }
@@ -5045,8 +5391,11 @@ pub(crate) fn config_fingerprint(main_cfg: &Path) -> Result<u64> {
 
 /// 业务作用：从已解析候选收集 watcher 精确目标，使观察范围与即将发布的配置模型保持一致。
 ///
-/// 参数说明：`main_cfg` 是相对路径根；`cfg` 是已展开候选；`config_dir` 是共同目录；
-/// `auxiliary_sources` 是 guard 与 Sentinel tracked load 返回的基础文件和 profile 候选。
+/// 参数说明：
+/// - `main_cfg`：是相对路径根
+/// - `cfg`：是已展开候选
+/// - `config_dir`：是共同目录
+/// - `auxiliary_sources`：是 guard 与 Sentinel tracked load 返回的基础文件和 profile 候选。
 ///
 /// 返回：guard、规则、Kubernetes 物化文件、SecretSource、schema、扩展和 snippet 的排序去重路径。
 fn config_watch_dependencies<'a>(
@@ -5059,7 +5408,7 @@ fn config_watch_dependencies<'a>(
         resolve_relative(main_cfg, &cfg.interface_guard_file),
         resolve_relative(main_cfg, &cfg.sentinel_rules_file),
     ];
-    if let Some(path) = crate::kubernetes_routes::generated_dependency(cfg, config_dir) {
+    if let Some(path) = crate::control::kubernetes::generated_dependency(cfg, config_dir) {
         paths.push(path);
     }
     paths.extend(collect_secret_dependencies(cfg, config_dir));
@@ -5075,12 +5424,41 @@ fn config_watch_dependencies<'a>(
 
 /// 业务作用：收集当前配置实际依赖的文件型 secret/document，供指纹、reload watcher 与审计同源。
 ///
-/// 参数说明：`cfg` 是已解析配置；`config_dir` 是尚未规范化相对路径的共同基准。
+/// 参数说明：
+/// - `cfg`：是已解析配置
+/// - `config_dir`：是尚未规范化相对路径的共同基准。
 ///
 /// 返回：去重前的依赖路径集合；调用方按各自需要排序去重，函数不读取文件内容。
 fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) -> Vec<PathBuf> {
-    let mut paths = crate::upstream_credential::dependency_paths(cfg, config_dir);
-    paths.extend(crate::external_crypto::dependency_paths(
+    let mut paths = crate::security::upstream_credential::dependency_paths(cfg, config_dir);
+    paths.extend(management::dependencies(&cfg.admin.management, config_dir));
+    if cfg.admin.operations.enabled {
+        paths.extend(crate::security::secret::dependency_path(
+            &cfg.admin.operations.database_url,
+            config_dir,
+        ));
+    }
+    #[cfg(feature = "xds-server")]
+    paths.extend(crate::control::xds_server::security::dependencies(
+        cfg.xds_server.as_ref(),
+        config_dir,
+    ));
+    #[cfg(feature = "scg-compat")]
+    paths.extend(scg::dependencies(cfg, config_dir));
+    #[cfg(feature = "config-providers")]
+    paths.extend(crate::control::providers::dependency_paths(
+        &cfg.providers,
+        config_dir,
+    ));
+    // 本地模板可由动态来源选择；即便当前没有路由引用，也必须观察其 SecretSource 轮换。
+    for snippet in cfg.snippets.definitions.values() {
+        for filter in &snippet.filters {
+            paths.extend(crate::security::secret::filter_dependency_paths(
+                filter, config_dir,
+            ));
+        }
+    }
+    paths.extend(crate::security::external_crypto::dependency_paths(
         &cfg.crypto_providers,
         config_dir,
     ));
@@ -5111,10 +5489,9 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
         ));
         if let Some(tickets) = &tls.session_tickets {
             paths.extend(
-                tickets
-                    .keys
-                    .iter()
-                    .filter_map(|source| crate::secret::dependency_path(source, config_dir)),
+                tickets.keys.iter().filter_map(|source| {
+                    crate::security::secret::dependency_path(source, config_dir)
+                }),
             );
         }
     }
@@ -5142,10 +5519,9 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
         ));
         if let Some(tickets) = &tls.session_tickets {
             paths.extend(
-                tickets
-                    .keys
-                    .iter()
-                    .filter_map(|source| crate::secret::dependency_path(source, config_dir)),
+                tickets.keys.iter().filter_map(|source| {
+                    crate::security::secret::dependency_path(source, config_dir)
+                }),
             );
         }
     }
@@ -5168,7 +5544,7 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
         cfg.admin.auth.bearer_token.as_str(),
         cfg.admin.auth.basic_password.as_str(),
     ] {
-        if let Some(path) = crate::secret::dependency_path(raw, config_dir) {
+        if let Some(path) = crate::security::secret::dependency_path(raw, config_dir) {
             paths.push(path);
         }
     }
@@ -5177,7 +5553,7 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
             principal.bearer_token.as_str(),
             principal.basic_password.as_str(),
         ] {
-            if let Some(path) = crate::secret::dependency_path(raw, config_dir) {
+            if let Some(path) = crate::security::secret::dependency_path(raw, config_dir) {
                 paths.push(path);
             }
         }
@@ -5186,7 +5562,7 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
         cfg.admin.audit.signing_key.as_str(),
         cfg.admin.audit.authorization.as_str(),
     ] {
-        if let Some(path) = crate::secret::dependency_path(raw, config_dir) {
+        if let Some(path) = crate::security::secret::dependency_path(raw, config_dir) {
             paths.push(path);
         }
     }
@@ -5197,11 +5573,11 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
         cfg.discovery.kubernetes.bearer_token.as_str(),
         cfg.discovery.kubernetes.ca_certificate.as_str(),
     ] {
-        if let Some(path) = crate::secret::dependency_path(raw, config_dir) {
+        if let Some(path) = crate::security::secret::dependency_path(raw, config_dir) {
             paths.push(path);
         }
     }
-    if let Some(path) = crate::secret::dependency_path(
+    if let Some(path) = crate::security::secret::dependency_path(
         &cfg.developer_portal.key_applications.authorization_token,
         config_dir,
     ) {
@@ -5221,9 +5597,40 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
             dns.rfc2136_tsig_secret.as_str(),
             dns.vault_token.as_str(),
         ] {
-            if let Some(path) = crate::secret::dependency_path(raw, config_dir) {
+            if let Some(path) = crate::security::secret::dependency_path(raw, config_dir) {
                 paths.push(path);
             }
+        }
+    }
+    for product in &cfg.developer_portal.products {
+        for version in &product.versions {
+            for document in &version.documents {
+                let path = Path::new(&document.file);
+                paths.push(if path.is_absolute() {
+                    path.to_owned()
+                } else {
+                    config_dir.join(path)
+                });
+            }
+        }
+    }
+    if let Some(meter) = &cfg.usage_plans.meter {
+        for source in [&meter.authorization, &meter.ca_certificate] {
+            if let Some(path) = crate::security::secret::dependency_path(source, config_dir) {
+                paths.push(path);
+            }
+        }
+    }
+    if let Some(management) = &cfg.developer_portal.management {
+        paths.extend(crate::portal::management::dependencies(
+            management, config_dir,
+        ));
+    }
+    for policy in &cfg.usage_plans.policies {
+        for filter in &policy.authentication {
+            paths.extend(crate::security::secret::filter_dependency_paths(
+                filter, config_dir,
+            ));
         }
     }
     for catalog in &cfg.developer_portal.catalogs {
@@ -5239,20 +5646,24 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
         .iter()
         .chain(cfg.proxies.iter().flat_map(|proxy| proxy.routes.iter()))
     {
+        if let Some(agent) = &route.agent {
+            paths.extend(crate::ai::agent::dependency_paths(agent, config_dir));
+        }
         if let Some(waf) = &route.waf {
-            paths.extend(crate::waf::dependency_paths(config_dir, waf));
+            paths.extend(crate::security::waf::dependency_paths(config_dir, waf));
         }
         if let Some(bot) = &route.bot {
             for trusted in &bot.trusted_search_bots {
-                if let Some(path) =
-                    crate::secret::dependency_path(trusted.signature_secret.as_str(), config_dir)
-                {
+                if let Some(path) = crate::security::secret::dependency_path(
+                    trusted.signature_secret.as_str(),
+                    config_dir,
+                ) {
                     paths.push(path);
                 }
             }
         }
         if let Some(csrf) = &route.csrf {
-            paths.extend(crate::csrf::dependency_paths(config_dir, csrf));
+            paths.extend(crate::security::csrf::dependency_paths(config_dir, csrf));
         }
         if let Some(ca_file) = route
             .webtransport
@@ -5260,7 +5671,7 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
             .and_then(|policy| policy.ca_file.as_deref())
             .filter(|path| !path.trim().is_empty())
         {
-            paths.push(crate::masque::resolve_webtransport_path(
+            paths.push(crate::protocols::masque::resolve_webtransport_path(
                 config_dir, ca_file,
             ));
         }
@@ -5273,7 +5684,9 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
             });
         }
         for filter in &route.filters {
-            paths.extend(crate::secret::filter_dependency_paths(filter, config_dir));
+            paths.extend(crate::security::secret::filter_dependency_paths(
+                filter, config_dir,
+            ));
         }
         if let Some(validation) = &route.request_validation {
             for file in [
@@ -5299,46 +5712,81 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
             route.response_transform.as_ref(),
         ));
         if let Some(opa) = &route.opa_authorization {
-            paths.extend(crate::opa::dependency_paths(config_dir, opa));
+            paths.extend(crate::security::opa::dependency_paths(config_dir, opa));
         }
         if let Some(casbin) = &route.casbin_authorization {
-            paths.extend(crate::casbin_auth::dependency_paths(config_dir, casbin));
+            paths.extend(crate::security::casbin_auth::dependency_paths(
+                config_dir, casbin,
+            ));
         }
         for plugin in &route.wasm_plugins {
-            paths.extend(crate::wasm::dependency_paths(config_dir, plugin));
+            paths.extend(crate::extensions::wasm::dependency_paths(
+                config_dir, plugin,
+            ));
+        }
+        for plugin in &route.script_plugins {
+            paths.push(config_dir.join(&plugin.source_file));
         }
         for plugin in &route.external_plugins {
-            if let Some(path) = crate::external_plugin::dependency_path(config_dir, plugin) {
+            if let Some(path) =
+                crate::extensions::external_plugin::dependency_path(config_dir, plugin)
+            {
                 paths.push(path);
             }
         }
+        if let Some(ws) = &route.ws_frame {
+            for plugin in ws.client_plugins.iter().chain(ws.server_plugins.iter()) {
+                if let model::WsMessagePluginCfg::External {
+                    authorization,
+                    ca_certificate,
+                    ..
+                } = plugin
+                {
+                    for source in [authorization, ca_certificate] {
+                        if let Some(path) =
+                            crate::security::secret::dependency_path(source, config_dir)
+                        {
+                            paths.push(path);
+                        }
+                    }
+                }
+            }
+        }
         if let Some(ext_proc) = &route.ext_proc {
-            if let Some(path) = crate::ext_proc::dependency_path(config_dir, ext_proc) {
+            if let Some(path) = crate::extensions::ext_proc::dependency_path(config_dir, ext_proc) {
                 paths.push(path);
             }
         }
         if let Some(dubbo) = &route.dubbo {
             for raw in dubbo.attachments.values() {
-                if let Some(path) = crate::secret::dependency_path(raw, config_dir) {
+                if let Some(path) = crate::security::secret::dependency_path(raw, config_dir) {
                     paths.push(path);
                 }
             }
         }
         if let Some(llm) = &route.llm {
+            if let Some(governance) = &llm.governance {
+                paths.extend(crate::ai::governance::dependency_paths(
+                    governance, config_dir,
+                ));
+            }
             for model in &llm.models {
-                if let Some(path) = crate::secret::dependency_path(&model.api_key, config_dir) {
+                if let Some(path) =
+                    crate::security::secret::dependency_path(&model.api_key, config_dir)
+                {
                     paths.push(path);
                 }
             }
             if let Some(cache) = &llm.semantic_cache {
                 if let Some(path) =
-                    crate::secret::dependency_path(&cache.embedding.api_key, config_dir)
+                    crate::security::secret::dependency_path(&cache.embedding.api_key, config_dir)
                 {
                     paths.push(path);
                 }
             }
             if let Some(moderation) = &llm.moderation {
-                if let Some(path) = crate::secret::dependency_path(&moderation.api_key, config_dir)
+                if let Some(path) =
+                    crate::security::secret::dependency_path(&moderation.api_key, config_dir)
                 {
                     paths.push(path);
                 }
@@ -5347,7 +5795,7 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
     }
     for sink in &cfg.access_log.sinks {
         for raw in sink.headers.values() {
-            if let Some(path) = crate::secret::dependency_path(raw, config_dir) {
+            if let Some(path) = crate::security::secret::dependency_path(raw, config_dir) {
                 paths.push(path);
             }
         }
@@ -5359,7 +5807,9 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
 
 /// 业务作用：收集 OCSP response 与显式 issuer 文件，确保其更新参与配置指纹和精确热换。
 ///
-/// 参数说明：`configs` 是默认证书与 SNI 证书的 OCSP 声明；`config_dir` 是相对路径根。
+/// 参数说明：
+/// - `configs`：是默认证书与 SNI 证书的 OCSP 声明
+/// - `config_dir`：是相对路径根。
 ///
 /// 返回：返回未去重的绝对或基准拼接路径，不读取响应或证书内容。
 fn ocsp_dependency_paths<'a>(
@@ -5387,7 +5837,9 @@ fn ocsp_dependency_paths<'a>(
 /// 业务作用：收集 GeoIP 策略声明的 MMDB 文件，使较大的地理数据库使用独立读取上限，
 /// 不会扩大 Secret、schema 和扩展文件的通用指纹预算。
 ///
-/// 参数说明：`cfg` 是已解析配置；`config_dir` 是相对路径的共同基准。
+/// 参数说明：
+/// - `cfg`：是已解析配置
+/// - `config_dir`：是相对路径的共同基准。
 ///
 /// 返回：返回去重前的 MMDB 依赖路径，调用方负责排序与内容读取。
 fn collect_geoip_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) -> Vec<PathBuf> {
@@ -5395,13 +5847,15 @@ fn collect_geoip_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) -> 
         .iter()
         .chain(cfg.proxies.iter().flat_map(|proxy| proxy.routes.iter()))
         .filter_map(|route| route.geoip.as_ref())
-        .flat_map(|geoip| crate::geoip::dependency_paths(config_dir, geoip))
+        .flat_map(|geoip| crate::security::geoip::dependency_paths(config_dir, geoip))
         .collect()
 }
 
 /// 业务作用：把一次 naml tracked load 实际读取的基础文件和活动 profile 按稳定顺序加入配置指纹。
 ///
-/// 参数说明：`hasher` 是当前候选摘要；`sources` 必须来自与该候选相同 loader 约定。
+/// 参数说明：
+/// - `hasher`：是当前候选摘要
+/// - `sources`：必须来自与该候选相同 loader 约定。
 ///
 /// 返回：全部实际来源均可有界读取时成功；缺失、超限或读取失败时返回错误。
 fn hash_yml_sources(hasher: &mut DefaultHasher, sources: &YmlLocalSources) -> Result<()> {
@@ -5413,7 +5867,9 @@ fn hash_yml_sources(hasher: &mut DefaultHasher, sources: &YmlLocalSources) -> Re
 
 /// 业务作用：有界读取单个声明式依赖并把内容加入配置指纹，部署绝对路径不参与集群收敛比较。
 ///
-/// 参数说明：`hasher` 是当前候选摘要；`path` 是已按固定业务角色排序的文件。
+/// 参数说明：
+/// - `hasher`：是当前候选摘要
+/// - `path`：是已按固定业务角色排序的文件。
 ///
 /// 返回：文件可在硬上限内完整读取时成功；缺失、超限或读取失败时返回错误。
 fn hash_config_file(hasher: &mut DefaultHasher, path: &Path) -> Result<()> {
@@ -5427,8 +5883,11 @@ fn hash_config_file(hasher: &mut DefaultHasher, path: &Path) -> Result<()> {
 
 /// 业务作用：在调用方声明的硬上限内读取依赖内容并加入配置指纹，部署绝对路径不参与比较。
 ///
-/// 参数说明：`hasher` 是当前候选摘要；`path` 是依赖文件；`max_bytes` 是独立读取硬门；
-/// `kind` 用于错误定位且不得包含敏感值。
+/// 参数说明：
+/// - `hasher`：是当前候选摘要
+/// - `path`：是依赖文件
+/// - `max_bytes`：是独立读取硬门
+/// - `kind`：用于错误定位且不得包含敏感值。
 ///
 /// 返回：文件可完整有界读取时更新摘要并成功；缺失、超限或读取失败时返回错误。
 fn hash_config_file_with_limit(
@@ -5439,17 +5898,19 @@ fn hash_config_file_with_limit(
 ) -> Result<()> {
     // 集群收敛比较的是配置内容，不是每台机器的部署目录。调用方已经按固定业务角色顺序
     // 喂入文件；把绝对路径也哈希进去会让内容相同、目录不同的节点永久显示 diverged。
-    crate::bounded_io::read_file(path, max_bytes, kind)?.hash(hasher);
+    crate::io::bounded_io::read_file(path, max_bytes, kind)?.hash(hasher);
     Ok(())
 }
 
 /// 业务作用：把可选物化配置的存在状态和内容加入指纹，使创建、删除和内容变化均能触发 reload。
 ///
-/// 参数说明：`hasher` 是当前候选摘要；`path` 是允许暂时缺失的声明式依赖。
+/// 参数说明：
+/// - `hasher`：是当前候选摘要
+/// - `path`：是允许暂时缺失的声明式依赖。
 ///
 /// 返回：缺失时写入稳定空标记，存在且可有界读取时写入内容；其它读取失败返回错误。
 fn hash_optional_config_file(hasher: &mut DefaultHasher, path: &Path) -> Result<()> {
-    match crate::bounded_io::read_optional_file(
+    match crate::io::bounded_io::read_optional_file(
         path,
         MAX_FINGERPRINT_FILE_BYTES,
         "optional config dependency",

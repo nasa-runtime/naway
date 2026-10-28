@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Naway 工作区</title>
+    <link rel="stylesheet" href="/ui/workspaces.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">GATEWAY / WORKSPACES</p>
+        <h1>工作区管理</h1>
+      </div>
+      <button id="disconnect" type="button">退出</button>
+    </header>
+    <main>
+      <section id="notice" class="notice" role="status">
+        仅显示当前凭据授权的工作区；配置变更必须由不同管理员复核。
+      </section>
+      <section class="card panel">
+        <form id="login">
+          <label for="token">管理 Bearer token</label
+          ><input
+            id="token"
+            type="password"
+            autocomplete="off"
+            required
+          /><button type="submit">连接</button>
+        </form>
+        <p class="muted">
+          凭据只在当前页面内存中使用。远程访问必须使用 HTTPS；不写入浏览器存储。
+        </p>
+      </section>
+      <section id="workspace-panel" hidden>
+        <section class="card panel">
+          <div class="actions">
+            <label for="workspace">工作区</label
+            ><select id="workspace"></select
+            ><button id="refresh" type="button">刷新</button
+            ><button id="watch" type="button">等待一次变更</button
+            ><button id="export" type="button">导出配置首页</button>
+          </div>
+          <p id="owner" class="muted"></p>
+        </section>
+        <section class="card panel">
+          <h2>工作区集群对象</h2>
+          <form id="catalog-query" class="actions">
+            <label for="catalog-domain">领域</label>
+            <select id="catalog-domain"><option value="routes">路由</option><option value="listeners">入口</option><option value="upstreams">上游</option></select>
+            <label for="catalog-search">搜索</label><input id="catalog-search" maxlength="64" placeholder="对象名称" />
+            <button type="submit">查询</button>
+          </form>
+          <p id="catalog-coverage" role="status" class="muted"></p>
+          <div id="catalog-nodes" class="catalog-nodes"></div>
+          <div id="objects" class="catalog-objects"></div>
+          <button id="first" type="button" disabled>首页</button>
+          <button id="next" type="button" disabled>下一页</button>
+        </section>
+        <section class="card panel">
+          <h2>提交候选</h2>
+          <p class="muted">
+            支持 patch、delete、create_route、delegate 与 rollback。rollback
+            指定 object 和 configuration_version 对应的历史
+            version，仅恢复当前同归属对象的可委派字段。
+          </p>
+          <textarea
+            id="mutation"
+            aria-label="候选 JSON"
+            spellcheck="false"
+            placeholder='{"action":"patch","object":"route:入口/路由","fields":{"request_timeout_ms":4000}}'
+          ></textarea
+          ><button id="submit" type="button">提交双人审批</button>
+          <pre id="result" class="result"></pre>
+        </section>
+        <section class="card panel">
+          <h2>本区审批</h2>
+          <div id="changes" class="list"></div>
+        </section>
+        <section class="card panel">
+          <h2>本区集群发布</h2>
+          <div id="rollouts" class="list"></div>
+        </section>
+        <section class="card panel">
+          <h2>本区审计</h2>
+          <pre id="audit" class="result"></pre>
+        </section>
+      </section>
+    </main>
+    <script src="/ui/workspaces.js" type="module"></script>
+  </body>
+</html>

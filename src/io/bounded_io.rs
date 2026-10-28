@@ -11,9 +11,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// 有界读取一个必须存在的普通文件。
+/// 业务作用：有界读取一个必须存在的普通文件。
 ///
-/// # 参数
+/// 参数说明：
 ///
 /// - `path`：要读取的本地文件；符号链接可以指向普通文件，以兼容 Kubernetes Secret 轮换。
 /// - `max_bytes`：允许返回的最大字节数。
@@ -23,9 +23,9 @@ pub(crate) fn read_file(path: &Path, max_bytes: usize, kind: &str) -> Result<Vec
     read_open_file(file, path, max_bytes, kind)
 }
 
-/// 有界读取一个可缺失的普通文件。
+/// 业务作用：有界读取一个可缺失的普通文件。
 ///
-/// # 参数
+/// 参数说明：
 ///
 /// - `path`：要读取的本地文件；不存在返回 `Ok(None)`。
 /// - `max_bytes`：允许返回的最大字节数。
@@ -43,15 +43,22 @@ pub(crate) fn read_optional_file(
     read_open_file(file, path, max_bytes, kind).map(Some)
 }
 
-/// 从已经解析到同一 inode 的句柄读取，避免 metadata 检查后按路径重新打开产生替换竞态。
+/// 业务作用：从已经解析到同一 inode 的句柄读取，避免 metadata 检查后按路径重新打开产生替换竞态。
 ///
-/// # 参数
+/// 参数说明：
 ///
 /// - `file`：已经打开的只读句柄。
 /// - `path`：只用于安全错误上下文，不参与第二次打开。
 /// - `max_bytes`：允许返回的最大字节数。
 /// - `kind`：文件业务类型。
-fn read_open_file(mut file: File, path: &Path, max_bytes: usize, kind: &str) -> Result<Vec<u8>> {
+///
+/// 返回：普通文件内容在硬上限内时成功；超限、非普通文件或读取失败均返回错误。
+pub(crate) fn read_open_file(
+    mut file: File,
+    path: &Path,
+    max_bytes: usize,
+    kind: &str,
+) -> Result<Vec<u8>> {
     let read_limit = max_bytes
         .checked_add(1)
         .context("bounded file byte limit overflows usize")?;

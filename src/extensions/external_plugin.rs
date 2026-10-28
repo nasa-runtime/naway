@@ -1,4 +1,4 @@
-//! V7 外部 HTTP 头部插件协议、构建期校验与有界编解码。
+//! 外部 HTTP 头部插件协议、构建期校验与有界编解码。
 //!
 //! 该扩展面刻意不传业务 body：普通代理继续逐 frame 流式转发。请求只包含固定元数据和
 //! 配置白名单头，响应只允许原子提交白名单头变更或生成有界本地响应。所有 JSON 都在硬
@@ -95,7 +95,7 @@ pub(crate) enum ExternalPluginInputError {
 }
 
 impl ExternalPluginChain {
-    /// 构建并校验一条 route 的外部插件链。
+    /// 业务作用：构建并校验一条 route 的外部插件链。
     pub(crate) fn build(
         cfgs: &[ExternalPluginCfg],
         config_dir: &Path,
@@ -139,15 +139,17 @@ impl ExternalPluginChain {
         })
     }
 
+    /// 业务作用：提供已编译的请求相位插件顺序，运行期不重新解释配置。
     pub(crate) fn request_plugins(&self) -> &[Arc<ExternalPlugin>] {
         &self.request_headers
     }
 
+    /// 业务作用：提供已编译的响应相位插件顺序，维持同一候选快照的执行合同。
     pub(crate) fn response_plugins(&self) -> &[Arc<ExternalPlugin>] {
         &self.response_headers
     }
 
-    /// 请求插件成功交付后捕获响应相位所需的最小请求快照。
+    /// 业务作用：请求插件成功交付后捕获响应相位所需的最小请求快照。
     pub(crate) fn capture_request_head(
         &self,
         parts: &Parts,
@@ -172,6 +174,7 @@ impl ExternalPluginChain {
 }
 
 impl ExternalPlugin {
+    /// 业务作用：冻结外部插件的调用目标、认证、超时和头部权限，拒绝不可执行或越权配置。
     fn build(cfg: &ExternalPluginCfg, config_dir: &Path, route_id: &str) -> Result<Self> {
         if cfg.id.is_empty()
             || cfg.id.len() > MAX_PLUGIN_ID_BYTES
@@ -213,7 +216,7 @@ impl ExternalPlugin {
         let authorization = if cfg.authorization.trim().is_empty() {
             None
         } else {
-            let secret = crate::secret::resolve_text(
+            let secret = crate::security::secret::resolve_text(
                 cfg.authorization.as_str(),
                 config_dir,
                 &format!(
@@ -243,35 +246,42 @@ impl ExternalPlugin {
         })
     }
 
+    /// 业务作用：提供固定插件身份，供执行归因使用，不采用客户端传入的标识。
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
 
+    /// 业务作用：提供已验证的插件后端，调用方不能据请求内容切换目标。
     pub(crate) fn upstream(&self) -> &str {
         &self.upstream
     }
 
+    /// 业务作用：提供构建期冻结的插件方法路径，避免任意外呼路径。
     pub(crate) fn path(&self) -> &str {
         &self.path
     }
 
+    /// 业务作用：提供插件依赖故障的声明处理策略，本地权限拒绝不由此转为放行。
     pub(crate) const fn fail_open(&self) -> bool {
         self.fail_open
     }
 
+    /// 业务作用：提供单次插件调用时限，限制依赖故障对请求生命周期的占用。
     pub(crate) const fn timeout(&self) -> Duration {
         self.timeout
     }
 
+    /// 业务作用：提供插件专用的冻结认证值，不复用业务请求中的未验证凭据。
     pub(crate) fn authorization(&self) -> Option<&HeaderValue> {
         self.authorization.as_ref()
     }
 
+    /// 业务作用：提供插件响应的硬字节上限，使读取在分配过程中保持有界。
     pub(crate) const fn max_response_bytes(&self) -> usize {
         self.max_response_bytes
     }
 
-    /// 编码 request_headers phase 输入；只借用当前 head，不 clone header value。
+    /// 业务作用：编码 request_headers phase 输入；只借用当前 head，不 clone header value。
     pub(crate) fn encode_request(
         &self,
         parts: &Parts,
@@ -295,7 +305,7 @@ impl ExternalPlugin {
         })
     }
 
-    /// 编码 response_headers phase 输入；请求头来自最小快照，响应头直接借用当前响应。
+    /// 业务作用：编码 response_headers phase 输入；请求头来自最小快照，响应头直接借用当前响应。
     pub(crate) fn encode_response(
         &self,
         request: &ExternalRequestHeadSnapshot,
@@ -325,6 +335,7 @@ impl ExternalPlugin {
         })
     }
 
+    /// 业务作用：按插件输入合同编码已允许的请求上下文，正文和未授权头部不进入载荷。
     fn encode(
         &self,
         input: PluginInput<'_>,
@@ -352,7 +363,7 @@ impl ExternalPlugin {
         })
     }
 
-    /// 严格解析并完整校验插件输出。调用方只有拿到本值后才能提交变更。
+    /// 业务作用：严格解析并完整校验插件输出。调用方只有拿到本值后才能提交变更。
     pub(crate) fn parse_action(&self, body: &[u8]) -> Result<ExternalPluginAction> {
         let output: PluginOutput =
             serde_json::from_slice(body).context("decode external plugin response JSON")?;
@@ -390,6 +401,7 @@ impl ExternalPlugin {
         }
     }
 
+    /// 业务作用：验证整组插件输出再形成变更计划，避免仅应用部分头部操作。
     fn compile_changes(
         &self,
         set_headers: BTreeMap<String, String>,
@@ -424,9 +436,13 @@ impl ExternalPlugin {
             }
             remove.push(name);
         }
-        Ok(HeaderChanges { set, remove })
+        Ok(HeaderChanges {
+            set,
+            remove,
+        })
     }
 
+    /// 业务作用：把插件返回的头部映射转换为已验证类型，拒绝非法名称、值和越权字段。
     fn compile_header_map(&self, raw: BTreeMap<String, String>) -> Result<HeaderMap> {
         if raw.len() > MAX_HEADERS {
             bail!("external plugin returned too many local response headers");
@@ -446,6 +462,7 @@ impl ExternalPlugin {
         Ok(headers)
     }
 
+    /// 业务作用：检查插件修改头部的权限边界，关键认证和协议字段不能被客体覆盖。
     fn validate_mutation_name(&self, name: &HeaderName) -> Result<()> {
         if !self.mutation_headers.contains(name) {
             bail!("external plugin attempted a header mutation outside its allowlist");
@@ -455,17 +472,18 @@ impl ExternalPlugin {
 }
 
 impl HeaderChanges {
-    /// 在全部 delta 校验通过后一次性写入请求 head。
+    /// 业务作用：在全部 delta 校验通过后一次性写入请求 head。
     pub(crate) fn apply_request(self, parts: &mut Parts) {
         apply_changes(&mut parts.headers, self);
     }
 
-    /// 在全部 delta 校验通过后一次性写入响应 head；body 不动、不 clone。
+    /// 业务作用：在全部 delta 校验通过后一次性写入响应 head；body 不动、不 clone。
     pub(crate) fn apply_response(self, response: &mut Response<BoxBody>) {
         apply_changes(response.headers_mut(), self);
     }
 }
 
+/// 业务作用：应用已经完整验证的头部操作，保证发布到请求或响应的是同一组合法变更。
 fn apply_changes(headers: &mut HeaderMap, changes: HeaderChanges) {
     for name in changes.remove {
         headers.remove(name);
@@ -475,7 +493,7 @@ fn apply_changes(headers: &mut HeaderMap, changes: HeaderChanges) {
     }
 }
 
-/// 外部插件成功响应只接受 JSON/vendor +json。
+/// 业务作用：外部插件成功响应只接受 JSON/vendor +json。
 pub(crate) fn response_is_json(headers: &HeaderMap) -> bool {
     let Some(value) = headers
         .get(CONTENT_TYPE)
@@ -496,7 +514,10 @@ pub(crate) fn response_is_json(headers: &HeaderMap) -> bool {
 
 /// 业务作用：有界收集外部插件 JSON body，并接受符合 HTTP 语义的尾随元数据。
 ///
-/// 参数说明：`body` 是插件响应流；`headers` 用于前置 Content-Length 门；`max_bytes` 是 JSON body 硬上限。
+/// 参数说明：
+/// - `body`：是插件响应流
+/// - `headers`：用于前置 Content-Length 门
+/// - `max_bytes`：是 JSON body 硬上限。
 ///
 /// 返回：单 DATA frame 保持零拷贝，多 frame 只合并一次；trailers 不参与插件动作解析但会被安全消费。
 pub(crate) async fn collect_response(
@@ -581,6 +602,7 @@ struct IncludedHeaders<'a> {
 }
 
 impl Serialize for IncludedHeaders<'_> {
+    /// 业务作用：仅序列化插件合同允许的上下文字段，限制外部处理器可见的信息范围。
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -603,6 +625,7 @@ struct IncludedHeaderValues<'a> {
 }
 
 impl Serialize for IncludedHeaderValues<'_> {
+    /// 业务作用：仅序列化插件合同允许的上下文字段，限制外部处理器可见的信息范围。
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -645,6 +668,7 @@ struct BoundedWriter {
 }
 
 impl BoundedWriter {
+    /// 业务作用：建立有界插件输入编码缓冲，把序列化内存计入显式输入预算。
     fn new(max_bytes: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(max_bytes.min(4096)),
@@ -655,6 +679,7 @@ impl BoundedWriter {
 }
 
 impl Write for BoundedWriter {
+    /// 业务作用：在插件输入编码时执行字节硬门，超限立即停止追加。
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
         let Some(length) = self.bytes.len().checked_add(input.len()) else {
             self.exceeded = true;
@@ -670,11 +695,13 @@ impl Write for BoundedWriter {
         Ok(input.len())
     }
 
+    /// 业务作用：完成内存序列化器的刷新合同，不产生文件或网络副作用。
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
+/// 业务作用：验证插件输入白名单，拒绝把禁止外传的认证和连接字段授予插件。
 fn validate_included_headers(
     headers: &HeaderMap,
     names: &[HeaderName],
@@ -690,6 +717,7 @@ fn validate_included_headers(
     Ok(())
 }
 
+/// 业务作用：验证固定插件目标及支持协议，防止声明退化为任意目的地转发。
 fn compile_target(target: &str, path: &str) -> Result<(String, String)> {
     let path = parse_path(path)?;
     if let Some(service) = target.strip_prefix("lb://") {
@@ -715,6 +743,7 @@ fn compile_target(target: &str, path: &str) -> Result<(String, String)> {
     ))
 }
 
+/// 业务作用：验证插件方法路径，拒绝会改变固定调用源或查询边界的声明。
 fn parse_path(path: &str) -> Result<String> {
     if path.is_empty()
         || path.len() > MAX_PATH_BYTES
@@ -730,6 +759,7 @@ fn parse_path(path: &str) -> Result<String> {
     Ok(path.to_owned())
 }
 
+/// 业务作用：在构建期冻结插件调用的附加头，避免请求时接受动态权限扩张。
 fn compile_headers(raw: &[String], operation: &str) -> Result<Vec<HeaderName>> {
     if raw.len() > MAX_HEADERS {
         bail!("header allowlist supports at most {MAX_HEADERS} names");
@@ -748,6 +778,7 @@ fn compile_headers(raw: &[String], operation: &str) -> Result<Vec<HeaderName>> {
     Ok(names)
 }
 
+/// 业务作用：识别插件不得读写的敏感及协议控制头，供输入输出共用安全边界。
 fn forbidden_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -772,10 +803,10 @@ fn forbidden_header(name: &HeaderName) -> bool {
     )
 }
 
-/// 返回外部插件 Authorization SecretSource 的文件依赖，供 reload watcher 对账。
+/// 业务作用：返回外部插件 Authorization SecretSource 的文件依赖，供 reload watcher 对账。
 pub(crate) fn dependency_path(
     config_dir: &Path,
     cfg: &ExternalPluginCfg,
 ) -> Option<std::path::PathBuf> {
-    crate::secret::dependency_path(cfg.authorization.as_str(), config_dir)
+    crate::security::secret::dependency_path(cfg.authorization.as_str(), config_dir)
 }

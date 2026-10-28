@@ -17,14 +17,14 @@ use serde::{Deserialize, Serialize};
 const AUDIT_MAX_EVENTS: usize = 256;
 
 use crate::config::model::BlacklistCfg;
-use crate::runtime_state::{DynamicStore, SwappableDynamicStore};
+use crate::runtime::state::{DynamicStore, SwappableDynamicStore};
 
 const MIN_REFRESH_INTERVAL_MS: u64 = 250;
 /// 所有黑名单本地 timer 的安全上限；一年已经远超正常封禁/豁免窗口，同时避免外部
 /// `u64` 极值越过平台 `Instant` 可表示范围。
 const MAX_BLACKLIST_DURATION_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
 
-/// 黑名单 ban/unban 审计事件(§18:审计每次 ban/unban 的 who/when/why/source)。
+/// 黑名单 ban/unban 审计事件(审计每次 ban/unban 的 who/when/why/source)。
 #[derive(Clone, Serialize)]
 pub struct BlacklistAuditEvent {
     /// 本节点单调事件号。
@@ -43,32 +43,30 @@ pub struct BlacklistAuditEvent {
 
 /// 黑名单本地快照:精确 IP 走 O(1) HashSet;CIDR 段走小规模线性扫描。
 ///
-/// WHY 分两张表:§12/§18 要求「CIDR 单 IP + 段」都能封禁。早期实现只把 key 解析成 `IpAddr`、
-/// CIDR key(如 `10.0.0.0/8`)解析失败被 debug 级静默丢弃 → 运维封一个网段实际是空操作,
-/// 一个「以为生效」的安全控制悄悄什么都没做。这里精确 IP 仍走哈希 O(1)(封单 IP 是常态、量大),
-/// CIDR 段数量少、线性扫描即可,不拖慢常态命中判定。
+/// 精确 IP 与 CIDR 分开存储，保证网段封禁不会因按单 IP 解析而失效。
+/// 高频单 IP 命中保持 O(1)，少量 CIDR 使用线性扫描，不增加普通哈希查找的成本。
 #[derive(Default)]
 pub struct BlacklistEntries {
     /// 精确单 IP,O(1) 命中。
     ips: HashSet<IpAddr>,
-    /// CIDR 网段,构建期已解析成位比较结构(§net),运行期零分配匹配。
-    cidrs: Vec<crate::net::Cidr>,
+    /// CIDR 网段，构建期已解析成位比较结构，运行期零分配匹配。
+    cidrs: Vec<crate::io::net::Cidr>,
 }
 
 impl BlacklistEntries {
-    /// 有效条目总数(精确 IP + CIDR 段)。
+    /// 业务作用：有效条目总数(精确 IP + CIDR 段)。
     pub fn len(&self) -> usize {
         self.ips.len() + self.cidrs.len()
     }
 
-    /// 是否为空。
+    /// 业务作用：是否为空。
     pub fn is_empty(&self) -> bool {
         self.ips.is_empty() && self.cidrs.is_empty()
     }
 
-    /// 判断 IP 是否命中黑名单:先查精确 IP(O(1)),再扫 CIDR 段。
+    /// 业务作用：判断 IP 是否命中黑名单:先查精确 IP(O(1)),再扫 CIDR 段。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `ip`: 待检查的真实客户端 IP。
     fn contains(&self, ip: IpAddr) -> bool {
         self.ips.contains(&ip) || self.cidrs.iter().any(|cidr| cidr.contains(ip))
@@ -92,9 +90,9 @@ pub struct BlacklistCache {
 }
 
 impl BlacklistCache {
-    /// 按配置创建空缓存。
+    /// 业务作用：按配置创建空缓存。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `cfg`: 黑名单及自动封禁配置。
     pub fn new(cfg: &BlacklistCfg) -> Result<Self> {
         validate_config(cfg)?;
@@ -110,9 +108,9 @@ impl BlacklistCache {
         })
     }
 
-    /// 原子应用新配置；禁用时同步清空数据面集合。
+    /// 业务作用：原子应用新配置；禁用时同步清空数据面集合。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `cfg`: 已解析并待校验的新配置。
     pub fn apply_config(&self, cfg: &BlacklistCfg) -> Result<()> {
         validate_config(cfg)?;
@@ -128,9 +126,9 @@ impl BlacklistCache {
         Ok(())
     }
 
-    /// 某 IP 当前是否处于解封豁免窗口内(auto-ban 应跳过它)。过期项顺带清理。
+    /// 业务作用：某 IP 当前是否处于解封豁免窗口内(auto-ban 应跳过它)。过期项顺带清理。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `ip`: 待判定的客户端 IP。
     pub fn is_exempt(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
@@ -145,9 +143,9 @@ impl BlacklistCache {
         }
     }
 
-    /// 记录一次拉黑审计(不改缓存,缓存由 store 刷新驱动)。
+    /// 业务作用：记录一次拉黑审计(不改缓存,缓存由 store 刷新驱动)。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `ip`: 被拉黑 IP。
     /// - `source`: 来源(`auto_limit_req` / `admin`)。
     /// - `ttl_ms`: 拉黑 TTL。
@@ -155,9 +153,9 @@ impl BlacklistCache {
         self.push_audit("ban", ip, source, Some(ttl_ms));
     }
 
-    /// 记录一次解封审计,并(若配置了 `unban_exempt_ms`)对该 IP 设置本节点解封豁免窗口。
+    /// 业务作用：记录一次解封审计,并(若配置了 `unban_exempt_ms`)对该 IP 设置本节点解封豁免窗口。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `ip`: 被解封 IP。
     /// - `source`: 来源(通常 `admin`)。
     pub fn record_unban(&self, ip: IpAddr, source: &str) {
@@ -171,6 +169,7 @@ impl BlacklistCache {
         self.push_audit("unban", ip, source, None);
     }
 
+    /// 业务作用：把封禁或撤销事件加入有界审计读面，保留原因与期限而不无限积累记录。
     fn push_audit(&self, kind: &'static str, ip: IpAddr, source: &str, ttl_ms: Option<u64>) {
         let id = self.audit_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let mut audit = self.audit.lock();
@@ -187,45 +186,45 @@ impl BlacklistCache {
         }
     }
 
-    /// 返回本节点最近的 ban/unban 审计事件(按发生顺序)。
+    /// 业务作用：返回本节点最近的 ban/unban 审计事件(按发生顺序)。
     pub fn audit_snapshot(&self) -> Vec<BlacklistAuditEvent> {
         self.audit.lock().iter().cloned().collect()
     }
 
-    /// 返回黑名单功能是否启用。
+    /// 业务作用：返回黑名单功能是否启用。
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// 返回当前动态存储集合名的快照。
+    /// 业务作用：返回当前动态存储集合名的快照。
     pub fn collection(&self) -> String {
         self.collection.read().clone()
     }
 
-    /// 在本地快照中判断 IP；不会访问外部存储。
+    /// 业务作用：在本地快照中判断 IP；不会访问外部存储。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `ip`: 待检查的客户端地址。
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
         self.is_enabled() && self.entries.load().contains(ip)
     }
 
-    /// 用新集合替换当前快照，读者无需等待刷新锁。
+    /// 业务作用：用新集合替换当前快照，读者无需等待刷新锁。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `entries`: 已完成过期清理的精确 IP + CIDR 段集合。
     pub fn replace_entries(&self, entries: BlacklistEntries) {
         self.entries.store(Arc::new(entries));
     }
 
-    /// 清空数据面黑名单快照。
+    /// 业务作用：清空数据面黑名单快照。
     pub fn clear(&self) {
         self.replace_entries(BlacklistEntries::default());
     }
 
-    /// 从动态存储加载、过滤过期项并替换本地快照。
+    /// 业务作用：从动态存储加载、过滤过期项并替换本地快照。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `store`: 动态存储事实源。
     /// - `collection`: 要读取的集合名。
     ///
@@ -241,6 +240,7 @@ impl BlacklistCache {
         Ok(count)
     }
 
+    /// 业务作用：提供动态黑名单的后台对账周期，不让请求线程承担事实源轮询。
     fn refresh_interval(&self) -> Duration {
         let ms = self
             .refresh_interval_ms
@@ -250,9 +250,9 @@ impl BlacklistCache {
     }
 }
 
-/// 校验黑名单配置及自动封禁参数之间的依赖关系。
+/// 业务作用：校验黑名单配置及自动封禁参数之间的依赖关系。
 ///
-/// # 参数
+/// 参数说明：
 /// - `cfg`: 待校验配置。
 pub fn validate_config(cfg: &BlacklistCfg) -> Result<()> {
     validate_component(&cfg.collection, "blacklist.collection")?;
@@ -287,9 +287,9 @@ pub fn validate_config(cfg: &BlacklistCfg) -> Result<()> {
     Ok(())
 }
 
-/// 从动态存储加载未过期的 IP，并删除已过期条目。
+/// 业务作用：从动态存储加载未过期的 IP，并删除已过期条目。
 ///
-/// # 参数
+/// 参数说明：
 /// - `store`: 动态存储事实源。
 /// - `collection`: 黑名单集合名。
 pub async fn load_blacklist_ips(
@@ -307,8 +307,8 @@ pub async fn load_blacklist_ips(
     };
     let now_ms = unix_now_ms();
     for key in keys {
-        // 单 IP 与 CIDR 段统一按 `Cidr::parse` 解析:含 `/` → 网段,否则精确 IP(§18「CIDR 单 IP + 段」)。
-        match crate::net::Cidr::parse(&key) {
+        // 单 IP 与 CIDR 段统一按 `Cidr::parse` 解析:含 `/` → 网段,否则精确 IP(「CIDR 单 IP + 段」)。
+        match crate::io::net::Cidr::parse(&key) {
             Ok(cidr) => {
                 let value = store
                     .get(collection, &key)
@@ -326,7 +326,7 @@ pub async fn load_blacklist_ips(
                 } else {
                     // 精确单 IP 进哈希表(O(1) 命中),真正的网段进 CIDR 表(线性扫描)。
                     match cidr {
-                        crate::net::Cidr::Single(ip) => {
+                        crate::io::net::Cidr::Single(ip) => {
                             entries.ips.insert(ip);
                         }
                         cidr => entries.cidrs.push(cidr),
@@ -352,6 +352,7 @@ struct BlacklistEntryMeta {
     expire_at_unix_ms: Option<i64>,
 }
 
+/// 业务作用：判断动态封禁是否已经失效，过期条目不能继续阻断请求。
 fn entry_expired(value: Option<&[u8]>, now_ms: i64) -> bool {
     let Some(value) = value else {
         return false;
@@ -364,6 +365,7 @@ fn entry_expired(value: Option<&[u8]>, now_ms: i64) -> bool {
         .unwrap_or(false)
 }
 
+/// 业务作用：提供动态封禁有效期使用的 Unix 毫秒时间，时钟异常采用保守零值。
 fn unix_now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -371,9 +373,9 @@ fn unix_now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// 启动后台黑名单刷新任务；任务持续监听动态存储变更并定期兜底刷新。
+/// 业务作用：启动后台黑名单刷新任务；任务持续监听动态存储变更并定期兜底刷新。
 ///
-/// # 参数
+/// 参数说明：
 /// - `cache`: 数据面黑名单缓存。
 /// - `store`: 可热切换的动态存储句柄。
 pub fn spawn_blacklist_refresh(
@@ -448,6 +450,7 @@ pub fn spawn_blacklist_refresh(
     })
 }
 
+/// 业务作用：约束黑名单集合标识，避免动态配置突破后端命名空间。
 fn validate_component(value: &str, name: &str) -> Result<()> {
     if value.is_empty()
         || value.contains('/')

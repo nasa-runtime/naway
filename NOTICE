@@ -3,3 +3,16 @@ Copyright 2026 Naway contributors
 
 This product is made available under either the Apache License, Version 2.0,
 or the MIT License, at your option. See LICENSE-APACHE and LICENSE-MIT.
+
+The Saga, Inbox and Outbox SQL contracts under src/admin/operations/workflow/sql
+are derived from nasaga-pgsql, nainbox-pgsql and naoutbox-pgsql 2.0.0.
+Copyright (c) 2026 nasa-runtime-rust authors.
+These portions are used under the MIT License reproduced in LICENSE-MIT.
+The Saga contract omits historical data backfill because initialization requires
+an empty workflow namespace and uses the host migration transaction.
+
+nasa-runtime-rust is an independent open-source project.
+It is not affiliated with, sponsored by, endorsed by, or an official project of
+the United States National Aeronautics and Space Administration. The project
+does not use the agency's insignia, logotype, seal, or other official visual
+identifiers.

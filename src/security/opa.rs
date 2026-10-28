@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::cache::expiry::ExpiringCache;
+use crate::control::ownership::state::{Budget, Lease};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
@@ -24,7 +26,6 @@ use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::request::Parts;
 use http::{HeaderMap, HeaderName, HeaderValue, Uri};
 use http_body_util::BodyExt;
-use nasa::cache::local_cache::BoundedLocalCache;
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -71,6 +72,7 @@ const FORBIDDEN_MUTATION_HEADERS: &[&str] = &[
 
 /// 构建完成的 route 级 OPA 策略。
 pub(crate) struct OpaPolicy {
+    workspace_budget: std::sync::OnceLock<Option<Budget>>,
     /// 已规范化的 OPA 上游 base；不含 Data API path。
     pub(crate) upstream: String,
     /// OPA Data API path。
@@ -98,12 +100,13 @@ pub(crate) struct OpaPolicy {
 }
 
 struct OpaDecisionCache {
-    entries: BoundedLocalCache<[u8; 32], CachedDecision>,
+    entries: ExpiringCache<[u8; 32], CachedDecision>,
     allow_ttl: Duration,
     deny_ttl: Duration,
 }
 
 struct CachedDecision {
+    _workspace_lease: Option<Lease>,
     decision: OpaDecision,
     expires_at: Instant,
 }
@@ -144,6 +147,7 @@ struct OpaDistributedCache {
 }
 
 pub(crate) struct OpaFlight {
+    _workspace_lease: Option<Lease>,
     finished: AtomicBool,
     notify: Notify,
 }
@@ -231,7 +235,7 @@ pub(crate) struct OpaRequestContext<'a> {
 }
 
 impl<'a> OpaRequestContext<'a> {
-    /// 创建请求级 OPA 输入视图；调用方须先冻结认证结果，不能传入未经验证的身份头。
+    /// 业务作用：创建请求级 OPA 输入视图；调用方须先冻结认证结果，不能传入未经验证的身份头。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         parts: &'a Parts,
@@ -272,7 +276,10 @@ pub(crate) enum OpaInputError {
 impl OpaPolicy {
     /// 业务作用：编译 route 级 OPA 策略，在候选快照发布前完成来源、签名、Rego 与所有资源门校验。
     ///
-    /// 参数说明：`cfg` 是声明配置，`config_dir` 解析文件依赖，`route_id` 提供错误定位。
+    /// 参数说明：
+    /// - `cfg`：是声明配置
+    /// - `config_dir`：解析文件依赖
+    /// - `route_id`：提供错误定位。
     ///
     /// 返回：返回只读可执行策略；任一 bundle/签名/配置错误都会拒绝候选，从而保留旧快照。
     pub(crate) fn build(
@@ -375,7 +382,7 @@ impl OpaPolicy {
         } else if cfg.authorization.trim().is_empty() {
             None
         } else {
-            let secret = crate::secret::resolve_text(
+            let secret = crate::security::secret::resolve_text(
                 cfg.authorization.as_str(),
                 config_dir,
                 &format!("route `{route_id}` opa_authorization authorization"),
@@ -431,7 +438,7 @@ impl OpaPolicy {
                     )?;
                 }
                 Ok(OpaDecisionCache {
-                    entries: BoundedLocalCache::new(cache.max_entries),
+                    entries: ExpiringCache::new(cache.max_entries),
                     allow_ttl: Duration::from_millis(cache.ttl_ms),
                     deny_ttl: Duration::from_millis(cache.deny_ttl_ms),
                 })
@@ -479,6 +486,7 @@ impl OpaPolicy {
             policy_salt,
             revision,
             cache,
+            workspace_budget: std::sync::OnceLock::new(),
             input,
             obligations,
             engine,
@@ -496,32 +504,32 @@ impl OpaPolicy {
         })
     }
 
-    /// OPA response head/body 的总 deadline。
+    /// 业务作用：OPA response head/body 的总 deadline。
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
     }
 
-    /// transport/5xx/畸形响应是否放行。
+    /// 业务作用：transport/5xx/畸形响应是否放行。
     pub(crate) fn fail_open(&self) -> bool {
         self.fail_open
     }
 
-    /// 可选 OPA 服务 Authorization header。值已标 sensitive，日志不得格式化它。
+    /// 业务作用：可选 OPA 服务 Authorization header。值已标 sensitive，日志不得格式化它。
     pub(crate) fn authorization(&self) -> Option<&HeaderValue> {
         self.authorization.as_ref()
     }
 
-    /// OPA response body 上限。
+    /// 业务作用：OPA response body 上限。
     pub(crate) fn max_response_bytes(&self) -> usize {
         self.max_response_bytes
     }
 
-    /// 是否要求稳定 consumer。
+    /// 业务作用：是否要求稳定 consumer。
     pub(crate) fn requires_identity(&self) -> bool {
         self.require_identity
     }
 
-    /// 是否启用了本节点 decision cache。
+    /// 业务作用：是否启用了本节点 decision cache。
     pub(crate) fn cache_enabled(&self) -> bool {
         self.cache.is_some()
     }
@@ -546,7 +554,8 @@ impl OpaPolicy {
 
     /// 业务作用：复验 request body media type，防止把未声明的二进制或表单载荷误交给 JSON 策略。
     ///
-    /// 参数说明：`headers` 是未经 obligation 改写的原始请求头。
+    /// 参数说明：
+    /// - `headers`：是未经 obligation 改写的原始请求头。
     ///
     /// 返回：关闭 body 输入时返回 true；开启时只接受显式 allowlist media type。
     pub(crate) fn permits_body_content_type(&self, headers: &HeaderMap) -> bool {
@@ -590,7 +599,8 @@ impl OpaPolicy {
 
     /// 业务作用：在进程内执行签名 bundle 的 Rego rule，并用与外部响应相同的 obligation contract 复验。
     ///
-    /// 参数说明：`payload` 是已经通过输入大小门的 `{input:...}` JSON。
+    /// 参数说明：
+    /// - `payload`：是已经通过输入大小门的 `{input:...}` JSON。
     ///
     /// 返回：embedded 模式返回明确 decision；外部模式或解释器错误返回 dependency error。
     pub(crate) fn evaluate_embedded(&self, payload: &OpaInputPayload) -> Result<OpaDecision> {
@@ -621,7 +631,8 @@ impl OpaPolicy {
 
     /// 业务作用：解析并整体验证 OPA result，确保非法 obligation 在任何 header 变更前失败。
     ///
-    /// 参数说明：`body` 是外部 OPA Data API 的完整有界 JSON body。
+    /// 参数说明：
+    /// - `body`：是外部 OPA Data API 的完整有界 JSON body。
     ///
     /// 返回：返回明确 allow/deny；缺失 result、未知字段、越权 mutation 或资源超限返回错误。
     pub(crate) fn parse_decision(&self, body: &[u8]) -> Result<OpaDecision> {
@@ -641,7 +652,8 @@ impl OpaPolicy {
 
     /// 业务作用：把 embedded rule 的原生值映射为统一 decision contract。
     ///
-    /// 参数说明：`value` 是 Regorus 返回的 JSON 等价值。
+    /// 参数说明：
+    /// - `value`：是 Regorus 返回的 JSON 等价值。
     ///
     /// 返回：boolean 或严格对象成功映射；undefined/其它类型和非法 obligations 返回错误。
     #[cfg(feature = "opa-embedded")]
@@ -665,7 +677,8 @@ impl OpaPolicy {
 
     /// 业务作用：整体验证对象 decision 与全部 obligations，任何单项越权时拒绝整次结果。
     ///
-    /// 参数说明：`result` 是严格反序列化但尚未做 route allowlist 校验的对象。
+    /// 参数说明：
+    /// - `result`：是严格反序列化但尚未做 route allowlist 校验的对象。
     ///
     /// 返回：合法 allow 携带规范化 obligations，deny 不携带副作用；非法对象返回 dependency error。
     fn parse_result_object(&self, result: OpaResultObject) -> Result<OpaDecision> {
@@ -677,12 +690,15 @@ impl OpaPolicy {
             return Ok(OpaDecision::Deny);
         }
         self.obligations.validate(&obligations)?;
-        Ok(OpaDecision::Allow { obligations })
+        Ok(OpaDecision::Allow {
+            obligations,
+        })
     }
 
     /// 业务作用：从节点内 single-flight 表取得 leader/follower 身份，表满时有界绕过而不增长内存。
     ///
-    /// 参数说明：`key` 是已覆盖 revision、身份与全部输入的稳定摘要。
+    /// 参数说明：
+    /// - `key`：是已覆盖 revision、身份与全部输入的稳定摘要。
     ///
     /// 返回：返回 leader guard、follower wait handle 或容量绕过标记。
     pub(crate) fn acquire_flight(&self, key: [u8; 32]) -> OpaFlightRole<'_> {
@@ -695,7 +711,18 @@ impl OpaPolicy {
         if self.flights.len() >= self.singleflight_max_keys {
             return OpaFlightRole::Bypass;
         }
+        let lease = match self
+            .workspace_budget
+            .get()
+            .and_then(Option::as_ref)
+            .map(Budget::acquire)
+            .transpose()
+        {
+            Ok(lease) => lease,
+            Err(_) => return OpaFlightRole::Bypass,
+        };
         let flight = Arc::new(OpaFlight {
+            _workspace_lease: lease,
             finished: AtomicBool::new(false),
             notify: Notify::new(),
         });
@@ -714,7 +741,8 @@ impl OpaPolicy {
 
     /// 业务作用：有界等待同 key leader 完成；Notify 前后复验 finished，避免 lost wakeup。
     ///
-    /// 参数说明：`flight` 是当前 key 的共享完成状态。
+    /// 参数说明：
+    /// - `flight`：是当前 key 的共享完成状态。
     ///
     /// 返回：leader 在 deadline 内结束返回 true，超时返回 false。
     pub(crate) async fn wait_flight(&self, flight: &Arc<OpaFlight>) -> bool {
@@ -779,15 +807,32 @@ impl OpaPolicy {
     /// 参数说明: 无。
     ///
     /// 返回：未显式开启时返回 None；开启时返回经过命名与容量复验的 collection/上限。
-    pub(crate) fn distributed_cache(&self) -> Option<(&str, usize)> {
-        self.distributed
-            .as_ref()
-            .map(|cache| (cache.collection.as_ref(), cache.max_entries))
+    pub(crate) fn distributed_cache(&self) -> Option<(String, usize)> {
+        self.distributed.as_ref().map(|cache| match self.budget() {
+            Some(budget) => (
+                format!(
+                    "workspace-opa-{:x}",
+                    Sha256::digest(budget.remote_scope().0.as_bytes())
+                ),
+                cache.max_entries.min(budget.remote_scope().1),
+            ),
+            None => (cache.collection.to_string(), cache.max_entries),
+        })
+    }
+
+    /// 业务作用：提供已冻结的工作区预算，确保共享授权缓存与本地授权使用相同归属。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：工作区预算或平台 None。
+    pub(crate) fn budget(&self) -> Option<&Budget> {
+        self.workspace_budget.get().and_then(Option::as_ref)
     }
 
     /// 业务作用：把 decision key 编码为不泄露输入的固定 DynamicStore key。
     ///
-    /// 参数说明：`key` 是 SHA-256 decision 摘要。
+    /// 参数说明：
+    /// - `key`：是 SHA-256 decision 摘要。
     ///
     /// 返回：返回 64 字节小写十六进制 key。
     pub(crate) fn distributed_key(&self, key: &[u8; 32]) -> String {
@@ -796,7 +841,8 @@ impl OpaPolicy {
 
     /// 业务作用：编码跨节点 decision cache 值，绑定当前 revision 与绝对过期时间。
     ///
-    /// 参数说明：`decision` 必须是已经过本策略 obligation contract 验证的明确结果。
+    /// 参数说明：
+    /// - `decision`：必须是已经过本策略 obligation contract 验证的明确结果。
     ///
     /// 返回：返回有界 JSON；系统时间或编码失败时返回错误且不得写入 store。
     pub(crate) fn encode_distributed_decision(&self, decision: &OpaDecision) -> Result<Vec<u8>> {
@@ -818,7 +864,8 @@ impl OpaPolicy {
 
     /// 业务作用：复验跨节点 cache 值的 schema、revision、expiry 与 obligations，拒绝旧策略或被篡改值。
     ///
-    /// 参数说明：`encoded` 是 DynamicStore 返回的未信任字节。
+    /// 参数说明：
+    /// - `encoded`：是 DynamicStore 返回的未信任字节。
     ///
     /// 返回：合法未过期值返回 decision；过期或 revision 不符返回 None；坏值返回错误供调用方删除。
     pub(crate) fn decode_distributed_decision(
@@ -836,23 +883,44 @@ impl OpaPolicy {
         if entry.revision != self.revision.as_ref() || entry.expires_unix_ms <= unix_millis()? {
             return Ok(None);
         }
-        if let OpaDecision::Allow { obligations } = &entry.decision {
+        if let OpaDecision::Allow {
+            obligations,
+        } = &entry.decision
+        {
             self.obligations.validate(obligations)?;
         }
         Ok(Some(entry.decision))
     }
 
-    /// 只计算 cache key 并验证所有输入字段；命中时不构造 JSON body。
+    /// 业务作用：绑定受信归属并计算包含工作区和全部授权输入的缓存摘要。
+    ///
+    /// 参数说明：
+    /// - `input`：为主管线冻结身份后的请求上下文。
+    ///
+    /// 返回：安全缓存键或输入错误；命中阶段不构造 JSON body。
     pub(crate) fn input_cache_key(
         &self,
         input: &OpaRequestContext<'_>,
     ) -> std::result::Result<[u8; 32], OpaInputError> {
+        let budget = self
+            .workspace_budget
+            .get_or_init(|| input.parts.extensions.get::<Budget>().cloned());
+        if let Some(cache) = &self.cache {
+            cache.entries.bind_budget(budget.as_ref());
+        }
         if self.require_identity && input.consumer.is_none() {
             return Err(OpaInputError::MissingIdentity);
         }
         let mut hasher = Sha256::new();
         hasher.update(b"gw-opa-input-v1\0");
         hasher.update(self.policy_salt);
+        if let Some(scope) = input
+            .parts
+            .extensions
+            .get::<crate::control::ownership::RequestScope>()
+        {
+            hash_field(&mut hasher, scope.0.as_bytes());
+        }
         hash_field(&mut hasher, input.parts.method.as_str().as_bytes());
         hash_field(&mut hasher, input.parts.uri.path().as_bytes());
         // Query 往往承载 resource/tenant/filter；漏入 key 会让同 path 的 allow 决策跨
@@ -899,7 +967,7 @@ impl OpaPolicy {
         Ok(hasher.finalize().into())
     }
 
-    /// 在 cache miss 后一次性编码有界 JSON input。
+    /// 业务作用：在 cache miss 后一次性编码有界 JSON input。
     pub(crate) fn encode_input(
         &self,
         cache_key: [u8; 32],
@@ -937,7 +1005,7 @@ impl OpaPolicy {
         })
     }
 
-    /// 查 decision L1。过期 entry 立即失效并按 miss 处理。
+    /// 业务作用：查 decision L1。过期 entry 立即失效并按 miss 处理。
     pub(crate) async fn cached_decision(&self, key: &[u8; 32]) -> Option<OpaDecision> {
         let cache = self.cache.as_ref()?;
         let entry = cache.entries.get(key).await?;
@@ -948,44 +1016,66 @@ impl OpaPolicy {
         None
     }
 
-    /// 只缓存明确 allow/deny；调用方不得把 transport/解析错误传入。
+    /// 业务作用：只缓存明确授权结果，并在真实插入前取得本工作区状态名额。
+    ///
+    /// 参数说明：
+    /// - `key`：为受信归属摘要
+    /// - `decision`：是经过校验的 allow/deny，不含依赖错误。
+    ///
+    /// 返回：容量足够时缓存到期值；不足时只跳过缓存，不改变本次授权决定。
     pub(crate) async fn store_decision(&self, key: [u8; 32], decision: OpaDecision) {
         let Some(cache) = &self.cache else {
             return;
         };
+        let budget = self.workspace_budget.get().and_then(Option::as_ref);
+        if !cache.entries.bind_budget(budget) {
+            return;
+        }
+        let Ok(lease) = budget.map(Budget::acquire).transpose() else {
+            return;
+        };
         let ttl = match decision {
-            OpaDecision::Allow { .. } => cache.allow_ttl,
+            OpaDecision::Allow {
+                ..
+            } => cache.allow_ttl,
             OpaDecision::Deny => cache.deny_ttl,
         };
+        let expires_at = Instant::now() + ttl;
         cache
             .entries
             .insert(
                 key,
                 CachedDecision {
+                    _workspace_lease: lease,
                     decision,
-                    expires_at: Instant::now() + ttl,
+                    expires_at,
                 },
+                expires_at,
             )
             .await;
     }
 
     /// 业务作用：按 allow/deny 分离 TTL，避免负决策与正决策具有相同陈旧窗口。
     ///
-    /// 参数说明：`decision` 是明确 OPA 结果。
+    /// 参数说明：
+    /// - `decision`：是明确 OPA 结果。
     ///
     /// 返回：返回当前 route cache 配置的对应 TTL；cache 关闭时返回零。
-    fn decision_ttl(&self, decision: &OpaDecision) -> Duration {
+    pub(crate) fn decision_ttl(&self, decision: &OpaDecision) -> Duration {
         let Some(cache) = &self.cache else {
             return Duration::ZERO;
         };
         match decision {
-            OpaDecision::Allow { .. } => cache.allow_ttl,
+            OpaDecision::Allow {
+                ..
+            } => cache.allow_ttl,
             OpaDecision::Deny => cache.deny_ttl,
         }
     }
 }
 
 impl Drop for OpaFlightGuard<'_> {
+    /// 业务作用：结束当前 OPA 合并请求并唤醒等待者，只删除仍属于本次执行的占位。
     fn drop(&mut self) {
         self.flight.finished.store(true, Ordering::Release);
         self.flight.notify.notify_waiters();
@@ -999,7 +1089,8 @@ impl Drop for OpaFlightGuard<'_> {
 impl OpaObligationPlan {
     /// 业务作用：一次性复验 OPA 副作用的 header 白名单、凭据禁区、冲突与资源预算。
     ///
-    /// 参数说明：`obligations` 是策略返回的完整副作用集合。
+    /// 参数说明：
+    /// - `obligations`：是策略返回的完整副作用集合。
     ///
     /// 返回：全部条目安全时成功；任一非法条目导致整次 decision 失败且调用方不得部分应用。
     fn validate(&self, obligations: &OpaObligations) -> Result<()> {
@@ -1059,7 +1150,8 @@ impl OpaObligations {
 
     /// 业务作用：在 OPA allow 后原子应用已验证的 request header mutations。
     ///
-    /// 参数说明：`headers` 是后续业务 filter 与 upstream 将读取的请求头。
+    /// 参数说明：
+    /// - `headers`：是后续业务 filter 与 upstream 将读取的请求头。
     ///
     /// 返回：构建期/解析期已验证，因此无失败分支；remove 先执行，set 后形成唯一最终值。
     pub(crate) fn apply_request(&self, headers: &mut HeaderMap) {
@@ -1068,7 +1160,8 @@ impl OpaObligations {
 
     /// 业务作用：在响应插件完成后、压缩前应用已验证的 response header mutations。
     ///
-    /// 参数说明：`headers` 是即将发送给下游的响应头。
+    /// 参数说明：
+    /// - `headers`：是即将发送给下游的响应头。
     ///
     /// 返回：构建期/解析期已验证，因此无失败分支；不会修改 hop-by-hop、凭据或 framing header。
     pub(crate) fn apply_response(&self, headers: &mut HeaderMap) {
@@ -1085,7 +1178,7 @@ impl OpaObligations {
     }
 }
 
-/// 检查 OPA 成功响应的 media type；允许 vendor `application/*+json`。
+/// 业务作用：检查 OPA 成功响应的 media type；允许 vendor `application/*+json`。
 pub(crate) fn response_is_json(headers: &HeaderMap) -> bool {
     let Some(value) = headers
         .get(CONTENT_TYPE)
@@ -1106,7 +1199,10 @@ pub(crate) fn response_is_json(headers: &HeaderMap) -> bool {
 
 /// 业务作用：有界收集 OPA decision JSON，并兼容代理链附加的 HTTP trailers。
 ///
-/// 参数说明：`body` 是 OPA 响应流；`headers` 用于 Content-Length 前置门；`max_bytes` 是 decision body 硬上限。
+/// 参数说明：
+/// - `body`：是 OPA 响应流
+/// - `headers`：用于 Content-Length 前置门
+/// - `max_bytes`：是 decision body 硬上限。
 ///
 /// 返回：返回完整 JSON 字节；trailers 被安全消费但不参与授权决定，防止尾部元数据绕过 JSON contract。
 pub(crate) async fn collect_response(
@@ -1192,6 +1288,7 @@ struct IncludedHeaders<'a> {
 }
 
 impl Serialize for IncludedHeaders<'_> {
+    /// 业务作用：只序列化 OPA 输入白名单允许的头部，避免外部授权引擎取得未授权凭据。
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -1214,6 +1311,7 @@ struct IncludedHeaderValues<'a> {
 }
 
 impl Serialize for IncludedHeaderValues<'_> {
+    /// 业务作用：只序列化 OPA 输入白名单允许的头部，避免外部授权引擎取得未授权凭据。
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -1234,6 +1332,7 @@ struct BoundedWriter {
 }
 
 impl BoundedWriter {
+    /// 业务作用：为 OPA 输入建立受字节上限约束的编码缓冲，容量门在追加过程中执行。
     fn new(max_bytes: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(max_bytes.min(4096)),
@@ -1244,6 +1343,7 @@ impl BoundedWriter {
 }
 
 impl Write for BoundedWriter {
+    /// 业务作用：在 OPA 输入序列化时检查总字节数，超限立即停止编码。
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
         let Some(next_len) = self.bytes.len().checked_add(input.len()) else {
             self.exceeded = true;
@@ -1257,6 +1357,7 @@ impl Write for BoundedWriter {
         Ok(input.len())
     }
 
+    /// 业务作用：完成内存编码器的刷新合同，不触发外部 I/O。
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -1306,7 +1407,9 @@ struct DistributedDecision {
 
 /// 业务作用：把 request body/claims 的 opt-in 配置编译为只读输入计划，并在换版前拒绝无界设置。
 ///
-/// 参数说明：`cfg` 是 route OPA 配置，`route_id` 提供错误定位。
+/// 参数说明：
+/// - `cfg`：是 route OPA 配置
+/// - `route_id`：提供错误定位。
 ///
 /// 返回：返回规范化 media type 集与资源上限；非法或无意义配置返回错误。
 fn compile_input_plan(cfg: &OpaAuthorizationCfg, route_id: &str) -> Result<OpaInputPlan> {
@@ -1346,7 +1449,9 @@ fn compile_input_plan(cfg: &OpaAuthorizationCfg, route_id: &str) -> Result<OpaIn
 
 /// 业务作用：编译 OPA obligation 白名单，提前排除凭据、hop-by-hop 与 framing header。
 ///
-/// 参数说明：`cfg` 是 obligation 配置，`route_id` 提供错误定位。
+/// 参数说明：
+/// - `cfg`：是 obligation 配置
+/// - `route_id`：提供错误定位。
 ///
 /// 返回：返回只读白名单与资源预算；危险、重复或越界名称返回错误。
 fn compile_obligation_plan(cfg: &OpaObligationsCfg, route_id: &str) -> Result<OpaObligationPlan> {
@@ -1392,7 +1497,10 @@ fn compile_obligation_plan(cfg: &OpaObligationsCfg, route_id: &str) -> Result<Op
 
 /// 业务作用：解析一组 header mutation allowlist，阻止 OPA 获得认证、连接或 framing 控制权。
 ///
-/// 参数说明：`raw` 是名称列表，`field`/`route_id` 仅用于错误定位。
+/// 参数说明：
+/// - `raw`：是名称列表
+/// - `field`：仅用于错误定位。
+/// - `route_id`：仅用于错误定位。
 ///
 /// 返回：返回规范化 HeaderName 集；危险、重复或非法名称返回错误。
 fn compile_mutation_headers(
@@ -1419,7 +1527,12 @@ fn compile_mutation_headers(
 
 /// 业务作用：验证一侧 header obligations 的名称、值、冲突及聚合预算。
 ///
-/// 参数说明：`headers` 是未信任结果，`allowlist`/`plan` 是 route 门；计数器与另一侧共享。
+/// 参数说明：
+/// - `headers`：OPA 返回但尚未信任的头部义务。
+/// - `allowlist`：当前路由允许修改的头名集合。
+/// - `plan`：当前路由的 OPA 安全与资源计划。
+/// - `entries`：请求与响应义务共用的条目计数。
+/// - `bytes`：请求与响应义务共用的字节计数。
 ///
 /// 返回：全部变更可原子应用时成功，否则返回 dependency error。
 fn validate_header_obligations(
@@ -1472,7 +1585,9 @@ fn validate_header_obligations(
 
 /// 业务作用：应用已经完整验证的 header 变更；remove 先于 set，避免多值残留和部分状态。
 ///
-/// 参数说明：`target` 是请求或响应头，`changes` 是可信 obligations。
+/// 参数说明：
+/// - `target`：是请求或响应头
+/// - `changes`：是可信 obligations。
 ///
 /// 返回：无；解析失败在先前验证后不可达，防御性跳过也不会放大权限。
 fn apply_header_obligations(target: &mut HeaderMap, changes: &HeaderObligations) {
@@ -1490,7 +1605,10 @@ fn apply_header_obligations(target: &mut HeaderMap, changes: &HeaderObligations)
 
 /// 业务作用：读取、验证并有界解包标准 OPA tar.gz bundle，形成尚未发布的候选策略材料。
 ///
-/// 参数说明：`cfg` 声明 bundle/签名/上限，`config_dir` 解析相对路径，`route_id` 定位错误。
+/// 参数说明：
+/// - `cfg`：声明 bundle/签名/上限
+/// - `config_dir`：解析相对路径
+/// - `route_id`：定位错误。
 ///
 /// 返回：签名、archive、manifest、Rego/data 全合法时返回候选；失败不会改变当前 snapshot。
 fn load_signed_bundle(
@@ -1505,7 +1623,7 @@ fn load_signed_bundle(
         bail!("route `{route_id}` OPA bundle resource bounds are invalid");
     }
     let source = resolve_bundle_path(config_dir, cfg.source.as_str())?;
-    let compressed = crate::bounded_io::read_file(
+    let compressed = crate::io::bounded_io::read_file(
         &source,
         cfg.max_bundle_bytes,
         &format!("route `{route_id}` OPA bundle"),
@@ -1592,7 +1710,11 @@ fn load_signed_bundle(
 
 /// 业务作用：验证 detached Ed25519 signature，防止未授权 bundle 在编译前进入候选策略。
 ///
-/// 参数说明：`bundle` 是原始压缩字节，`cfg`/`config_dir` 提供 key 与 signature SecretSource。
+/// 参数说明：
+/// - `bundle`：未改写的 bundle 原始压缩字节。
+/// - `cfg`：提供签名算法、密钥与签名来源的策略。
+/// - `config_dir`：SecretSource 相对路径解析根。
+/// - `route_id`：用于低敏错误定位的 route 标识。
 ///
 /// 返回：签名严格匹配时成功；长度、Base64、key 或签名错误均拒绝候选。
 fn verify_bundle_signature(
@@ -1601,12 +1723,12 @@ fn verify_bundle_signature(
     config_dir: &Path,
     route_id: &str,
 ) -> Result<()> {
-    let signature = crate::secret::resolve_text(
+    let signature = crate::security::secret::resolve_text(
         cfg.signature.as_str(),
         config_dir,
         &format!("route `{route_id}` OPA bundle signature"),
     )?;
-    let public_key = crate::secret::resolve_text(
+    let public_key = crate::security::secret::resolve_text(
         cfg.public_key.as_str(),
         config_dir,
         &format!("route `{route_id}` OPA bundle public key"),
@@ -1631,7 +1753,10 @@ fn verify_bundle_signature(
 #[cfg(feature = "opa-embedded")]
 /// 业务作用：把已验签 bundle 编译为可 clone 的 Regorus 模板，并在发布前验证 query 语法。
 ///
-/// 参数说明：`bundle` 是候选材料，`query` 是规则路径，`route_id` 定位错误。
+/// 参数说明：
+/// - `bundle`：是候选材料
+/// - `query`：是规则路径
+/// - `route_id`：定位错误。
 ///
 /// 返回：全部 module/data 编译成功时返回模板；任何 Rego/data/query 错误拒绝候选。
 fn build_embedded_engine(
@@ -1665,7 +1790,9 @@ fn build_embedded_engine(
 #[cfg(feature = "opa-embedded")]
 /// 业务作用：限制 embedded query 为 `data.<package>.<rule>` 静态路径，禁止请求期动态表达式扩权。
 ///
-/// 参数说明：`query` 是配置值，`route_id` 定位错误。
+/// 参数说明：
+/// - `query`：是配置值
+/// - `route_id`：定位错误。
 ///
 /// 返回：静态标识符路径合法时成功，否则拒绝候选。
 fn validate_embedded_query(query: &str, route_id: &str) -> Result<()> {
@@ -1691,7 +1818,11 @@ fn validate_embedded_query(query: &str, route_id: &str) -> Result<()> {
 
 /// 业务作用：把根或子目录 data.json 合并到 OPA data 文档，并拒绝类型冲突与覆盖。
 ///
-/// 参数说明：`root` 是累计 data，`path` 是 archive 路径，`value` 是当前 JSON，`route_id` 定位错误。
+/// 参数说明：
+/// - `root`：是累计 data
+/// - `path`：是 archive 路径
+/// - `value`：是当前 JSON
+/// - `route_id`：定位错误。
 ///
 /// 返回：无冲突合并成功；非对象中间节点、重复 key 或根非对象返回错误。
 fn merge_bundle_data(
@@ -1721,7 +1852,10 @@ fn merge_bundle_data(
 
 /// 业务作用：递归合并 OPA data object，拒绝后文件覆盖先前事实导致 archive 顺序依赖。
 ///
-/// 参数说明：`target` 是累计节点，`incoming` 是新节点，`route_id` 定位冲突。
+/// 参数说明：
+/// - `target`：是累计节点
+/// - `incoming`：是新节点
+/// - `route_id`：定位冲突。
 ///
 /// 返回：对象键互不冲突时成功；标量/数组重复或类型冲突返回错误。
 fn merge_json_object(
@@ -1746,7 +1880,9 @@ fn merge_json_object(
 
 /// 业务作用：拒绝 archive 绝对路径、父目录与平台前缀，防止 bundle 解包语义发生路径穿越。
 ///
-/// 参数说明：`path` 是 tar entry path，`route_id` 定位错误。
+/// 参数说明：
+/// - `path`：是 tar entry path
+/// - `route_id`：定位错误。
 ///
 /// 返回：仅包含当前目录/普通组件且最终非空时成功。
 fn validate_bundle_entry_path(path: &Path, route_id: &str) -> Result<()> {
@@ -1766,7 +1902,9 @@ fn validate_bundle_entry_path(path: &Path, route_id: &str) -> Result<()> {
 
 /// 业务作用：解析 bundle 本地依赖路径，禁止 URL 或空来源混入同步候选构建。
 ///
-/// 参数说明：`config_dir` 是根配置目录，`raw` 是配置 path。
+/// 参数说明：
+/// - `config_dir`：是根配置目录
+/// - `raw`：是配置 path。
 ///
 /// 返回：返回绝对或相对解析路径；空值与 URL 返回错误。
 fn resolve_bundle_path(config_dir: &Path, raw: &str) -> Result<PathBuf> {
@@ -1783,12 +1921,14 @@ fn resolve_bundle_path(config_dir: &Path, raw: &str) -> Result<PathBuf> {
 
 /// 业务作用：收集 OPA bundle、签名、公钥与外部凭据文件依赖，使独立替换也进入同一原子 reload。
 ///
-/// 参数说明：`config_dir` 是根配置目录，`cfg` 是 route OPA 配置。
+/// 参数说明：
+/// - `config_dir`：是根配置目录
+/// - `cfg`：是 route OPA 配置。
 ///
 /// 返回：返回不含 secret 内容的文件路径；literal/env source 不产生路径。
 pub(crate) fn dependency_paths(config_dir: &Path, cfg: &OpaAuthorizationCfg) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(4);
-    if let Some(path) = crate::secret::dependency_path(&cfg.authorization, config_dir) {
+    if let Some(path) = crate::security::secret::dependency_path(&cfg.authorization, config_dir) {
         paths.push(path);
     }
     if let Some(bundle) = &cfg.bundle {
@@ -1801,7 +1941,7 @@ pub(crate) fn dependency_paths(config_dir: &Path, cfg: &OpaAuthorizationCfg) -> 
             });
         }
         for secret in [&bundle.signature, &bundle.public_key] {
-            if let Some(path) = crate::secret::dependency_path(secret, config_dir) {
+            if let Some(path) = crate::security::secret::dependency_path(secret, config_dir) {
                 paths.push(path);
             }
         }
@@ -1811,7 +1951,9 @@ pub(crate) fn dependency_paths(config_dir: &Path, cfg: &OpaAuthorizationCfg) -> 
 
 /// 业务作用：对可选 JSON 输入做无歧义流式哈希，确保 claims/body 变化必然形成不同 decision key。
 ///
-/// 参数说明：`hasher` 是当前 key 摘要，`value` 为可选可信 JSON。
+/// 参数说明：
+/// - `hasher`：是当前 key 摘要
+/// - `value`：为可选可信 JSON。
 ///
 /// 返回：序列化成功时更新摘要；理论编码错误映射为本地输入错误。
 fn hash_optional_json(
@@ -1832,11 +1974,13 @@ fn hash_optional_json(
 struct DigestWriter<'a>(&'a mut Sha256);
 
 impl Write for DigestWriter<'_> {
+    /// 业务作用：把策略身份相关字节直接送入摘要，避免为计算缓存身份再保存一份完整输入。
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.0.update(bytes);
         Ok(bytes.len())
     }
 
+    /// 业务作用：完成摘要写入接口的刷新合同，不改变已累计的策略身份。
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -1844,7 +1988,8 @@ impl Write for DigestWriter<'_> {
 
 /// 业务作用：生成不含原始身份/输入的稳定十六进制摘要，可安全用作 DynamicStore key。
 ///
-/// 参数说明：`bytes` 是固定长度密码学摘要。
+/// 参数说明：
+/// - `bytes`：是固定长度密码学摘要。
 ///
 /// 返回：返回小写十六进制字符串。
 fn hex_digest(bytes: &[u8]) -> String {
@@ -1858,7 +2003,10 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 /// 业务作用：验证 DynamicStore collection 组件，阻止分隔符注入其它业务命名空间。
 ///
-/// 参数说明：`value` 是 collection，`field`/`route_id` 定位错误。
+/// 参数说明：
+/// - `value`：是 collection
+/// - `field`：定位错误。
+/// - `route_id`：定位错误。
 ///
 /// 返回：1..=128 的安全 ASCII 组件成功，否则返回错误。
 fn validate_store_component(value: &str, field: &str, route_id: &str) -> Result<()> {
@@ -1900,6 +2048,7 @@ fn unix_millis() -> Result<u64> {
         .min(u128::from(u64::MAX)) as u64)
 }
 
+/// 业务作用：冻结 OPA 固定调用目标，拒绝不支持协议或客户端可控目的地。
 fn compile_target(target: &str, path: &str, route_id: &str) -> Result<(String, String)> {
     let path = parse_policy_path(path, route_id)?;
     if let Some(service) = target.strip_prefix("lb://") {
@@ -1932,6 +2081,7 @@ fn compile_target(target: &str, path: &str, route_id: &str) -> Result<(String, S
     ))
 }
 
+/// 业务作用：校验 OPA Data API 路径，明确目标策略而不开放任意外部接口。
 fn parse_policy_path(path: &str, route_id: &str) -> Result<String> {
     if path.is_empty()
         || path.len() > MAX_OPA_PATH_BYTES
@@ -1951,6 +2101,7 @@ fn parse_policy_path(path: &str, route_id: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
+/// 业务作用：编译 OPA 调用允许附带的头部，禁止覆盖传输关键字段。
 fn compile_headers(raw: &[String], route_id: &str) -> Result<Vec<HeaderName>> {
     if raw.len() > MAX_OPA_HEADERS {
         bail!(
@@ -1976,6 +2127,7 @@ fn compile_headers(raw: &[String], route_id: &str) -> Result<Vec<HeaderName>> {
     Ok(headers)
 }
 
+/// 业务作用：识别授权输出允许修改的头名，保护认证、分帧和连接语义。
 fn opa_header_is_safe(name: &HeaderName) -> bool {
     !matches!(
         name.as_str(),
@@ -1999,6 +2151,7 @@ fn opa_header_is_safe(name: &HeaderName) -> bool {
     )
 }
 
+/// 业务作用：限制策略修订标识的格式，使缓存身份与观测标签保持有界。
 fn validate_policy_revision(value: &str, route_id: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > MAX_OPA_POLICY_REVISION_BYTES
@@ -2011,6 +2164,7 @@ fn validate_policy_revision(value: &str, route_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：把策略目标、修订和输入权限绑定到缓存域，防止不同授权合同复用旧决定。
 fn policy_salt(
     upstream: &str,
     path: &str,
@@ -2035,6 +2189,7 @@ fn policy_salt(
     hasher.finalize().into()
 }
 
+/// 业务作用：为摘要输入添加字段边界，避免不同策略字段拼接成相同缓存身份。
 fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);

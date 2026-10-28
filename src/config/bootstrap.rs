@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 
 /// 最低运行默认:能监听、无路由(请求 404),operator 按需加 routes。
 const DEFAULT_GATEWAY_YML: &str = r#"# 默认主配置(启动自举生成的最低运行默认)。改此文件即热更;或 `naway -s reload`。
-# 配置 schema 版本(架构规范 §6):便于长期演进期迁移;缺省按 v1 处理并告警。
+# 配置 schema 版本:便于长期演进期迁移;缺省按 v1 处理并告警。
 schema_version: 1
 
 server:
@@ -133,7 +133,7 @@ server:
 #           default: true
 #           upstream: "10.0.0.31:9092"
 
-# 管理/观测面(只绑内网,与数据面端口隔离):/healthz /readyz(+ 后续 /metrics、admin API)。
+# 管理/观测面与数据面端口隔离，提供 /healthz、/readyz、/metrics 和 admin API。
 admin:
   listen: "127.0.0.1:18080"
   expose_metrics: true
@@ -183,7 +183,7 @@ access_log:
   #     index: gateway-access
   # Kafka 需使用 `--features log-kafka` 构建，并配置 bootstrap_servers/topic/lane。
 
-# V5 OpenTelemetry。关闭导出时仍生成 W3C trace-id 并向上游传播；启用后用有界批处理，
+# OpenTelemetry。关闭导出时仍生成 W3C trace-id 并向上游传播；启用后用有界批处理，
 # collector 故障不反压数据面。以下字段属于 bootstrap 层，修改后需重启。
 telemetry:
   enabled: false
@@ -205,15 +205,16 @@ long_connections:
   drain_on_config_change: false
   drain_grace_ms: 0
 
-# V3 nginx set/map/变量系统。默认不开放任意 header/query,避免高基数或敏感字段误用。
+# nginx set/map/变量系统。默认不开放任意 header/query,避免高基数或敏感字段误用。
 variables:
   allow_headers: []
   allow_queries: []
   set: {}
   maps: []
 
-# V2/V7 动态服务发现。所有远端 I/O 都在后台 worker；请求路径只读本地不可变实例快照。
+# 动态服务发现。所有远端 I/O 都在后台 worker；请求路径只读本地不可变实例快照。
 discovery:
+  enabled: false # 服务发现总开关；启用动态后端时同时开启，静态上游不需要
   nacos:
     enabled: false
     server_addr: ""
@@ -275,7 +276,7 @@ discovery:
     max_response_bytes: 4194304
     max_instances: 1024
 
-# V7 Kubernetes 路由控制器。复用 discovery.kubernetes 的 API/凭据；对象先原子物化，
+# Kubernetes 路由控制器。复用 discovery.kubernetes 的 API/凭据；对象先原子物化，
 # 再经唯一 reload worker 完整校验和 ArcSwap 发布，不允许在数据面直接解释 K8s JSON。
 kubernetes_routes:
   enabled: false
@@ -304,8 +305,9 @@ kubernetes_routes:
   max_objects: 4096
   max_routes: 4096
 
-# V4 统一配置来源。默认关闭;启用后 watch Nacos 配置中心三份 yml,坏配置不上线。
+# 统一配置来源。默认关闭;启用后 watch Nacos 配置中心三份 yml,坏配置不上线。
 config_source:
+  enabled: false # 远端配置输入总开关；本地文件热更与 Admin 不受影响
   nacos:
     enabled: false
     server_addr: ""
@@ -377,13 +379,13 @@ interface_guard_file: "interface-guard.yml"
 # Sentinel 流量防护独立规则(相对本文件目录或绝对路径)。
 sentinel_rules_file: "sentinel-rules.yml"
 
-# V7 套餐目录。consumer 只能来自已验证的 Basic/JWT/API-Key 身份；Redis limiter 可把
+# 套餐目录。consumer 只能来自已验证的 Basic/JWT/API-Key 身份；Redis limiter 可把
 # 额度变成跨节点一致状态。route 没有 usage_plan 时不会构造配额 key。
 usage_plans:
   plans: {}
   consumers: {}
 
-# V7 开发者门户默认关闭。OpenAPI 在 build/reload 阶段有界导入并物化普通 route；key
+# 开发者门户默认关闭。OpenAPI 在 build/reload 阶段有界导入并物化普通 route；key
 # 申请只写 pending 记录，不在公网路径直接签发 secret。Redis 后端用单条 Lua 原子守住
 # max_pending，file 后端用进程内写锁守住，不能用 list + put 拼接 admission。
 developer_portal:
@@ -422,17 +424,17 @@ upstreams:
 #       - "Method=GET,POST"
 #     filters:
 #       - "StripPrefix=1"
-#       # V5 响应压缩：未知长度保持流式，不会为 min_length 聚合 body；默认 br 优先。
+#       # 响应压缩：未知长度保持流式，不会为 min_length 聚合 body；默认 br 优先。
 #       - "compression algorithms=br,gzip min_length=1k types=text/*,application/json gzip_level=6 brotli_quality=5 chunk_bytes=16k"
-#       # V5 公共 L1/L2 缓存：最多复制 1MiB 未压缩实体；Redis L2 需上方 backend=redis。
+#       # 公共 L1/L2 缓存：最多复制 1MiB 未压缩实体；Redis L2 需上方 backend=redis。
 #       - "proxy_cache public=true ttl_ms=60000 stale_while_revalidate_ms=0 ttl_jitter_percent=10 max_body_bytes=1m max_entries=10000 statuses=200 vary=Accept-Language l2=false singleflight=true singleflight_wait_ms=1000 max_inflight=1024"
-#     # V5 OpenAPI/JSON Schema 显式慢路径。只有 body schema 才聚合正文，且上限必填；
+#     # OpenAPI/JSON Schema 显式慢路径。只有 body schema 才聚合正文，且上限必填；
 #     # schema 在 reload/build 时编译，外部 $ref 被拒绝。也可改用 head_schema/body_schema(_file)。
 #     request_validation:
 #       openapi_file: "api/openapi.yml"
 #       operation_id: "createOrder"
 #       max_body_bytes: 1048576
-#   # V7 GraphQL：只在显式 route 上有界解析；fragment 每次展开重复计费。
+#   # GraphQL：只在显式 route 上有界解析；fragment 每次展开重复计费。
 #   # 支持 GET query、POST application/json 与 application/graphql；multipart/subscription
 #   # transport 尚未实现。degraphql 是下面单独的、固定 query 的 REST 映射终端。
 #   - id: graphql
@@ -446,7 +448,7 @@ upstreams:
 #       max_depth: 16
 #       max_complexity: 1000
 #       allow_introspection: false
-#   # V7 degraphql：客户端只能填显式 path/query/header/literal variables，不能上传 query。
+#   # degraphql：客户端只能填显式 path/query/header/literal variables，不能上传 query。
 #   # JSON envelope 在 max_body_bytes 内一次生成；固定 query/operation 在 reload 时校验。
 #   - id: rest-to-graphql
 #     uri: "${GW_GRAPHQL_UPSTREAM:http://127.0.0.1:4000}"
@@ -481,7 +483,7 @@ upstreams:
 #       request_timeout_ms: 3000
 #       max_idle_connections: 8
 #       attachments: { tenant: "env://GW_DUBBO_TENANT" }
-#   # V7 稳定加权灰度：同组成员必须有完全相同的非 Weight predicates 和 order；基于
+#   # 稳定加权灰度：同组成员必须有完全相同的非 Weight predicates 和 order；基于
 #   # request-id 做稳定 hash，无每请求候选 Vec/随机数。组至少两条、每组最多 32 条。
 #   - id: release-stable
 #     uri: lb://stable
@@ -549,7 +551,7 @@ upstreams:
 #   #     max_bundle_bytes: 8388608
 #   #     max_expanded_bytes: 33554432
 #   #     max_files: 256
-#   # V7 内嵌 Casbin RBAC/ABAC。model/policy 热更重建整个只读 Enforcer，旧快照
+#   # 内嵌 Casbin RBAC/ABAC。model/policy 热更重建整个只读 Enforcer，旧快照
 #   # 不被就地修改。consumer 只取本地已验认证结果；header:* 永远是不可信 ABAC 属性。
 #   - id: casbin-protected
 #     uri: "${GW_PROTECTED_UPSTREAM:http://127.0.0.1:9002}"
@@ -674,7 +676,7 @@ routes: []
 
 /// 空守卫默认:不拦任何接口,operator 按需加 rules。
 const DEFAULT_INTERFACE_GUARD_YML: &str = r#"# 接口级拦截(启动自举生成的最低运行默认)。rules 空 = 不拦任何接口;按需添加。
-# 配置 schema 版本(§6);缺省按 v1 处理并告警。
+# 配置 schema 版本;缺省按 v1 处理并告警。
 schema_version: 1
 
 # 未单独配 response 的规则用的默认响应。
@@ -728,7 +730,7 @@ flow: []
 degrade: []
 "#;
 
-/// 确保配置目录与所需 yml 齐全,缺失则新建最低运行默认。在 `load_snapshot` 之前调用。
+/// 业务作用：确保配置目录与所需 yml 齐全,缺失则新建最低运行默认。在 `load_snapshot` 之前调用。
 pub fn ensure(cfg_path: &Path) -> Result<()> {
     // 1. 配置目录不存在则创建(便于「首次挂空目录 / 全新机器」直接起)。
     if let Some(dir) = cfg_path.parent() {
@@ -765,7 +767,7 @@ pub fn ensure(cfg_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 只在文件不存在时写入(create_new 语义:并发/竞态下也不会覆盖已存在文件)。
+/// 业务作用：只在文件不存在时写入(create_new 语义:并发/竞态下也不会覆盖已存在文件)。
 fn write_new(path: &Path, content: &str) -> Result<()> {
     use std::io::Write;
     match std::fs::OpenOptions::new()
@@ -784,7 +786,8 @@ fn write_new(path: &Path, content: &str) -> Result<()> {
 
 /// 业务作用：从已存在的主配置读取 `interface_guard_file`，失败时让启动流程使用安全默认文件名。
 ///
-/// 参数说明：`cfg_path` 是主配置路径。
+/// 参数说明：
+/// - `cfg_path`：是主配置路径。
 ///
 /// 返回：naml 成功解析且字段为字符串时返回文件名，否则返回 `None`。
 fn guard_file_name(cfg_path: &Path) -> Option<String> {
@@ -793,7 +796,9 @@ fn guard_file_name(cfg_path: &Path) -> Option<String> {
 
 /// 业务作用：通过统一 naml loader 读取主配置中的字符串文件引用，避免 bootstrap 自造解析语义。
 ///
-/// 参数说明：`cfg_path` 是主配置路径；`key` 是待读取的顶层配置键。
+/// 参数说明：
+/// - `cfg_path`：是主配置路径
+/// - `key`：是待读取的顶层配置键。
 ///
 /// 返回：字段存在且为字符串时返回其值；文件、profile、占位符或字段解析失败时返回 `None`。
 fn configured_file_name(cfg_path: &Path, key: &str) -> Option<String> {

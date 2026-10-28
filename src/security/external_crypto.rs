@@ -85,7 +85,8 @@ pub struct ExternalEnvelopePlan {
 impl std::fmt::Debug for ExternalCryptoProvider {
     /// 业务作用：提供不含 endpoint path、认证值、CA 或客户端私钥的低敏诊断。
     ///
-    /// 参数说明：`formatter` 是标准格式化目标。
+    /// 参数说明：
+    /// - `formatter`：是标准格式化目标。
     ///
     /// 返回：只输出算法数量与公开资源预算。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -112,7 +113,8 @@ pub struct ExternalPrivateKeyPlan {
 impl PartialEq for ExternalPrivateKeyPlan {
     /// 业务作用：按非敏感内容身份比较外部 signer 计划，使配置热更能识别 provider 或 key 变化。
     ///
-    /// 参数说明：`other` 是候选 signer 计划。
+    /// 参数说明：
+    /// - `other`：是候选 signer 计划。
     ///
     /// 返回：provider、key reference 与算法集合一致时为 true。
     fn eq(&self, other: &Self) -> bool {
@@ -125,7 +127,8 @@ impl Eq for ExternalPrivateKeyPlan {}
 impl std::fmt::Debug for ExternalPrivateKeyPlan {
     /// 业务作用：避免 key identity 或 provider endpoint 进入 TLS 配置诊断。
     ///
-    /// 参数说明：`formatter` 是标准格式化目标。
+    /// 参数说明：
+    /// - `formatter`：是标准格式化目标。
     ///
     /// 返回：仅输出 signature scheme 集合。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -162,7 +165,8 @@ struct KeylessDispatcher {
 impl std::fmt::Debug for KeylessDispatcher {
     /// 业务作用：提供不暴露 provider 与 key identity 的签名桥运行态诊断。
     ///
-    /// 参数说明：`formatter` 是标准格式化目标。
+    /// 参数说明：
+    /// - `formatter`：是标准格式化目标。
     ///
     /// 返回：只输出 deadline 与输入字节上限。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -184,7 +188,8 @@ struct ExternalSigningKey {
 impl std::fmt::Debug for ExternalSigningKey {
     /// 业务作用：输出 TLS 协商算法而不暴露 provider、key identity 或证书公钥字节。
     ///
-    /// 参数说明：`formatter` 是标准格式化目标。
+    /// 参数说明：
+    /// - `formatter`：是标准格式化目标。
     ///
     /// 返回：仅输出允许的 signature scheme。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -203,7 +208,8 @@ struct ExternalSigner {
 impl std::fmt::Debug for ExternalSigner {
     /// 业务作用：只暴露本次 TLS 已选择的公开签名算法。
     ///
-    /// 参数说明：`formatter` 是标准格式化目标。
+    /// 参数说明：
+    /// - `formatter`：是标准格式化目标。
     ///
     /// 返回：不包含 message、签名或远程 key 信息。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -217,7 +223,8 @@ impl std::fmt::Debug for ExternalSigner {
 impl SigningKey for ExternalSigningKey {
     /// 业务作用：只从 provider 与证书共同允许的算法中选择客户端已声明支持的方案。
     ///
-    /// 参数说明：`offered` 是客户端提供的 signature schemes，顺序不改变服务端 allowlist。
+    /// 参数说明：
+    /// - `offered`：是客户端提供的 signature schemes，顺序不改变服务端 allowlist。
     ///
     /// 返回：找到交集时返回同步签名桥；没有安全交集时拒绝该证书身份。
     fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
@@ -235,7 +242,7 @@ impl SigningKey for ExternalSigningKey {
 
     /// 业务作用：向 rustls 提供证书内同一 SPKI，使其可在发布前复验证书与外部 key 身份。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回从叶证书解析的公开 SPKI，不触及私钥。
     fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
@@ -244,7 +251,7 @@ impl SigningKey for ExternalSigningKey {
 
     /// 业务作用：声明外部 key 的公钥算法族，约束 rustls 的签名协商。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回构建期从全部 scheme 一致推导的算法族。
     fn algorithm(&self) -> SignatureAlgorithm {
@@ -255,7 +262,8 @@ impl SigningKey for ExternalSigningKey {
 impl Signer for ExternalSigner {
     /// 业务作用：把 rustls 待签名 message 投递到有界专用 worker，并在 deadline 内等待远程结果。
     ///
-    /// 参数说明：`message` 是 rustls 生成的握手签名输入，长度受 provider 配置硬门约束。
+    /// 参数说明：
+    /// - `message`：是 rustls 生成的握手签名输入，长度受 provider 配置硬门约束。
     ///
     /// 返回：队列、熔断、deadline、provider 或签名格式失败时拒绝握手；绝不回退本地私钥。
     fn sign(&self, message: &[u8]) -> std::result::Result<Vec<u8>, TlsError> {
@@ -289,7 +297,7 @@ impl Signer for ExternalSigner {
 
     /// 业务作用：向 rustls 报告本 signer 固定使用的公开 signature scheme。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回构建期冻结且客户端已提供的 scheme。
     fn scheme(&self) -> SignatureScheme {
@@ -300,7 +308,8 @@ impl Signer for ExternalSigner {
 impl ExternalPrivateKeyPlan {
     /// 业务作用：为一张叶证书建立固定大小 worker pool 和有界同步桥，远程调用不占用 Tokio worker。
     ///
-    /// 参数说明：`public_key` 必须来自将与该 signer 绑定的叶证书 SPKI。
+    /// 参数说明：
+    /// - `public_key`：必须来自将与该 signer 绑定的叶证书 SPKI。
     ///
     /// 返回：返回 rustls SigningKey；worker/runtime 创建失败时拒绝 TLS 候选。
     pub fn signing_key(
@@ -363,7 +372,10 @@ impl ExternalPrivateKeyPlan {
 impl ExternalCryptoProvider {
     /// 业务作用：调用不导出私钥的远程 signer，并落实并发、deadline、算法 allowlist 与熔断。
     ///
-    /// 参数说明：`key_id` 是 provider 固定引用；`scheme` 是 TLS 算法；`message` 是原始签名输入。
+    /// 参数说明：
+    /// - `key_id`：是 provider 固定引用
+    /// - `scheme`：是 TLS 算法
+    /// - `message`：是原始签名输入。
     ///
     /// 返回：合法有界签名成功；依赖、协议、Base64 或预算失败返回低敏错误。
     pub async fn sign(
@@ -389,7 +401,10 @@ impl ExternalCryptoProvider {
 
     /// 业务作用：请求 provider 解开 envelope ciphertext，明文只返回给候选构建者且不进入日志。
     ///
-    /// 参数说明：`key_id` 固定 KEK；`ciphertext` 是受限密文；`aad` 绑定配置上下文。
+    /// 参数说明：
+    /// - `key_id`：固定 KEK
+    /// - `ciphertext`：是受限密文
+    /// - `aad`：绑定配置上下文。
     ///
     /// 返回：provider 成功时返回有界明文；任何依赖或协议错误失败闭合。
     pub async fn decrypt(&self, key_id: &str, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
@@ -406,7 +421,10 @@ impl ExternalCryptoProvider {
 
     /// 业务作用：请求 provider 使用不可导出的 key 封装明文，供控制面生成 envelope ciphertext。
     ///
-    /// 参数说明：`key_id` 固定 KEK；`plaintext` 是有界敏感值；`aad` 绑定使用上下文。
+    /// 参数说明：
+    /// - `key_id`：固定 KEK
+    /// - `plaintext`：是有界敏感值
+    /// - `aad`：绑定使用上下文。
     ///
     /// 返回：provider 成功时返回有界密文；任何依赖或协议错误失败闭合。
     pub async fn encrypt(&self, key_id: &str, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
@@ -423,7 +441,13 @@ impl ExternalCryptoProvider {
 
     /// 业务作用：执行单次已冻结的密码操作，共享并发门与熔断状态。
     ///
-    /// 参数说明：operation/key/algorithm/input/aad 已由上层冻结；`max_output_bytes` 限制解码结果。
+    /// 参数说明：
+    /// - `operation`：上层冻结且已经授权的加密或签名动作。
+    /// - `key_id`：上层冻结的远端密钥标识。
+    /// - `algorithm`：与密钥和动作相容的算法。
+    /// - `input`：受输入预算约束的请求字节。
+    /// - `aad`：绑定业务来源的附加认证数据。
+    /// - `max_output_bytes`：解码后输出字节硬上限。
     ///
     /// 返回：依赖可用且响应成功、格式正确、大小有界时返回结果；失败更新熔断状态。
     async fn operation(
@@ -508,8 +532,16 @@ impl ExternalCryptoProvider {
     /// 业务作用：按固定 HTTPS endpoint 执行远程密码操作，严格解析
     /// `{result_base64}` 响应契约。
     ///
-    /// 参数说明：`client`/`endpoint`/`authorization` 是冻结传输；operation、key、
-    /// algorithm、input 与 aad 是已校验请求；`max_output_bytes` 限制解码结果。
+    /// 参数说明：
+    /// - `client`：固定 TLS 与超时策略的 HTTP 客户端。
+    /// - `endpoint`：构建期冻结的加密服务 endpoint。
+    /// - `authorization`：构建期冻结的服务认证材料。
+    /// - `operation`：已经授权的加密或签名动作。
+    /// - `key_id`：已经授权的远端密钥标识。
+    /// - `algorithm`：与密钥和动作相容的算法。
+    /// - `input`：受输入预算约束的请求字节。
+    /// - `aad`：绑定业务来源的附加认证数据。
+    /// - `max_output_bytes`：解码后输出字节硬上限。
     ///
     /// 返回：deadline 内收到成功 JSON 且 Base64 结果非空、有界时返回字节，
     /// 传输、类型、编码或资源门不满足时失败闭合。
@@ -607,8 +639,10 @@ impl Pkcs11Provider {
     /// 业务作用：从固定 session 池独占一个 HSM session 完成 TLS 签名，
     /// 避免同一 PKCS#11 session 被并发使用。
     ///
-    /// 参数说明：`key_id` 是精确 private-key label；`scheme` 是已冻结 TLS 算法；
-    /// `message` 是 rustls 待签名原文。
+    /// 参数说明：
+    /// - `key_id`：是精确 private-key label
+    /// - `scheme`：是已冻结 TLS 算法
+    /// - `message`：是 rustls 待签名原文。
     ///
     /// 返回：在 deadline 内取得 session、唯一命中 key 且 HSM 签名成功时返回
     /// TLS 所需格式；任何歧义、算法错配或 session 异常均失败闭合。
@@ -647,8 +681,9 @@ impl Pkcs11Provider {
 
     /// 业务作用：在发布 TLS 候选前确认 key label 唯一且公钥类型覆盖所有算法。
     ///
-    /// 参数说明：`key_id` 是精确 private-key label；`schemes` 是该证书允许的 TLS
-    /// signature scheme 集合。
+    /// 参数说明：
+    /// - `key_id`：是精确 private-key label
+    /// - `schemes`：是该证书允许的 TLS signature scheme 集合。
     ///
     /// 返回：所有算法均与唯一 key 类型匹配时成功；不读取任何私钥属性或值。
     fn validate_key(&self, key_id: &str, schemes: &[SignatureScheme]) -> Result<()> {
@@ -663,8 +698,10 @@ impl Pkcs11Provider {
 
     /// 业务作用：将证书 SPKI 与 HSM 内同一 key pair 的公开属性做密码身份对照。
     ///
-    /// 参数说明：`key_id` 是 private-key label；`spki_der` 来自待发布叶证书；`schemes`
-    /// 是该身份允许的 TLS signature scheme 集合。
+    /// 参数说明：
+    /// - `key_id`：是 private-key label
+    /// - `spki_der`：来自待发布叶证书
+    /// - `schemes`：是该身份允许的 TLS signature scheme 集合。
     ///
     /// 返回：唯一 private/public object 共享非空 `CKA_ID`，且 RSA 参数或 EC
     /// curve/point 与证书完全一致时成功；不读取私钥值。
@@ -694,7 +731,8 @@ impl Pkcs11Provider {
 
     /// 业务作用：为一次 HSM 操作独占 session，并在成功或失败后归还池中。
     ///
-    /// 参数说明：`operation` 在独占 session 上执行一次有界业务操作。
+    /// 参数说明：
+    /// - `operation`：在独占 session 上执行一次有界业务操作。
     ///
     /// 返回：取得 session 且运算完成时返回结果；排队超时或 session 无法归还时
     /// 视为 provider 不可用。
@@ -724,7 +762,9 @@ struct Pkcs11PrivateKey {
 
 /// 业务作用：按精确 label 查找唯一可签名私钥，防止 token 内同名 key 导致身份漂移。
 ///
-/// 参数说明：`session` 是已登录的独占 session；`key_id` 是配置固定 label。
+/// 参数说明：
+/// - `session`：是已登录的独占 session
+/// - `key_id`：是配置固定 label。
 ///
 /// 返回：恰好一个 `CKO_PRIVATE_KEY` 且 `CKA_SIGN=true` 时返回 handle、公开 key type 与
 /// 非敏感 `CKA_ID`；缺失、重名或身份属性不可读时拒绝。
@@ -784,7 +824,9 @@ fn find_pkcs11_private_key(
 
 /// 业务作用：按 private key 的非空 `CKA_ID` 查找唯一公钥对象，作为证书身份对照根。
 ///
-/// 参数说明：`session` 是已登录独占 session；`id` 来自已唯一命中的 private key。
+/// 参数说明：
+/// - `session`：是已登录独占 session
+/// - `id`：来自已唯一命中的 private key。
 ///
 /// 返回：恰好一个 `CKO_PUBLIC_KEY` 共享 ID 时返回 handle；缺失或重名时拒绝身份。
 #[cfg(feature = "pkcs11")]
@@ -819,8 +861,10 @@ fn find_pkcs11_public_key(
 
 /// 业务作用：核对 HSM RSA 公钥参数与证书 SPKI，确保不可导出私钥引用属于该证书身份。
 ///
-/// 参数说明：`session` 是独占 session；`public` 是同 `CKA_ID` 的唯一公钥；`spki_der`
-/// 是叶证书的完整 SPKI DER。
+/// 参数说明：
+/// - `session`：是独占 session
+/// - `public`：是同 `CKA_ID` 的唯一公钥
+/// - `spki_der`：是叶证书的完整 SPKI DER。
 ///
 /// 返回：SPKI 为 `rsaEncryption` 且 modulus/exponent 与 HSM 完全一致时成功；缺失属性、非规范
 /// SPKI 或参数错位时拒绝候选。
@@ -886,8 +930,12 @@ fn validate_pkcs11_rsa_spki(
 
 /// 业务作用：核对 HSM EC/Edwards 曲线与公钥点和证书 SPKI，阻止同类型不同曲线或不同 key 被发布。
 ///
-/// 参数说明：`session` 是独占 session；`public` 是同 `CKA_ID` 的唯一公钥；`spki_der` 是证书
-/// SPKI；`schemes` 是配置 allowlist；`edwards` 区分 Ed25519 与 NIST ECDSA。
+/// 参数说明：
+/// - `session`：是独占 session
+/// - `public`：是同 `CKA_ID` 的唯一公钥
+/// - `spki_der`：是证书 SPKI
+/// - `schemes`：是配置 allowlist
+/// - `edwards`：区分 Ed25519 与 NIST ECDSA。
 ///
 /// 返回：算法 OID、命名曲线、scheme、点长度和点值全部一致时成功；压缩点、错曲线或身份错位时拒绝。
 #[cfg(feature = "pkcs11")]
@@ -1019,7 +1067,8 @@ fn validate_pkcs11_ec_spki(
 
 /// 业务作用：规范比较 ASN.1 INTEGER 与 PKCS#11 无符号整数，忽略只为正数符号添加的前导零。
 ///
-/// 参数说明：`value` 是 big-endian modulus 或 exponent。
+/// 参数说明：
+/// - `value`：是 big-endian modulus 或 exponent。
 ///
 /// 返回：非空且非全零时返回去除前导零的切片；无效整数拒绝身份对照。
 #[cfg(feature = "pkcs11")]
@@ -1033,7 +1082,9 @@ fn normalized_unsigned_integer(value: &[u8]) -> Result<&[u8]> {
 
 /// 业务作用：兼容 PKCS#11 标准 DER OCTET STRING 与少数 module 的原始 EC point 表示，形成唯一比较值。
 ///
-/// 参数说明：`value` 是 `CKA_EC_POINT`；`expected_len` 由已冻结曲线确定。
+/// 参数说明：
+/// - `value`：是 `CKA_EC_POINT`
+/// - `expected_len`：由已冻结曲线确定。
 ///
 /// 返回：长度精确的原始 point；其它编码、长长度形式或大小错位均拒绝。
 #[cfg(feature = "pkcs11")]
@@ -1052,7 +1103,9 @@ fn normalized_pkcs11_ec_point(value: &[u8], expected_len: usize) -> Result<&[u8]
 
 /// 业务作用：校验 HSM key 类型与 TLS signature scheme 的公钥族一致性。
 ///
-/// 参数说明：`key_type` 来自 `CKA_KEY_TYPE`；`scheme` 来自已校验配置。
+/// 参数说明：
+/// - `key_type`：来自 `CKA_KEY_TYPE`
+/// - `scheme`：来自已校验配置。
 ///
 /// 返回：RSA、EC 或 EC Edwards 精确匹配时成功，跨族使用时拒绝。
 #[cfg(feature = "pkcs11")]
@@ -1077,7 +1130,8 @@ fn ensure_pkcs11_key_type(
 
 /// 业务作用：把 TLS signature scheme 映射为包含消息摘要的 PKCS#11 mechanism。
 ///
-/// 参数说明：`scheme` 是 provider 与证书共同允许的 TLS 算法。
+/// 参数说明：
+/// - `scheme`：是 provider 与证书共同允许的 TLS 算法。
 ///
 /// 返回：返回与 rustls 原始待签名 message 匹配的标准 mechanism，其它算法失败闭合。
 #[cfg(feature = "pkcs11")]
@@ -1114,7 +1168,9 @@ fn pkcs11_mechanism(scheme: SignatureScheme) -> Result<cryptoki::mechanism::Mech
 
 /// 业务作用：把 PKCS#11 ECDSA 的 `r || s` 字节串转为 TLS 要求的 DER SEQUENCE。
 ///
-/// 参数说明：`raw` 必须是等长、非空的 r 与 s 串联值；`component_bytes` 由 TLS 曲线固定。
+/// 参数说明：
+/// - `raw`：必须是等长、非空的 r 与 s 串联值
+/// - `component_bytes`：由 TLS 曲线固定。
 ///
 /// 返回：两个正整数都可规范编码时返回短长度 DER；奇数、空值或超界输入拒绝。
 #[cfg(feature = "pkcs11")]
@@ -1141,7 +1197,8 @@ fn pkcs11_ecdsa_signature_to_der(raw: &[u8], component_bytes: usize) -> Result<V
 
 /// 业务作用：把固定宽度无符号整数规范为 DER 正 INTEGER 内容。
 ///
-/// 参数说明：`value` 是 r 或 s 的 big-endian 固定宽度表示。
+/// 参数说明：
+/// - `value`：是 r 或 s 的 big-endian 固定宽度表示。
 ///
 /// 返回：返回去除多余前导零且必要时增加符号零的非空字节串。
 #[cfg(feature = "pkcs11")]
@@ -1162,7 +1219,11 @@ fn der_positive_integer(value: &[u8]) -> Vec<u8> {
 impl ExternalEnvelopePlan {
     /// 业务作用：用不可导出 KEK 生成可由远程 Secret provider 保存的 envelope ciphertext。
     ///
-    /// 参数说明：来源标识、路径和版本组成强制 AAD；`plaintext` 是待封装的 UTF-8 secret。
+    /// 参数说明：
+    /// - `secret_provider`：用于强制 AAD 的 Secret provider 标识。
+    /// - `secret_path`：用于强制 AAD 的远程 Secret 路径。
+    /// - `version`：用于强制 AAD 的远程 Secret 版本。
+    /// - `plaintext`：待封装的 UTF-8 Secret 明文。
     ///
     /// 返回：远程 encrypt 成功时返回标准 Base64 ciphertext；预算或 provider 失败时返回错误。
     pub async fn encrypt_remote_secret(
@@ -1191,8 +1252,11 @@ impl ExternalEnvelopePlan {
 
     /// 业务作用：解开远程 Secret ciphertext，并用 AAD 强制绑定 provider、路径、版本与业务上下文。
     ///
-    /// 参数说明：`secret_provider` 与 `secret_path` 标识来源；`version` 是单调版本；
-    /// `ciphertext_base64` 是远程 JSON value。
+    /// 参数说明：
+    /// - `secret_provider`：标识来源
+    /// - `secret_path`：标识来源
+    /// - `version`：是单调版本
+    /// - `ciphertext_base64`：是远程 JSON value。
     ///
     /// 返回：Base64、远程 decrypt、UTF-8 与大小全部合法时返回明文；否则拒绝候选且不回退密文。
     pub async fn decrypt_remote_secret(
@@ -1233,7 +1297,11 @@ impl ExternalEnvelopePlan {
 
 /// 业务作用：构造不会因字段拼接歧义而碰撞的 envelope AAD，阻止 ciphertext 跨来源重放。
 ///
-/// 参数说明：provider、path、version 和 context 均由已校验配置或远程引用产生。
+/// 参数说明：
+/// - `secret_provider`：已经校验的 Secret provider 标识。
+/// - `secret_path`：远程 Secret 引用路径。
+/// - `version`：远程 Secret 引用版本。
+/// - `context`：已经校验的加密上下文，连同来源绑定 AAD。
 ///
 /// 返回：各字段有界且不含 NUL 时返回带协议域分隔的字节串，否则拒绝操作。
 fn envelope_aad(
@@ -1259,8 +1327,9 @@ fn envelope_aad(
 
 /// 业务作用：解析外部 TLS private key 引用，验证 provider 唯一性、传输、SecretSource 与算法闭包。
 ///
-/// 参数说明：`reference` 指定外部 key 与允许算法；`catalog` 是已在候选构建期校验完成的
-/// 全局密码 provider 目录。
+/// 参数说明：
+/// - `reference`：指定外部 key 与允许算法
+/// - `catalog`：是已在候选构建期校验完成的 全局密码 provider 目录。
 ///
 /// 返回：返回不含可导出私钥的签名计划；provider 不存在、算法错配或预算无界时失败。
 pub fn build_private_key_plan(
@@ -1323,7 +1392,9 @@ pub fn build_private_key_plan(
 
 /// 业务作用：在候选快照发布前一次性校验并构建全局外部密码 provider 目录。
 ///
-/// 参数说明：`config_dir` 是本地 SecretSource 基准；`providers` 是全局声明。
+/// 参数说明：
+/// - `config_dir`：是本地 SecretSource 基准
+/// - `providers`：是全局声明。
 ///
 /// 返回：名称唯一且每个 provider 的传输、认证与预算均有效时返回共享目录，否则拒绝候选。
 pub fn build_catalog(
@@ -1343,12 +1414,16 @@ pub fn build_catalog(
         let runtime = Arc::new(build_provider(config_dir, provider)?);
         catalog.insert(provider.name.clone(), runtime);
     }
-    Ok(ExternalCryptoCatalog { providers: catalog })
+    Ok(ExternalCryptoCatalog {
+        providers: catalog,
+    })
 }
 
 /// 业务作用：把远程 Secret envelope 引用绑定到本快照共享的外部密码 provider。
 ///
-/// 参数说明：`reference` 指定 KEK 与附加 AAD；`catalog` 是已校验 provider 目录。
+/// 参数说明：
+/// - `reference`：指定 KEK 与附加 AAD
+/// - `catalog`：是已校验 provider 目录。
 ///
 /// 返回：provider 存在且 key/AAD 有界时返回解密计划；引用错误时拒绝候选。
 pub fn build_envelope_plan(
@@ -1361,7 +1436,9 @@ pub fn build_envelope_plan(
         .cloned()
         .context("remote secret envelope crypto provider is missing")?;
     anyhow::ensure!(
-        matches!(&provider.backend, ExternalCryptoBackend::Https { .. }),
+        matches!(&provider.backend, ExternalCryptoBackend::Https {
+            ..
+        }),
         "remote secret envelope requires an HTTPS crypto provider"
     );
     anyhow::ensure!(
@@ -1381,7 +1458,9 @@ pub fn build_envelope_plan(
 
 /// 业务作用：构建固定 HTTPS 或 PKCS#11 provider，并把身份与资源预算冻结为运行态。
 ///
-/// 参数说明：`config_dir` 是 SecretSource 基准；`cfg` 是单 provider 声明。
+/// 参数说明：
+/// - `config_dir`：是 SecretSource 基准
+/// - `cfg`：是单 provider 声明。
 ///
 /// 返回：恰好一种传输、认证、算法和预算均有效时返回 provider；
 /// 敏感材料不进入错误文本。
@@ -1497,7 +1576,9 @@ pub fn build_provider(
 
 /// 业务作用：构建固定 HTTPS 密码操作后端，并绑定本地 bootstrap 身份。
 ///
-/// 参数说明：`config_dir` 是 SecretSource 基准；`cfg` 提供 endpoint、CA、认证与 mTLS。
+/// 参数说明：
+/// - `config_dir`：是 SecretSource 基准
+/// - `cfg`：提供 endpoint、CA、认证与 mTLS。
 ///
 /// 返回：URL 固定且本地身份完整时返回 HTTPS backend 与仅用于热更判定的摘要；
 /// 凭据不进入诊断或公开输出。
@@ -1527,7 +1608,7 @@ fn build_https_backend(
             !source.starts_with("remote://"),
             "external crypto bootstrap secret cannot use a remote provider"
         );
-        crate::secret::resolve_text(source, config_dir, label).map(Some)
+        crate::security::secret::resolve_text(source, config_dir, label).map(Some)
     };
     let authorization_value = resolve(&cfg.authorization, "external crypto authorization")?;
     let ca = resolve(&cfg.ca_certificate, "external crypto CA")?;
@@ -1556,7 +1637,7 @@ fn build_https_backend(
         .timeout(Duration::from_millis(cfg.timeout_ms));
     if let Some(ca) = &ca {
         builder = builder.add_root_certificate(
-            reqwest::Certificate::from_pem(ca.as_bytes())
+            crate::tls::trust::http_ca(ca.as_bytes())
                 .context("external crypto CA is not valid PEM")?,
         );
     }
@@ -1599,8 +1680,12 @@ fn build_https_backend(
 
 /// 业务作用：加载显式指定的 PKCS#11 module，登录唯一 token 并建立固定 session 池。
 ///
-/// 参数说明：`config_dir` 是 PIN SecretSource 基准；`cfg` 固定 module/token；
-/// `session_count` 是并发上限；`timeout_ms` 是 session 排队 deadline；`algorithms` 是允许集。
+/// 参数说明：
+/// - `config_dir`：是 PIN SecretSource 基准
+/// - `cfg`：固定 module/token
+/// - `session_count`：是并发上限
+/// - `timeout_ms`：是 session 排队 deadline
+/// - `algorithms`：是允许集。
 ///
 /// 返回：module、token、PIN、mechanism 和全部 session 均可用时返回 provider 与私有身份摘要；
 /// 不自动选择其它 slot，不读取私钥值。
@@ -1642,7 +1727,8 @@ fn build_pkcs11_provider(
         !cfg.user_pin.is_empty() && !cfg.user_pin.starts_with("remote://"),
         "PKCS#11 user_pin must use a local SecretSource"
     );
-    let pin_source = crate::secret::resolve_text(&cfg.user_pin, config_dir, "PKCS#11 user PIN")?;
+    let pin_source =
+        crate::security::secret::resolve_text(&cfg.user_pin, config_dir, "PKCS#11 user PIN")?;
     let pin = pin_source.trim_end_matches(['\r', '\n']);
     anyhow::ensure!(
         !pin.is_empty() && pin.len() <= 1024 && !pin.contains('\0'),
@@ -1725,7 +1811,8 @@ fn build_pkcs11_provider(
 
 /// 业务作用：把 TLS signature scheme 映射为用于 token 能力门的 PKCS#11 mechanism type。
 ///
-/// 参数说明：`scheme` 是已解析的 TLS 算法。
+/// 参数说明：
+/// - `scheme`：是已解析的 TLS 算法。
 ///
 /// 返回：返回 HSM 必须声明的带摘要签名 mechanism；其它算法拒绝。
 #[cfg(feature = "pkcs11")]
@@ -1745,7 +1832,8 @@ fn pkcs11_mechanism_type(scheme: SignatureScheme) -> Result<cryptoki::mechanism:
 
 /// 业务作用：把公开配置名映射为 rustls signature scheme，未知或弱算法失败闭合。
 ///
-/// 参数说明：`name` 是配置算法标识。
+/// 参数说明：
+/// - `name`：是配置算法标识。
 ///
 /// 返回：仅返回当前实现明确支持的现代 TLS 算法。
 fn parse_signature_scheme(name: &str) -> Result<SignatureScheme> {
@@ -1762,7 +1850,8 @@ fn parse_signature_scheme(name: &str) -> Result<SignatureScheme> {
 
 /// 业务作用：将 rustls scheme 转为固定 provider 协议字符串，不接受动态算法名。
 ///
-/// 参数说明：`scheme` 已通过 provider allowlist。
+/// 参数说明：
+/// - `scheme`：已通过 provider allowlist。
 ///
 /// 返回：返回稳定协议标识。
 fn signature_scheme_name(scheme: SignatureScheme) -> &'static str {
@@ -1779,7 +1868,8 @@ fn signature_scheme_name(scheme: SignatureScheme) -> &'static str {
 
 /// 业务作用：把 signature scheme 收敛为 rustls 公钥算法族，禁止一个 key reference 跨族声明。
 ///
-/// 参数说明：`scheme` 是已支持方案。
+/// 参数说明：
+/// - `scheme`：是已支持方案。
 ///
 /// 返回：返回 RSA、ECDSA 或 ED25519 算法族。
 fn signature_algorithm(scheme: SignatureScheme) -> SignatureAlgorithm {
@@ -1797,7 +1887,9 @@ fn signature_algorithm(scheme: SignatureScheme) -> SignatureAlgorithm {
 
 /// 业务作用：收集 crypto provider 的本地 SecretSource 文件，纳入统一 watcher 与配置指纹。
 ///
-/// 参数说明：`providers` 是全局声明；`config_dir` 是相对路径根。
+/// 参数说明：
+/// - `providers`：是全局声明
+/// - `config_dir`：是相对路径根。
 ///
 /// 返回：返回认证、CA 和 mTLS 身份依赖，不读取或暴露内容。
 pub fn dependency_paths(
@@ -1819,6 +1911,6 @@ pub fn dependency_paths(
                     .unwrap_or_default(),
             ]
         })
-        .filter_map(|source| crate::secret::dependency_path(source, config_dir))
+        .filter_map(|source| crate::security::secret::dependency_path(source, config_dir))
         .collect()
 }

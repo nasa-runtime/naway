@@ -1,4 +1,4 @@
-//! V7 GraphQL-over-HTTP 查询预算守卫。
+//! GraphQL-over-HTTP 查询预算守卫。
 //!
 //! 普通 route 不会进入本模块。显式配置 `graphql_guard` 后，GET 只借用 URI query，
 //! POST 才在 route 独立硬上限内读取实体。lexer/parser 的 token、嵌套、fragment 展开和
@@ -76,8 +76,23 @@ pub(crate) enum GraphqlOutcome {
     Rejected(GraphqlRejection),
 }
 
+/// 只有完整查询或受信模板通过编译后才产生的成本，不由 HTTP 字段反序列化。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VerifiedQueryCost(u64);
+
+impl VerifiedQueryCost {
+    /// 业务作用：向准入账本提供本次已验证查询的成本，避免以深度或客户端声明代替实际字段数。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：选定操作展开 fragment 后的字段总数；batch 为所有操作之和。
+    pub(crate) fn units(self) -> u64 {
+        self.0
+    }
+}
+
 impl GraphqlGuardPolicy {
-    /// 编译 route 配置并拒绝无效或无法形成真实资源约束的预算。
+    /// 业务作用：编译 route 配置并拒绝无效或无法形成真实资源约束的预算。
     pub(crate) fn build(cfg: &GraphqlGuardCfg, route_id: &str) -> Result<Self> {
         if !(1..=HARD_MAX_BODY_BYTES).contains(&cfg.max_body_bytes) {
             bail!(
@@ -114,22 +129,35 @@ impl GraphqlGuardPolicy {
         })
     }
 
-    /// 构建期校验 degraphql 固定文档。查询形状不会随请求变化，因此只需在候选快照
-    /// 发布前完成一次 lexer/parser/fragment 预算检查，运行期只编码 variables。
+    /// 业务作用：构建期校验 degraphql 固定文档并冻结成本，运行期不重复解析受信模板。
+    ///
+    /// 参数说明：
+    /// - `query`：为静态查询
+    /// - `operation_name`：选择具体操作。
+    ///
+    /// 返回：通过 lexer/parser/fragment 预算的复杂度；非法或越界文档拒绝候选。
     pub(crate) fn validate_static_query(
         &self,
         query: &str,
         operation_name: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.analyze(query, operation_name, false)
             .map_err(|rejection| anyhow::anyhow!(rejection.message))
     }
 
-    /// 校验 GraphQL-over-HTTP envelope 与查询预算。
+    /// 业务作用：校验 GraphQL-over-HTTP envelope 与查询预算，记录通过验证的成本事实。
     ///
     /// GET 不接触 body。POST 聚合是 GraphQL 解析不可避免的显式慢路径：单 frame 直接
     /// 复用 `Bytes`，多 frame 只合并一次，成功后同一字节块连同 trailers 重放给上游。
-    pub(crate) async fn inspect(&self, parts: &Parts, body: ForwardBody) -> GraphqlOutcome {
+    ///
+    /// 参数说明：
+    /// - `parts`：提供方法、媒体类型与计量上下文
+    /// - `body`：为唯一原始正文。
+    ///
+    /// 返回：通过验证的可重放正文或固定拒绝结果；WebSocket 握手不伪造消息成本。
+    pub(crate) async fn inspect(&self, parts: &mut Parts, body: ForwardBody) -> GraphqlOutcome {
+        // 重新检查必须撤销旧成本证据；非法输入和 WebSocket 握手不能沿用先前操作的准入事实。
+        parts.extensions.remove::<VerifiedQueryCost>();
         match parts.method {
             Method::GET => {
                 if is_graphql_websocket_upgrade(parts) {
@@ -147,7 +175,10 @@ impl GraphqlGuardPolicy {
                 }
                 let analysis = self.inspect_get(parts);
                 match analysis {
-                    Ok(()) => GraphqlOutcome::Allowed(body),
+                    Ok(cost) => {
+                        record_cost(parts, cost);
+                        GraphqlOutcome::Allowed(body)
+                    }
                     Err(rejection) => GraphqlOutcome::Rejected(rejection),
                 }
             }
@@ -160,7 +191,13 @@ impl GraphqlGuardPolicy {
         }
     }
 
-    fn inspect_get(&self, parts: &Parts) -> std::result::Result<(), GraphqlRejection> {
+    /// 业务作用：验证 GET 查询及唯一 operationName，拒绝通过 GET 执行变更操作。
+    ///
+    /// 参数说明：
+    /// - `parts`：为原请求 URI。
+    ///
+    /// 返回：已验证查询成本；缺失、重复、语法或预算错误时拒绝。
+    fn inspect_get(&self, parts: &Parts) -> std::result::Result<u64, GraphqlRejection> {
         let raw = parts.uri.query().ok_or_else(|| {
             reject(
                 GraphqlGuardResult::Invalid,
@@ -201,7 +238,14 @@ impl GraphqlGuardPolicy {
         self.analyze(query.as_ref(), operation_name.as_deref(), true)
     }
 
-    async fn inspect_post(&self, parts: &Parts, body: ForwardBody) -> GraphqlOutcome {
+    /// 业务作用：按媒体类型解析有界 POST，保留原字节重放并记录整个 batch 成本。
+    ///
+    /// 参数说明：
+    /// - `parts`：提供协议头和计量上下文
+    /// - `body`：是待检查的唯一正文。
+    ///
+    /// 返回：通过全部预算的正文或拒绝，读取失败不会产生已验证成本。
+    async fn inspect_post(&self, parts: &mut Parts, body: ForwardBody) -> GraphqlOutcome {
         if content_length(parts).is_some_and(|length| length > self.max_body_bytes) {
             return GraphqlOutcome::Rejected(reject(
                 GraphqlGuardResult::TooLarge,
@@ -229,8 +273,7 @@ impl GraphqlGuardPolicy {
         let media_type = request_media_type(parts);
         let analysis = match media_type {
             Some(MediaType::Json) => {
-                // `Cow<str>` lets serde_json borrow the common unescaped query directly from
-                // `Bytes`; escaped JSON strings allocate only the decoded query, which is required.
+                // 普通未转义查询借用原始字节，只有 JSON 转义才需要分配解码字符串。
                 self.inspect_json_operations(&collected.bytes)
             }
             Some(MediaType::Graphql) => match std::str::from_utf8(&collected.bytes) {
@@ -249,21 +292,26 @@ impl GraphqlGuardPolicy {
             )),
         };
         match analysis {
-            Ok(()) => GraphqlOutcome::Allowed(buffered_body(collected)),
+            Ok(cost) => {
+                record_cost(parts, cost);
+                GraphqlOutcome::Allowed(buffered_body(collected))
+            }
             Err(rejection) => GraphqlOutcome::Rejected(rejection),
         }
     }
 
     /// 业务作用：从 GraphQL multipart request 提取 operations JSON，并对每个 operation 执行同一预算门。
     ///
-    /// 参数说明：`parts` 提供 multipart boundary；`body` 是已受 max_body_bytes 限制且将原样重放的实体。
+    /// 参数说明：
+    /// - `parts`：提供 multipart boundary
+    /// - `body`：是已受 max_body_bytes 限制且将原样重放的实体。
     ///
-    /// 返回：operations 唯一且所有查询通过时成功；MIME/envelope 非法或任一查询越界时返回固定拒绝。
+    /// 返回：operations 唯一且所有查询通过时返回成本；MIME/envelope 非法或任一查询越界时返回固定拒绝。
     fn inspect_multipart(
         &self,
         parts: &Parts,
         body: &[u8],
-    ) -> std::result::Result<(), GraphqlRejection> {
+    ) -> std::result::Result<u64, GraphqlRejection> {
         let boundary = multipart_boundary(parts).ok_or_else(|| {
             reject(
                 GraphqlGuardResult::Invalid,
@@ -284,10 +332,11 @@ impl GraphqlGuardPolicy {
 
     /// 业务作用：统一检查单 operation 与 GraphQL batch JSON envelope，避免 multipart 绕过查询预算。
     ///
-    /// 参数说明：`bytes` 是普通 JSON body 或 multipart 的 operations part。
+    /// 参数说明：
+    /// - `bytes`：是普通 JSON body 或 multipart 的 operations part。
     ///
-    /// 返回：每个 envelope 都通过 parser/depth/complexity 门时成功；空 batch 或 JSON 结构错误时拒绝。
-    fn inspect_json_operations(&self, bytes: &[u8]) -> std::result::Result<(), GraphqlRejection> {
+    /// 返回：每个 envelope 都通过 parser/depth/complexity 门时返回总成本；空 batch 或 JSON 结构错误时拒绝。
+    fn inspect_json_operations(&self, bytes: &[u8]) -> std::result::Result<u64, GraphqlRejection> {
         let operations: JsonOperations<'_> = serde_json::from_slice(bytes).map_err(|_| {
             reject(
                 GraphqlGuardResult::Invalid,
@@ -309,24 +358,33 @@ impl GraphqlGuardPolicy {
                         "GraphQL JSON envelope is invalid",
                     ));
                 }
+                let mut total = 0u64;
                 for envelope in envelopes {
-                    self.analyze(
+                    total = total.saturating_add(self.analyze(
                         envelope.query.as_ref(),
                         envelope.operation_name.as_deref(),
                         false,
-                    )?;
+                    )?);
                 }
-                Ok(())
+                Ok(total)
             }
         }
     }
 
+    /// 业务作用：以预算受控的 AST 选择操作并计算实际字段复杂度，拒绝深度与 introspection 越权。
+    ///
+    /// 参数说明：
+    /// - `query`：已按协议预算限定的 GraphQL 查询文本。
+    /// - `operation_name`：可选的执行操作名。
+    /// - `get_request`：是否来自 GET，用于拒绝不允许的写操作。
+    ///
+    /// 返回：通过完整策略的复杂度；任一解析或授权门不满足时拒绝。
     fn analyze(
         &self,
         query: &str,
         operation_name: Option<&str>,
         get_request: bool,
-    ) -> std::result::Result<(), GraphqlRejection> {
+    ) -> std::result::Result<u64, GraphqlRejection> {
         if query.is_empty() || query.len() > self.max_query_bytes {
             return Err(reject(
                 GraphqlGuardResult::TooLarge,
@@ -363,10 +421,25 @@ impl GraphqlGuardPolicy {
                 "GraphQL introspection is disabled",
             ));
         }
-        Ok(())
+        Ok(stats.complexity as u64)
     }
 }
 
+/// 业务作用：将完整编译通过的成本同时交给准入与计量，二者使用同一个事实来源。
+///
+/// 参数说明：
+/// - `parts`：携带当前请求及可选计量上下文
+/// - `cost`：是完整查询或 batch 的复杂度。
+///
+/// 返回：写入仅进程内可见的成本证据；已启用产品计量时同步记录，不访问外部存储。
+pub(crate) fn record_cost(parts: &mut Parts, cost: u64) {
+    parts.extensions.insert(VerifiedQueryCost(cost));
+    if let Some(facts) = parts.extensions.get::<crate::portal::meter::MeterFacts>() {
+        facts.graphql(cost);
+    }
+}
+
+/// 业务作用：构造固定分类的 GraphQL 拒绝结果，不向客户端泄露内部分析状态。
 fn reject(result: GraphqlGuardResult, status: u16, message: &'static str) -> GraphqlRejection {
     GraphqlRejection {
         result,
@@ -375,6 +448,7 @@ fn reject(result: GraphqlGuardResult, status: u16, message: &'static str) -> Gra
     }
 }
 
+/// 业务作用：把词法或结构分析失败映射为受控拒绝类别，区分无效查询与预算耗尽。
 fn map_analysis_error(error: AnalysisError) -> GraphqlRejection {
     match error {
         AnalysisError::Invalid => {
@@ -398,6 +472,7 @@ fn map_analysis_error(error: AnalysisError) -> GraphqlRejection {
     }
 }
 
+/// 业务作用：读取可验证的实体长度，供 GraphQL 读取前执行声明大小门。
 fn content_length(parts: &Parts) -> Option<u64> {
     parts
         .headers
@@ -413,6 +488,7 @@ enum MediaType {
     Multipart,
 }
 
+/// 业务作用：识别 GraphQL 请求的媒体类型，只进入明确支持的协议解析路径。
 fn request_media_type(parts: &Parts) -> Option<MediaType> {
     let content_type = parts.headers.get(CONTENT_TYPE)?.to_str().ok()?;
     let media_type = content_type.split(';').next()?.trim();
@@ -452,7 +528,8 @@ enum JsonOperations<'a> {
 
 /// 业务作用：识别 GraphQL WebSocket upgrade，且只接受标准/legacy 两个明确 subprotocol。
 ///
-/// 参数说明：`parts` 是尚未转交透明 WebSocket tunnel 的请求 head。
+/// 参数说明：
+/// - `parts`：是尚未转交透明 WebSocket tunnel 的请求 head。
 ///
 /// 返回：Upgrade/Connection 与 Sec-WebSocket-Protocol 同时满足时为 true，普通 GET 为 false。
 fn is_graphql_websocket_upgrade(parts: &Parts) -> bool {
@@ -484,7 +561,8 @@ fn is_graphql_websocket_upgrade(parts: &Parts) -> bool {
 
 /// 业务作用：从 Content-Type 读取并校验 multipart boundary，防止控制字符或超长分隔符进入扫描器。
 ///
-/// 参数说明：`parts` 是 GraphQL POST 请求 head。
+/// 参数说明：
+/// - `parts`：是 GraphQL POST 请求 head。
 ///
 /// 返回：boundary 为 1..=70 个可见 ASCII 且不含 MIME 分隔危险字符时返回其值，否则 None。
 fn multipart_boundary(parts: &Parts) -> Option<String> {
@@ -516,7 +594,10 @@ fn multipart_boundary(parts: &Parts) -> Option<String> {
 
 /// 业务作用：在有界 multipart 实体中定位唯一命名 part，并返回其 body slice。
 ///
-/// 参数说明：`body` 是完整实体；`boundary` 已校验；`target` 是 Content-Disposition name。
+/// 参数说明：
+/// - `body`：是完整实体
+/// - `boundary`：已校验
+/// - `target`：是 Content-Disposition name。
 ///
 /// 返回：目标 part 恰好出现一次且 MIME 边界完整时返回借用切片；缺失、重复或结构错误返回 None。
 fn multipart_named_part<'a>(body: &'a [u8], boundary: &[u8], target: &[u8]) -> Option<&'a [u8]> {
@@ -555,7 +636,8 @@ fn multipart_named_part<'a>(body: &'a [u8], boundary: &[u8], target: &[u8]) -> O
 
 /// 业务作用：从单个 MIME part headers 中提取 Content-Disposition 的 name 参数。
 ///
-/// 参数说明：`headers` 不含末尾空行，使用 CRLF 分隔。
+/// 参数说明：
+/// - `headers`：不含末尾空行，使用 CRLF 分隔。
 ///
 /// 返回：唯一合法 name 的借用字节；缺失或畸形时 None。
 fn multipart_headers_name(headers: &[u8]) -> Option<&[u8]> {
@@ -578,7 +660,9 @@ fn multipart_headers_name(headers: &[u8]) -> Option<&[u8]> {
 
 /// 业务作用：在有界 MIME 字节中查找子串，不执行 UTF-8 假设。
 ///
-/// 参数说明：`haystack` 是待扫描字节，`needle` 必须非空。
+/// 参数说明：
+/// - `haystack`：是待扫描字节
+/// - `needle`：必须非空。
 ///
 /// 返回：首次匹配偏移；不存在时 None。
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -593,7 +677,8 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// 业务作用：去除 MIME 参数两侧 SP/HTAB，保持其余字节逐字语义。
 ///
-/// 参数说明：`value` 是单个 header parameter 字节。
+/// 参数说明：
+/// - `value`：是单个 header parameter 字节。
 ///
 /// 返回：返回借用的裁剪切片。
 fn trim_ascii(mut value: &[u8]) -> &[u8] {
@@ -640,6 +725,7 @@ struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
+    /// 业务作用：建立受输入与分析预算约束的 GraphQL 解析状态，不执行查询。
     fn new(input: &'a str, max_tokens: usize) -> Self {
         Self {
             input,
@@ -650,6 +736,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// 业务作用：从查询文本读取下一个合法 token，非法输入在进入结构分析前拒绝。
     fn next(&mut self) -> std::result::Result<Token<'a>, AnalysisError> {
         self.skip_ignored();
         if self.offset == self.bytes.len() {
@@ -686,6 +773,7 @@ impl<'a> Lexer<'a> {
         Ok(token)
     }
 
+    /// 业务作用：跳过 GraphQL 允许忽略的空白与注释，不把它们计为查询结构。
     fn skip_ignored(&mut self) {
         loop {
             while self
@@ -714,6 +802,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// 业务作用：读取合法 GraphQL 名称，保持关键字、字段和变量的词法边界。
     fn scan_name(&mut self) -> Token<'a> {
         let start = self.offset;
         self.offset += 1;
@@ -727,6 +816,7 @@ impl<'a> Lexer<'a> {
         Token::Name(&self.input[start..self.offset])
     }
 
+    /// 业务作用：校验字符串和转义边界，避免字符串内容被误解释为查询结构。
     fn scan_string(&mut self) -> std::result::Result<(), AnalysisError> {
         if self.bytes.get(self.offset..self.offset + 3) == Some(b"\"\"\"") {
             self.offset += 3;
@@ -783,6 +873,7 @@ impl<'a> Lexer<'a> {
         Err(AnalysisError::Invalid)
     }
 
+    /// 业务作用：验证 GraphQL 数字字面量，使畸形数值不能穿透结构分析。
     fn scan_number(&mut self) -> std::result::Result<(), AnalysisError> {
         let start = self.offset;
         if self.bytes[self.offset] == b'-' {
@@ -862,7 +953,10 @@ struct SelectionSet<'a> {
 }
 
 enum Selection<'a> {
-    Field { name: &'a str, child: Option<usize> },
+    Field {
+        name: &'a str,
+        child: Option<usize>,
+    },
     FragmentSpread(&'a str),
     InlineFragment(usize),
 }
@@ -875,6 +969,7 @@ struct Document<'a> {
 }
 
 impl<'a> Document<'a> {
+    /// 业务作用：按请求的 operationName 选择唯一操作，未指定且含糊时拒绝执行。
     fn select_operation(
         &self,
         requested: Option<&str>,
@@ -897,6 +992,7 @@ impl<'a> Document<'a> {
         }
     }
 
+    /// 业务作用：计算选定操作的深度和复杂度，不让未被选择的操作改变准入结果。
     fn operation_stats(
         &self,
         operation: &Operation<'a>,
@@ -915,6 +1011,7 @@ impl<'a> Document<'a> {
         )
     }
 
+    /// 业务作用：聚合 selection set 的成本，执行深度、节点和复杂度边界。
     fn set_stats(
         &self,
         set_index: usize,
@@ -930,7 +1027,10 @@ impl<'a> Document<'a> {
         let mut total = QueryStats::default();
         for selection in &self.sets[set_index].selections {
             let stats = match selection {
-                Selection::Field { name, child } => {
+                Selection::Field {
+                    name,
+                    child,
+                } => {
                     let child_stats = match child {
                         Some(child) => self.set_stats(
                             *child,
@@ -985,6 +1085,7 @@ impl<'a> Document<'a> {
         Ok(total)
     }
 
+    /// 业务作用：计算 fragment 展开的成本并检测循环，防止引用绕过查询预算。
     fn fragment_stats(
         &self,
         fragment_index: usize,
@@ -1031,6 +1132,7 @@ enum VisitState {
     Done,
 }
 
+/// 业务作用：有界累计查询复杂度，溢出或超过声明预算时拒绝。
 fn add_cost(left: usize, right: usize, limit: usize) -> usize {
     left.saturating_add(right).min(limit.saturating_add(1))
 }
@@ -1046,6 +1148,7 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
+    /// 业务作用：建立受输入与分析预算约束的 GraphQL 解析状态，不执行查询。
     fn new(
         input: &'a str,
         max_tokens: usize,
@@ -1064,6 +1167,7 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// 业务作用：解析 GraphQL 文档的操作与 fragment 定义，建立有限的结构视图。
     fn parse_document(&mut self) -> std::result::Result<Document<'a>, AnalysisError> {
         while self.current != Token::Eof {
             match self.current {
@@ -1085,8 +1189,7 @@ impl<'a> Parser<'a> {
         if self.operations.is_empty() {
             return Err(AnalysisError::Invalid);
         }
-        // Duplicate operation names make operationName ambiguous. Multiple anonymous operations
-        // are also invalid and must not be resolved by file order.
+        // 重复 operation 名称或多个匿名 operation 都无法唯一定位请求目标，不能用文件顺序消除歧义。
         let mut operation_names = HashMap::new();
         let mut anonymous = 0usize;
         for operation in &self.operations {
@@ -1109,6 +1212,7 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// 业务作用：解析单个操作的类型、变量和选择集，为后续成本裁决保留结构。
     fn parse_operation(&mut self, kind: OperationKind) -> std::result::Result<(), AnalysisError> {
         self.bump()?;
         let name = match self.current {
@@ -1131,6 +1235,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// 业务作用：登记合法 fragment 的名称与选择集，拒绝冲突或不完整定义。
     fn parse_fragment(&mut self) -> std::result::Result<(), AnalysisError> {
         self.bump()?;
         let name = self.take_name()?;
@@ -1142,11 +1247,14 @@ impl<'a> Parser<'a> {
         self.parse_directives()?;
         let selection_set = self.parse_selection_set(1)?;
         let index = self.fragments.len();
-        self.fragments.push(Fragment { selection_set });
+        self.fragments.push(Fragment {
+            selection_set,
+        });
         self.fragment_by_name.insert(name, index);
         Ok(())
     }
 
+    /// 业务作用：解析字段和 fragment 引用，递归过程受结构预算约束。
     fn parse_selection_set(&mut self, nesting: usize) -> std::result::Result<usize, AnalysisError> {
         if nesting > self.max_depth {
             return Err(AnalysisError::TooDeep);
@@ -1207,10 +1315,13 @@ impl<'a> Parser<'a> {
             return Err(AnalysisError::Invalid);
         }
         let index = self.sets.len();
-        self.sets.push(SelectionSet { selections });
+        self.sets.push(SelectionSet {
+            selections,
+        });
         Ok(index)
     }
 
+    /// 业务作用：消费指令及其参数语法，不在网关执行用户指令。
     fn parse_directives(&mut self) -> std::result::Result<(), AnalysisError> {
         while self.current == Token::Punct(b'@') {
             self.bump()?;
@@ -1222,8 +1333,8 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// 跳过 variable/argument 的值语法，但仍逐 token 扣 CPU 预算，并用堆上小栈限制
-    /// `()[]{}` 嵌套。这里不能递归，否则攻击者可在参数对象里绕开 selection 深度限制。
+    /// 业务作用：跳过 variable/argument 的值语法，但仍逐 token 扣 CPU 预算，并用堆上小栈限制
+    /// `[]{}` 嵌套。这里不能递归，否则攻击者可在参数对象里绕开 selection 深度限制。
     fn skip_balanced(&mut self, open: u8, close: u8) -> std::result::Result<(), AnalysisError> {
         self.expect_punct(open)?;
         let mut stack = vec![close];
@@ -1256,6 +1367,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// 业务作用：要求当前位置存在指定名称，语法不符时返回明确分析错误。
     fn expect_name(&mut self, expected: &str) -> std::result::Result<(), AnalysisError> {
         match self.current {
             Token::Name(actual) if actual == expected => self.bump(),
@@ -1263,6 +1375,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// 业务作用：取得当前位置的合法名称，缺少名称时终止当前结构解析。
     fn take_name(&mut self) -> std::result::Result<&'a str, AnalysisError> {
         match self.current {
             Token::Name(name) => {
@@ -1273,6 +1386,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// 业务作用：验证结构分隔符，防止损坏文档被部分接受。
     fn expect_punct(&mut self, expected: u8) -> std::result::Result<(), AnalysisError> {
         if self.current != Token::Punct(expected) {
             return Err(AnalysisError::Invalid);
@@ -1280,6 +1394,7 @@ impl<'a> Parser<'a> {
         self.bump()
     }
 
+    /// 业务作用：推进词法状态，使结构分析始终基于已验证的下一 token。
     fn bump(&mut self) -> std::result::Result<(), AnalysisError> {
         self.current = self.lexer.next()?;
         Ok(())

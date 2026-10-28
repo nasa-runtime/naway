@@ -26,7 +26,9 @@ use super::forward::ForwardBody;
 use crate::{full_body, BoxBody, BoxError};
 
 #[cfg(feature = "grpc-descriptor")]
-use crate::grpc_transcoding::{GrpcTranscodingPlan, ResolvedGoogleRequest, ResolvedGrpcMethod};
+use crate::protocols::grpc_transcoding::{
+    GrpcTranscodingPlan, ResolvedGoogleRequest, ResolvedGrpcMethod,
+};
 #[cfg(feature = "grpc-descriptor")]
 use http::Uri;
 
@@ -88,16 +90,22 @@ pub(super) struct BrowserGrpcError {
 impl BrowserGrpcError {
     /// 业务作用：构造客户端协议错误，确保不把无效 envelope 误报为上游故障。
     ///
-    /// 参数说明：`status` 是稳定 HTTP 状态；`message` 是不含敏感载荷的固定原因。
+    /// 参数说明：
+    /// - `status`：是稳定 HTTP 状态
+    /// - `message`：是不含敏感载荷的固定原因。
     ///
     /// 返回：可交给通用 forward error 映射的浏览器协议错误。
     fn request(status: StatusCode, message: &'static str) -> Self {
-        Self { status, message }
+        Self {
+            status,
+            message,
+        }
     }
 
     /// 业务作用：构造上游响应协议错误，防止缺失 status 或畸形 unary frame 被当作成功。
     ///
-    /// 参数说明：`message` 是低基数、无业务数据的固定原因。
+    /// 参数说明：
+    /// - `message`：是低基数、无业务数据的固定原因。
     ///
     /// 返回：HTTP 502 浏览器协议错误。
     fn upstream(message: &'static str) -> Self {
@@ -136,6 +144,7 @@ impl BrowserGrpcError {
 }
 
 impl fmt::Display for BrowserGrpcError {
+    /// 业务作用：展示浏览器 gRPC 适配的协议失败原因，保持统一错误表示。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.message)
     }
@@ -165,7 +174,9 @@ impl BrowserGrpc {
 
     /// 业务作用：按标准 Content-Type 与 Connect 版本头识别浏览器 RPC，不误拦普通 JSON/Protobuf HTTP API。
     ///
-    /// 参数说明：`method` 与 `headers` 来自已完成通用请求头校验的下游请求。
+    /// 参数说明：
+    /// - `method`：来自已完成通用请求头校验的下游请求。
+    /// - `headers`：来自已完成通用请求头校验的下游请求。
     ///
     /// 返回：支持的 protobuf 模式返回计划；普通 HTTP 返回 None；已声明但不支持的 JSON/方法返回 4xx。
     #[cfg(not(feature = "grpc-descriptor"))]
@@ -179,8 +190,11 @@ impl BrowserGrpc {
     /// 业务作用：在 route 显式携带 descriptor 计划时识别 Connect JSON，并按 RPC path 绑定
     /// 唯一 message schema；普通 JSON route 继续不被误拦。
     ///
-    /// 参数说明：`method`/`headers`/`uri` 来自下游 request head；`transcoding` 是当前 route
-    /// 的可选只读 descriptor 计划。
+    /// 参数说明：
+    /// - `method`：来自下游 request head
+    /// - `headers`：来自下游 request head
+    /// - `uri`：来自下游 request head
+    /// - `transcoding`：是当前 route 的可选只读 descriptor 计划。
     ///
     /// 返回：支持的浏览器 RPC 返回 wire 计划；未知 Connect schema 或错误 unary/streaming
     /// Content-Type 明确 4xx；普通 HTTP 返回 None。
@@ -261,7 +275,10 @@ impl BrowserGrpc {
     /// 业务作用：识别不需要 descriptor 的 gRPC-Web/Connect protobuf 模式，并保留 schema-less
     /// Connect JSON 的早拒语义。
     ///
-    /// 参数说明：`method`/`headers` 是下游 head；`known_media_type` 可复用调用方已解析结果。
+    /// 参数说明：
+    /// - `method`：是下游 head
+    /// - `headers`：是下游 head
+    /// - `known_media_type`：可复用调用方已解析结果。
     ///
     /// 返回：支持的 protobuf wire 计划、普通 HTTP None 或协议 4xx。
     fn detect_inner(
@@ -302,8 +319,10 @@ impl BrowserGrpc {
 
     /// 业务作用：把浏览器请求 head/body 改写成 native gRPC，同时保持 protobuf payload 与背压语义。
     ///
-    /// 参数说明：`parts` 是准备进入上游 header filter 的请求；`body` 是唯一 body 所有权；
-    /// `max_body_bytes` 为 proxy 请求预算，Connect unary 聚合不得越过它。
+    /// 参数说明：
+    /// - `parts`：是准备进入上游 header filter 的请求
+    /// - `body`：是唯一 body 所有权
+    /// - `max_body_bytes`：为 proxy 请求预算，Connect unary 聚合不得越过它。
     ///
     /// 返回：成功时返回 native gRPC body；客户端 Base64/压缩/大小错误时返回明确 4xx。
     pub(super) async fn prepare_request(
@@ -394,8 +413,9 @@ impl BrowserGrpc {
 
     /// 业务作用：把 native gRPC response 恢复成浏览器可消费的 gRPC-Web/Connect wire 语义。
     ///
-    /// 参数说明：`response` 已包含上游流式治理 wrapper；`max_body_bytes` 是 Connect unary
-    /// 有界聚合上限，0 时使用内部 64MiB 安全上限。
+    /// 参数说明：
+    /// - `response`：已包含上游流式治理 wrapper
+    /// - `max_body_bytes`：是 Connect unary 有界聚合上限，0 时使用内部 64MiB 安全上限。
     ///
     /// 返回：gRPC-Web/Connect streaming 立即返回流式 body；Connect unary 等最终 status 后返回；
     /// native 响应畸形或超限时返回 502。
@@ -429,7 +449,8 @@ impl BrowserGrpc {
 
 /// 业务作用：解析 Content-Type 主类型，参数不参与 wire mode 判定。
 ///
-/// 参数说明：`headers` 是下游请求头。
+/// 参数说明：
+/// - `headers`：是下游请求头。
 ///
 /// 返回：合法 UTF-8 主类型的借用字符串，否则 None。
 fn media_type(headers: &HeaderMap) -> Option<&str> {
@@ -444,7 +465,8 @@ fn media_type(headers: &HeaderMap) -> Option<&str> {
 
 /// 业务作用：只在 Connect 显式版本头为 1 时把通用 application/proto/json 识别为 unary RPC。
 ///
-/// 参数说明：`headers` 是下游请求头。
+/// 参数说明：
+/// - `headers`：是下游请求头。
 ///
 /// 返回：版本精确为 1 时 true，避免误拦普通 HTTP API。
 fn is_connect_unary(headers: &HeaderMap) -> bool {
@@ -456,7 +478,8 @@ fn is_connect_unary(headers: &HeaderMap) -> bool {
 
 /// 业务作用：决定 Connect unary 唯一允许的聚合预算；即使全局 0 表示不限制，也不允许协议翻译无界占用内存。
 ///
-/// 参数说明：`configured` 是 proxy max_body_bytes。
+/// 参数说明：
+/// - `configured`：是 proxy max_body_bytes。
 ///
 /// 返回：非零配置原样使用，0 回退 64MiB 内部安全线。
 fn unary_limit(configured: u64) -> u64 {
@@ -469,7 +492,9 @@ fn unary_limit(configured: u64) -> u64 {
 
 /// 业务作用：拒绝当前翻译层不能保持语义的压缩组合，避免把压缩字节当明文 protobuf 转发。
 ///
-/// 参数说明：`protocol` 决定读取 Content-Encoding 还是 Connect-Content-Encoding；`headers` 是原请求头。
+/// 参数说明：
+/// - `protocol`：决定读取 Content-Encoding 还是 Connect-Content-Encoding
+/// - `headers`：是原请求头。
 ///
 /// 返回：identity/缺省成功；支持的 streaming 压缩交给 native gRPC；Connect unary 压缩返回 415。
 fn validate_request_encoding(
@@ -524,7 +549,8 @@ fn validate_request_encoding(
 
 /// 业务作用：把 Connect timeout 毫秒值转换为 gRPC timeout，并在非法/溢出时 fail closed。
 ///
-/// 参数说明：`headers` 是即将发往 native gRPC upstream 的请求头。
+/// 参数说明：
+/// - `headers`：是即将发往 native gRPC upstream 的请求头。
 ///
 /// 返回：缺省/合法值成功；非十进制或超过八位协议上限时返回 400。
 fn map_connect_timeout(headers: &mut HeaderMap) -> Result<(), BrowserGrpcError> {
@@ -558,7 +584,9 @@ fn map_connect_timeout(headers: &mut HeaderMap) -> Result<(), BrowserGrpcError> 
 
 /// 业务作用：把 Connect streaming 压缩协商头映射到 native gRPC，且移除浏览器协议私有头。
 ///
-/// 参数说明：`protocol` 是已识别模式；`headers` 将原地改写。
+/// 参数说明：
+/// - `protocol`：是已识别模式
+/// - `headers`：将原地改写。
 ///
 /// 返回：无返回值；header value 已由 HTTP parser 校验，原样移动避免复制 payload。
 fn map_connect_compression(protocol: &BrowserGrpc, headers: &mut HeaderMap) {
@@ -626,6 +654,7 @@ struct CollectedUnaryPayload {
     trailers: Option<HeaderMap>,
 }
 
+/// 业务作用：在显式上限内读取浏览器 gRPC unary 载荷，拒绝多消息或截断的信封。
 async fn collect_unary_payload(
     mut body: BoxBody,
     limit: u64,
@@ -674,7 +703,10 @@ async fn collect_unary_payload(
 
 /// 业务作用：对 Connect unary gzip 实体执行同步有界解压，防止压缩炸弹进入 protobuf/JSON 编码器。
 ///
-/// 参数说明：`bytes` 是已受压缩体上限保护的原始实体；`encoding` 只允许 identity/gzip；`limit` 是解压后硬门。
+/// 参数说明：
+/// - `bytes`：是已受压缩体上限保护的原始实体
+/// - `encoding`：只允许 identity/gzip
+/// - `limit`：是解压后硬门。
 ///
 /// 返回：identity 原样复用；gzip 成功返回解压字节；算法、格式或解压后超限返回 4xx。
 fn decode_unary_request(
@@ -703,7 +735,8 @@ fn decode_unary_request(
 
 /// 业务作用：限制浏览器请求 trailers 为低风险应用 metadata，防止在认证后追加凭据、路由或 framing 权威。
 ///
-/// 参数说明：`trailers` 是下游提交且准备转发给 native gRPC 的最终 trailer block。
+/// 参数说明：
+/// - `trailers`：是下游提交且准备转发给 native gRPC 的最终 trailer block。
 ///
 /// 返回：名称、数量和值总预算均合法时成功；敏感字段、控制字符或超限返回 400 类协议错误。
 fn validate_browser_request_trailers(trailers: &HeaderMap) -> Result<(), BrowserGrpcError> {
@@ -776,7 +809,9 @@ struct GrpcUnaryRequestBody {
 impl GrpcUnaryRequestBody {
     /// 业务作用：把一条 Connect unary 裸消息包装为 native gRPC envelope，不再复制 payload。
     ///
-    /// 参数说明：`payload` 已通过 u32 frame 长度与 proxy body 预算校验。
+    /// 参数说明：
+    /// - `payload`：已通过 u32 帧长度与代理 body 预算校验的 payload。
+    /// - `trailers`：随正文结束一并交付的原始 trailers。
     ///
     /// 返回：两帧以内的请求 body；HTTP frame 边界不改变 gRPC 字节流语义。
     fn new(payload: Bytes, trailers: Option<HeaderMap>) -> Self {
@@ -796,7 +831,8 @@ impl Body for GrpcUnaryRequestBody {
 
     /// 业务作用：按 envelope header→payload 顺序交付 Connect unary，保持 payload 的原 Bytes 所有权。
     ///
-    /// 参数说明：`_cx` 无需注册唤醒，因为两帧都已就绪。
+    /// 参数说明：
+    /// - `_cx`：无需注册唤醒，因为两帧都已就绪。
     ///
     /// 返回：依次返回 header DATA、payload DATA 与 EOF。
     fn poll_frame(
@@ -852,8 +888,10 @@ struct EnvelopeValidateBody {
 impl EnvelopeValidateBody {
     /// 业务作用：建立请求 framing 门禁，拒绝 Connect EndStream、保留位与无协商压缩标志。
     ///
-    /// 参数说明：`inner` 是已完成 text 解码/unary 包装的 native envelope 字节；
-    /// `compression_allowed` 表示请求头已声明 grpc-encoding。
+    /// 参数说明：
+    /// - `inner`：完成 text 解码或 unary 包装后的原生 envelope 字节流。
+    /// - `compression_allowed`：请求头是否声明了 grpc-encoding。
+    /// - `max_frame_bytes`：单条原生 gRPC frame 的字节硬上限。
     ///
     /// 返回：逐帧零拷贝转发、同时跨 HTTP chunk 校验 5-byte envelope 的 body。
     fn new(inner: BoxBody, compression_allowed: bool, max_frame_bytes: u64) -> Self {
@@ -871,7 +909,8 @@ impl EnvelopeValidateBody {
 
     /// 业务作用：消费一段 envelope 字节并推进 framing 状态，不复制将要转发的 DATA。
     ///
-    /// 参数说明：`data` 是一个 HTTP DATA frame，可在 header/message 任意位置切分。
+    /// 参数说明：
+    /// - `data`：是一个 HTTP DATA frame，可在 header/message 任意位置切分。
     ///
     /// 返回：边界与 flag 合法时成功；EndStream/保留位/无协商压缩时返回 body error。
     fn validate(&mut self, data: &[u8]) -> Result<(), BoxError> {
@@ -925,7 +964,8 @@ impl Body for EnvelopeValidateBody {
     /// 业务作用：在 DATA 交给上游 transport 前逐段复验 gRPC envelope，截断、保留 flag 或非法
     /// compression 只终止当前 request stream。
     ///
-    /// 参数说明：`cx` 是上游 Hyper client 的 body 唤醒上下文。
+    /// 参数说明：
+    /// - `cx`：是上游 Hyper client 的 body 唤醒上下文。
     ///
     /// 返回：合法 frame 原 Bytes 转发；协议错误返回 body error；无数据时保持 Pending/EOF。
     fn poll_frame(
@@ -1039,8 +1079,11 @@ impl StreamingJsonBody {
     /// 业务作用：建立逐消息 descriptor codec，并按 RPC streaming 形态把非流一侧收窄为单消息，
     /// 防止声明为 server/client streaming 的 method 被错误扩展成 bidi。
     ///
-    /// 参数说明：`inner` 是 Connect/native envelope body；`method` 固定 input/output schema；
-    /// `direction` 决定 JSON→protobuf 或 protobuf→JSON；`initial_status` 只用于响应 trailers-only 基数判断。
+    /// 参数说明：
+    /// - `inner`：是 Connect/native envelope body
+    /// - `method`：固定 input/output schema
+    /// - `direction`：决定 JSON→protobuf 或 protobuf→JSON
+    /// - `initial_status`：只用于响应 trailers-only 基数判断。
     ///
     /// 返回：只在下游继续 poll 时读取下一帧、且驻留量受 route stream buffer 限制的 body。
     fn new(
@@ -1143,7 +1186,8 @@ impl StreamingJsonBody {
     /// 业务作用：在 EOF/trailer 处复验未完成 envelope 与非流一侧的消息基数，避免把截断或
     /// 多消息输入当作正常 half-close；错误 status 的 trailers-only 响应仍合法。
     ///
-    /// 参数说明：`trailers` 是响应方向刚收到的 native trailer；请求 EOF 或无 trailer 响应传 None。
+    /// 参数说明：
+    /// - `trailers`：是响应方向刚收到的 native trailer；请求 EOF 或无 trailer 响应传 None。
     ///
     /// 返回：边界完整且基数符合 descriptor 时成功，否则产生当前 stream 的协议错误。
     fn validate_finish(&self, trailers: Option<&HeaderMap>) -> Result<(), BoxError> {
@@ -1188,7 +1232,8 @@ impl Body for StreamingJsonBody {
     /// 业务作用：按下游 demand 推进最多一条 JSON/protobuf 消息，并把 trailer 保留给外层
     /// Connect EndStream 转换器；取消该 future 会直接停止读取上游/下游 stream。
     ///
-    /// 参数说明：`cx` 是 Hyper 当前 body 消费者的唤醒上下文。
+    /// 参数说明：
+    /// - `cx`：是 Hyper 当前 body 消费者的唤醒上下文。
     ///
     /// 返回：产生一条转换后的 DATA、原样 trailer、协议错误、Pending 或流结束。
     fn poll_frame(
@@ -1282,7 +1327,8 @@ struct Base64DecodeBody {
 impl Base64DecodeBody {
     /// 业务作用：建立跨 chunk 的 Base64 解码状态，保持下游背压并把错误留在当前 stream。
     ///
-    /// 参数说明：`inner` 是 gRPC-Web text body。
+    /// 参数说明：
+    /// - `inner`：是 gRPC-Web text body。
     ///
     /// 返回：逐批产生 native gRPC envelope 字节的 body。
     fn new(inner: BoxBody) -> Self {
@@ -1297,7 +1343,8 @@ impl Base64DecodeBody {
 
     /// 业务作用：解码当前已具备的完整 Base64 quartet，并保留不足四字节的尾部。
     ///
-    /// 参数说明：`eof` 表示下游已结束，此时剩余字节也必须构成合法最终量子。
+    /// 参数说明：
+    /// - `eof`：表示下游已结束，此时剩余字节也必须构成合法最终量子。
     ///
     /// 返回：有解码产物时返回 Bytes；等待更多输入时 None；非法 Base64 返回 body error。
     fn decode_ready(&mut self, eof: bool) -> Result<Option<Bytes>, BoxError> {
@@ -1330,7 +1377,8 @@ impl Body for Base64DecodeBody {
     /// 业务作用：按下游 demand 增量解码 gRPC-Web text，Base64 quartet 可跨 HTTP DATA frame，
     /// 且不会读取到当前输出之后的整个请求。
     ///
-    /// 参数说明：`cx` 是 native 上游消费者的唤醒上下文。
+    /// 参数说明：
+    /// - `cx`：是 native 上游消费者的唤醒上下文。
     ///
     /// 返回：可用 decoded DATA、协议错误、Pending 或 EOF。
     fn poll_frame(
@@ -1424,7 +1472,8 @@ impl Body for Base64DecodeBody {
 
 /// 业务作用：把 BoxBody 协议错误构造成可取消当前 H2 request stream 的 owned error。
 ///
-/// 参数说明：`message` 是固定、无 payload 的错误原因。
+/// 参数说明：
+/// - `message`：是固定、无 payload 的错误原因。
 ///
 /// 返回：线程安全的 io::Error trait object。
 fn protocol_body_error(message: &'static str) -> BoxError {
@@ -1436,7 +1485,9 @@ fn protocol_body_error(message: &'static str) -> BoxError {
 
 /// 业务作用：构造 gRPC-Web 响应，DATA 原样流过，最终 gRPC trailer 改成 body trailer frame。
 ///
-/// 参数说明：`response` 是 native gRPC 响应；`text` 决定是否再做连续 Base64 编码。
+/// 参数说明：
+/// - `response`：是 native gRPC 响应
+/// - `text`：决定是否再做连续 Base64 编码。
 ///
 /// 返回：HTTP status/metadata 保留、Content-Type 与 body framing 已转换的响应。
 fn grpc_web_response(response: Response<BoxBody>, text: bool) -> Response<BoxBody> {
@@ -1463,7 +1514,8 @@ fn grpc_web_response(response: Response<BoxBody>, text: bool) -> Response<BoxBod
 
 /// 业务作用：构造 Connect streaming 响应，把最终 gRPC trailer 转成唯一 EndStream envelope。
 ///
-/// 参数说明：`response` 是 native gRPC streaming 响应。
+/// 参数说明：
+/// - `response`：是 native gRPC streaming 响应。
 ///
 /// 返回：逐消息流式响应；结束状态在 body 中表达，不依赖浏览器不可见的 HTTP trailer。
 fn connect_streaming_response(response: Response<BoxBody>) -> Response<BoxBody> {
@@ -1488,7 +1540,9 @@ fn connect_streaming_response(response: Response<BoxBody>) -> Response<BoxBody> 
 /// 业务作用：逐条把 native protobuf response envelope 转为 Connect JSON，并在最后复用
 /// EndStream status/details/metadata 映射；DATA 流不聚合、不预读下一条消息。
 ///
-/// 参数说明：`response` 是 native gRPC streaming 响应；`method` 固定 output descriptor 与流预算。
+/// 参数说明：
+/// - `response`：是 native gRPC streaming 响应
+/// - `method`：固定 output descriptor 与流预算。
 ///
 /// 返回：HTTP 200 `application/connect+json` 流；每条消息和最终 EndStream 都是独立 envelope。
 #[cfg(feature = "grpc-descriptor")]
@@ -1539,8 +1593,10 @@ struct BrowserTrailerBody {
 impl BrowserTrailerBody {
     /// 业务作用：建立 trailer-to-body 转换器，并保留 trailers-only response 的初始 status。
     ///
-    /// 参数说明：`inner` 是 native gRPC body；`initial` 是从 response head 移出的 status；
-    /// `mode` 决定 gRPC-Web header block 或 Connect EndStream JSON。
+    /// 参数说明：
+    /// - `inner`：是 native gRPC body
+    /// - `initial`：是从 response head 移出的 status
+    /// - `mode`：决定 gRPC-Web header block 或 Connect EndStream JSON。
     ///
     /// 返回：不聚合 DATA、最多额外产生一个结尾 DATA frame 的 body。
     fn new(inner: BoxBody, initial: HeaderMap, mode: TrailerMode) -> Self {
@@ -1554,7 +1610,8 @@ impl BrowserTrailerBody {
 
     /// 业务作用：合并 response-head status 与真实 trailer，并保证缺失 grpc-status 时 fail closed。
     ///
-    /// 参数说明：`trailers` 是上游 body 的最终 trailer；None 表示上游直接 EOF。
+    /// 参数说明：
+    /// - `trailers`：是上游 body 的最终 trailer；None 表示上游直接 EOF。
     ///
     /// 返回：按下游协议编码的唯一结束 envelope。
     fn finish(&mut self, trailers: Option<HeaderMap>) -> Bytes {
@@ -1581,7 +1638,8 @@ impl Body for BrowserTrailerBody {
     /// 业务作用：流式转发 native DATA，并在观察到 trailer/EOF 的同一位置生成唯一浏览器结束
     /// envelope，防止先向浏览器宣告成功再丢失最终 gRPC status。
     ///
-    /// 参数说明：`cx` 是浏览器下游连接的 body 唤醒上下文。
+    /// 参数说明：
+    /// - `cx`：是浏览器下游连接的 body 唤醒上下文。
     ///
     /// 返回：原 DATA、编码后的结束 DATA、上游错误、Pending 或 EOF。
     fn poll_frame(
@@ -1635,7 +1693,8 @@ struct Base64EncodeBody {
 impl Base64EncodeBody {
     /// 业务作用：建立跨 native DATA frame 的连续 Base64 编码器，避免在中间 chunk 写 padding。
     ///
-    /// 参数说明：`inner` 已把 gRPC trailer 转成最后一个 DATA frame。
+    /// 参数说明：
+    /// - `inner`：已把 gRPC trailer 转成最后一个 DATA frame。
     ///
     /// 返回：gRPC-Web text body。
     fn new(inner: BoxBody) -> Self {
@@ -1649,7 +1708,8 @@ impl Base64EncodeBody {
 
     /// 业务作用：编码当前可安全输出的 Base64 字节，并保留不足 3 字节的尾部。
     ///
-    /// 参数说明：`flush` 只在 source EOF 时为 true，允许输出 padding。
+    /// 参数说明：
+    /// - `flush`：只在 source EOF 时为 true，允许输出 padding。
     ///
     /// 返回：有可输出数据时返回 ASCII Bytes，否则 None。
     fn encode_ready(&mut self, flush: bool) -> Option<Bytes> {
@@ -1672,7 +1732,8 @@ impl Body for Base64EncodeBody {
 
     /// 业务作用：按下游写入能力增量编码连续 gRPC-Web text 字节流，只在源 EOF 写 Base64 padding。
     ///
-    /// 参数说明：`cx` 是 HTTP 下游消费者的唤醒上下文。
+    /// 参数说明：
+    /// - `cx`：是 HTTP 下游消费者的唤醒上下文。
     ///
     /// 返回：完整三字节组的 Base64 DATA、错误、Pending 或最终带 padding DATA/EOF。
     fn poll_frame(
@@ -1724,7 +1785,8 @@ impl Body for Base64EncodeBody {
 
 /// 业务作用：从 native response head 移出 trailers-only status，避免浏览器收到两份冲突状态。
 ///
-/// 参数说明：`headers` 是 native gRPC response headers。
+/// 参数说明：
+/// - `headers`：是 native gRPC response headers。
 ///
 /// 返回：只包含 grpc-status/message/details 的 HeaderMap，其余初始 metadata 仍留在 response head。
 fn take_initial_status(headers: &mut HeaderMap) -> HeaderMap {
@@ -1740,7 +1802,8 @@ fn take_initial_status(headers: &mut HeaderMap) -> HeaderMap {
 
 /// 业务作用：保证浏览器结束 envelope 总有权威 status；上游直接 EOF 不得被解释为成功。
 ///
-/// 参数说明：`trailers` 是合并后的 native status/metadata。
+/// 参数说明：
+/// - `trailers`：是合并后的 native status/metadata。
 ///
 /// 返回：无返回值；缺失 status 时原地写入 UNKNOWN 与固定原因。
 fn ensure_grpc_status(trailers: &mut HeaderMap) {
@@ -1755,7 +1818,8 @@ fn ensure_grpc_status(trailers: &mut HeaderMap) {
 
 /// 业务作用：把 gRPC trailer headers 编码为 gRPC-Web MSB trailer frame。
 ///
-/// 参数说明：`trailers` 已保证包含 grpc-status。
+/// 参数说明：
+/// - `trailers`：已保证包含 grpc-status。
 ///
 /// 返回：`0x80 + u32 length + HTTP/1 header block` 的完整 body frame。
 fn encode_grpc_web_trailers(trailers: &HeaderMap) -> Bytes {
@@ -1775,7 +1839,8 @@ fn encode_grpc_web_trailers(trailers: &HeaderMap) -> Bytes {
 
 /// 业务作用：把 native gRPC status/metadata 编码为 Connect streaming EndStream JSON envelope。
 ///
-/// 参数说明：`trailers` 已保证包含 grpc-status。
+/// 参数说明：
+/// - `trailers`：已保证包含 grpc-status。
 ///
 /// 返回：flag=0x02 的 Connect envelope；成功省略 error，失败包含规范 code/message。
 fn encode_connect_end_stream(trailers: &HeaderMap) -> Bytes {
@@ -1812,7 +1877,9 @@ fn encode_connect_end_stream(trailers: &HeaderMap) -> Bytes {
 
 /// 业务作用：聚合 Connect unary native response，读取最终 trailer 后映射 HTTP status 与裸消息。
 ///
-/// 参数说明：`response` 是 native unary response；`limit` 同时限制 envelope 聚合与下游 payload。
+/// 参数说明：
+/// - `response`：是 native unary response
+/// - `limit`：同时限制 envelope 聚合与下游 payload。
 ///
 /// 返回：成功响应为 application/proto 裸消息；RPC 错误为 Connect JSON + canonical HTTP status；
 /// 缺失/多条/畸形 gRPC message 返回 502。
@@ -1905,8 +1972,10 @@ async fn connect_unary_response(
 /// 业务作用：复用 Connect unary status/trailer 聚合后，把唯一 protobuf success message 按
 /// descriptor 编码为 canonical JSON；RPC error 继续沿用 Connect JSON error 语义。
 ///
-/// 参数说明：`response` 是 native unary response；`limit` 是通用聚合上限；`method` 锁定
-/// output schema 和 route 级 JSON/output 预算。
+/// 参数说明：
+/// - `response`：是 native unary response
+/// - `limit`：是通用聚合上限
+/// - `method`：锁定 output schema 和 route 级 JSON/output 预算。
 ///
 /// 返回：成功为 `application/json` canonical protobuf JSON；RPC error 保留 Connect HTTP/JSON；
 /// 压缩、畸形或超预算上游 payload 返回 502。
@@ -1947,7 +2016,10 @@ async fn connect_unary_json_response(
 /// 业务作用：把 annotated unary RPC response 转为 canonical protobuf JSON；错误使用
 /// `google.rpc.Status` 风格的数字 code/HTTP status，而不是 Connect 的字符串 code。
 ///
-/// 参数说明：`response` 是 native unary response；`limit` 是聚合预算；`request` 持有 output schema。
+/// 参数说明：
+/// - `response`：是 native unary response
+/// - `limit`：是聚合预算
+/// - `request`：持有 output schema。
 ///
 /// 返回：成功为 protobuf canonical JSON；RPC error 为数字 code JSON；畸形/压缩/超限为 502。
 #[cfg(feature = "grpc-descriptor")]
@@ -2008,7 +2080,9 @@ async fn google_unary_json_response(
 
 /// 业务作用：把 trailer metadata 搬到 Connect unary response headers，使浏览器无需读取 HTTP trailer。
 ///
-/// 参数说明：`headers` 是下游 response headers；`trailers` 含 status 与应用 metadata。
+/// 参数说明：
+/// - `headers`：是下游 response headers
+/// - `trailers`：含 status 与应用 metadata。
 ///
 /// 返回：无返回值；保留多值，排除 gRPC status 专用字段与 hop-by-hop 字段。
 fn append_connect_metadata(headers: &mut HeaderMap, trailers: &HeaderMap) {
@@ -2025,7 +2099,8 @@ fn append_connect_metadata(headers: &mut HeaderMap, trailers: &HeaderMap) {
 
 /// 业务作用：把 Connect RPC error 编码为浏览器客户端可解析的 JSON error body。
 ///
-/// 参数说明：`trailers` 含 grpc-status/message。
+/// 参数说明：
+/// - `trailers`：含 grpc-status/message。
 ///
 /// 返回：UTF-8 JSON Bytes；不反射未经解码的 header 文本。
 fn connect_error_json(trailers: &HeaderMap) -> Bytes {
@@ -2046,7 +2121,8 @@ fn connect_error_json(trailers: &HeaderMap) -> Bytes {
 
 /// 业务作用：抽取 Connect EndStream 可公开的应用 trailer metadata，并保持重复值顺序。
 ///
-/// 参数说明：`trailers` 是 native gRPC trailer。
+/// 参数说明：
+/// - `trailers`：是 native gRPC trailer。
 ///
 /// 返回：按 header name 排序的 JSON map；status 专用字段不混入 metadata。
 fn connect_metadata(trailers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
@@ -2065,7 +2141,8 @@ fn connect_metadata(trailers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
 
 /// 业务作用：识别只表达 RPC 状态、不得当作应用 metadata 复制的 gRPC 字段。
 ///
-/// 参数说明：`name` 是已由 HTTP parser 校验的 header name。
+/// 参数说明：
+/// - `name`：是已由 HTTP parser 校验的 header name。
 ///
 /// 返回：grpc-status/message/details-bin 时 true。
 fn is_grpc_status_header(name: &HeaderName) -> bool {
@@ -2074,7 +2151,8 @@ fn is_grpc_status_header(name: &HeaderName) -> bool {
 
 /// 业务作用：读取并约束 gRPC canonical status；非法值按 UNKNOWN fail closed。
 ///
-/// 参数说明：`trailers` 是合并后的 status metadata。
+/// 参数说明：
+/// - `trailers`：是合并后的 status metadata。
 ///
 /// 返回：0..=16 原值，缺失/非法返回 2。
 fn grpc_status(trailers: &HeaderMap) -> u16 {
@@ -2088,7 +2166,8 @@ fn grpc_status(trailers: &HeaderMap) -> u16 {
 
 /// 业务作用：按 gRPC percent-encoding 解码错误消息，避免把转义文本原样展示给 Connect 客户端。
 ///
-/// 参数说明：`trailers` 是合并后的 status metadata。
+/// 参数说明：
+/// - `trailers`：是合并后的 status metadata。
 ///
 /// 返回：存在合法 UTF-8 header 时返回有损安全解码文本，否则 None。
 fn grpc_message(trailers: &HeaderMap) -> Option<String> {
@@ -2102,7 +2181,8 @@ fn grpc_message(trailers: &HeaderMap) -> Option<String> {
 
 /// 业务作用：把 google.rpc.Status 中的 Any details 转为 Connect Error.details，保留强类型错误载荷。
 ///
-/// 参数说明：`trailers` 的 grpc-status-details-bin 是 Base64 编码 google.rpc.Status protobuf。
+/// 参数说明：
+/// - `trailers`：的 grpc-status-details-bin 是 Base64 编码 google.rpc.Status protobuf。
 ///
 /// 返回：成功解析至少一个 Any 时返回 Connect detail 数组；缺失或畸形时 None，主 status 仍可返回。
 fn grpc_error_details(trailers: &HeaderMap) -> Option<Vec<serde_json::Value>> {
@@ -2131,7 +2211,8 @@ fn grpc_error_details(trailers: &HeaderMap) -> Option<Vec<serde_json::Value>> {
 
 /// 业务作用：解析 google.protobuf.Any 的 type_url/value，转换为 Connect 的 type/value 对象。
 ///
-/// 参数说明：`input` 是单个 Any 的 length-delimited protobuf payload。
+/// 参数说明：
+/// - `input`：是单个 Any 的 length-delimited protobuf payload。
 ///
 /// 返回：字段完整时返回 JSON detail；畸形或缺字段时 None。
 fn decode_any_detail(input: &[u8]) -> Option<serde_json::Value> {
@@ -2154,12 +2235,17 @@ fn decode_any_detail(input: &[u8]) -> Option<serde_json::Value> {
         .next()
         .filter(|name| !name.is_empty())?;
     let value = STANDARD_NO_PAD.encode(value?);
-    Some(serde_json::json!({"type": type_name, "value": value}))
+    Some(serde_json::json!({
+        "type": type_name,
+        "value": value
+    }))
 }
 
 /// 业务作用：读取受 header 大小上限保护的 protobuf varint，供 status details 的无 schema 解析使用。
 ///
-/// 参数说明：`input` 是 protobuf 字节；`cursor` 是读位置并在成功后推进。
+/// 参数说明：
+/// - `input`：是 protobuf 字节
+/// - `cursor`：是读位置并在成功后推进。
 ///
 /// 返回：最多十字节的 u64；截断或溢出返回 None。
 fn read_proto_varint(input: &[u8], cursor: &mut usize) -> Option<u64> {
@@ -2180,7 +2266,9 @@ fn read_proto_varint(input: &[u8], cursor: &mut usize) -> Option<u64> {
 
 /// 业务作用：读取 length-delimited protobuf 字段并严格检查边界。
 ///
-/// 参数说明：`input` 是 protobuf 字节；`cursor` 位于长度 varint。
+/// 参数说明：
+/// - `input`：是 protobuf 字节
+/// - `cursor`：位于长度 varint。
 ///
 /// 返回：字段借用切片；长度溢出或截断返回 None。
 fn read_proto_bytes<'a>(input: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
@@ -2193,7 +2281,10 @@ fn read_proto_bytes<'a>(input: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]>
 
 /// 业务作用：跳过 google.rpc.Status/Any 的未知 protobuf 字段，保持向前兼容且不越界。
 ///
-/// 参数说明：`input` 是 protobuf 字节；`cursor` 位于字段值；`wire` 是 wire type。
+/// 参数说明：
+/// - `input`：是 protobuf 字节
+/// - `cursor`：位于字段值
+/// - `wire`：是 wire type。
 ///
 /// 返回：支持的 wire type 且字段完整时 true，否则 false。
 fn skip_proto_field(input: &[u8], cursor: &mut usize, wire: u8) -> bool {
@@ -2220,7 +2311,8 @@ fn skip_proto_field(input: &[u8], cursor: &mut usize, wire: u8) -> bool {
 
 /// 业务作用：把 gRPC canonical code 映射为 Connect 协议使用的小写枚举名。
 ///
-/// 参数说明：`status` 已归一到 0..=16。
+/// 参数说明：
+/// - `status`：已归一到 0..=16。
 ///
 /// 返回：稳定 Connect code 字符串。
 fn grpc_code_name(status: u16) -> &'static str {
@@ -2248,7 +2340,8 @@ fn grpc_code_name(status: u16) -> &'static str {
 
 /// 业务作用：把 gRPC canonical error 映射为 Connect unary 规范 HTTP 状态。
 ///
-/// 参数说明：`status` 是 1..=16 的 gRPC code。
+/// 参数说明：
+/// - `status`：是 1..=16 的 gRPC code。
 ///
 /// 返回：与 Connect protocol 一致的 4xx/5xx；未知值为 500。
 fn grpc_status_to_http(status: u16) -> StatusCode {

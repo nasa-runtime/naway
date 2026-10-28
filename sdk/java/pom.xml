@@ -9,7 +9,7 @@
   <version>0.1.0</version>
   <packaging>jar</packaging>
   <name>Naway gRPC Edge Client</name>
-  <description>Naway gRPC 边缘模式(V8)Java 客户端 SDK</description>
+  <description>Naway gRPC 边缘模式 Java 客户端 SDK</description>
 
   <url>https://github.com/nasa-runtime/naway</url>
   <licenses>
@@ -46,13 +46,12 @@
 
   <!--
     刻意不使用 protobuf-maven-plugin 做代码生成:
-    1. 业务 payload 对网关是不透明字节(§25.2.2「业务 payload 不解析」),SDK 收发
+    1. 业务 payload 对网关是不透明字节，SDK 收发
        byte[] 即可,使用方用自己的 protobuf 库编解码;
     2. 需要类型的只有两个回执消息,它们是平坦 varint 结构,手写 marshaller 比引入
        protoc 插件(要下载与平台绑定的 protoc/protoc-gen-grpc-java 二进制)更可复现;
     3. 与 Rust SDK 口径一致,两侧解析同一份 wire 契约。
-    契约本身仍以 proto/naway/edge/v1/edge.proto 为准,并由网关侧的
-    edge_proto_matches_wire_contract 用例锁死字段号。
+    契约以 proto/naway/edge/v1/edge.proto 为准，已有字段号不得改变。
   -->
 
   <properties>
@@ -87,21 +86,5 @@
       <scope>runtime</scope>
     </dependency>
 
-    <dependency>
-      <groupId>org.junit.jupiter</groupId>
-      <artifactId>junit-jupiter</artifactId>
-      <version>5.10.2</version>
-      <scope>test</scope>
-    </dependency>
   </dependencies>
-
-  <build>
-    <plugins>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.2.5</version>
-      </plugin>
-    </plugins>
-  </build>
 </project>

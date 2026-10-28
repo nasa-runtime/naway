@@ -1,0 +1,52 @@
+//! 按功能域组织的声明式配置；运行期使用构建后的不可变快照。
+
+use serde::Deserialize;
+use std::collections::HashMap;
+
+mod admin;
+mod contracts;
+mod defaults;
+mod discovery;
+mod edge;
+mod extensions;
+mod gateway;
+mod graphql;
+mod listener;
+mod llm;
+mod portal;
+mod routing;
+mod rules;
+mod secrets;
+mod security;
+mod serve;
+mod sources;
+mod state;
+mod stream;
+mod telemetry;
+mod tls;
+mod upstream;
+mod websocket;
+
+pub use admin::*;
+pub use contracts::*;
+use defaults::*;
+pub use discovery::*;
+pub use edge::*;
+pub use extensions::*;
+pub use gateway::*;
+pub use graphql::*;
+pub use listener::*;
+pub use llm::*;
+pub use portal::*;
+pub use routing::*;
+pub use rules::*;
+pub use secrets::*;
+pub use security::*;
+pub use serve::*;
+pub use sources::*;
+pub use state::*;
+pub use stream::*;
+pub use telemetry::*;
+pub use tls::*;
+pub use upstream::*;
+pub use websocket::*;

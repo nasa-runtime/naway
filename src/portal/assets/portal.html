@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Naway Developer Portal</title>
+    <link rel="stylesheet" href="/developer/app.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">NAWAY · API PRODUCTS</p>
+        <h1>Developer Portal</h1>
+        <p>浏览已发布的产品合同，查看团队应用、凭据状态与持久用量事实。</p>
+        <nav aria-label="开发者会话">
+          <a href="/api/developer/account/login">企业 SSO 登录</a> ·
+          <a href="/api/developer/account/logout">退出</a>
+        </nav>
+      </header>
+      <section aria-labelledby="products-heading">
+        <h2 id="products-heading">API 产品</h2>
+        <p id="products-status" role="status">正在载入…</p>
+        <div id="products" class="catalogs"></div>
+      </section>
+      <section aria-labelledby="account-heading">
+        <h2 id="account-heading">团队与应用</h2>
+        <p id="account-status" role="status">
+          登录后显示当前团队范围内的应用。
+        </p>
+        <div id="applications" class="catalogs"></div>
+        <button id="refresh-account" type="button">刷新应用与用量</button>
+        <h3>用量事实</h3>
+        <p>
+          来自外部持久
+          meter，不等同于本节点限额余量。未完成、未知成本不会计为成功或零成本。
+        </p>
+        <pre id="usage" role="status"></pre>
+        <button id="export-usage" type="button">
+          读取结算明细（团队 owner）
+        </button>
+        <button id="next-usage" type="button" hidden>读取下一页</button>
+        <pre id="usage-export" role="status"></pre>
+      </section>
+      <section aria-labelledby="catalog-heading">
+        <h2 id="catalog-heading">API Catalog</h2>
+        <p id="catalog-status" role="status">正在载入…</p>
+        <div id="catalogs" class="catalogs"></div>
+      </section>
+      <section aria-labelledby="application-heading">
+        <h2 id="application-heading">申请 API key</h2>
+        <p>这里只创建 pending 申请；网关不会在浏览器响应中签发 secret。</p>
+        <form id="application-form">
+          <label
+            >Catalog
+            <select id="catalog-id" required></select
+          ></label>
+          <label
+            >Applicant ID <input id="applicant-id" maxlength="128" required
+          /></label>
+          <label
+            >Display name <input id="display-name" maxlength="128"
+          /></label>
+          <label
+            >Requested plan <input id="requested-plan" maxlength="64"
+          /></label>
+          <label
+            >Portal token
+            <input
+              id="portal-token"
+              type="password"
+              autocomplete="off"
+              required
+          /></label>
+          <button type="submit">提交申请</button>
+        </form>
+        <pre id="application-result" role="status"></pre>
+      </section>
+    </main>
+    <script src="/developer/app.js" defer></script>
+  </body>
+</html>

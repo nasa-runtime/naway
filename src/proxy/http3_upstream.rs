@@ -18,7 +18,7 @@ use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
 
 use super::forward::{PhysicalConnectionBudget, PhysicalConnectionSlot};
-use crate::metrics::Metrics;
+use crate::observability::metrics::Metrics;
 use crate::tls::UpstreamTlsProfile;
 use crate::{BoxBody, BoxError};
 
@@ -63,7 +63,7 @@ struct UpstreamH3TransportLifetime {
 impl Drop for UpstreamH3TransportLifetime {
     /// 业务作用：H3 driver 已观察 connection close 并退出后归还上游 H3 active gauge。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：无；物理预算随同一结构继续由 `_slot` Drop 归还。
     fn drop(&mut self) {
@@ -77,8 +77,15 @@ impl UpstreamH3Client {
     /// 业务作用：在 cache miss/reload 时固化 authority、TLS identity 与 transport 预算；构造过程
     /// 不做 DNS/UDP I/O，首个真实请求才拨号。
     ///
-    /// 参数说明：`base` 是已验证的 HTTPS 实例 URI；`tls_profile` 是 native/custom CA/mTLS
-    /// 客户端身份；其余字段限制响应 header、QUIC receive window、idle 与物理连接数。
+    /// 参数说明：
+    /// - `base`：已经验证的 HTTPS 上游实例 URI。
+    /// - `tls_profile`：native/custom CA 或 mTLS 客户端身份策略。
+    /// - `max_response_header_bytes`：响应头累计字节上限。
+    /// - `stream_receive_window_bytes`：单个 QUIC 流接收窗口字节数。
+    /// - `connection_receive_window_bytes`：整条 QUIC 连接接收窗口字节数。
+    /// - `idle_timeout_ms`：连接空闲超时毫秒数。
+    /// - `physical_budget`：按完整上游身份共享的物理连接预算。
+    /// - `metrics`：固定上游协议观测指标。
     ///
     /// 返回：成功时返回可共享 client；URI/SNI 无法转换时拒绝候选 cache entry。
     #[allow(clippy::too_many_arguments)]
@@ -127,7 +134,8 @@ impl UpstreamH3Client {
     /// 并行驱动，TTFB 前不聚合 body。GOAWAY/已关闭 generation 在开 stream 失败后重连一次，且
     /// 此时 body 尚未被消费，不会重放已产生副作用的数据。
     ///
-    /// 参数说明：`request` 已由唯一 forward 管线完成 URI/header/版本改写。
+    /// 参数说明：
+    /// - `request`：已由唯一 forward 管线完成 URI/header/版本改写。
     ///
     /// 返回：成功时响应 body 继续逐帧读取 H3 DATA/trailers；DNS/TLS/QUIC/H3/上传失败返回错误。
     pub(super) async fn request(
@@ -201,7 +209,7 @@ impl UpstreamH3Client {
     /// 业务作用：避免冷启动并发请求重复建立 QUIC socket；driver 已观察 GOAWAY/close 时新请求
     /// 建新 generation，旧 response stream 继续持有自身 connection 自然 drain。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：可 clone sender 的 connection；资源预算、DNS、TLS 或 H3 初始化失败时返回错误。
     async fn connection(&self) -> Result<Arc<UpstreamH3Connection>, BoxError> {
@@ -228,7 +236,8 @@ impl UpstreamH3Client {
     /// 业务作用：开 stream 观察 GOAWAY/close 后只撤下同一 generation，不能误删并发请求已经
     /// 建好的替代连接。
     ///
-    /// 参数说明：`failed` 是刚刚开 stream 失败的 connection。
+    /// 参数说明：
+    /// - `failed`：是刚刚开 stream 失败的 connection。
     ///
     /// 返回：无；不匹配时保留较新的 generation。
     async fn invalidate(&self, failed: &Arc<UpstreamH3Connection>) {
@@ -246,7 +255,7 @@ impl UpstreamH3Client {
     /// 业务作用：把 DNS、UDP socket、TLS identity、ALPN、receive window、idle 和 H3 control
     /// driver 作为一个原子 generation 构建；任一步失败都由 RAII 归还物理名额。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：握手与 H3 SETTINGS 初始化完成的 connection；失败不发布半完成 sender。
     async fn connect(&self) -> Result<Arc<UpstreamH3Connection>, BoxError> {
@@ -307,7 +316,10 @@ impl UpstreamH3Client {
             driver_metrics.inc_upstream_http3_goaway();
             tracing::debug!(%error, "HTTP/3 upstream connection driver stopped");
         });
-        Ok(Arc::new(UpstreamH3Connection { sender, usable }))
+        Ok(Arc::new(UpstreamH3Connection {
+            sender,
+            usable,
+        }))
     }
 
     /// 构建本 generation 的 Quinn client TLS/transport 配置。
@@ -315,7 +327,7 @@ impl UpstreamH3Client {
     /// 业务作用：强制 ALPN `h3`、关闭 DATAGRAM，并把响应流/连接 receive window 与 idle 预算
     /// 下沉到 QUIC；TLS profile 的 CA、SNI 与客户端证书语义保持不变。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：可安装到 client endpoint 的配置；TLS/VarInt/idle 转换失败时拒绝拨号。
     fn quic_client_config(&self) -> Result<quinn::ClientConfig, BoxError> {
@@ -354,7 +366,9 @@ impl UpstreamH3Client {
 /// 业务作用：DATA/trailers 保持原顺序与 QUIC 背压；下游取消时 task 被 response body Drop abort，
 /// send half 随之释放并让上游观察 request cancellation。
 ///
-/// 参数说明：`send` 是单 request 独占发送半边；`body` 是过滤器处理后的统一流式 body。
+/// 参数说明：
+/// - `send`：是单 request 独占发送半边
+/// - `body`：是过滤器处理后的统一流式 body。
 ///
 /// 返回：FIN 写完时成功；body 或 H3 send 错误会 reset 当前 stream 并返回错误。
 async fn upload_request_body(mut send: H3SendStream, mut body: BoxBody) -> Result<(), BoxError> {
@@ -402,7 +416,7 @@ impl UpstreamH3Body {
     ///
     /// 业务作用：响应结束、下游取消或读取失败后不允许请求 body task 继续占用 QUIC stream/预算。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：无；已完成或不存在的 task 不做操作。
     fn abort_upload(&mut self) {
@@ -416,7 +430,7 @@ impl Drop for UpstreamH3Body {
     /// 业务作用：下游提前放弃响应时立即取消尚在上传的请求 body，防止已取消
     /// 的业务请求继续产生上游副作用或占用 QUIC stream。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：无；若 upload task 未完成则将其 abort。
     fn drop(&mut self) {
@@ -431,7 +445,8 @@ impl Body for UpstreamH3Body {
     /// 业务作用：按 DATA→trailers 顺序暴露上游 H3 response，并把并发 request upload 错误映射到
     /// 同一 body；任何失败都终止另一方向，避免半完成 stream。
     ///
-    /// 参数说明：`cx` 是当前下游消费者的唤醒上下文。
+    /// 参数说明：
+    /// - `cx`：是当前下游消费者的唤醒上下文。
     ///
     /// 返回：下一帧、流结束或 transport/upload 错误；Pending 时不预读 QUIC payload。
     fn poll_frame(
@@ -498,7 +513,7 @@ impl Body for UpstreamH3Body {
 
     /// 业务作用：只在 DATA/trailers 都消费完后向下游报告 EOF，防止 trailers 被截断。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：完整结束或失败后为 true，否则 false。
     fn is_end_stream(&self) -> bool {
@@ -507,7 +522,7 @@ impl Body for UpstreamH3Body {
 
     /// 业务作用：H3 response 未知长度时保持未知，禁止 adapter 为流式响应臆测并聚合。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：默认未知长度提示；Content-Length 继续由响应 header 表达。
     fn size_hint(&self) -> SizeHint {

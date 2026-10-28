@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::config::model::AccessLogCfg;
 use crate::config::GatewaySnapshot;
-use crate::metrics::Metrics;
+use crate::observability::metrics::Metrics;
 
 /// 数据面到后台日志 worker 的非阻塞发送句柄。
 #[derive(Clone)]
@@ -38,9 +38,9 @@ struct AccessLoggerInner {
 }
 
 impl AccessLogger {
-    /// 启动 access log 后台任务。
+    /// 业务作用：启动 access log 后台任务。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `metrics`: 日志丢弃计数等低基数指标。
     /// - `snap`: 当前网关快照;后台任务逐条读取最新 `access_log` 配置,支持热更格式/条件/采样。
     /// - `queue_size`: bounded 队列容量。队列容量是 channel 属性,启动期生效。
@@ -55,8 +55,11 @@ impl AccessLogger {
 
     /// 业务作用：为尚未发布的候选快照准备独立 access-log dispatcher 与 sink worker。
     ///
-    /// 参数说明：`metrics` 承载丢弃计数；`snap` 在提交后提供当前格式；`queue_size`
-    /// 是硬队列上限；`runtime` 提供候选 sink 拓扑。
+    /// 参数说明：
+    /// - `metrics`：承载丢弃计数
+    /// - `snap`：在提交后提供当前格式
+    /// - `queue_size`：是硬队列上限
+    /// - `runtime`：提供候选 sink 拓扑。
     ///
     /// 返回：所有 sink 客户端与有界 worker 已就绪时返回未接收业务记录的候选代；
     /// 任一初始化失败则返回错误，在线代不受影响。
@@ -68,7 +71,10 @@ impl AccessLogger {
     ) -> Result<Self> {
         // 候选必须在发布前建好全部 sink，避免快照已上线却丢失审计出口。
         let sink_specs = runtime.sink_specs.clone();
-        let spawned = crate::log_sink::spawn_sink_workers(sink_specs.as_ref(), metrics.clone())?;
+        let spawned = crate::observability::log_sink::spawn_sink_workers(
+            sink_specs.as_ref(),
+            metrics.clone(),
+        )?;
         let shutdown_timeout = sink_specs
             .iter()
             .map(|spec| spec.timeout.saturating_add(Duration::from_secs(1)))
@@ -137,7 +143,8 @@ impl AccessLogger {
 
     /// 业务作用：复用当前 logger 的指标与快照句柄，完整准备候选 sink 代。
     ///
-    /// 参数说明：`runtime` 是候选快照编译得到的格式、队列与 sink 计划。
+    /// 参数说明：
+    /// - `runtime`：是候选快照编译得到的格式、队列与 sink 计划。
     ///
     /// 返回：全部 sink worker 已就绪时返回候选 logger；失败时在线代不变。
     pub fn prepare_replacement(&self, runtime: &AccessLogRuntime) -> Result<Self> {
@@ -149,9 +156,9 @@ impl AccessLogger {
         )
     }
 
-    /// 尝试写入一条 access log 记录。
+    /// 业务作用：尝试写入一条 access log 记录。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `record`: 已在请求管线收集好的低基数字段。
     pub fn log(&self, record: AccessRecord) {
         let active = self.active.load_full();
@@ -165,7 +172,8 @@ impl AccessLogger {
 
     /// 业务作用：在快照发布后原子切换 access-log 写入代，并异步排空旧 sink。
     ///
-    /// 参数说明：`candidate` 是已成功准备但尚未接收数据面记录的候选代。
+    /// 参数说明：
+    /// - `candidate`：是已成功准备但尚未接收数据面记录的候选代。
     ///
     /// 返回：无返回值；新记录立即只进入候选代，旧队列在自身 deadline 内排空。
     pub fn replace(&self, candidate: &Self) {
@@ -179,7 +187,7 @@ impl AccessLogger {
         });
     }
 
-    /// 停止接收新记录，排空 dispatcher 与所有 sink queue，并执行 backend flush/shutdown。
+    /// 业务作用：停止接收新记录，排空 dispatcher 与所有 sink queue，并执行 backend flush/shutdown。
     pub async fn shutdown(&self) -> Result<()> {
         shutdown_generation(self.active.load_full()).await
     }
@@ -187,7 +195,8 @@ impl AccessLogger {
 
 /// 业务作用：停收并有界排空单个 access-log 代，不影响已切换的新代。
 ///
-/// 参数说明：`generation` 持有该代唯一队列、sink worker 和完成回执。
+/// 参数说明：
+/// - `generation`：持有该代唯一队列、sink worker 和完成回执。
 ///
 /// 返回：全部排空并确认退出时成功；超时或 worker 异常时返回错误。
 async fn shutdown_generation(generation: Arc<AccessLoggerInner>) -> Result<()> {
@@ -228,14 +237,15 @@ pub struct AccessLogRuntime {
     /// 稳定采样率,范围 0.0..=1.0。
     sample: f64,
     /// 启动期已校验/解密的 sink 计划。reload 只允许完全相同，避免留下两套 worker。
-    pub(crate) sink_specs: Arc<[crate::log_sink::LogSinkSpec]>,
+    pub(crate) sink_specs: Arc<[crate::observability::log_sink::LogSinkSpec]>,
 }
 
 impl AccessLogRuntime {
-    /// 从 yml 配置构建运行期 access log 配置。
+    /// 业务作用：从 yml 配置构建运行期 access log 配置。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `cfg`: 顶层 `access_log` 配置。
+    /// - `config_dir`：日志文件与凭据相对路径的解析根。
     pub fn build(cfg: &AccessLogCfg, config_dir: &Path) -> Result<Self> {
         if !cfg.sample.is_finite() || !(0.0..=1.0).contains(&cfg.sample) {
             bail!("access_log.sample must be within 0.0..=1.0");
@@ -254,7 +264,7 @@ impl AccessLogRuntime {
             .map(AccessLogCondition::parse)
             .transpose()
             .context("build access_log.if")?;
-        let sink_specs = crate::log_sink::build_sink_specs(
+        let sink_specs = crate::observability::log_sink::build_sink_specs(
             cfg.sinks.as_slice(),
             config_dir,
             cfg.queue_size.max(1),
@@ -270,7 +280,7 @@ impl AccessLogRuntime {
         })
     }
 
-    /// 返回当前快照是否启用 access log。
+    /// 业务作用：返回当前快照是否启用 access log。
     ///
     /// 数据面在构造 [`AccessRecord`] 前先检查该位：关闭态不能仍把每个请求送入 dispatcher，
     /// 否则不仅产生 route/upstream/trace-id 字符串分配，还会让无消费者价值的记录争用 bounded
@@ -279,9 +289,9 @@ impl AccessLogRuntime {
         self.enabled
     }
 
-    /// 判断当前记录是否需要输出。
+    /// 业务作用：判断当前记录是否需要输出。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `record`: 待输出 access record。
     fn should_log(&self, record: &AccessRecord) -> bool {
         self.enabled
@@ -293,7 +303,7 @@ impl AccessLogRuntime {
             && sampled(record.request_id.as_str(), self.sample)
     }
 
-    /// Sink client/channel 属 bootstrap 资源；该比较只用于拒绝无法原地重建的热更。
+    /// 业务作用：Sink client/channel 属 bootstrap 资源；该比较只用于拒绝无法原地重建的热更。
     pub(crate) fn same_sink_topology(&self, other: &Self) -> bool {
         self.queue_size == other.queue_size && self.sink_specs == other.sink_specs
     }
@@ -309,8 +319,10 @@ pub struct AccessRecord {
     pub method: AccessMethod,
     /// HTTP URI 或 L4 stream id；HTTP 分支 clone `Uri` 的共享存储，不复制 path 字节。
     pub path: AccessPath,
-    /// 最终命中的 route id；HTTP 数据面与编译路由共享字符串，L4 低频连接才构造一次。
+    /// 公开入口 route id；多层路由保持根观测归属，叶子身份保存在完整执行链。
     pub route_id: Option<Arc<str>>,
+    /// 已访问的稳定根到当前层链；只共享构建期字符串，不记录主体、claim 或条件值。
+    pub route_chain: Option<Arc<[Arc<str>]>>,
     /// 最终上游标识；与选择器/响应 trace 共享底层字符串。
     pub upstream: Option<Arc<str>>,
     /// 实际发起的上游尝试次数。
@@ -336,7 +348,7 @@ pub enum AccessMethod {
 }
 
 impl AccessMethod {
-    /// 返回仅在记录渲染期借用的文本。
+    /// 业务作用：返回仅在记录渲染期借用的文本。
     fn as_str(&self) -> &str {
         match self {
             Self::Http(method) => method.as_str(),
@@ -354,7 +366,7 @@ pub enum AccessPath {
 }
 
 impl AccessPath {
-    /// 返回 HTTP path（不含 query）或 stream id。
+    /// 业务作用：返回 HTTP path（不含 query）或 stream id。
     fn as_str(&self) -> &str {
         match self {
             Self::Http(uri) => uri.path(),
@@ -412,6 +424,7 @@ enum AccessLogVar {
     Method,
     Path,
     Route,
+    RouteChain,
     Upstream,
     UpstreamAttempts,
     Status,
@@ -422,9 +435,9 @@ enum AccessLogVar {
 }
 
 impl AccessLogFormat {
-    /// 编译 `access_log.format`。
+    /// 业务作用：编译 `access_log.format`。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `raw`: 格式字符串,支持 `$status` 与 `${status}` 两种变量写法。
     fn parse(raw: &str) -> Result<Self> {
         let mut parts = Vec::new();
@@ -467,9 +480,9 @@ impl AccessLogFormat {
         })
     }
 
-    /// 渲染 access log 字符串。
+    /// 业务作用：渲染 access log 字符串。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `record`: 当前 access log 记录。
     fn render(&self, record: &AccessRecord) -> String {
         let mut out = String::new();
@@ -484,20 +497,24 @@ impl AccessLogFormat {
 }
 
 impl AccessLogCondition {
-    /// 编译 `access_log.if` 条件表达式。
+    /// 业务作用：编译 `access_log.if` 条件表达式。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `raw`: 条件表达式,如 `$status >= 500` 或 `${method} = GET`。
     fn parse(raw: &str) -> Result<Self> {
         let (left, op, right) = split_condition(raw)?;
         let left = parse_log_var(strip_var_sigil(left.trim()))?;
         let right = parse_condition_value(right.trim(), left, op)?;
-        Ok(Self { left, op, right })
+        Ok(Self {
+            left,
+            op,
+            right,
+        })
     }
 
-    /// 判断记录是否满足条件。
+    /// 业务作用：判断记录是否满足条件。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `record`: 当前 access log 记录。
     fn matches(&self, record: &AccessRecord) -> bool {
         match &self.right {
@@ -527,10 +544,12 @@ impl AccessLogCondition {
 }
 
 impl AccessLogVar {
-    /// 取字符串形式字段值。
+    /// 业务作用：在后台日志渲染时解析字段，根路由和完整层级链使用独立变量。
     ///
-    /// # 参数
-    /// - `record`: 当前 access log 记录。
+    /// 参数说明：
+    /// - `record`：是数据面已冻结的低敏访问事实。
+    ///
+    /// 返回：借用已有文本或格式化有限数值、层级链，不读取请求凭据。
     fn value(self, record: &AccessRecord) -> Cow<'_, str> {
         match self {
             Self::RequestId => Cow::Borrowed(record.request_id.as_str()),
@@ -538,6 +557,19 @@ impl AccessLogVar {
             Self::Method => Cow::Borrowed(record.method.as_str()),
             Self::Path => Cow::Borrowed(record.path.as_str()),
             Self::Route => Cow::Borrowed(record.route_id.as_deref().unwrap_or("-")),
+            Self::RouteChain => Cow::Owned(
+                record
+                    .route_chain
+                    .as_deref()
+                    .map(|chain| {
+                        chain
+                            .iter()
+                            .map(AsRef::as_ref)
+                            .collect::<Vec<&str>>()
+                            .join(">")
+                    })
+                    .unwrap_or_else(|| "-".to_owned()),
+            ),
             Self::Upstream => Cow::Borrowed(record.upstream.as_deref().unwrap_or("-")),
             Self::UpstreamAttempts => Cow::Owned(record.upstream_attempts.to_string()),
             Self::Status => Cow::Owned(record.status.to_string()),
@@ -552,9 +584,9 @@ impl AccessLogVar {
         }
     }
 
-    /// 取数值形式字段值。
+    /// 业务作用：取数值形式字段值。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `record`: 当前 access log 记录。
     fn numeric_value(self, record: &AccessRecord) -> Option<u64> {
         match self {
@@ -567,7 +599,7 @@ impl AccessLogVar {
         }
     }
 
-    /// 该变量是否支持数值比较。
+    /// 业务作用：该变量是否支持数值比较。
     fn is_numeric(self) -> bool {
         matches!(
             self,
@@ -582,7 +614,9 @@ impl AccessLogVar {
 
 /// 业务作用：把一条已完成请求的访问事实写入 Naway access tracing target，供本地日志层消费。
 ///
-/// 参数说明：`record` 是当前 access log 记录；`line` 是当前快照已渲染的可选自定义行。
+/// 参数说明：
+/// - `record`：是当前 access log 记录
+/// - `line`：是当前快照已渲染的可选自定义行。
 ///
 /// 返回：无；日志层是否保留记录由当前 subscriber 与过滤配置决定。
 pub(crate) fn log_record(record: &AccessRecord, line: Option<&str>) {
@@ -593,6 +627,7 @@ pub(crate) fn log_record(record: &AccessRecord, line: Option<&str>) {
         method = record.method.as_str(),
         path = record.path.as_str(),
         route = %record.route_id.as_deref().unwrap_or("-"),
+        route_chain = ?record.route_chain.as_deref().unwrap_or(&[]),
         upstream = %record.upstream.as_deref().unwrap_or("-"),
         upstream_attempts = record.upstream_attempts,
         status = record.status,
@@ -605,12 +640,17 @@ pub(crate) fn log_record(record: &AccessRecord, line: Option<&str>) {
     );
 }
 
-/// 序列化一次远端 sink 共用的结构化 JSON。AccessRecord 从热路径移入 Arc；serializer
-/// 直接借用字段写 Vec，不先构造 `serde_json::Value`，避免再复制 method/path/upstream 字符串。
+/// 业务作用：为所有远端 sink 序列化同一份访问事实和稳定层级链，不重复复制业务正文或身份。
+///
+/// 参数说明：
+/// - `runtime`：提供当前输出格式
+/// - `record`：从数据面移交后台日志 worker。
+///
+/// 返回：可共享的 JSON 与原始记录；序列化失败返回错误，不生成部分事件。
 fn encode_record(
     runtime: &AccessLogRuntime,
     record: AccessRecord,
-) -> Result<crate::log_sink::LogEnvelope> {
+) -> Result<crate::observability::log_sink::LogEnvelope> {
     #[derive(serde::Serialize)]
     struct WireRecord<'a> {
         timestamp_unix_nanos: u128,
@@ -619,6 +659,7 @@ fn encode_record(
         method: &'a str,
         path: &'a str,
         route_id: Option<&'a str>,
+        route_chain: Option<Vec<&'a str>>,
         upstream: Option<&'a str>,
         upstream_attempts: usize,
         status: u16,
@@ -641,6 +682,10 @@ fn encode_record(
         method: record.method.as_str(),
         path: record.path.as_str(),
         route_id: record.route_id.as_deref(),
+        route_chain: record
+            .route_chain
+            .as_deref()
+            .map(|chain| chain.iter().map(AsRef::as_ref).collect()),
         upstream: record.upstream.as_deref(),
         upstream_attempts: record.upstream_attempts,
         status: record.status,
@@ -651,7 +696,7 @@ fn encode_record(
         formatted: formatted.as_deref(),
     })
     .context("serialize access log record")?;
-    Ok(crate::log_sink::LogEnvelope {
+    Ok(crate::observability::log_sink::LogEnvelope {
         record: Arc::new(record),
         json: bytes::Bytes::from(json),
         unix_nanos,
@@ -659,9 +704,9 @@ fn encode_record(
     })
 }
 
-/// 追加字面量片段。
+/// 业务作用：追加字面量片段。
 ///
-/// # 参数
+/// 参数说明：
 /// - `parts`: 正在构建的格式片段列表。
 /// - `value`: 要追加的字面量。
 fn push_literal(parts: &mut Vec<LogFormatPart>, value: &str) {
@@ -670,10 +715,12 @@ fn push_literal(parts: &mut Vec<LogFormatPart>, value: &str) {
     }
 }
 
-/// 解析 access log 字段变量名。
+/// 业务作用：限定日志模板只能读取已声明的访问事实，不能借任意变量暴露请求内容。
 ///
-/// # 参数
-/// - `name`: 去掉 `$` / `${}` 后的变量名。
+/// 参数说明：
+/// - `name`：是去掉变量标记后的字段名。
+///
+/// 返回：已知字段的强类型标识；未知字段拒绝候选配置。
 fn parse_log_var(name: &str) -> Result<AccessLogVar> {
     match name.trim() {
         "request_id" => Ok(AccessLogVar::RequestId),
@@ -681,6 +728,7 @@ fn parse_log_var(name: &str) -> Result<AccessLogVar> {
         "method" | "request_method" => Ok(AccessLogVar::Method),
         "path" | "uri" | "request_uri" => Ok(AccessLogVar::Path),
         "route" | "route_id" => Ok(AccessLogVar::Route),
+        "route_chain" => Ok(AccessLogVar::RouteChain),
         "upstream" | "upstream_addr" => Ok(AccessLogVar::Upstream),
         "upstream_attempts" => Ok(AccessLogVar::UpstreamAttempts),
         "status" => Ok(AccessLogVar::Status),
@@ -694,9 +742,9 @@ fn parse_log_var(name: &str) -> Result<AccessLogVar> {
     }
 }
 
-/// 拆分条件表达式。
+/// 业务作用：拆分条件表达式。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 原始条件表达式。
 fn split_condition(raw: &str) -> Result<(&str, ConditionOp, &str)> {
     for (token, op) in [
@@ -718,9 +766,9 @@ fn split_condition(raw: &str) -> Result<(&str, ConditionOp, &str)> {
     bail!("access_log.if must contain one of = != == >= <= > <");
 }
 
-/// 去掉变量表达式的 `$` 或 `${}` 包裹。
+/// 业务作用：去掉变量表达式的 `$` 或 `${}` 包裹。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 条件左值。
 fn strip_var_sigil(raw: &str) -> &str {
     raw.strip_prefix("${")
@@ -729,9 +777,9 @@ fn strip_var_sigil(raw: &str) -> &str {
         .unwrap_or(raw)
 }
 
-/// 解析条件右值。
+/// 业务作用：解析条件右值。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 条件右值。
 /// - `left`: 左值变量。
 /// - `op`: 条件操作符。
@@ -757,9 +805,9 @@ fn parse_condition_value(raw: &str, left: AccessLogVar, op: ConditionOp) -> Resu
     }
 }
 
-/// 按 request id 做稳定采样。
+/// 业务作用：按 request id 做稳定采样。
 ///
-/// # 参数
+/// 参数说明：
 /// - `request_id`: 网关生成的请求 ID。
 /// - `sample`: 采样率,范围 0.0..=1.0。
 fn sampled(request_id: &str, sample: f64) -> bool {

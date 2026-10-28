@@ -1,4 +1,4 @@
-//! V7 内嵌 Casbin RBAC/ABAC 授权。
+//! 内嵌 Casbin RBAC/ABAC 授权。
 //!
 //! model 与 policy 文件只在 `GatewaySnapshot` 构建期读取，并被编译成只读
 //! `Enforcer`。请求期不读文件、不动态解析 matcher；只按构建期已编译的参数计划
@@ -58,7 +58,7 @@ pub(crate) enum CasbinInputError {
 }
 
 impl CasbinPolicy {
-    /// 从文件构建不可变 Enforcer；并用同样参数数量做一次空输入 enforce，
+    /// 业务作用：从文件构建不可变 Enforcer；并用同样参数数量做一次空输入 enforce，
     /// 在候选快照上线前暴露 request_definition 元数不匹配等错误。
     pub(crate) fn build(
         cfg: &CasbinAuthorizationCfg,
@@ -106,17 +106,17 @@ impl CasbinPolicy {
         })
     }
 
-    /// 是否必须有一个已通过网关认证的 consumer。
+    /// 业务作用：是否必须有一个已通过网关认证的 consumer。
     pub(crate) fn requires_identity(&self) -> bool {
         self.require_identity
     }
 
-    /// Casbin 内部执行异常是否 fail-open。
+    /// 业务作用：Casbin 内部执行异常是否 fail-open。
     pub(crate) fn fail_open(&self) -> bool {
         self.fail_open
     }
 
-    /// 执行一次同步内存决策。
+    /// 业务作用：执行一次同步内存决策。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enforce(
         &self,
@@ -168,6 +168,7 @@ impl CasbinPolicy {
     }
 }
 
+/// 业务作用：检查 Casbin 模型、策略和参数声明的资源边界，拒绝无法安全执行的授权配置。
 fn validate_cfg(cfg: &CasbinAuthorizationCfg) -> Result<()> {
     if cfg.model_file.trim().is_empty() || cfg.policy_file.trim().is_empty() {
         bail!("model_file and policy_file cannot be empty");
@@ -184,6 +185,7 @@ fn validate_cfg(cfg: &CasbinAuthorizationCfg) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：把授权输入声明编译为固定请求来源，防止请求动态选择授权字段。
 fn parse_argument(raw: &str) -> Result<CasbinArgument> {
     let raw = raw.trim();
     match raw {
@@ -208,11 +210,13 @@ fn parse_argument(raw: &str) -> Result<CasbinArgument> {
     }
 }
 
+/// 业务作用：有界读取授权模型与策略文本，拒绝超限或无效 UTF-8 文件。
 fn read_bounded_utf8(path: &Path, kind: &str) -> Result<String> {
-    let bytes = crate::bounded_io::read_file(path, MAX_CASBIN_FILE_BYTES, kind)?;
+    let bytes = crate::io::bounded_io::read_file(path, MAX_CASBIN_FILE_BYTES, kind)?;
     String::from_utf8(bytes).with_context(|| format!("{kind} {} must be UTF-8", path.display()))
 }
 
+/// 业务作用：以主配置目录为基准定位授权文件，不由业务请求指定本地路径。
 fn resolve(base: &Path, raw: &str) -> PathBuf {
     let path = Path::new(raw);
     if path.is_absolute() {
@@ -222,7 +226,7 @@ fn resolve(base: &Path, raw: &str) -> PathBuf {
     }
 }
 
-/// 返回 model/policy 文件依赖，供 reload watcher 和配置指纹共用。
+/// 业务作用：返回 model/policy 文件依赖，供 reload watcher 和配置指纹共用。
 pub(crate) fn dependency_paths(config_dir: &Path, cfg: &CasbinAuthorizationCfg) -> [PathBuf; 2] {
     [
         resolve(config_dir, &cfg.model_file),

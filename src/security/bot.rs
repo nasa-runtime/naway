@@ -53,7 +53,7 @@ pub(crate) enum BotDecision {
 impl BotDecision {
     /// 业务作用：判断固定决策是否需要挑战或阻断请求。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：普通允许与签名可信返回 false，其余决策返回 true。
     pub(crate) const fn denied(self) -> bool {
@@ -62,7 +62,7 @@ impl BotDecision {
 
     /// 业务作用：为日志和固定基数指标提供不含客户端输入的稳定原因。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回编译期固定原因字符串。
     pub(crate) const fn reason(self) -> &'static str {
@@ -117,7 +117,9 @@ pub(crate) struct BotPolicy {
 impl BotPolicy {
     /// 业务作用：编译 route Bot 策略，冻结匹配器、header、指纹、签名 secret 与资源边界。
     ///
-    /// 参数说明：`cfg` 是 route Bot 声明；`config_dir` 是 SecretSource 相对路径基准。
+    /// 参数说明：
+    /// - `cfg`：是 route Bot 声明
+    /// - `config_dir`：是 SecretSource 相对路径基准。
     ///
     /// 返回：全部规则无冲突且资源有界时返回不可变策略；未知模式、弱 secret、非法 header、
     /// glob 或预算会拒绝候选快照。
@@ -202,7 +204,9 @@ impl BotPolicy {
 
     /// 业务作用：在认证、插件和上游副作用前组合 User-Agent、header、指纹、行为与签名信号。
     ///
-    /// 参数说明：`parts` 是当前请求 head；`client_ip` 是 trusted-proxy 规则确定的权威地址。
+    /// 参数说明：
+    /// - `parts`：是当前请求 head
+    /// - `client_ip`：是 trusted-proxy 规则确定的权威地址。
     ///
     /// 返回：返回固定允许、可信或挑战原因；任何可信机器人声明只有逐请求签名通过后才可信。
     pub(crate) fn evaluate_head(&self, parts: &Parts, client_ip: IpAddr) -> BotDecision {
@@ -280,7 +284,9 @@ impl BotPolicy {
 
     /// 业务作用：生成不暴露 IP 或 header 原值的稳定限流维度键。
     ///
-    /// 参数说明：`parts` 是请求 head；`client_ip` 是权威客户端地址。
+    /// 参数说明：
+    /// - `parts`：是请求 head
+    /// - `client_ip`：是权威客户端地址。
     ///
     /// 返回：返回当前策略字段与客户端 IP 的 SHA-256 前 64 位十六进制值。
     pub(crate) fn rate_key(&self, parts: &Parts, client_ip: IpAddr) -> String {
@@ -295,7 +301,7 @@ impl BotPolicy {
 
     /// 业务作用：判断命中是否只观测而不改变业务请求。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：配置为 `monitor` 时返回 true。
     pub(crate) const fn monitor(&self) -> bool {
@@ -304,7 +310,7 @@ impl BotPolicy {
 
     /// 业务作用：返回速率挑战的 `Retry-After` 秒数，避免客户端立即重试放大压力。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：配置速率信号时返回向上取整且至少为一秒的窗口；未配置返回一秒。
     pub(crate) fn retry_after_secs(&self) -> u64 {
@@ -316,7 +322,9 @@ impl BotPolicy {
 
     /// 业务作用：按已验证字段顺序计算稳定 SHA-256 指纹，避免拼接歧义和原值外泄。
     ///
-    /// 参数说明：`parts` 是请求 head；`client_ip` 仅在限流维度需要按地址隔离时提供。
+    /// 参数说明：
+    /// - `parts`：是请求 head
+    /// - `client_ip`：仅在限流维度需要按地址隔离时提供。
     ///
     /// 返回：返回固定 32 字节摘要。
     fn fingerprint(&self, parts: &Parts, client_ip: Option<IpAddr>) -> [u8; 32] {
@@ -364,7 +372,10 @@ struct TrustedSearchBot {
 impl TrustedSearchBot {
     /// 业务作用：复验可信搜索机器人逐请求签名，阻止只伪造 User-Agent 获得豁免。
     ///
-    /// 参数说明：`parts` 是请求 head；`client_ip` 是权威地址；`user_agent` 已经过单值 UTF-8 校验。
+    /// 参数说明：
+    /// - `parts`：是请求 head
+    /// - `client_ip`：是权威地址
+    /// - `user_agent`：已经过单值 UTF-8 校验。
     ///
     /// 返回：时间戳新鲜、header 单值、Base64URL 合法且 HMAC 覆盖地址、方法、authority、
     /// URI 与 User-Agent 时返回 true；任何异常返回 false。
@@ -419,7 +430,9 @@ impl TrustedSearchBot {
 
 /// 业务作用：编译大小写不敏感的 User-Agent glob 集合，并约束规则数量与单值长度。
 ///
-/// 参数说明：`field` 用于错误定位；`patterns` 是配置的 glob 列表。
+/// 参数说明：
+/// - `field`：用于错误定位
+/// - `patterns`：是配置的 glob 列表。
 ///
 /// 返回：空列表返回 `None`；全部 glob 合法且不重复时返回集合，否则拒绝候选。
 fn build_globs(field: &str, patterns: &[String]) -> Result<Option<GlobSet>> {
@@ -457,7 +470,10 @@ fn build_globs(field: &str, patterns: &[String]) -> Result<Option<GlobSet>> {
 
 /// 业务作用：拒绝 allow/deny 中完全相同的 User-Agent glob，避免处置优先级依赖实现细节。
 ///
-/// 参数说明：`field` 用于错误定位；`allowed` 与 `denied` 是配置原值。
+/// 参数说明：
+/// - `field`：用于错误定位
+/// - `allowed`：是配置原值。
+/// - `denied`：是配置原值。
 ///
 /// 返回：无精确冲突返回成功；忽略大小写后存在同值返回错误。
 fn reject_exact_overlap(field: &str, allowed: &[String], denied: &[String]) -> Result<()> {
@@ -477,7 +493,9 @@ fn reject_exact_overlap(field: &str, allowed: &[String], denied: &[String]) -> R
 
 /// 业务作用：把配置 header 名编译为无重复的标准 HeaderName，拒绝歧义和过量字段。
 ///
-/// 参数说明：`field` 用于错误定位；`values` 是配置 header 名。
+/// 参数说明：
+/// - `field`：用于错误定位
+/// - `values`：是配置 header 名。
 ///
 /// 返回：全部名称合法且不重复时返回固定列表；否则返回错误。
 fn parse_headers(field: &str, values: &[String]) -> Result<Vec<HeaderName>> {
@@ -499,7 +517,8 @@ fn parse_headers(field: &str, values: &[String]) -> Result<Vec<HeaderName>> {
 
 /// 业务作用：解析指纹 denylist，并拒绝非规范十六进制和重复摘要。
 ///
-/// 参数说明：`values` 是配置的 SHA-256 小写十六进制字符串。
+/// 参数说明：
+/// - `values`：是配置的 SHA-256 小写十六进制字符串。
 ///
 /// 返回：全部摘要合法且唯一时返回固定集合；否则返回错误。
 fn parse_fingerprints(values: &[String]) -> Result<HashSet<[u8; 32]>> {
@@ -530,7 +549,9 @@ fn parse_fingerprints(values: &[String]) -> Result<HashSet<[u8; 32]>> {
 
 /// 业务作用：编译可信搜索机器人声明并在候选发布前解析签名 SecretSource。
 ///
-/// 参数说明：`configs` 是声明列表；`config_dir` 是 SecretSource 路径基准。
+/// 参数说明：
+/// - `configs`：是声明列表
+/// - `config_dir`：是 SecretSource 路径基准。
 ///
 /// 返回：名称、glob、header、时间窗和 secret 均合法时返回固定计划，否则拒绝候选。
 fn build_trusted_bots(
@@ -568,7 +589,7 @@ fn build_trusted_bots(
                 config.name
             );
         }
-        let secret = crate::secret::resolve_text(
+        let secret = crate::security::secret::resolve_text(
             config.signature_secret.as_str(),
             config_dir,
             "bot trusted search signature",
@@ -599,7 +620,8 @@ fn build_trusted_bots(
 
 /// 业务作用：编译 Bot 速率信号并约束令牌、窗口和活动维度资源。
 ///
-/// 参数说明：`cfg` 是 route 速率声明。
+/// 参数说明：
+/// - `cfg`：是 route 速率声明。
 ///
 /// 返回：全部边界合法时返回固定规则，否则拒绝候选。
 fn build_rate(cfg: &BotRateCfg) -> Result<BotRatePolicy> {
@@ -626,7 +648,9 @@ fn build_rate(cfg: &BotRateCfg) -> Result<BotRatePolicy> {
 
 /// 业务作用：读取严格单值 UTF-8 header，防止重复值拼接改变签名、身份或行为语义。
 ///
-/// 参数说明：`headers` 是请求 header；`name` 是已验证名称。
+/// 参数说明：
+/// - `headers`：是请求 header
+/// - `name`：是已验证名称。
 ///
 /// 返回：恰有一个非空 UTF-8 值时返回该值；缺失、重复、空值或非法编码返回 `None`。
 fn strict_text_header<'a>(headers: &'a http::HeaderMap, name: &HeaderName) -> Option<&'a str> {
@@ -640,7 +664,10 @@ fn strict_text_header<'a>(headers: &'a http::HeaderMap, name: &HeaderName) -> Op
 
 /// 业务作用：以长度前缀向 SHA-256 写入 header 名和值序列，避免不同字段组合产生拼接碰撞。
 ///
-/// 参数说明：`digest` 是当前摘要；`name` 是字段名；`values` 是一个或多个原始字节值。
+/// 参数说明：
+/// - `digest`：是当前摘要
+/// - `name`：是字段名
+/// - `values`：是一个或多个原始字节值。
 ///
 /// 返回：无；仅更新调用方摘要状态。
 fn update_component<T, I>(digest: &mut Sha256, name: &[u8], values: I)

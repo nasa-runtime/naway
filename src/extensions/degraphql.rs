@@ -1,4 +1,4 @@
-//! V7 degraphql：把受限 REST GET 映射成固定 GraphQL POST。
+//! degraphql：把受限 REST GET 映射成固定 GraphQL POST。
 //!
 //! query 文档由配置提供并在 build-then-swap 阶段完成语法、深度、复杂度与 introspection
 //! 检查。请求只能填充显式声明的 path/query/header variables，不能提交任意 GraphQL 文本。
@@ -19,8 +19,8 @@ use crate::config::model::{
     DegraphqlCfg, DegraphqlVariableCfg, DegraphqlVariableKindCfg, DegraphqlVariableSourceCfg,
     GraphqlGuardCfg,
 };
+use crate::extensions::graphql::GraphqlGuardPolicy;
 use crate::full_body;
-use crate::graphql::GraphqlGuardPolicy;
 use crate::proxy::forward::ForwardBody;
 use crate::routing::predicate::Predicate;
 
@@ -29,6 +29,7 @@ const MAX_GENERATED_BODY_BYTES: usize = 1024 * 1024;
 
 /// 构建期编译后的 REST→GraphQL 计划。
 pub(crate) struct DegraphqlPlan {
+    cost: u64,
     query: Arc<str>,
     operation_name: Option<Arc<str>>,
     upstream_uri: Uri,
@@ -79,10 +80,22 @@ enum VariableKind {
 
 pub(crate) enum DegraphqlOutcome {
     Transformed(ForwardBody),
-    Rejected { status: u16, message: &'static str },
+    Rejected {
+        status: u16,
+        message: &'static str,
+    },
 }
 
 impl DegraphqlPlan {
+    /// 业务作用：冻结受信查询与变量映射，拒绝任意查询注入和无界生成正文。
+    ///
+    /// 参数说明：
+    /// - `cfg`：提供静态模板
+    /// - `guard`：限定查询预算
+    /// - `predicates`：定位受控入口。
+    /// - `route_id`：定位受控入口。
+    ///
+    /// 返回：可复用计划和已验证成本；任何查询、变量或路由约束不一致时拒绝候选。
     pub(crate) fn build(
         cfg: &DegraphqlCfg,
         guard: Option<&GraphqlGuardPolicy>,
@@ -112,7 +125,7 @@ impl DegraphqlPlan {
             query_guard = GraphqlGuardPolicy::build(&GraphqlGuardCfg::default(), route_id)?;
             &query_guard
         };
-        guard
+        let cost = guard
             .validate_static_query(&cfg.query, cfg.operation_name.as_deref())
             .with_context(|| format!("route `{route_id}` degraphql query"))?;
 
@@ -129,7 +142,9 @@ impl DegraphqlPlan {
                 .with_context(|| format!("route `{route_id}` degraphql rest_path_template"))?;
             anyhow::ensure!(
                 predicates.iter().any(|predicate| {
-                    matches!(predicate, Predicate::PathTemplate { signature, .. } if signature == &template.signature)
+                    matches!(predicate, Predicate::PathTemplate {
+                        signature, ..
+                    } if signature == &template.signature)
                 }),
                 "route `{route_id}` degraphql rest_path_template must match its PathTemplate predicate"
             );
@@ -153,6 +168,7 @@ impl DegraphqlPlan {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            cost,
             query: Arc::from(cfg.query.as_str()),
             operation_name: cfg.operation_name.as_deref().map(Arc::from),
             upstream_uri,
@@ -162,10 +178,16 @@ impl DegraphqlPlan {
         })
     }
 
-    /// 把当前 REST head 转为 GraphQL POST，并返回有界生成的 body。
+    /// 业务作用：把当前 REST head 转为 GraphQL POST，并返回有界生成的 body。
     ///
     /// 原请求必须是 Hyper 已知的空 body；未知 chunked body 也拒绝，避免为“确认空”额外 poll
     /// 客户端流。生成 JSON 只有一个 `Vec`，完成后直接转 `Bytes` 交给上游。
+    ///
+    /// 参数说明：
+    /// - `parts`：提供受控变量输入和计量上下文
+    /// - `request_end_of_stream`：确认原请求没有正文。
+    ///
+    /// 返回：完整生成正文及修改后的 head，或失败闭合响应；通过时记录冻结查询成本。
     pub(crate) fn transform(
         &self,
         parts: &mut Parts,
@@ -245,11 +267,13 @@ impl DegraphqlPlan {
             .headers
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         parts.headers.insert(CONTENT_LENGTH, content_length);
+        crate::extensions::graphql::record_cost(parts, self.cost);
         DegraphqlOutcome::Transformed(full_body(bytes))
     }
 }
 
 impl VariablePlan {
+    /// 业务作用：把已验证的输入标量转换为 GraphQL variables 值，保留声明的数据类型。
     fn value(
         &self,
         parts: &Parts,
@@ -316,6 +340,7 @@ impl VariablePlan {
 }
 
 impl PathTemplate {
+    /// 业务作用：编译变量来源的声明，使运行期只读取允许的 path、query 或 header 字段。
     fn parse(raw: &str) -> Result<Self> {
         let tail = raw
             .strip_prefix('/')
@@ -352,6 +377,7 @@ impl PathTemplate {
         })
     }
 
+    /// 业务作用：从当前请求提取固定来源的变量值，不允许调用方改写变量来源或 GraphQL 文档。
     fn extract(&self, path: &str) -> std::result::Result<HashMap<String, String>, ()> {
         let mut actual = path.strip_prefix('/').ok_or(())?.split('/');
         let mut values = HashMap::new();
@@ -379,6 +405,7 @@ impl PathTemplate {
     }
 }
 
+/// 业务作用：验证变量名称、来源和类型，把固定 REST 映射冻结为可执行计划。
 fn compile_variable(
     cfg: &DegraphqlVariableCfg,
     path: Option<&PathTemplate>,
@@ -456,6 +483,7 @@ fn compile_variable(
     }
 }
 
+/// 业务作用：构造固定 GraphQL 后端地址，不接受请求提供的外部调用目标。
 fn build_upstream_uri(path: &str) -> Result<Uri> {
     anyhow::ensure!(
         path.starts_with('/')
@@ -467,6 +495,7 @@ fn build_upstream_uri(path: &str) -> Result<Uri> {
     path.parse().context("invalid URI path")
 }
 
+/// 业务作用：校验 GraphQL 标识符语法，避免变量名改变查询文档结构。
 fn validate_graphql_name(value: &str, label: &str) -> Result<()> {
     let mut bytes = value.bytes();
     let first = bytes.next().context("name cannot be empty")?;
@@ -479,6 +508,7 @@ fn validate_graphql_name(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：限制请求字段名称，使变量提取遵守明确的 HTTP 输入边界。
 fn validate_input_name(value: &str, label: &str) -> Result<()> {
     anyhow::ensure!(
         !value.is_empty()
@@ -491,6 +521,7 @@ fn validate_input_name(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：按表单查询串语义解析变量来源，保持百分号与加号的解码规则。
 fn parse_query(parts: &Parts) -> HashMap<String, Vec<String>> {
     let mut values = HashMap::new();
     if let Some(query) = parts.uri.query() {
@@ -504,6 +535,7 @@ fn parse_query(parts: &Parts) -> HashMap<String, Vec<String>> {
     values
 }
 
+/// 业务作用：按声明类型解释变量值，拒绝不能无损转换的输入。
 fn parse_scalar(raw: &str, kind: VariableKind) -> std::result::Result<Value, &'static str> {
     match kind {
         VariableKind::String => Ok(Value::String(raw.to_owned())),
@@ -532,6 +564,7 @@ struct BoundedWriter {
 }
 
 impl BoundedWriter {
+    /// 业务作用：创建带字节上限的变量编码器，在编码过程中执行容量限制。
     fn new(max: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(max.min(16 * 1024)),
@@ -539,12 +572,14 @@ impl BoundedWriter {
         }
     }
 
+    /// 业务作用：取出已完成的变量编码结果，转移缓冲所有权而不重复复制。
     fn finish(self) -> Vec<u8> {
         self.bytes
     }
 }
 
 impl Write for BoundedWriter {
+    /// 业务作用：在写入 JSON 编码字节之前检查容量，超限时中止变量生成。
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let Some(next) = self.bytes.len().checked_add(bytes.len()) else {
             return Err(std::io::Error::other("degraphql body too large"));
@@ -556,6 +591,7 @@ impl Write for BoundedWriter {
         Ok(bytes.len())
     }
 
+    /// 业务作用：完成内存编码器的刷新合同，不触发外部 I/O。
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }

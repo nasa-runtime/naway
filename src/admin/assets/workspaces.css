@@ -1,0 +1,99 @@
+.panel {
+  min-height: 0;
+  margin-bottom: 16px;
+}
+.topbar {
+  padding-top: 32px;
+}
+h1 {
+  font-size: clamp(28px, 4vw, 42px);
+}
+#login {
+  display: grid;
+  grid-template-columns: auto minmax(160px, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+.muted {
+  margin-top: 12px;
+  line-height: 1.6;
+}
+.actions {
+  justify-content: flex-start;
+}
+.actions select {
+  width: auto;
+  flex: 1 1 180px;
+}
+.result {
+  max-height: 360px;
+  margin-bottom: 12px;
+}
+.result:empty {
+  display: none;
+}
+#mutation {
+  margin: 12px 0;
+}
+.list {
+  margin-top: 12px;
+}
+.row {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+.row pre {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.5;
+}
+button:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+.catalog-nodes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.catalog-node {
+  overflow-wrap: anywhere;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.catalog-objects {
+  margin: 16px 0;
+  overflow-wrap: anywhere;
+}
+.catalog-objects details {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+.catalog-objects summary {
+  cursor: pointer;
+}
+.catalog-objects pre {
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 680px) {
+  #login {
+    grid-template-columns: 1fr;
+  }
+  .row {
+    grid-template-columns: 1fr 1fr;
+  }
+  .row pre {
+    grid-column: 1 / -1;
+  }
+  .actions select {
+    flex-basis: 100%;
+  }
+}

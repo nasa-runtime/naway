@@ -6,13 +6,20 @@ import java.util.Map;
 /**
  * 两个回执消息的解析与语义。
  *
- * <p>wire 契约见 {@code proto/naway/edge/v1/edge.proto},字段号由网关侧的
- * {@code edge_proto_matches_wire_contract} 用例与实现锁死。这里手写解析而不是引 protobuf
- * 代码生成:回执是平坦的 varint-only 结构,手写既避免了 protoc 这个平台相关的构建期
- * 依赖,也让"proto3 省零 = 缺失即 0"这条最容易踩错的语义在代码里显式可见。
+ * <p>wire 契约见 {@code proto/naway/edge/v1/edge.proto}，字段号必须与网关保持一致。
+ * 回执是平坦的 varint-only 结构，因此直接解析而不依赖 protoc 构建期代码生成。
+ * proto3 省略零值字段，缺失计数必须解释为零，不能解释为未知或读取失败。
  */
 public final class EdgeSummaries {
 
+    /**
+     * 业务作用：限制回执解析工具类实例化，业务只通过静态解析入口使用它。
+     *
+     *
+     * 返回：不提供可供业务调用的实例。
+     *
+     * 参数说明: 无。
+     */
     private EdgeSummaries() {}
 
     /** 字段号,与 .proto 及网关的 {@code summary_field} 常量一一对应。 */
@@ -47,6 +54,15 @@ public final class EdgeSummaries {
         /** 断线或无回执的 peer 数;网关<b>不自动重试</b>。 */
         public final long peersUnknown;
 
+        /**
+         * 业务作用：按共享字段号构造群播回执，缺失的 proto3 计数字段按零处理。
+         *
+         *
+         * 返回：冻结全部群播计数；没有对应字段的计数为零。
+         *
+         * 参数说明：
+         * @param fields 已解析的 protobuf 字段号与计数映射。
+         */
         PublishSummary(Map<Integer, Long> fields) {
             this.accepted = get(fields, F_ACCEPTED);
             this.dropped = get(fields, F_DROPPED);
@@ -57,6 +73,14 @@ public final class EdgeSummaries {
             this.peersUnknown = get(fields, F_PEERS_UNKNOWN);
         }
 
+        /**
+         * 业务作用：输出群播回执计数摘要，不把入队数误标为最终交付数。
+         *
+         *
+         * 返回：仅包含入队、丢弃、处理与 peer 计数的文本。
+         *
+         * 参数说明: 无。
+         */
         @Override
         public String toString() {
             return "PublishSummary{accepted=" + accepted + ", dropped=" + dropped
@@ -83,6 +107,15 @@ public final class EdgeSummaries {
         /** 断线或无回执的 peer 数。 */
         public final long peersUnknown;
 
+        /**
+         * 业务作用：按共享字段号构造定向回执，离线目标的零入队数仍是正常结果。
+         *
+         *
+         * 返回：冻结定向入队与 peer 计数，不创建离线投递状态。
+         *
+         * 参数说明：
+         * @param fields 已解析的 protobuf 字段号与计数映射。
+         */
         PushSummary(Map<Integer, Long> fields) {
             this.accepted = get(fields, F_ACCEPTED);
             this.peersAccepted = get(fields, F_PEERS_ACCEPTED);
@@ -90,6 +123,14 @@ public final class EdgeSummaries {
             this.peersUnknown = get(fields, F_PEERS_UNKNOWN);
         }
 
+        /**
+         * 业务作用：输出定向回执计数摘要，保留 peer 拒绝与未知结果的区别。
+         *
+         *
+         * 返回：仅包含本地与 peer 入队结果的文本。
+         *
+         * 参数说明: 无。
+         */
         @Override
         public String toString() {
             return "PushSummary{accepted=" + accepted + ", peersAccepted=" + peersAccepted
@@ -98,8 +139,14 @@ public final class EdgeSummaries {
     }
 
     /**
-     * proto3 省零:网关不发送值为 0 的字段,<b>缺失即 0,不是「未知」</b>。
+     * 业务作用：proto3 省零:网关不发送值为 0 的字段,<b>缺失即 0,不是「未知」</b>。
      * 把缺失当成异常或 null 会让调用方在完全正常的响应上误判。
+     *
+     * 返回：字段存在时返回原值，否则返回零。
+     *
+     * 参数说明：
+     * @param fields 已解析的计数字段映射。
+     * @param tag 公开回执协议中的字段号。
      */
     private static long get(Map<Integer, Long> fields, int tag) {
         Long value = fields.get(tag);
@@ -107,11 +154,13 @@ public final class EdgeSummaries {
     }
 
     /**
-     * 解析平坦 varint-only 消息。
+     * 业务作用：解析平坦 varint-only 消息。
      *
      * <p>遇到长度前缀字段整段跳过而不是报错:网关将来往回执里加非 varint 字段时,
      * 旧版 SDK 仍应能读懂已有字段(protobuf 前向兼容语义)。
      *
+     *
+     * 参数说明：
      * @param body 已去掉 gRPC 5 字节前缀的 message 体
      * @return 字段号到值的映射
      */
@@ -140,7 +189,15 @@ public final class EdgeSummaries {
         return fields;
     }
 
-    /** 返回 {@code [value, nextCursor]}。 */
+    /**
+     * 业务作用：返回 {@code [value, nextCursor]}。
+     *
+     * 返回：解码值与下一偏移；截断或超过 varint 位宽时抛出异常。
+     *
+     * 参数说明：
+     * @param body 完整回执 message。
+     * @param cursor 待解码 varint 的起始偏移。
+     */
     private static long[] readVarint(byte[] body, int cursor) {
         long value = 0;
         int shift = 0;

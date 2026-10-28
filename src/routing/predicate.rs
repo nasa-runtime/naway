@@ -17,6 +17,12 @@ pub enum Predicate {
     PathElementPrefix(String),
     /// `PathExact=/api/order`:路径精确匹配。
     PathExact(String),
+    /// 有界原始 URI 正则，供声明编译器表达不等于前缀或 glob 的路径语义。
+    #[cfg(feature = "scg-compat")]
+    PathRegex {
+        raw: String,
+        matcher: Regex,
+    },
     /// `PathGlob=/api/**`:预编译 glob 匹配。
     PathGlob {
         /// 用于冲突诊断和稳定签名的原始表达式。
@@ -35,7 +41,7 @@ pub enum Predicate {
     Method(Vec<Method>),
     /// `Host=api.example.com,*.example.com`:Host 精确或后缀匹配。
     Host(Vec<HostPattern>),
-    /// `Header=<name>,<op>[,<value>]`:请求头断言(P0-1 gRPC L7 声明式分流)。
+    /// `Header=<name>,<op>[,<value>]`:请求头断言，用于 gRPC 等协议的 L7 声明式分流。
     ///
     /// 构建期把 header 名编译成 [`HeaderName`],请求期只做借用比较——不建 map、不分配、
     /// 热路径无 regex。多值语义显式定义在 [`HeaderOp`]。
@@ -118,7 +124,8 @@ pub enum HostPattern {
 impl Predicate {
     /// 业务作用：在请求热路径执行构建期已验证的单个路由断言。
     ///
-    /// 参数说明：`parts` 是只读请求 head，不读取或聚合 body。
+    /// 参数说明：
+    /// - `parts`：是只读请求 head，不读取或聚合 body。
     ///
     /// 返回：请求满足该断言时为 true；不匹配或缺少所需字段时为 false，且不分配业务状态。
     pub(crate) fn matches(&self, parts: &Parts) -> bool {
@@ -126,16 +133,28 @@ impl Predicate {
             Predicate::PathPrefix(p) => parts.uri.path().starts_with(p.as_str()),
             Predicate::PathElementPrefix(p) => path_element_prefix_matches(p, parts.uri.path()),
             Predicate::PathExact(p) => parts.uri.path() == p,
-            Predicate::PathGlob { matcher, .. } => matcher.is_match(parts.uri.path()),
-            Predicate::PathTemplate { segments, .. } => {
-                path_template_matches(segments, parts.uri.path())
-            }
+            #[cfg(feature = "scg-compat")]
+            Predicate::PathRegex {
+                matcher,
+                ..
+            } => matcher.is_match(parts.uri.path()),
+            Predicate::PathGlob {
+                matcher,
+                ..
+            } => matcher.is_match(parts.uri.path()),
+            Predicate::PathTemplate {
+                segments,
+                ..
+            } => path_template_matches(segments, parts.uri.path()),
             Predicate::Method(ms) => ms.contains(&parts.method),
             Predicate::Host(patterns) => request_host(parts)
                 .map(|host| patterns.iter().any(|p| p.matches(&host)))
                 .unwrap_or(false),
             // 只读 request head:借用 header 值切片比较,不 collect、不分配、不碰 body。
-            Predicate::Header { name, op } => {
+            Predicate::Header {
+                name,
+                op,
+            } => {
                 let mut values = parts.headers.get_all(name).iter();
                 match op {
                     HeaderOp::Present => values.next().is_some(),
@@ -147,12 +166,18 @@ impl Predicate {
                     HeaderOp::Prefix(expected) => {
                         values.any(|value| value.as_bytes().starts_with(expected.as_bytes()))
                     }
-                    HeaderOp::Regex { matcher, .. } => values
+                    HeaderOp::Regex {
+                        matcher,
+                        ..
+                    } => values
                         .filter_map(|value| value.to_str().ok())
                         .any(|value| matcher.is_match(value)),
                 }
             }
-            Predicate::Query { name, op } => parts
+            Predicate::Query {
+                name,
+                op,
+            } => parts
                 .uri
                 .query()
                 .into_iter()
@@ -160,11 +185,16 @@ impl Predicate {
                 .filter(|(actual, _)| actual.as_ref() == name.as_ref())
                 .any(|(_, value)| match op {
                     ValueOp::Exact(expected) => value.as_ref() == expected.as_ref(),
-                    ValueOp::Regex { matcher, .. } => matcher.is_match(value.as_ref()),
+                    ValueOp::Regex {
+                        matcher,
+                        ..
+                    } => matcher.is_match(value.as_ref()),
                 }),
             // Weight 必须由 Router 在全部同组候选之间统一选择。普通 predicate 扫描把它视为
             // 已满足，避免为了跳过该枚举在每请求构造临时候选 predicate slice。
-            Predicate::Weight { .. } => true,
+            Predicate::Weight {
+                ..
+            } => true,
         }
     }
 
@@ -178,8 +208,19 @@ impl Predicate {
             Predicate::PathPrefix(p) => format!("Path={p}"),
             Predicate::PathElementPrefix(p) => format!("PathElementPrefix={p}"),
             Predicate::PathExact(p) => format!("PathExact={p}"),
-            Predicate::PathGlob { raw, .. } => format!("PathGlob={raw}"),
-            Predicate::PathTemplate { signature, .. } => {
+            #[cfg(feature = "scg-compat")]
+            Predicate::PathRegex {
+                raw,
+                ..
+            } => format!("PathRegex={raw}"),
+            Predicate::PathGlob {
+                raw,
+                ..
+            } => format!("PathGlob={raw}"),
+            Predicate::PathTemplate {
+                signature,
+                ..
+            } => {
                 format!("PathTemplate={signature}")
             }
             Predicate::Method(ms) => {
@@ -195,23 +236,39 @@ impl Predicate {
                 hosts.sort_unstable();
                 format!("Host={}", hosts.join(","))
             }
-            Predicate::Header { name, op } => match op {
+            Predicate::Header {
+                name,
+                op,
+            } => match op {
                 HeaderOp::Exact(value) => format!("Header={},exact,{value}", name.as_str()),
                 HeaderOp::Prefix(value) => format!("Header={},prefix,{value}", name.as_str()),
-                HeaderOp::Regex { raw, .. } => format!("Header={},regex,{raw}", name.as_str()),
+                HeaderOp::Regex {
+                    raw,
+                    ..
+                } => format!("Header={},regex,{raw}", name.as_str()),
                 HeaderOp::Present => format!("Header={},present", name.as_str()),
                 HeaderOp::Absent => format!("Header={},absent", name.as_str()),
             },
-            Predicate::Query { name, op } => match op {
+            Predicate::Query {
+                name,
+                op,
+            } => match op {
                 ValueOp::Exact(value) => format!("Query={name},exact,{value}"),
-                ValueOp::Regex { raw, .. } => format!("Query={name},regex,{raw}"),
+                ValueOp::Regex {
+                    raw,
+                    ..
+                } => format!("Query={name},regex,{raw}"),
             },
-            Predicate::Weight { group, weight } => format!("Weight={group},{weight}"),
+            Predicate::Weight {
+                group,
+                weight,
+            } => format!("Weight={group},{weight}"),
         }
     }
 }
 
 impl HostPattern {
+    /// 业务作用：按已编译 Host 模式匹配请求主机，保持精确域名与后缀域的边界。
     fn matches(&self, host: &str) -> bool {
         match self {
             Self::Exact(expected) => host.eq_ignore_ascii_case(expected),
@@ -219,6 +276,7 @@ impl HostPattern {
         }
     }
 
+    /// 业务作用：生成 Host 断言的稳定表示，供路由身份和冲突检查使用。
     fn signature(&self) -> String {
         match self {
             Self::Exact(host) => host.clone(),
@@ -229,7 +287,8 @@ impl HostPattern {
 
 /// 业务作用：把声明式路由断言编译成请求热路径可直接执行的只读匹配器。
 ///
-/// 参数说明：`spec` 是配置或控制面生成的单条 predicate DSL。
+/// 参数说明：
+/// - `spec`：是配置或控制面生成的单条 predicate DSL。
 ///
 /// 返回：语法和边界合法时返回编译结果；未知类型、非法名称或危险表达式返回错误并阻止发布快照。
 pub(crate) fn parse_predicate(spec: &str) -> Result<Predicate> {
@@ -238,6 +297,16 @@ pub(crate) fn parse_predicate(spec: &str) -> Result<Predicate> {
         "Path" => parse_path(args.trim()),
         "PathElementPrefix" => parse_path_element_prefix(args.trim()),
         "PathExact" => Ok(Predicate::PathExact(args.trim().to_string())),
+        #[cfg(feature = "scg-compat")]
+        "PathRegex" => {
+            anyhow::ensure!(!args.is_empty() && args.len() <= 32768, "PathRegex requires 1..32768 bytes");
+            let matcher = regex::RegexBuilder::new(args).size_limit(2 << 20).build()
+                .context("PathRegex exceeds syntax or compiled-size limits")?;
+            Ok(Predicate::PathRegex {
+                raw: args.to_owned(),
+                matcher
+            })
+        }
         "PathGlob" => parse_path_glob(args.trim()),
         "PathTemplate" => parse_path_template(args.trim()),
         "Method" => {
@@ -268,7 +337,9 @@ pub(crate) fn parse_predicate(spec: &str) -> Result<Predicate> {
 /// 业务作用：执行 Gateway API/Kubernetes Ingress 的完整 path element 前缀语义，
 /// 防止 `/v2` 意外匹配 `/v2example`。
 ///
-/// 参数说明：`prefix` 是构建期已去除非根尾斜杠的绝对路径；`path` 是请求 URI path。
+/// 参数说明：
+/// - `prefix`：是构建期已去除非根尾斜杠的绝对路径
+/// - `path`：是请求 URI path。
 ///
 /// 返回：两者相等，或请求在 prefix 后紧接 `/` 时为 true；根前缀匹配所有绝对路径。
 fn path_element_prefix_matches(prefix: &str, path: &str) -> bool {
@@ -284,7 +355,7 @@ const MAX_HEADER_NAME_BYTES: usize = 128;
 /// header 期望值字节上限:断言值是路由标签,不是业务载荷。
 const MAX_HEADER_VALUE_BYTES: usize = 256;
 
-/// `Header=<name>,<op>[,<value>]` → Predicate。
+/// 业务作用：`Header=<name>,<op>[,<value>]` → Predicate。
 ///
 /// 值里允许出现逗号(只按前两个逗号切分),因此 `Header=x-tag,exact,a,b` 的期望值是 `a,b`。
 /// `present`/`absent` 不接受值参数——给了就是语义矛盾,构建期直接拒绝而不是静默忽略。
@@ -329,7 +400,10 @@ fn parse_header(raw: &str) -> Result<Predicate> {
             let raw = require_value(value)?;
             let matcher = Regex::new(raw.as_ref())
                 .with_context(|| format!("Header predicate regex `{raw}` is invalid"))?;
-            HeaderOp::Regex { raw, matcher }
+            HeaderOp::Regex {
+                raw,
+                matcher
+            }
         }
         "present" | "absent" => {
             anyhow::ensure!(
@@ -346,12 +420,16 @@ fn parse_header(raw: &str) -> Result<Predicate> {
             "unsupported Header predicate op `{other}` (supports exact / prefix / regex / present / absent)"
         ),
     };
-    Ok(Predicate::Header { name, op })
+    Ok(Predicate::Header {
+        name,
+        op,
+    })
 }
 
 /// 业务作用：编译 Gateway API 等控制面来源的 query 参数断言，并锁定解码后多值语义。
 ///
-/// 参数说明：`raw` 使用 `<name>,exact|regex,<value>` 形态，值允许包含逗号。
+/// 参数说明：
+/// - `raw`：使用 `<name>,exact|regex,<value>` 形态，值允许包含逗号。
 ///
 /// 返回：名称、值与正则均合法时返回匹配器；空值、控制字符或超限输入返回错误。
 fn parse_query(raw: &str) -> Result<Predicate> {
@@ -391,6 +469,7 @@ fn parse_query(raw: &str) -> Result<Predicate> {
     })
 }
 
+/// 业务作用：验证加权路由的分组和正权重，避免无效比例进入选择器。
 fn parse_weight(raw: &str) -> Result<Predicate> {
     let Some((group, weight)) = raw.split_once(',') else {
         bail!("Weight predicate requires `Weight=<group>,<weight>`");
@@ -423,6 +502,7 @@ pub enum PathTemplateSegment {
     Variable,
 }
 
+/// 业务作用：把路径模板编译为有限片段，拒绝不受支持的动态语法。
 fn parse_path_template(raw: &str) -> Result<Predicate> {
     if raw == "/" {
         return Ok(Predicate::PathTemplate {
@@ -473,7 +553,7 @@ fn parse_path_template(raw: &str) -> Result<Predicate> {
     })
 }
 
-/// OpenAPI 模板匹配直接借用 URI path 分段，不构造参数 map；参数提取只在显式
+/// 业务作用：OpenAPI 模板匹配直接借用 URI path 分段，不构造参数 map；参数提取只在显式
 /// request-validation 慢路径中进行。这样门户生成路由的常规匹配仍保持零分配。
 fn path_template_matches(segments: &[PathTemplateSegment], path: &str) -> bool {
     if segments.is_empty() {
@@ -496,6 +576,7 @@ fn path_template_matches(segments: &[PathTemplateSegment], path: &str) -> bool {
     actual.next().is_none()
 }
 
+/// 业务作用：编译原生路径断言，明确区分精确、前缀与通配语义。
 fn parse_path(args: &str) -> Result<Predicate> {
     if args.contains('*') || args.contains('?') {
         parse_path_glob(args)
@@ -506,7 +587,8 @@ fn parse_path(args: &str) -> Result<Predicate> {
 
 /// 业务作用：把控制面生成的 element-prefix DSL 编译为无正则的边界匹配器。
 ///
-/// 参数说明：`args` 是绝对 path prefix，非根路径允许尾斜杠并会被规范化。
+/// 参数说明：
+/// - `args`：是绝对 path prefix，非根路径允许尾斜杠并会被规范化。
 ///
 /// 返回：合法、无 glob 元字符且不含 query/fragment 的前缀返回断言；非法配置阻止快照发布。
 fn parse_path_element_prefix(args: &str) -> Result<Predicate> {
@@ -525,6 +607,7 @@ fn parse_path_element_prefix(args: &str) -> Result<Predicate> {
     Ok(Predicate::PathElementPrefix(normalized.to_owned()))
 }
 
+/// 业务作用：构建路径 glob 匹配器，解析失败必须阻止候选发布。
 fn parse_path_glob(args: &str) -> Result<Predicate> {
     let glob = Glob::new(args).with_context(|| format!("invalid path glob `{args}`"))?;
     Ok(Predicate::PathGlob {
@@ -533,6 +616,7 @@ fn parse_path_glob(args: &str) -> Result<Predicate> {
     })
 }
 
+/// 业务作用：规范并验证主机匹配声明，不把含糊通配形式解释为授权域。
 fn parse_host_pattern(raw: &str) -> Result<HostPattern> {
     if raw.is_empty() {
         bail!("empty Host pattern");
@@ -547,6 +631,7 @@ fn parse_host_pattern(raw: &str) -> Result<HostPattern> {
     }
 }
 
+/// 业务作用：取得请求用于路由的 Host 视图，统一处理 authority 与端口边界。
 fn request_host(parts: &Parts) -> Option<String> {
     let raw = parts
         .headers
@@ -565,7 +650,7 @@ fn request_host(parts: &Parts) -> Option<String> {
     Some(host)
 }
 
-/// `"StripPrefix=2"` → Some(2);非 StripPrefix 过滤器返回 None(R1 暂只实现 StripPrefix)。
+/// 业务作用：提取 `StripPrefix` 的路径段数；其它过滤器或非法数字返回 None。
 pub(crate) fn parse_strip_prefix(spec: &str) -> Result<Option<usize>> {
     let (name, args) = spec.split_once('=').unwrap_or((spec, ""));
     if name.trim() == "StripPrefix" {

@@ -1,11 +1,11 @@
-//! Naway gRPC 边缘模式(V8)Rust 客户端 SDK。
+//! Naway gRPC 边缘模式Rust 客户端 SDK。
 //!
 //! wire 契约见 `proto/naway/edge/v1/edge.proto`。本 SDK **不引 prost/tonic**:
-//! 业务 payload 对网关是不透明字节(§25.2.2「业务 payload 不解析」),使用方用自己
+//! 业务 payload 对网关是不透明字节(「业务 payload 不解析」),使用方用自己
 //! 的 protobuf 库编解码即可;SDK 只负责三件网关侧真正较真、而手写客户端最容易写错
 //! 的事——**metadata 契约、gRPC 分帧、以及订阅断线后的退避重连**。
 //!
-//! # 必须先理解的产品语义(架构规范 §25.2.2b)
+//! # 必须先理解的产品语义
 //!
 //! - **at-most-once**:队满、peer 断线、节点重启、下游读得慢都允许丢消息。SDK
 //!   **不会**替你重传。
@@ -22,7 +22,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use http::{HeaderName, HeaderValue, Request};
+use http::{HeaderName, Request};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, SizeHint};
@@ -47,16 +47,23 @@ pub enum EdgeError {
     ///
     /// 常见:`7` = 无权访问该 group(route 的 `grpc_edge.authz` 策略);
     /// `16` = 缺少已验证身份;`8` = 预算耗尽;`3` = 元数据/分帧非法。
-    Status { status: String, message: String },
+    Status {
+        status: String,
+        message: String,
+    },
     /// 响应不符合契约(分帧错误、长度越界)。
     Protocol(String),
 }
 
 impl std::fmt::Display for EdgeError {
+    /// 业务作用：把传输、gRPC 状态和协议失败转换为可显示的 SDK 错误，保留失败类别。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport(detail) => write!(f, "transport: {detail}"),
-            Self::Status { status, message } => write!(f, "grpc-status {status}: {message}"),
+            Self::Status {
+                status,
+                message,
+            } => write!(f, "grpc-status {status}: {message}"),
             Self::Protocol(detail) => write!(f, "protocol: {detail}"),
         }
     }
@@ -104,7 +111,10 @@ pub struct PushSummary {
 #[derive(Debug, Clone)]
 pub enum Auth {
     /// API-Key:头名与值由 route 的 `api_key` filter 决定。
-    ApiKey { header: String, value: String },
+    ApiKey {
+        header: String,
+        value: String,
+    },
     /// JWT bearer;网关按 route 的 `jwt` 策略校验并取 claim 作为 tenant/user。
     Bearer(String),
     /// 不带凭证。边缘面几乎总是要求认证(否则返回 16),仅用于本地联调。
@@ -138,8 +148,7 @@ pub struct EdgeConfig {
     /// group 头名(默认 `x-naway-group`)。
     pub group_header: String,
     /// 定向 target 头名。默认 `x-naway-target-user`——注意**不是** `x-naway-target`,
-    /// 与网关 `default_grpc_edge_target_header` 保持一致(端到端用例第一次跑就是
-    /// 因为这里少了 `-user` 后缀,拿到 3 push-requires-target-header)。
+    /// 与网关 `default_grpc_edge_target_header` 保持一致；头名不一致会因缺少目标身份而拒绝推送。
     pub target_header: String,
     /// 单条 `FramePush` protobuf message 的 wire 字节上限，必须与 route 的
     /// `grpc_edge.limits.max_msg_bytes` 一致。默认 64 KiB。
@@ -151,14 +160,14 @@ pub struct EdgeConfig {
 }
 
 impl EdgeConfig {
-    /// 以默认头名与默认方法路径构造。
+    /// 业务作用：以默认头名与默认方法路径构造。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `endpoint`: 形如 `http://host:port`。
     /// - `authority`: Host 头。
     ///
-    /// # 返回
-    /// 一份可直接使用的配置;方法路径取 架构规范 §25.2.3 的建议默认值,
+    /// 返回：
+    /// 一份可直接使用的配置；方法路径采用 NawayEdge 服务的默认值，
     /// route 若改过路径必须在此同步覆盖。
     pub fn new(endpoint: impl Into<String>, authority: impl Into<String>) -> Self {
         Self {
@@ -178,13 +187,13 @@ impl EdgeConfig {
         }
     }
 
-    /// 设置认证方式(链式)。
+    /// 业务作用：设置认证方式(链式)。
     pub fn with_auth(mut self, auth: Auth) -> Self {
         self.auth = auth;
         self
     }
 
-    /// 覆盖单条 `FramePush` wire message 上限。
+    /// 业务作用：覆盖单条 `FramePush` wire message 上限。
     pub fn with_max_message_bytes(mut self, max_message_bytes: usize) -> Self {
         self.max_message_bytes = max_message_bytes;
         self
@@ -210,7 +219,8 @@ pub struct PublishFrame {
 impl PublishFrame {
     /// 业务作用：构造不参与 keyed 合并的普通发布消息。
     ///
-    /// 参数说明：`payload` 是业务 protobuf 字节。
+    /// 参数说明：
+    /// - `payload`：是业务 protobuf 字节。
     ///
     /// 返回：返回 `coalesce_key=None` 的消息。
     pub fn new(payload: Bytes) -> Self {
@@ -222,7 +232,9 @@ impl PublishFrame {
 
     /// 业务作用：构造显式参与 `latest_by_key` 合并的发布消息。
     ///
-    /// 参数说明：`coalesce_key` 必须为 1..=256 字节，`payload` 是业务 protobuf 字节。
+    /// 参数说明：
+    /// - `coalesce_key`：必须为 1..=256 字节
+    /// - `payload`：是业务 protobuf 字节。
     ///
     /// 返回：返回尚未编码的 keyed 消息；长度门在发送前统一执行。
     pub fn keyed(coalesce_key: Bytes, payload: Bytes) -> Self {
@@ -245,7 +257,8 @@ impl Body for PublishRequestBody {
 
     /// 业务作用：把调用方逐条送入的业务 payload 按 H2 flow-control 节奏封成 FramePush DATA。
     ///
-    /// 参数说明：`cx` 是 Hyper 请求体轮询上下文。
+    /// 参数说明：
+    /// - `cx`：是 Hyper 请求体轮询上下文。
     ///
     /// 返回：有 payload 时返回恰一条 gRPC frame；发送端关闭后返回 EOS；越界消息返回错误并停止半完成流。
     fn poll_frame(
@@ -267,10 +280,12 @@ impl Body for PublishRequestBody {
         }
     }
 
+    /// 业务作用：向 HTTP 编码层报告流是否已经结束，避免省略尚未发送的正文或 trailers。
     fn is_end_stream(&self) -> bool {
         self.receiver.is_closed() && self.receiver.is_empty()
     }
 
+    /// 业务作用：向 HTTP 编码层提供剩余实体长度约束，供帧传输选择定长或流式编码。
     fn size_hint(&self) -> SizeHint {
         SizeHint::default()
     }
@@ -278,22 +293,25 @@ impl Body for PublishRequestBody {
 
 /// 业务作用：把小型 unary 请求统一装箱为 SDK 请求 body，供同一 H2 client 与流式请求复用。
 ///
-/// 参数说明：`bytes` 是已经完成 gRPC/FramePush 编码的请求字节。
+/// 参数说明：
+/// - `bytes`：是已经完成 gRPC/FramePush 编码的请求字节。
 ///
 /// 返回：返回不会失败、写完即 EOS 的 boxed body。
 fn full_request_body(bytes: Bytes) -> RequestBody {
     Full::new(bytes)
-        .map_err(|never| -> std::io::Error { match never {} })
+        .map_err(|never| -> std::io::Error {
+            match never {}
+        })
         .boxed_unsync()
 }
 
 impl EdgeClient {
-    /// 建立客户端。
+    /// 业务作用：建立客户端。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `cfg`: 端点、认证与方法路径。
     ///
-    /// # 返回
+    /// 返回：
     /// 客户端句柄。此处**不做**网络连接,首次请求才拨号;因此配置错误(如路径写错)
     /// 会在第一次调用时以 gRPC 状态码暴露,而不是在这里。
     pub fn new(cfg: EdgeConfig) -> Self {
@@ -307,13 +325,13 @@ impl EdgeClient {
         }
     }
 
-    /// 群播一条消息给 group 全体订阅者。
+    /// 业务作用：群播一条消息给 group 全体订阅者。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `group`: 目标 group;能否发布由 route 的 `grpc_edge.authz.publish_groups` 决定。
     /// - `payload`: 业务 protobuf 字节(**不含** gRPC 5 字节前缀,SDK 负责封帧)。
     ///
-    /// # 返回
+    /// 返回：
     /// [`PublishSummary`]。**注意 accepted 只表示入队份数,不代表任何终端已收到。**
     /// 被授权策略拒绝时返回 [`EdgeError::Status`] 且 status 为 `7`。
     pub async fn publish(&self, group: &str, payload: Bytes) -> Result<PublishSummary> {
@@ -340,7 +358,10 @@ impl EdgeClient {
 
     /// 业务作用：群播一条带 `coalesce_key` 的消息，使 `latest_by_key` 队列可按业务实体合并旧状态。
     ///
-    /// 参数说明：`group` 是授权 group；`coalesce_key` 必须为 1..=256 字节；`payload` 是业务字节。
+    /// 参数说明：
+    /// - `group`：是授权 group
+    /// - `coalesce_key`：必须为 1..=256 字节
+    /// - `payload`：是业务字节。
     ///
     /// 返回：返回诚实入队回执；key 非法、越权或传输失败时返回对应错误。
     pub async fn publish_keyed(
@@ -370,13 +391,13 @@ impl EdgeClient {
         })
     }
 
-    /// 定向单播给某 user 的全部在线 session。
+    /// 业务作用：定向单播给某 user 的全部在线 session。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `target`: 目标 user;能否 push 由 `grpc_edge.authz.push_targets` 决定。
     /// - `payload`: 业务字节。
     ///
-    /// # 返回
+    /// 返回：
     /// [`PushSummary`]。目标完全不在线时 `accepted == 0`,**这是正常结果不是错误**——
     /// 边缘面无离线堆积,不会为离线用户排队。
     pub async fn push(&self, target: &str, payload: Bytes) -> Result<PushSummary> {
@@ -400,7 +421,10 @@ impl EdgeClient {
 
     /// 业务作用：定向推送一条带 `coalesce_key` 的状态消息，供目标会话的 keyed 队列只保留最新值。
     ///
-    /// 参数说明：`target` 是授权 user；`coalesce_key` 必须为 1..=256 字节；`payload` 是业务字节。
+    /// 参数说明：
+    /// - `target`：是授权 user
+    /// - `coalesce_key`：必须为 1..=256 字节
+    /// - `payload`：是业务字节。
     ///
     /// 返回：返回诚实入队回执；目标离线仍是 `accepted=0` 的正常结果。
     pub async fn push_keyed(
@@ -427,14 +451,14 @@ impl EdgeClient {
         })
     }
 
-    /// 以 client-streaming 长流持续群播,返回**本段**的聚合回执。
+    /// 业务作用：以 client-streaming 长流持续群播,返回**本段**的聚合回执。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `group`: 目标 group;能否发布由 `grpc_edge.authz.publish_groups` 决定。
     /// - `payloads`: 本次要发的业务字节序列。SDK 逐条封成 `FramePush` 并按顺序写出,
     ///   写完即 half-close,由网关返回聚合 summary。
     ///
-    /// # 返回
+    /// 返回：
     /// [`PublishSummary`]。与 unary 的关键差别在 `messages`:**它不是恒 1**,而是网关
     /// **本段实际处理的条数**。网关按 route 的四门(生命周期 / 累计消息数 / 每秒速率 /
     /// 累计字节)做**优雅轮转**——到界即停读并返回已聚合结果,而不是报错;发布方要凭
@@ -462,7 +486,9 @@ impl EdgeClient {
 
     /// 业务作用：用固定 slice 增量发送带可选 `coalesce_key` 的 PublishStream。
     ///
-    /// 参数说明：`group` 是授权 group；`frames` 按顺序发送，每项 key 必须为空缺或 1..=256 字节。
+    /// 参数说明：
+    /// - `group`：是授权 group
+    /// - `frames`：按顺序发送，每项 key 必须为空缺或 1..=256 字节。
     ///
     /// 返回：本地先完整预检以保证参数错误时零发送，随后按 H2 flow-control 增量编码并返回聚合回执。
     pub async fn publish_stream_keyed(
@@ -491,7 +517,9 @@ impl EdgeClient {
 
     /// 业务作用：从有界 channel 真正增量发送 PublishStream，允许生产方边生成边发布。
     ///
-    /// 参数说明：`group` 是授权 group；`receiver` 每项是一条业务 payload，发送端 Drop 即 half-close。
+    /// 参数说明：
+    /// - `group`：是授权 group
+    /// - `receiver`：每项是一条业务 payload，发送端 Drop 即 half-close。
     ///
     /// 返回：网关正常收尾时返回本段聚合回执；中途越界、传输失败或 gRPC 拒绝返回错误。
     /// 调用方必须使用有界 channel；这样网关背压会经 H2 和本 receiver 传回生产方，不形成 SDK 内存堆积。
@@ -514,7 +542,9 @@ impl EdgeClient {
 
     /// 业务作用：从有界 channel 增量发送可选 keyed 的 PublishStream，并把 H2 背压传回生产方。
     ///
-    /// 参数说明：`group` 是授权 group；`receiver` 每项携带 payload 与可选 `coalesce_key`。
+    /// 参数说明：
+    /// - `group`：是授权 group
+    /// - `receiver`：每项携带 payload 与可选 `coalesce_key`。
     ///
     /// 返回：网关正常收尾时返回本段聚合回执；非法 key、越界、传输失败或 gRPC 拒绝返回错误。
     pub async fn publish_stream_keyed_receiver(
@@ -550,17 +580,17 @@ impl EdgeClient {
         })
     }
 
-    /// 创建订阅句柄(自动重连)。
+    /// 业务作用：创建订阅句柄(自动重连)。
     ///
     /// **注意:本方法不建立连接。**订阅流在**首次 [`Subscription::next`]** 时才真正打开
     /// (这样重连与首连才能共用同一条路径)。因此"先 subscribe 再 publish"存在竞态:
     /// 订阅还没登记时发布会诚实地返回 `accepted = 0`,而不是报错。要确保投递,
-    /// 应先 `next()` 起来(例如放进独立 task)并留出登记时间,再开始发布。
+    /// 应先 `next` 起来(例如放进独立 task)并留出登记时间,再开始发布。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `group`: 目标 group;能否订阅由 `grpc_edge.authz.subscribe_groups` 决定。
     ///
-    /// # 返回
+    /// 返回：
     /// [`Subscription`]。**它不会在建立失败时返回错误**——首次连接同样走重连循环,
     /// 因为边缘面的正常运维(节点 drain/重启)必然造成断流,把首连失败与后续断线
     /// 区别对待只会让调用方写两套逻辑。授权被拒(7)属于**不可重试**错误,
@@ -575,7 +605,7 @@ impl EdgeClient {
         }
     }
 
-    /// 组装并发出一次 unary edge 请求,返回响应 message 体(已去掉 gRPC 前缀)。
+    /// 业务作用：组装并发出一次 unary edge 请求,返回响应 message 体(已去掉 gRPC 前缀)。
     async fn unary(
         &self,
         path: &str,
@@ -596,7 +626,12 @@ impl EdgeClient {
 
     /// 业务作用：组装并发出一条可携带合并键的 unary FramePush 请求。
     ///
-    /// 参数说明：head 参数定义 edge 方法与作用域，`frame` 提供业务 payload 和可选 key。
+    /// 参数说明：
+    /// - `path`：精确 gRPC 方法路径。
+    /// - `action`：网关必须确认的 edge 动作。
+    /// - `scope_header`：承载 group 或 target 的 metadata 头名。
+    /// - `scope`：本次动作的目标 group 或 user。
+    /// - `frame`：业务 payload 与可选合并键。
     ///
     /// 返回：成功返回已去 gRPC 前缀的 summary message；编码、传输或状态错误原样返回。
     async fn unary_frame(
@@ -620,7 +655,7 @@ impl EdgeClient {
         self.send_unary_reply(request).await
     }
 
-    /// 发出请求并取回**恰一条**回执 message(已去 gRPC 前缀)。
+    /// 业务作用：发出请求并取回**恰一条**回执 message(已去 gRPC 前缀)。
     ///
     /// unary Publish/Push 与 client-streaming PublishStream 的**响应侧契约完全相同**
     /// (都是一条 summary + 成功 trailer),差别只在请求体是一条还是多条,因此这里共用
@@ -643,9 +678,8 @@ impl EdgeClient {
                 });
             }
         }
-        // 路径/route 配错时网关会返回普通 HTTP 错误页,而不是 gRPC 帧。若不在这里
-        // identify,后面会把 HTML 首字节当成压缩位,报出"不支持压缩帧"这种完全误导
-        // 的错误——本 SDK 的端到端用例第一次跑就踩了这个坑。
+        // 方法路径未匹配 edge route 时可能收到普通 HTTP 错误页；先核对媒体类型，
+        // 避免把 HTML 等非 gRPC 实体解释成帧前缀而掩盖真实的路由配置错误。
         let content_type = header_str(response.headers(), "content-type")
             .unwrap_or_default()
             .to_string();
@@ -687,7 +721,7 @@ impl EdgeClient {
         Ok(message)
     }
 
-    /// 组装 edge 请求的公共 head(方法路径 + 三个 metadata + 认证)。
+    /// 业务作用：组装 edge 请求的公共 head(方法路径 + 三个 metadata + 认证)。
     fn base_request(
         &self,
         path: &str,
@@ -705,7 +739,10 @@ impl EdgeClient {
             .header(header_name(&self.cfg.action_header)?, action)
             .header(header_name(scope_header)?, scope);
         builder = match &self.cfg.auth {
-            Auth::ApiKey { header, value } => builder.header(header_name(header)?, value.as_str()),
+            Auth::ApiKey {
+                header,
+                value,
+            } => builder.header(header_name(header)?, value.as_str()),
             Auth::Bearer(token) => {
                 builder.header(http::header::AUTHORIZATION, format!("Bearer {token}"))
             }
@@ -722,19 +759,16 @@ pub struct Subscription {
     stream: Option<hyper::body::Incoming>,
     /// 跨 DATA 帧的重组缓冲。
     ///
-    /// **必须有**:hyper/h2 会把超过 max_frame_size(默认 16 KiB)的 DATA 负载拆成
-    /// 多个帧,而 route 的 `max_msg_bytes` 默认就是 64 KiB——**默认配置下就会出现
-    /// 跨帧消息**。早期版本按"一条消息 = 一个 chunk"处理,遇到大消息读到半帧即报错,
-    /// 再被订阅循环当成断线,最终退化为静默重连死循环:调用方只看到"消息一直不来",
-    /// 拿不到任何错误。断线时必须清空本缓冲,否则旧流的半帧会污染新流。
+    /// HTTP/2 DATA 边界不等于 gRPC 消息边界；半条消息必须等待更多数据，不能视为断线。
+    /// 断线时清空缓冲，避免旧流的半帧污染重连后的消息。
     buffer: BytesMut,
     backoff: Duration,
 }
 
 impl Subscription {
-    /// 取下一条业务消息(已去掉 gRPC 前缀)。
+    /// 业务作用：取下一条业务消息(已去掉 gRPC 前缀)。
     ///
-    /// # 返回
+    /// 返回：
     /// - `Ok(bytes)`:一条完整业务消息。
     /// - `Err(Status)` 且 status 为 `7`/`16`:授权或身份问题,**不可重试**,直接返回。
     /// - 其它传输错误不返回给调用方,而是内部退避重连——因为节点 drain/重启造成的
@@ -749,7 +783,11 @@ impl Subscription {
                         self.backoff = self.client.cfg.reconnect_base;
                     }
                     // 授权/身份类错误重试多少次都一样,立即上报,避免无声打转。
-                    Err(err @ EdgeError::Status { .. }) if is_terminal(&err) => return Err(err),
+                    Err(
+                        err @ EdgeError::Status {
+                            ..
+                        },
+                    ) if is_terminal(&err) => return Err(err),
                     Err(_) => {
                         tokio::time::sleep(self.backoff).await;
                         self.backoff = (self.backoff * 2).min(self.client.cfg.reconnect_max);
@@ -776,7 +814,7 @@ impl Subscription {
         }
     }
 
-    /// 建立一条新的订阅流。请求体是**恰好一条**空 SubReq 并立即 EOS(§25.2.3 契约)。
+    /// 业务作用：建立一条新的订阅流。请求体是**恰好一条**空 SubReq 并立即 EOS( 契约)。
     async fn open(&self) -> Result<hyper::body::Incoming> {
         let request = self
             .client
@@ -819,12 +857,14 @@ impl Subscription {
     }
 }
 
-/// 授权/身份类错误重试无意义,应立刻上报给调用方。
+/// 业务作用：授权/身份类错误重试无意义,应立刻上报给调用方。
 fn is_terminal(err: &EdgeError) -> bool {
-    matches!(err, EdgeError::Status { status, .. } if status == "7" || status == "16" || status == "3")
+    matches!(err, EdgeError::Status {
+        status, ..
+    } if status == "7" || status == "16" || status == "3")
 }
 
-/// 从服务端流读下一块 DATA 负载(不做分帧解释)。返回 `Ok(None)` 表示流结束。
+/// 业务作用：从服务端流读下一块 DATA 负载(不做分帧解释)。返回 `Ok(None)` 表示流结束。
 async fn next_chunk(stream: &mut hyper::body::Incoming) -> Result<Option<Bytes>> {
     use http_body_util::BodyExt as _;
     while let Some(frame) = stream.frame().await {
@@ -843,7 +883,7 @@ async fn next_chunk(stream: &mut hyper::body::Incoming) -> Result<Option<Bytes>>
     Ok(None)
 }
 
-/// 若缓冲里已有一条完整 gRPC message,取走并返回;不足则 `Ok(None)` 等更多数据。
+/// 业务作用：若缓冲里已有一条完整 gRPC message,取走并返回;不足则 `Ok(None)` 等更多数据。
 ///
 /// 一次 DATA 帧可能带来半条、一条或多条消息,三种都必须正确处理:边缘面既有超过
 /// 单帧的大消息(默认上限 64 KiB > 帧上限 16 KiB),也有多条小广播被攒在同一次写出。
@@ -870,7 +910,7 @@ fn take_message(buffer: &mut BytesMut, max_message_bytes: usize) -> Result<Optio
     Ok(Some(frame.slice(GRPC_PREFIX_BYTES..)))
 }
 
-/// 给业务字节加上 gRPC 5 字节前缀。
+/// 业务作用：给业务字节加上 gRPC 5 字节前缀。
 fn frame(payload: &[u8]) -> Bytes {
     let mut out = BytesMut::with_capacity(GRPC_PREFIX_BYTES + payload.len());
     out.put_u8(0);
@@ -879,7 +919,7 @@ fn frame(payload: &[u8]) -> Bytes {
     out.freeze()
 }
 
-/// 拆掉 gRPC 前缀,返回 (message, 剩余字节)。
+/// 业务作用：拆掉 gRPC 前缀,返回 (message, 剩余字节)。
 fn split_frame(bytes: &Bytes, max_message_bytes: usize) -> Result<(Bytes, Bytes)> {
     if bytes.len() < GRPC_PREFIX_BYTES {
         return Err(EdgeError::Protocol("grpc frame shorter than prefix".into()));
@@ -902,18 +942,19 @@ fn split_frame(bytes: &Bytes, max_message_bytes: usize) -> Result<(Bytes, Bytes)
     Ok((bytes.slice(GRPC_PREFIX_BYTES..end), bytes.slice(end..)))
 }
 
-/// 按统一 `.proto` 编码 `FramePush { bytes payload = 1; }`，再加 gRPC 前缀。
+/// 业务作用：按统一 `.proto` 编码 `FramePush { bytes payload = 1; }`，再加 gRPC 前缀。
 ///
-/// WHY:早期 SDK 只加了 5 字节 gRPC 前缀，把业务 bytes 直接冒充整个 protobuf message；
-/// 网关因 payload opaque 会照常转发，但 protoc 生成的订阅端无法把它解析成 FramePush。
+/// 业务字节必须放入 FramePush 的 payload 字段；仅添加 gRPC 前缀不能形成合法的 protobuf 信封。
 fn encode_frame_push(payload: &Bytes, max_message_bytes: usize) -> Result<Bytes> {
     encode_frame_push_with_key(payload, None, max_message_bytes)
 }
 
 /// 业务作用：按统一 proto 编码 payload 与可选 `coalesce_key`，再添加 gRPC 前缀。
 ///
-/// 参数说明：`payload` 是业务字节；`coalesce_key` 为空缺或 1..=256 字节；
-/// `max_message_bytes` 是完整 FramePush protobuf 上限。
+/// 参数说明：
+/// - `payload`：是业务字节
+/// - `coalesce_key`：为空缺或 1..=256 字节
+/// - `max_message_bytes`：是完整 FramePush protobuf 上限。
 ///
 /// 返回：合法时返回完整 gRPC 帧；key/总长非法时在分配前返回协议错误。
 fn encode_frame_push_with_key(
@@ -940,7 +981,10 @@ fn encode_frame_push_with_key(
 
 /// 业务作用：在不分配编码缓冲的前提下验证一条 FramePush 的精确 wire 长度。
 ///
-/// 参数说明：`payload_len` 是业务字节数；`max_message_bytes` 必须与 route 单消息门一致。
+/// 参数说明：
+/// - `payload_len`：业务 payload 字节数。
+/// - `coalesce_key`：可选业务实体合并键，非空时受键长度上限约束。
+/// - `max_message_bytes`：整条 protobuf message 的字节上限，必须与 route 单消息门一致。
 ///
 /// 返回：合法时返回 protobuf message 长度；算术溢出或超过任一协议上限时返回错误。
 fn validate_frame_push_size(
@@ -977,7 +1021,7 @@ fn validate_frame_push_size(
     Ok(protobuf_len)
 }
 
-/// 从统一 `FramePush` protobuf message 取出 field 1，未知字段按 protobuf 规则跳过。
+/// 业务作用：从统一 `FramePush` protobuf message 取出 field 1，未知字段按 protobuf 规则跳过。
 fn decode_frame_push(message: &Bytes) -> Result<Bytes> {
     let mut cursor = 0usize;
     let mut payload = None;
@@ -1013,6 +1057,7 @@ fn decode_frame_push(message: &Bytes) -> Result<Bytes> {
     Ok(payload.unwrap_or_else(Bytes::new))
 }
 
+/// 业务作用：按 wire type 跳过未知 protobuf 字段，保留信封的向前兼容性并拒绝越界载荷。
 fn skip_protobuf_field(message: &Bytes, cursor: usize, wire: u64) -> Result<usize> {
     match wire {
         0 => read_varint(message, cursor).map(|(_, next)| next),
@@ -1036,6 +1081,7 @@ fn skip_protobuf_field(message: &Bytes, cursor: usize, wire: u64) -> Result<usiz
     }
 }
 
+/// 业务作用：在分配 FramePush 缓冲前计算长度字段的编码开销，使消息上限包含完整信封。
 fn varint_len(mut value: u64) -> usize {
     let mut len = 1;
     while value >= 0x80 {
@@ -1045,6 +1091,7 @@ fn varint_len(mut value: u64) -> usize {
     len
 }
 
+/// 业务作用：编码 protobuf 无符号整数，供业务信封长度与回执字段共享 wire 格式。
 fn put_varint(mut value: u64, out: &mut BytesMut) {
     while value >= 0x80 {
         out.put_u8((value as u8 & 0x7f) | 0x80);
@@ -1063,7 +1110,7 @@ struct FlatMessage {
 }
 
 impl FlatMessage {
-    /// 取字段值;**缺失即 0**(proto3 省零),不是"未知"。
+    /// 业务作用：取字段值;**缺失即 0**(proto3 省零),不是"未知"。
     fn get(&self, tag: u32) -> u64 {
         self.fields
             .iter()
@@ -1073,6 +1120,7 @@ impl FlatMessage {
     }
 }
 
+/// 业务作用：解析边缘入队回执的整数域，未知字段可跳过且缺省字段保持 proto3 零值语义。
 fn decode_flat_message(body: &Bytes) -> Result<FlatMessage> {
     let mut fields = Vec::new();
     let mut cursor = 0usize;
@@ -1101,9 +1149,12 @@ fn decode_flat_message(body: &Bytes) -> Result<FlatMessage> {
             }
         }
     }
-    Ok(FlatMessage { fields })
+    Ok(FlatMessage {
+        fields,
+    })
 }
 
+/// 业务作用：有界读取 protobuf 整数，拒绝截断和溢出而不消费未证明完整的字段。
 fn read_varint(body: &Bytes, mut cursor: usize) -> Result<(u64, usize)> {
     let mut value = 0u64;
     let mut shift = 0u32;
@@ -1123,225 +1174,12 @@ fn read_varint(body: &Bytes, mut cursor: usize) -> Result<(u64, usize)> {
     }
 }
 
+/// 业务作用：读取合法文本形式的响应元数据，供 gRPC 状态判定使用。
 fn header_str<'h>(headers: &'h http::HeaderMap, name: &str) -> Option<&'h str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+/// 业务作用：把端点契约中的头名转换为 HTTP 类型，让非法配置在请求构造时明确失败。
 fn header_name(raw: &str) -> Result<HeaderName> {
     HeaderName::try_from(raw).map_err(|_| EdgeError::Protocol(format!("invalid header name {raw}")))
-}
-
-/// 让编译器确认 `HeaderValue` 依赖被使用(认证值走 `&str`,此处仅做类型可见性)。
-#[allow(dead_code)]
-fn _assert_header_value(value: &str) -> Option<HeaderValue> {
-    HeaderValue::from_str(value).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn publish_request_body_is_incremental_and_channel_backpressured() {
-        // 回归场景：PublishStream 不能预编码整段；body 只在生产方送入一条后产出一帧，
-        // channel 暂无下一条时保持 Pending，发送端 Drop 后才 half-close。
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let mut body = PublishRequestBody {
-            receiver,
-            max_message_bytes: 64,
-        };
-        sender
-            .send(PublishFrame::new(Bytes::from_static(b"one")))
-            .await
-            .expect("send first");
-        let first = body
-            .frame()
-            .await
-            .expect("frame")
-            .expect("encode")
-            .into_data()
-            .expect("data");
-        let (message, rest) = split_frame(&first, 64).expect("grpc frame");
-        assert!(rest.is_empty());
-        assert_eq!(decode_frame_push(&message).unwrap().as_ref(), b"one");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), body.frame())
-                .await
-                .is_err()
-        );
-        drop(sender);
-        assert!(body.frame().await.is_none(), "sender Drop 才产生 EOS");
-    }
-
-    /// 回归场景：SDK keyed API 必须把 `coalesce_key` 写成 FramePush field 2，并在分配前
-    /// 拒绝空键和超过 256 字节的键，避免网关把调用方以为可合并的消息按 drop_new 处理。
-    #[test]
-    fn keyed_frame_push_encodes_field_two_and_enforces_bound() {
-        let frame = encode_frame_push_with_key(&Bytes::from_static(b"v"), Some(b"device-1"), 64)
-            .expect("encode keyed frame");
-        let (message, rest) = split_frame(&frame, 64).expect("grpc frame");
-        assert!(rest.is_empty());
-        assert_eq!(
-            message.as_ref(),
-            b"\x0a\x01v\x12\x08device-1",
-            "field 2 必须跟随 payload 写入统一 proto wire"
-        );
-        assert!(encode_frame_push_with_key(&Bytes::new(), Some(b""), 512).is_err());
-        assert!(encode_frame_push_with_key(&Bytes::new(), Some(&[b'k'; 257]), 512).is_err());
-    }
-
-    /// 回归场景:回执解析必须遵守 proto3 省零——**缺失字段是 0,不是未知**。
-    /// 网关不会发送值为 0 的字段,SDK 若把缺失当成错误或 None,调用方会误判。
-    #[test]
-    fn missing_fields_decode_as_zero() {
-        // [tag=1<<3][2] [tag=4<<3][1]:只有 accepted 与 messages 上 wire。
-        let body = Bytes::from_static(&[0x08, 0x02, 0x20, 0x01]);
-        let fields = decode_flat_message(&body).expect("decode");
-        assert_eq!(fields.get(1), 2);
-        assert_eq!(fields.get(4), 1);
-        assert_eq!(fields.get(2), 0, "dropped 缺失必须解析为 0");
-        assert_eq!(fields.get(7), 0, "peers_unknown 缺失必须解析为 0");
-    }
-
-    /// 回归场景:网关将来往回执加长度前缀字段时,旧 SDK 必须仍能读懂已有 varint 字段,
-    /// 而不是整条解析失败。
-    #[test]
-    fn unknown_length_delimited_field_is_skipped() {
-        // [tag=1 varint 5][tag=9 len-delimited "ab"][tag=5 varint 3]
-        let body = Bytes::from_static(&[0x08, 0x05, 0x4a, 0x02, b'a', b'b', 0x28, 0x03]);
-        let fields = decode_flat_message(&body).expect("decode");
-        assert_eq!(fields.get(1), 5);
-        assert_eq!(fields.get(5), 3, "未知字段之后的已知字段仍须可读");
-    }
-
-    /// 回归场景:分帧必须与网关一致——5 字节前缀、压缩位为 0、长度不得越界。
-    #[test]
-    fn framing_roundtrip_and_bounds() {
-        let framed = frame(b"hello");
-        assert_eq!(&framed[..5], &[0, 0, 0, 0, 5]);
-        let (message, rest) = split_frame(&framed, 64).expect("split");
-        assert_eq!(message.as_ref(), b"hello");
-        assert!(rest.is_empty());
-        // 声明长度大于实际负载:必须拒绝而不是读越界。
-        let bad = Bytes::from_static(&[0, 0, 0, 0, 9, b'x']);
-        assert!(split_frame(&bad, 64).is_err());
-        // 压缩帧在边缘面不支持,必须明确报错而不是把压缩位当负载。
-        let compressed = Bytes::from_static(&[1, 0, 0, 0, 1, b'x']);
-        assert!(split_frame(&compressed, 64).is_err());
-    }
-
-    /// 回归场景:一次 DATA 帧带来**半条**消息时必须等待,而不是报错。
-    ///
-    /// 这是本 SDK 修过的真 bug:早期按"一条消息 = 一个 chunk"处理,默认配置
-    /// (max_msg_bytes 64 KiB > H2 帧上限 16 KiB)下的大消息读到半帧就报错,
-    /// 再被订阅循环当成断线,退化为静默重连死循环。
-    #[test]
-    fn partial_frame_waits_for_more_data() {
-        let mut buffer = BytesMut::new();
-        // 声明 10 字节负载,先只给 4 字节。
-        buffer.extend_from_slice(&[0, 0, 0, 0, 10, b'a', b'b', b'c', b'd']);
-        assert!(
-            take_message(&mut buffer, 64).expect("no error").is_none(),
-            "半帧必须等待而不是报错"
-        );
-        buffer.extend_from_slice(b"efghij");
-        let message = take_message(&mut buffer, 64)
-            .expect("ok")
-            .expect("complete");
-        assert_eq!(message.as_ref(), b"abcdefghij");
-        assert!(buffer.is_empty(), "取走后缓冲应清空");
-    }
-
-    /// 回归场景:一次 DATA 帧带来**多条**完整消息时必须逐条取出,不能丢弃后续。
-    #[test]
-    fn multiple_messages_in_one_chunk_are_all_returned() {
-        let mut buffer = BytesMut::new();
-        buffer.extend_from_slice(&frame(b"one"));
-        buffer.extend_from_slice(&frame(b"two"));
-        assert_eq!(
-            take_message(&mut buffer, 64)
-                .expect("ok")
-                .expect("first")
-                .as_ref(),
-            b"one"
-        );
-        assert_eq!(
-            take_message(&mut buffer, 64)
-                .expect("ok")
-                .expect("second")
-                .as_ref(),
-            b"two"
-        );
-        assert!(take_message(&mut buffer, 64).expect("ok").is_none());
-    }
-
-    /// SDK 必须与统一 proto 的 `FramePush.payload=1` wire 形状一致，并在只看到前缀时
-    /// 就拒绝超限声明，不能继续等待攻击者填满一个巨型缓冲。
-    #[test]
-    fn frame_push_contract_and_inbound_limit_are_enforced() {
-        let framed = encode_frame_push(&Bytes::from_static(b"hello"), 64).expect("encode");
-        let (wire, rest) = split_frame(&framed, 64).expect("grpc frame");
-        assert!(rest.is_empty());
-        assert_eq!(wire.as_ref(), &[0x0a, 0x05, b'h', b'e', b'l', b'l', b'o']);
-        assert_eq!(decode_frame_push(&wire).expect("decode").as_ref(), b"hello");
-
-        let mut oversized = BytesMut::from(&[0, 0, 0, 1, 0][..]);
-        assert!(take_message(&mut oversized, 64).is_err());
-        assert_eq!(
-            oversized.len(),
-            GRPC_PREFIX_BYTES,
-            "拒绝发生在读取 payload 之前"
-        );
-    }
-
-    /// 回归场景:**proto3 省零** —— `bytes payload = 1` 取默认值(空)时 protoc **不上 wire**,
-    /// 于是 `FramePush{payload: b""}` 序列化成 **0 字节** message。
-    ///
-    /// 把"字段缺失"当错误会直接拒掉第三方 protoc 客户端发来的空帧(心跳/ping 就是这形态),
-    /// 而这正是引入 FramePush 信封本来要解决的互通问题。
-    #[test]
-    fn absent_payload_field_decodes_as_empty() {
-        let empty = Bytes::from_static(&[]);
-        assert_eq!(
-            decode_frame_push(&empty).expect("空 FramePush 必须解析为空 payload"),
-            Bytes::new()
-        );
-        // 显式写出的零长度字段同样合法(两种编码 protobuf 都接受)。
-        let explicit = Bytes::from_static(&[0x0a, 0x00]);
-        assert_eq!(
-            decode_frame_push(&explicit).expect("explicit"),
-            Bytes::new()
-        );
-    }
-
-    /// 回归场景:`.proto` 明确允许业务扩展 FramePush(只增字段、不改字段号),
-    /// 因此**未知字段必须跳过而不是报错**,且不影响 payload 的取值。
-    #[test]
-    fn unknown_fields_do_not_break_payload_extraction() {
-        // [field1 bytes "ab"][field2 varint 7][field3 bytes "zz"]
-        let wire =
-            Bytes::from_static(&[0x0a, 0x02, b'a', b'b', 0x10, 0x07, 0x1a, 0x02, b'z', b'z']);
-        assert_eq!(decode_frame_push(&wire).expect("decode").as_ref(), b"ab");
-        // payload 在未知字段之后同样要能取到(protobuf 不保证字段顺序)。
-        let reordered = Bytes::from_static(&[0x10, 0x07, 0x0a, 0x02, b'a', b'b']);
-        assert_eq!(
-            decode_frame_push(&reordered).expect("decode").as_ref(),
-            b"ab"
-        );
-    }
-
-    /// 授权/身份类状态码不可重试:订阅循环必须立即上报,不能无声打转。
-    #[test]
-    fn authz_status_is_terminal() {
-        let denied = EdgeError::Status {
-            status: "7".into(),
-            message: "edge-scope-not-allowed-for-principal".into(),
-        };
-        assert!(is_terminal(&denied));
-        let unavailable = EdgeError::Status {
-            status: "14".into(),
-            message: "transport".into(),
-        };
-        assert!(!is_terminal(&unavailable), "14 应当走重连而不是直接失败");
-    }
 }

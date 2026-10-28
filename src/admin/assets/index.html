@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Naway 管理台</title>
+    <link rel="stylesheet" href="/ui/shell.css" />
+    <script type="module" src="/ui/core/app.js"></script>
+  </head>
+  <body>
+    <a href="#view" class="skip-link">跳转到页面内容</a>
+    <header class="topbar">
+      <a class="brand" href="/monitor"
+        >N<span>AWAY</span><small>网关管理</small></a
+      >
+      <div class="identity">
+        <span id="principal">未登录</span
+        ><button id="signout" type="button" hidden>退出</button>
+      </div>
+    </header>
+    <div class="layout">
+      <aside id="navigation" aria-label="管理导航">
+        <p class="nav-label">集群管理</p>
+        <button id="nodes-nav" type="button" data-view="nodes">集群节点</button>
+        <button id="catalog-nav" type="button" data-view="catalog">路由与入口</button>
+        <button id="operations-nav" type="button" data-view="operations">变更提案</button>
+        <p class="nav-label">运行观测</p>
+        <button id="traffic-nav" type="button" data-view="traffic">路由实时流量</button>
+        <button id="monitor-nav" type="button" data-view="monitor">
+          实时监控 <span>LIVE</span>
+        </button>
+        <p class="nav-label">管理访问</p>
+        <button type="button" data-view="system">当前管理能力</button>
+        <p class="nav-foot">当前快照 · 有界采样<br />不保存监控历史</p>
+      </aside>
+      <main>
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">NAWAY / CONTROL PLANE</p>
+            <h1 id="title">Naway 管理台</h1>
+            <p id="subtitle">连接管理面，查看当前运行状态</p>
+          </div>
+        </div>
+        <p id="notice" role="status" aria-live="polite"></p>
+        <form id="login" class="login panel">
+          <h2>连接管理面</h2>
+          <p class="subtle">凭据仅保存在当前页面内存。关闭页面或退出后清除。</p>
+          <label
+            >认证方式<select id="auth-mode">
+              <option value="bearer">Bearer Token</option>
+              <option value="basic">Basic</option>
+            </select></label
+          >
+          <div id="bearer-fields">
+            <label
+              >Token<input
+                id="token"
+                type="password"
+                autocomplete="off"
+                maxlength="8192"
+                placeholder="未启用认证的本机可留空"
+            /></label>
+          </div>
+          <div id="basic-fields" hidden>
+            <label
+              >用户名<input
+                id="user"
+                autocomplete="off"
+                maxlength="1024" /></label
+            ><label
+              >密码<input
+                id="password"
+                type="password"
+                autocomplete="off"
+                maxlength="8192"
+            /></label>
+          </div>
+          <button class="primary" type="submit">连接</button>
+        </form>
+        <section id="workspace" hidden>
+          <div id="view" tabindex="-1"></div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

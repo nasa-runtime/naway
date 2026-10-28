@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Naway Control Plane</title>
+    <link rel="stylesheet" href="/ui/app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">GATEWAY / CONTROL PLANE</p>
+        <h1>集群运行态</h1>
+      </div>
+      <div class="actions">
+        <a href="/monitor">实时监控</a>
+        <a href="/cluster">集群节点</a>
+        <span id="mode" class="pill">加载中</span>
+        <button id="dry-run" type="button">配置 Dry Run</button>
+        <button id="refresh" class="primary" type="button">刷新</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="notice" class="notice" hidden></section>
+      <section class="hero-grid">
+        <article class="card metric">
+          <span>配置版本</span><strong id="version">—</strong>
+        </article>
+        <article class="card metric">
+          <span>路由</span><strong id="routes">—</strong>
+        </article>
+        <article class="card metric">
+          <span>上游服务</span><strong id="services">—</strong>
+        </article>
+        <article class="card metric">
+          <span>数据面状态</span><strong id="ready">—</strong>
+        </article>
+      </section>
+
+      <section id="telemetry-panel" class="card panel" hidden>
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">TELEMETRY</p>
+            <h2>治理与遥测</h2>
+          </div>
+          <span class="muted">本进程累计 · 固定低基数目录</span>
+        </div>
+        <div id="telemetry" class="list empty">暂无遥测数据</div>
+      </section>
+
+      <section class="two-column">
+        <article class="card panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">DISCOVERY</p>
+              <h2>上游健康</h2>
+            </div>
+          </div>
+          <div id="health" class="list empty">暂无健康探测数据</div>
+        </article>
+        <article class="card panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">CONFIG</p>
+              <h2>最近变更</h2>
+            </div>
+          </div>
+          <div id="history" class="list empty">暂无配置事件</div>
+        </article>
+      </section>
+
+      <section class="card panel config-panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">CONFIG</p>
+            <h2>gateway.yml 编辑与发布</h2>
+          </div>
+          <div class="actions">
+            <span id="config-meta" class="muted">未载入</span>
+            <button id="config-load" type="button">载入当前配置</button>
+            <button id="config-diff" type="button" disabled>语义 Diff</button>
+            <button id="config-publish" class="primary" type="button" disabled>
+              发布
+            </button>
+          </div>
+        </div>
+        <textarea
+          id="candidate"
+          spellcheck="false"
+          aria-label="候选 gateway.yml"
+          placeholder="点击「载入当前配置」取回线上 gateway.yml 与 ETag；改完点「发布」走 If-Match CAS，网关确认真正生效后才报 applied。留空时顶部 Dry Run 校验当前本地配置"
+        ></textarea>
+        <pre id="config-diff-result" class="result" hidden></pre>
+      </section>
+
+      <section class="two-column">
+        <article class="card panel tool-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">ROUTES</p>
+              <h2>路由推演</h2>
+            </div>
+          </div>
+          <div class="form-grid">
+            <select id="explain-method" aria-label="HTTP method">
+              <option>GET</option>
+              <option>POST</option>
+              <option>PUT</option>
+              <option>DELETE</option>
+              <option>PATCH</option>
+            </select>
+            <input
+              id="explain-path"
+              value="/"
+              aria-label="请求路径"
+              placeholder="/api/orders?id=1"
+            />
+            <input
+              id="explain-host"
+              aria-label="Host"
+              placeholder="Host（可选）"
+            />
+            <button id="explain-run" class="primary" type="button">推演</button>
+          </div>
+          <pre id="explain-result" class="result">
+输入请求后查看命中 route、变量解析和 filter chain</pre>
+        </article>
+        <article class="card panel tool-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">SENTINEL</p>
+              <h2>流量防护规则</h2>
+            </div>
+            <div class="actions">
+              <button id="sentinel-load" type="button">载入</button
+              ><button
+                id="sentinel-publish"
+                class="primary"
+                type="button"
+                disabled
+              >
+                提交
+              </button>
+            </div>
+          </div>
+          <textarea
+            id="sentinel-candidate"
+            spellcheck="false"
+            aria-label="Sentinel YAML"
+            placeholder="载入当前 Sentinel 文档"
+          ></textarea>
+        </article>
+      </section>
+
+      <section class="two-column">
+        <article class="card panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">CONSUMERS</p>
+              <h2>消费者与 API-Key</h2>
+            </div>
+            <span id="consumer-state" class="muted">未加载</span>
+          </div>
+          <div id="consumers" class="list empty">无查看权限或尚未配置</div>
+        </article>
+        <article class="card panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">CERTIFICATES</p>
+              <h2>TLS 证书</h2>
+            </div>
+            <span id="cert-state" class="muted">未加载</span>
+          </div>
+          <div id="certificates" class="list empty">无查看权限或尚未配置</div>
+        </article>
+      </section>
+
+      <section class="card panel approval-panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">MAKER / CHECKER</p>
+            <h2>待复核变更</h2>
+          </div>
+          <span id="approval-state" class="muted">未启用或无权限</span>
+        </div>
+        <div id="approvals" class="list empty">没有可复核变更</div>
+      </section>
+
+      <section class="two-column">
+        <article class="card panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">CLUSTER</p>
+              <h2>节点收敛</h2>
+            </div>
+            <span id="cluster-state" class="muted">未加载</span>
+          </div>
+          <div id="cluster-nodes" class="list empty">
+            仅 Nacos 自注册集群可见
+          </div>
+        </article>
+        <article class="card panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">ROLLOUT</p>
+              <h2>最近一次发布</h2>
+            </div>
+            <span id="rollout-state" class="muted">无</span>
+          </div>
+          <div id="rollout-nodes" class="list empty">
+            本节点尚未发起集群发布
+          </div>
+        </article>
+      </section>
+
+      <section class="card panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">CLUSTER</p>
+            <h2>节点流量</h2>
+          </div>
+          <span id="node-traffic-state" class="muted">未加载</span>
+        </div>
+        <div id="node-traffic" class="list empty">
+          需开启 admin.auth.allow_cluster_metrics_scrape
+        </div>
+      </section>
+
+      <section class="card panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">CLUSTER</p>
+            <h2>上游拓扑</h2>
+          </div>
+          <span id="topology-state" class="muted">未加载</span>
+        </div>
+        <div id="topology" class="list empty">加载中</div>
+      </section>
+
+      <section class="card panel audit-panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">SECURITY</p>
+            <h2>操作审计尾部</h2>
+          </div>
+          <span class="muted">HMAC hash-chain 已验证</span>
+        </div>
+        <div id="audit" class="list empty">暂无审计事件或无查看权限</div>
+      </section>
+    </main>
+    <script src="/ui/app.js" defer></script>
+  </body>
+</html>

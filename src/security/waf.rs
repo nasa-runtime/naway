@@ -86,7 +86,7 @@ const ALL_RULES: [WafRule; 10] = [
 impl WafRule {
     /// 业务作用：把固定规则映射为配置、日志和指标共同使用的稳定 id。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回不含请求数据的静态规则 id。
     const fn id(self) -> &'static str {
@@ -106,7 +106,8 @@ impl WafRule {
 
     /// 业务作用：解析配置中的规则 id，拒绝拼写错误导致策略静默缺失。
     ///
-    /// 参数说明：`value` 是 route 配置声明的规则 id。
+    /// 参数说明：
+    /// - `value`：是 route 配置声明的规则 id。
     ///
     /// 返回：已知 id 返回固定规则；未知 id 返回 `None`。
     fn from_id(value: &str) -> Option<Self> {
@@ -170,7 +171,9 @@ struct RulePackRule {
 impl ExternalRulePack {
     /// 业务作用：在候选快照发布前完成规则包读取、摘要、签名、格式、预算和 target 索引构建。
     ///
-    /// 参数说明：`cfg` 声明真实性与资源门；`config_dir` 是本地文件和 SecretSource 路径基准。
+    /// 参数说明：
+    /// - `cfg`：声明真实性与资源门
+    /// - `config_dir`：是本地文件和 SecretSource 路径基准。
     ///
     /// 返回：全部校验通过时返回只读索引；任何错误或超时拒绝候选并保留当前快照。
     fn load(cfg: &WafRulePackCfg, config_dir: &Path) -> Result<Self> {
@@ -185,7 +188,7 @@ impl ExternalRulePack {
         let started = Instant::now();
         let source = resolve_rule_pack_path(config_dir, cfg.source.as_str())?;
         let bytes =
-            crate::bounded_io::read_file(&source, cfg.max_pack_bytes, "WAF rule pack source")?;
+            crate::io::bounded_io::read_file(&source, cfg.max_pack_bytes, "WAF rule pack source")?;
         verify_rule_pack_digest(bytes.as_slice(), cfg.sha256.as_str())?;
         verify_rule_pack_signature(bytes.as_slice(), cfg, config_dir)?;
         ensure_compile_deadline(started, deadline)?;
@@ -298,7 +301,10 @@ impl ExternalRulePack {
 
     /// 业务作用：按预索引 target 扫描外部 literal，并保持规则包声明顺序的确定优先级。
     ///
-    /// 参数说明：`normalized` 是已转成 ASCII 小写的有界输入；`target` 是固定或规范 header 位置。
+    /// 参数说明：
+    /// - `normalized`：已规范化为 ASCII 小写的有界输入。
+    /// - `target`：固定检查位置或规范化的 header 位置。
+    /// - `exclusions`：当前路由显式允许的检查排除项。
     ///
     /// 返回：首条命中规则的已验证 id；无适用规则或 literal 未命中返回 `None`。
     fn detect(
@@ -337,7 +343,9 @@ impl ExternalRulePack {
 
     /// 业务作用：验证 route 例外只引用规则包中存在且会作用于该精确位置的规则。
     ///
-    /// 参数说明：`rule` 是外部规则 id；`target` 是已规范化的精确例外位置。
+    /// 参数说明：
+    /// - `rule`：是外部规则 id
+    /// - `target`：是已规范化的精确例外位置。
     ///
     /// 返回：规则存在且 target 属于其声明范围时返回 true。
     fn applies_to(&self, rule: &str, target: &str) -> bool {
@@ -395,7 +403,9 @@ pub(crate) struct WafPolicy {
 impl WafPolicy {
     /// 业务作用：在快照切换前编译并验证 route WAF，防止无效规则或无界预算进入数据面。
     ///
-    /// 参数说明：`cfg` 是单条 route 的 WAF 声明；`config_dir` 是规则包与 SecretSource 的路径基准。
+    /// 参数说明：
+    /// - `cfg`：是单条 route 的 WAF 声明
+    /// - `config_dir`：是规则包与 SecretSource 的路径基准。
     ///
     /// 返回：配置有效时返回只读策略；模式、规则、例外或预算无效时返回错误并阻止换版。
     pub(crate) fn build(cfg: &WafCfg, config_dir: &Path) -> Result<Self> {
@@ -511,7 +521,7 @@ impl WafPolicy {
 
     /// 业务作用：告知请求管线命中后应拦截还是只观测。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：`enforce` 模式返回 true，`monitor` 模式返回 false。
     pub(crate) const fn enforces(&self) -> bool {
@@ -520,7 +530,7 @@ impl WafPolicy {
 
     /// 业务作用：向 route 构建器暴露该策略是否会取得请求体所有权。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：显式启用 JSON/XML body 检查时返回 true。
     pub(crate) const fn inspects_body(&self) -> bool {
@@ -529,7 +539,8 @@ impl WafPolicy {
 
     /// 业务作用：在认证和外部插件之前检查请求行与 headers，尽早拒绝协议歧义和常见攻击输入。
     ///
-    /// 参数说明：`parts` 是已通过 listener 基础语法校验的请求 head。
+    /// 参数说明：
+    /// - `parts`：是已通过 listener 基础语法校验的请求 head。
     ///
     /// 返回：首次确定命中返回低敏规则与 target；未命中返回 `None`。
     pub(crate) fn inspect_head(&self, parts: &Parts) -> Option<WafMatch> {
@@ -605,7 +616,8 @@ impl WafPolicy {
 
     /// 业务作用：识别会造成不同 HTTP hop 对消息边界理解不一致的请求 head。
     ///
-    /// 参数说明：`parts` 是当前下游请求 head。
+    /// 参数说明：
+    /// - `parts`：是当前下游请求 head。
     ///
     /// 返回：存在 framing 冲突时返回 `protocol_smuggling` 命中，否则返回 `None`。
     fn inspect_protocol(&self, parts: &Parts) -> Option<WafMatch> {
@@ -705,7 +717,8 @@ impl WafPolicy {
 
     /// 业务作用：解析 JSON 并以迭代方式约束节点、深度和解码后字符串，防止结构炸弹与转义绕过。
     ///
-    /// 参数说明：`bytes` 是已通过请求体字节上限的完整 JSON entity。
+    /// 参数说明：
+    /// - `bytes`：是已通过请求体字节上限的完整 JSON entity。
     ///
     /// 返回：非法或超预算返回 `json_threat`；字符串命中返回对应攻击规则；通过返回 `None`。
     fn inspect_json(&self, bytes: &[u8]) -> Option<DetectedRule> {
@@ -763,7 +776,8 @@ impl WafPolicy {
 
     /// 业务作用：解析 XML 并拒绝 DTD、自定义 entity 与超预算结构，防止 XXE 和实体扩展攻击。
     ///
-    /// 参数说明：`bytes` 是已通过请求体字节上限的完整 XML entity。
+    /// 参数说明：
+    /// - `bytes`：是已通过请求体字节上限的完整 XML entity。
     ///
     /// 返回：非法或超预算返回 `xml_threat`；文本命中返回对应攻击规则；通过返回 `None`。
     fn inspect_xml(&self, bytes: &[u8]) -> Option<DetectedRule> {
@@ -953,7 +967,7 @@ impl WafPolicy {
 
     /// 业务作用：判断 body 是否至少启用一条内容攻击特征规则，避免仅结构规则关闭时无意义遍历。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：SQL/XSS/命令/模板/路径规则任一启用且未整体豁免 body 时返回 true。
     fn has_body_signature_rules(&self) -> bool {
@@ -1001,8 +1015,11 @@ enum StructuredMediaType {
 
 /// 业务作用：在一个 target 的规则索引中寻找声明顺序最靠前的 literal 命中。
 ///
-/// 参数说明：`rules` 已保持规则包顺序；`value` 是规范化后的有界输入；`target` 与
-/// `exclusions` 用于跳过精确豁免而继续检查后续规则。
+/// 参数说明：
+/// - `rules`：已保持规则包顺序
+/// - `value`：是规范化后的有界输入
+/// - `target`：用于跳过精确豁免而继续检查后续规则。
+/// - `exclusions`：用于跳过精确豁免而继续检查后续规则。
 ///
 /// 返回：返回规则顺序和 id；无命中返回 `None`。
 fn first_external_match(
@@ -1030,7 +1047,9 @@ fn first_external_match(
 
 /// 业务作用：解析规则包本地来源，禁止 URL 或空路径绕开统一文件观察与有界读取。
 ///
-/// 参数说明：`config_dir` 是主配置目录；`raw` 是 source 配置值。
+/// 参数说明：
+/// - `config_dir`：是主配置目录
+/// - `raw`：是 source 配置值。
 ///
 /// 返回：绝对路径原样返回，相对路径基于主配置目录解析；非法来源返回错误。
 fn resolve_rule_pack_path(config_dir: &Path, raw: &str) -> Result<PathBuf> {
@@ -1047,7 +1066,9 @@ fn resolve_rule_pack_path(config_dir: &Path, raw: &str) -> Result<PathBuf> {
 
 /// 业务作用：复验规则包原始字节摘要，防止签名材料或部署文件错配。
 ///
-/// 参数说明：`bytes` 是原始 JSON；`expected` 是配置声明的 SHA-256 十六进制值。
+/// 参数说明：
+/// - `bytes`：是原始 JSON
+/// - `expected`：是配置声明的 SHA-256 十六进制值。
 ///
 /// 返回：摘要严格一致时成功；格式错误或内容不匹配返回错误。
 fn verify_rule_pack_digest(bytes: &[u8], expected: &str) -> Result<()> {
@@ -1067,16 +1088,19 @@ fn verify_rule_pack_digest(bytes: &[u8], expected: &str) -> Result<()> {
 
 /// 业务作用：复验规则包原始字节的 detached Ed25519 signature，阻止未授权规则进入候选。
 ///
-/// 参数说明：`bytes` 是原始 JSON；`cfg` 与 `config_dir` 提供 signature/public-key SecretSource。
+/// 参数说明：
+/// - `bytes`：是原始 JSON
+/// - `cfg`：提供 signature/public-key SecretSource。
+/// - `config_dir`：提供 signature/public-key SecretSource。
 ///
 /// 返回：签名、key 与 Base64 均合法且严格验签通过时成功，否则返回错误。
 fn verify_rule_pack_signature(bytes: &[u8], cfg: &WafRulePackCfg, config_dir: &Path) -> Result<()> {
-    let signature = crate::secret::resolve_text(
+    let signature = crate::security::secret::resolve_text(
         cfg.signature.as_str(),
         config_dir,
         "WAF rule pack signature",
     )?;
-    let public_key = crate::secret::resolve_text(
+    let public_key = crate::security::secret::resolve_text(
         cfg.public_key.as_str(),
         config_dir,
         "WAF rule pack public key",
@@ -1101,7 +1125,9 @@ fn verify_rule_pack_signature(bytes: &[u8], cfg: &WafRulePackCfg, config_dir: &P
 
 /// 业务作用：限制规则包和规则 id 为低敏、稳定、可安全记录的标识符。
 ///
-/// 参数说明：`value` 是候选 id；`field` 用于错误定位。
+/// 参数说明：
+/// - `value`：是候选 id
+/// - `field`：用于错误定位。
 ///
 /// 返回：1..=128 字节且只含 ASCII 字母数字、点、下划线或连字符时成功。
 fn validate_rule_pack_id(value: &str, field: &str) -> Result<()> {
@@ -1118,7 +1144,8 @@ fn validate_rule_pack_id(value: &str, field: &str) -> Result<()> {
 
 /// 业务作用：规范化规则包 target，拒绝模糊 wildcard 和非法 header 名扩大扫描范围。
 ///
-/// 参数说明：`target` 是规则声明的位置。
+/// 参数说明：
+/// - `target`：是规则声明的位置。
 ///
 /// 返回：固定 path/query/body/header 或精确小写 header target；非法值返回错误。
 fn normalize_rule_pack_target(target: &str) -> Result<String> {
@@ -1138,7 +1165,9 @@ fn normalize_rule_pack_target(target: &str) -> Result<String> {
 
 /// 业务作用：在候选构建检查点执行 wall-time 门禁，避免超预算规则包被发布。
 ///
-/// 参数说明：`started` 是本轮起点；`limit` 是 route 声明且受进程硬门约束的上限。
+/// 参数说明：
+/// - `started`：是本轮起点
+/// - `limit`：是 route 声明且受进程硬门约束的上限。
 ///
 /// 返回：尚未超过上限时成功，超时返回错误并保留当前快照。
 fn ensure_compile_deadline(started: Instant, limit: Duration) -> Result<()> {
@@ -1150,7 +1179,9 @@ fn ensure_compile_deadline(started: Instant, limit: Duration) -> Result<()> {
 
 /// 业务作用：收集规则包 source、signature 与 public key 的文件依赖，使独立替换进入统一热更新事务。
 ///
-/// 参数说明：`config_dir` 是主配置目录；`cfg` 是 route WAF 声明。
+/// 参数说明：
+/// - `config_dir`：是主配置目录
+/// - `cfg`：是 route WAF 声明。
 ///
 /// 返回：返回不含 secret 内容的本地依赖路径；未配置规则包或非文件 SecretSource 返回空集合。
 pub(crate) fn dependency_paths(config_dir: &Path, cfg: &WafCfg) -> Vec<PathBuf> {
@@ -1167,7 +1198,7 @@ pub(crate) fn dependency_paths(config_dir: &Path, cfg: &WafCfg) -> Vec<PathBuf> 
         });
     }
     for value in [&pack.signature, &pack.public_key] {
-        if let Some(path) = crate::secret::dependency_path(value, config_dir) {
+        if let Some(path) = crate::security::secret::dependency_path(value, config_dir) {
             paths.push(path);
         }
     }
@@ -1191,7 +1222,8 @@ fn validate_structured_budget(name: &str, value: usize, maximum: usize) -> Resul
 
 /// 业务作用：验证并规范化 WAF 精确例外 target，拒绝通配符和大小写歧义。
 ///
-/// 参数说明：`target` 是 route 配置中的例外 target。
+/// 参数说明：
+/// - `target`：是 route 配置中的例外 target。
 ///
 /// 返回：合法 target 返回规范化字符串；非法 target 返回错误。
 fn normalize_exclusion_target(target: &str) -> Result<String> {
@@ -1227,7 +1259,9 @@ fn waf_match(rule: WafRule, target: String) -> WafMatch {
 
 /// 业务作用：把内置或外部规则身份转换为不含请求原值的命中记录。
 ///
-/// 参数说明：`rule` 是候选构建期确定的规则身份；`target` 是固定位置。
+/// 参数说明：
+/// - `rule`：是候选构建期确定的规则身份
+/// - `target`：是固定位置。
 ///
 /// 返回：返回可安全写入低敏日志的有界规则 id 与 target。
 fn waf_detected_match(rule: DetectedRule, target: String) -> WafMatch {
@@ -1242,7 +1276,8 @@ fn waf_detected_match(rule: DetectedRule, target: String) -> WafMatch {
 
 /// 业务作用：识别会覆盖方法或路由语义的客户端 header。
 ///
-/// 参数说明：`name` 是入站 header 名。
+/// 参数说明：
+/// - `name`：是入站 header 名。
 ///
 /// 返回：命中固定危险 header 集合时返回 true。
 fn is_dangerous_header(name: &HeaderName) -> bool {
@@ -1254,7 +1289,8 @@ fn is_dangerous_header(name: &HeaderName) -> bool {
 
 /// 业务作用：检查重复 Content-Length 是否均为同一个有效十进制值。
 ///
-/// 参数说明：`parts` 是当前请求 head。
+/// 参数说明：
+/// - `parts`：是当前请求 head。
 ///
 /// 返回：语法无效、溢出或重复值不一致时返回 true。
 fn invalid_content_lengths(parts: &Parts) -> bool {
@@ -1283,7 +1319,8 @@ fn invalid_content_lengths(parts: &Parts) -> bool {
 
 /// 业务作用：拒绝 Connection token 把 framing/authority 字段错误声明为逐跳字段。
 ///
-/// 参数说明：`parts` 是当前请求 head。
+/// 参数说明：
+/// - `parts`：是当前请求 head。
 ///
 /// 返回：Connection 引用了 Content-Length、Transfer-Encoding 或 Host 时返回 true。
 fn connection_overrides_framing(parts: &Parts) -> bool {
@@ -1301,7 +1338,8 @@ fn connection_overrides_framing(parts: &Parts) -> bool {
 
 /// 业务作用：把 URI percent 编码严格解码一次，保留一次解码后的安全检查语义。
 ///
-/// 参数说明：`input` 是 path 或 query 原始字节。
+/// 参数说明：
+/// - `input`：是 path 或 query 原始字节。
 ///
 /// 返回：所有 `%HH` 合法时返回解码字节；残缺或非十六进制 escape 返回错误。
 fn percent_decode_once(input: &[u8]) -> std::result::Result<Vec<u8>, ()> {
@@ -1326,7 +1364,8 @@ fn percent_decode_once(input: &[u8]) -> std::result::Result<Vec<u8>, ()> {
 
 /// 业务作用：把单个 ASCII 十六进制字符转换为数值。
 ///
-/// 参数说明：`byte` 是 percent escape 中的候选字符。
+/// 参数说明：
+/// - `byte`：是 percent escape 中的候选字符。
 ///
 /// 返回：合法十六进制返回 0..=15；其它字节返回 `None`。
 const fn hex_value(byte: u8) -> Option<u8> {
@@ -1340,7 +1379,8 @@ const fn hex_value(byte: u8) -> Option<u8> {
 
 /// 业务作用：识别一次解码后仍存在的 `%HH`，防止下游二次解码扩大语义。
 ///
-/// 参数说明：`input` 是已经完成一次 percent 解码的字节。
+/// 参数说明：
+/// - `input`：是已经完成一次 percent 解码的字节。
 ///
 /// 返回：仍包含完整 percent escape 时返回 true。
 fn contains_percent_escape(input: &[u8]) -> bool {
@@ -1351,7 +1391,8 @@ fn contains_percent_escape(input: &[u8]) -> bool {
 
 /// 业务作用：为 ASCII 规则匹配生成大小写无关表示，不对非 ASCII payload 做有损字符转换。
 ///
-/// 参数说明：`input` 是有界待扫描值。
+/// 参数说明：
+/// - `input`：是有界待扫描值。
 ///
 /// 返回：仅 ASCII 大写字母被转换为小写的同长度字节。
 fn ascii_lowercase(input: &[u8]) -> Vec<u8> {
@@ -1431,7 +1472,8 @@ fn contains_any(value: &[u8], patterns: &[&[u8]]) -> bool {
 
 /// 业务作用：从 Content-Type 识别唯一允许进入 body WAF 慢路径的结构化格式。
 ///
-/// 参数说明：`parts` 是当前请求 head。
+/// 参数说明：
+/// - `parts`：是当前请求 head。
 ///
 /// 返回：JSON/XML 返回固定分类；缺失、非 UTF-8 或其它 media type 返回 `None`。
 fn structured_media_type(parts: &Parts) -> Option<StructuredMediaType> {
@@ -1473,7 +1515,8 @@ fn declared_body_too_large(parts: &Parts, limit: u64) -> bool {
 
 /// 业务作用：只允许 XML 预定义实体与数字字符引用，拒绝需要 DTD resolver 的自定义实体。
 ///
-/// 参数说明：`reference` 是 `&` 与 `;` 之间的原始引用名。
+/// 参数说明：
+/// - `reference`：位于 & 与 ; 之间的原始 XML 引用名。
 ///
 /// 返回：预定义实体或合法十进制/十六进制字符引用返回 true。
 fn is_predefined_or_numeric_entity(reference: &[u8]) -> bool {

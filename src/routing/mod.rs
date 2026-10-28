@@ -1,5 +1,15 @@
 //! 路由表:predicates 全命中 → 命中 route → 指向上游 + nginx/Higress 风格 filter 计划。
 
+pub mod circuit;
+pub mod sentinel;
+use circuit::parse_circuit_breaker;
+pub use circuit::CircuitBreakerPolicy;
+use sentinel::parse_limit_req;
+pub use sentinel::LimitReqPolicy;
+pub(crate) mod layers;
+pub(crate) mod traffic;
+pub mod variable;
+
 pub mod predicate;
 
 use std::borrow::Cow;
@@ -21,33 +31,33 @@ use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::auth::{basic_authorization_matches, constant_time_eq, escape_header_quote};
-use crate::bot::BotPolicy;
-use crate::casbin_auth::CasbinPolicy;
+use crate::ai::llm::LlmRoutePolicy;
+use crate::cache::http::HttpCachePolicy;
 use crate::config::model::{
     BffAggregationCfg, FaultInjectionCfg, GatewayRedirectCfg, HedgeCfg, InferencePoolRouteCfg,
     MockResponseCfg, RouteCfg,
 };
-use crate::csrf::CsrfPolicy;
-use crate::degraphql::DegraphqlPlan;
-use crate::dlp::DlpPolicy;
-use crate::dubbo::DubboPlan;
-use crate::enterprise_identity::{EnterpriseAuthPolicy, EnterpriseAuthResult};
-use crate::ext_proc::ExtProcPlan;
-use crate::external_plugin::ExternalPluginChain;
-use crate::geoip::{GeoIpCatalog, GeoIpPolicy};
-use crate::graphql::GraphqlGuardPolicy;
-use crate::http_cache::HttpCachePolicy;
-use crate::llm::LlmRoutePolicy;
-use crate::net::Cidr;
-use crate::opa::OpaPolicy;
+use crate::extensions::degraphql::DegraphqlPlan;
+use crate::extensions::ext_proc::ExtProcPlan;
+use crate::extensions::external_plugin::ExternalPluginChain;
+use crate::extensions::graphql::GraphqlGuardPolicy;
+use crate::extensions::wasm::WasmPluginChain;
+use crate::io::net::Cidr;
+use crate::io::static_serve::StaticServe;
+use crate::protocols::dubbo::DubboPlan;
 use crate::proxy::request_validation::RequestValidationPlan;
 use crate::proxy::response_contract::{BodyTransformPlan, ResponseContractPlan};
-use crate::static_serve::StaticServe;
-use crate::upstream_credential::UpstreamCredentialPlan;
-use crate::variable::{ValueTemplate, VariablePhase, VariablePlan};
-use crate::waf::WafPolicy;
-use crate::wasm::WasmPluginChain;
+use crate::routing::variable::{ValueTemplate, VariablePhase, VariablePlan};
+use crate::security::auth::{basic_authorization_matches, constant_time_eq, escape_header_quote};
+use crate::security::bot::BotPolicy;
+use crate::security::casbin_auth::CasbinPolicy;
+use crate::security::csrf::CsrfPolicy;
+use crate::security::dlp::DlpPolicy;
+use crate::security::enterprise_identity::{EnterpriseAuthPolicy, EnterpriseAuthResult};
+use crate::security::geoip::{GeoIpCatalog, GeoIpPolicy};
+use crate::security::opa::OpaPolicy;
+use crate::security::upstream_credential::UpstreamCredentialPlan;
+use crate::security::waf::WafPolicy;
 use predicate::{parse_predicate, parse_strip_prefix, Predicate};
 
 /// `sub_filter` 单个匹配串的最大长度,避免配置把流式回看窗口撑成大内存。
@@ -96,19 +106,19 @@ const DEFAULT_LIMIT_REQ_MAX_ACTIVE_KEYS: usize = 100_000;
 const DEFAULT_MIRROR_MAX_BODY_BYTES: u64 = 64 * 1024;
 /// mirror body tee 最大允许字节数,防止误配把镜像变成大 body 聚合慢路径。
 const MAX_MIRROR_BODY_BYTES: u64 = 1024 * 1024;
-/// V5 响应压缩默认最小实体长度；未知长度的流仍可压缩，避免为判长而聚合 body。
+/// 响应压缩默认最小实体长度；未知长度的流仍可压缩，避免为判长而聚合 body。
 const DEFAULT_COMPRESSION_MIN_LENGTH: u64 = 1024;
-/// V5 流式 codec 单次最多向 Hyper 交付的压缩字节数，限制每请求暂存内存。
+/// 流式 codec 单次最多向 Hyper 交付的压缩字节数，限制每请求暂存内存。
 const DEFAULT_COMPRESSION_CHUNK_BYTES: usize = 16 * 1024;
 /// 单个压缩输出 frame 的允许上限，防止配置把每个并发请求的暂存块放大到无界。
 const MAX_COMPRESSION_CHUNK_BYTES: usize = 1024 * 1024;
 /// 每条 route 最多声明的可压缩 MIME 匹配项，限制热路径线性扫描成本。
 const MAX_COMPRESSION_CONTENT_TYPES: usize = 64;
-/// V5 公共响应缓存默认 TTL，毫秒。
+/// 公共响应缓存默认 TTL，毫秒。
 const DEFAULT_HTTP_CACHE_TTL_MS: u64 = 60_000;
-/// V5 每条 cache route 默认允许的 L1 entry 数。
+/// 每条 cache route 默认允许的 L1 entry 数。
 const DEFAULT_HTTP_CACHE_MAX_ENTRIES: u64 = 10_000;
-/// V5 cache miss 默认最多复制 1MiB 未压缩实体；超过后透明转发但不回填。
+/// cache miss 默认最多复制 1MiB 未压缩实体；超过后透明转发但不回填。
 const DEFAULT_HTTP_CACHE_MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// 单 route 缓存 body 上限的硬保护，避免显式慢路径吃掉无界内存。
 const MAX_HTTP_CACHE_BODY_BYTES: u64 = 16 * 1024 * 1024;
@@ -128,7 +138,22 @@ pub struct Route {
     /// `id` 保留给构建期校验和需要 owned String 的低频控制面；请求命中后 clone 本字段只增加
     /// 引用计数，不能为 access log、trace 和每条 gRPC stream 重复复制同一段 UTF-8。
     pub id_shared: Arc<str>,
-    /// R1:`http://host:port` 直连;R2:`lb://service`。
+    /// 只属于本配置代的入口事实，旧响应结束不能写入热更后的路由归属。
+    pub(crate) traffic: Arc<crate::observability::http_stream::routes::Counters>,
+    /// 实际选择优先级同时进入管理语义，不能只保留排序结果而丢失候选差异。
+    pub(crate) order: i32,
+    /// 只读层级声明参与管理解释与语义差异，不从数据面头反向构造。
+    pub(crate) layer: Option<Arc<crate::config::layers::LayerCfg>>,
+    /// 记录协议仅在显式制品中进入数据面。
+    #[cfg(any(feature = "fastcgi", feature = "uwsgi", feature = "scgi"))]
+    pub(crate) cgi: Option<Arc<crate::protocols::cgi::Plan>>,
+    /// 显式文件协议计划，关闭制品能力时不进入路由结构。
+    #[cfg(feature = "webdav")]
+    pub(crate) webdav: Option<Arc<crate::io::webdav::Plan>>,
+    /// 仅动态来源路由具有证据期限；到期不得等待控制面构建成功后才停止接收新请求。
+    #[cfg(feature = "config-providers")]
+    pub(crate) provider_deadline: Option<std::time::Instant>,
+    /// `http://host:port` 直连，或通过 `lb://service` 从共享目录选择实例。
     pub upstream: String,
     /// `uri` 的编译模板。静态路由走 `upstream` 快路径;包含变量时运行期按请求上下文求值。
     pub upstream_template: ValueTemplate,
@@ -148,7 +173,7 @@ pub struct Route {
     pub pass_request_headers: bool,
     /// 是否透传下游请求体,对应 nginx `proxy_pass_request_body`。
     pub pass_request_body: bool,
-    /// V9 有界 hedged request；None 保持单请求/既有 retry 路径，不增加任何 timer 或副本。
+    /// 有界 hedged request；None 保持单请求/既有 retry 路径，不增加任何 timer 或副本。
     pub(crate) hedge: Option<HedgePolicy>,
     /// 上游请求头设置规则集合。
     pub request_headers: Vec<RequestHeaderOp>,
@@ -156,13 +181,15 @@ pub struct Route {
     pub(crate) upstream_credentials: Option<Arc<UpstreamCredentialPlan>>,
     /// 下游响应头过滤规则集合。
     pub response_headers: Vec<ResponseHeaderOp>,
-    /// V3 `sub_filter` 响应体流式替换规则。存在时仅包当前 route 的响应 body。
+    /// `sub_filter` 响应体流式替换规则。存在时仅包当前 route 的响应 body。
     pub sub_filters: Vec<SubFilterRule>,
-    /// V5 gzip/brotli 响应压缩策略。不存在时该 route 完全不介入内容编码。
+    /// gzip/brotli 响应压缩策略。不存在时该 route 完全不介入内容编码。
     pub compression: Option<CompressionPolicy>,
-    /// V5 公共 HTTP 响应 L1/L2 缓存；不存在时不构造 key、不复制 body。
+    /// 普通HTTP请求在认证后解码，正文安全检查始终消费解码表示。
+    pub(crate) request_decompression: Option<crate::io::request_decompression::Policy>,
+    /// 公共 HTTP 响应 L1/L2 缓存；不存在时不构造 key、不复制 body。
     pub(crate) http_cache: Option<Arc<HttpCachePolicy>>,
-    /// V5 请求 OpenAPI/JSON Schema 显式慢路径；不存在时不构造 JSON、不读取 body。
+    /// 请求 OpenAPI/JSON Schema 显式慢路径；不存在时不构造 JSON、不读取 body。
     pub(crate) request_validation: Option<RequestValidationPlan>,
     /// 请求实体声明式转换；不存在时保持原始 body 流。
     pub(crate) request_transform: Option<Arc<BodyTransformPlan>>,
@@ -180,50 +207,56 @@ pub struct Route {
     pub(crate) csrf: Option<Arc<CsrfPolicy>>,
     /// 请求、响应与日志 path 的 PII/secret 策略。
     pub(crate) dlp: Option<Arc<DlpPolicy>>,
-    /// V7 GraphQL query depth/complexity guard；不存在时不读取或解析普通代理 body。
+    /// GraphQL query depth/complexity guard；不存在时不读取或解析普通代理 body。
     pub(crate) graphql_guard: Option<GraphqlGuardPolicy>,
     /// 双向带宽整形与成本型限额策略。
     pub(crate) traffic_limit: Option<Arc<TrafficLimitPolicy>>,
     /// 受控正向代理策略;None 表示该 route 不接受 CONNECT。
-    pub(crate) forward_proxy: Option<Arc<crate::forward_proxy::ForwardProxyPolicy>>,
+    pub(crate) forward_proxy: Option<Arc<crate::protocols::forward_proxy::ForwardProxyPolicy>>,
     /// WebTransport 真上游策略；None 表示 extended CONNECT 不会建立 session。
-    pub(crate) webtransport: Option<Arc<crate::masque::WebTransportPolicy>>,
+    pub(crate) webtransport: Option<Arc<crate::protocols::masque::WebTransportPolicy>>,
     /// 显式的 0-RTT 读路由计划；None 表示任何 early request 都必须返回 425。
-    pub(crate) early_data: Option<crate::masque::EarlyDataRoutePolicy>,
+    pub(crate) early_data: Option<crate::protocols::masque::EarlyDataRoutePolicy>,
     /// WebSocket 帧级治理策略;None 表示保持透明隧道。
-    pub(crate) ws_frame: Option<Arc<crate::ws_frame::FramePolicy>>,
-    /// V7 REST→GraphQL 固定文档映射；不存在时普通 route 无 variables 编码成本。
+    pub(crate) ws_frame: Option<Arc<crate::protocols::ws_frame::FramePolicy>>,
+    /// REST→GraphQL 固定文档映射；不存在时普通 route 无 variables 编码成本。
     pub(crate) degraphql: Option<Arc<DegraphqlPlan>>,
-    /// V7 OPA 外部授权；不存在时普通 route 不编码 policy input、不访问 decision cache。
+    /// OPA 外部授权；不存在时普通 route 不编码 policy input、不访问 decision cache。
     pub(crate) opa_authorization: Option<Arc<OpaPolicy>>,
-    /// V7 内嵌 Casbin RBAC/ABAC；快照内只读，请求期无文件 I/O。
+    /// 内嵌 Casbin RBAC/ABAC；快照内只读，请求期无文件 I/O。
     pub(crate) casbin_authorization: Option<Arc<CasbinPolicy>>,
-    /// V7 Proxy-Wasm request/response header 插件链；不存在时数据面无沙箱调度成本。
+    /// Proxy-Wasm request/response header 插件链；不存在时数据面无沙箱调度成本。
     pub(crate) wasm_plugins: Option<Arc<WasmPluginChain>>,
-    /// V7 外部 HTTP request/response header 插件链；不存在时不编码 JSON、不发子请求。
+    /// 源码与预算已冻结的脚本链；关闭 feature 后不保留数据面字段。
+    #[cfg(feature = "lua-scripts")]
+    pub(crate) script_plugins: Option<Arc<crate::extensions::scripts::Chain>>,
+    /// 外部 HTTP request/response header 插件链；不存在时不编码 JSON、不发子请求。
     pub(crate) external_plugins: Option<Arc<ExternalPluginChain>>,
     /// Envoy External Processing 双向流计划；不存在时请求路径不编码 protobuf。
     #[cfg_attr(not(feature = "ext-proc"), allow(dead_code))]
     pub(crate) ext_proc: Option<Arc<ExtProcPlan>>,
     /// InferencePool 的 EPP 选择门；不存在时普通 `lb://` 路由不解析 endpoint 决策。
     pub(crate) inference_pool: Option<InferencePoolPolicy>,
-    /// V7 BFF 并发只读子请求计划；终端慢路径，普通 route 为 None。
+    /// BFF 并发只读子请求计划；终端慢路径，普通 route 为 None。
     pub(crate) bff_aggregation: Option<Arc<BffAggregationPolicy>>,
-    /// V7 HTTP→Dubbo2 generic invocation；不存在时不聚合 JSON、不建立原始 TCP RPC 连接。
+    /// HTTP→Dubbo2 generic invocation；不存在时不聚合 JSON、不建立原始 TCP RPC 连接。
     pub(crate) dubbo: Option<Arc<DubboPlan>>,
-    /// V7 typed mock 固定响应；body 使用 Bytes，单请求只 clone 引用计数句柄。
+    /// typed mock 固定响应；body 使用 Bytes，单请求只 clone 引用计数句柄。
     pub(crate) mock_response: Option<MockResponsePolicy>,
-    /// V7 显式 chaos 策略；采样不读取/复制 body。
+    /// 显式 chaos 策略；采样不读取/复制 body。
     pub(crate) fault_injection: Option<FaultInjectionPolicy>,
-    /// V7 consumer usage-plan 配额；全局 catalog 已解析为共享只读 plan。
+    /// consumer usage-plan 配额；全局 catalog 已解析为共享只读 plan。
     pub(crate) usage_plan: Option<UsagePlanPolicy>,
-    /// V6 多模型 LLM 统一协议计划；不存在时普通代理路径没有 JSON/token 处理开销。
+    /// 多模型 LLM 统一协议计划；不存在时普通代理路径没有 JSON/token 处理开销。
     pub(crate) llm: Option<Arc<LlmRoutePolicy>>,
+    /// 显式 Agent 协议终端；未编译对应制品时配置构建必须拒绝。
+    pub(crate) agent: Option<Arc<crate::ai::agent::Plan>>,
     /// gRPC 边缘模式已编译计划；None = 普通 L7 透传（默认）。
     /// 订阅/发布分支读取该计划，静态 relay 由进程级集群计划接线。
-    pub(crate) grpc_edge: Option<Arc<crate::grpc_edge::GrpcEdgePlan>>,
+    pub(crate) grpc_edge: Option<Arc<crate::edge::config::GrpcEdgePlan>>,
     /// descriptor 驱动 JSON 转码慢路径；None 时 native gRPC 不读取反射计划。
-    pub(crate) grpc_transcoding: Option<Arc<crate::grpc_transcoding::GrpcTranscodingPlan>>,
+    pub(crate) grpc_transcoding:
+        Option<Arc<crate::protocols::grpc_transcoding::GrpcTranscodingPlan>>,
     /// 上游写成功后要推进 generation 的同 proxy 缓存 route id；最多 8 个，避免控制面 I/O 无界。
     pub(crate) cache_invalidations: Vec<String>,
     /// CORS 策略,命中预检请求时可直接短路。
@@ -236,33 +269,35 @@ pub struct Route {
     pub referer: Option<RefererPolicy>,
     /// route 命中后允许的方法集合,对应 nginx `limit_except` 基础子集。
     pub limit_except: Option<Vec<Method>>,
-    /// V4 HTTP Basic 鉴权策略,对应 nginx `auth_basic` 基础形态。
+    /// HTTP Basic 鉴权策略,对应 nginx `auth_basic` 基础形态。
     pub basic_auth: Option<BasicAuthPolicy>,
-    /// V4 API-Key 鉴权策略集合。多条策略之间视为同一种认证方式的 OR。
+    /// 具有严格一次性计数消费的 Digest 策略，不从普通请求头推导认证成功。
+    pub(crate) digest_auth: Option<crate::security::digest::Policy>,
+    /// API-Key 鉴权策略集合。多条策略之间视为同一种认证方式的 OR。
     pub api_keys: Vec<ApiKeyPolicy>,
-    /// V4 HMAC-SHA256 请求签名策略集合。多条策略之间视为同一种认证方式的 OR。
+    /// HMAC-SHA256 请求签名策略集合。多条策略之间视为同一种认证方式的 OR。
     pub hmac_auth: Vec<HmacAuthPolicy>,
-    /// V4 JWT HS256 鉴权策略集合。多条策略之间视为同一种认证方式的 OR。
+    /// JWT HS256 鉴权策略集合。多条策略之间视为同一种认证方式的 OR。
     pub jwt_auth: Vec<JwtAuthPolicy>,
     /// OAuth2/OIDC Authorization Code RP；存在时浏览器会话是本地认证的唯一身份来源。
     oidc_rp: Option<Arc<OidcRpPolicy>>,
     /// 可选 SAML/LDAP 企业身份策略；同协议策略之间按 OR，作为独立认证方式参与 satisfy。
     pub(crate) enterprise_auth: Vec<EnterpriseAuthPolicy>,
-    /// V4 ext_authz / auth_request 外部鉴权策略集合。多条策略之间视为同一种认证方式的 OR。
+    /// ext_authz / auth_request 外部鉴权策略集合。多条策略之间视为同一种认证方式的 OR。
     pub ext_authz: Vec<ExtAuthzPolicy>,
-    /// V4 多认证策略组合方式,对应 nginx `satisfy any/all` 的数据面鉴权子集。
+    /// 多认证策略组合方式,对应 nginx `satisfy any/all` 的数据面鉴权子集。
     pub satisfy: SatisfyMode,
-    /// V3 nginx `if` 安全子集:条件命中后执行固定 `return` 短路。
+    /// nginx `if` 安全子集:条件命中后执行固定 `return` 短路。
     pub conditional_returns: Vec<ConditionalReturn>,
-    /// V3 `limit_req` 请求速率规则。
+    /// `limit_req` 请求速率规则。
     pub limit_req: Vec<LimitReqPolicy>,
-    /// V3 `limit_conn` 并发规则。
+    /// `limit_conn` 并发规则。
     pub limit_conn: Vec<LimitConnPolicy>,
-    /// V3 `limit_rate` 响应字节限速规则。
+    /// `limit_rate` 响应字节限速规则。
     pub limit_rate: Option<LimitRatePolicy>,
-    /// V3 熔断/降级规则。
+    /// 熔断/降级规则。
     pub circuit_breakers: Vec<CircuitBreakerPolicy>,
-    /// V3 `error_page` 状态映射规则。
+    /// `error_page` 状态映射规则。
     pub error_pages: Vec<ErrorPagePolicy>,
     /// 是否让 `error_page` 接管上游错误响应,对应 nginx `proxy_intercept_errors`。
     pub proxy_intercept_errors: bool,
@@ -274,7 +309,7 @@ pub struct Route {
     pub gateway_redirect: Option<GatewayRedirectPolicy>,
     /// 本地静态文件/SPA 后端。存在时不走上游代理。
     pub static_serve: Option<StaticServe>,
-    /// V3 `mirror` 流量镜像规则。当前基础版只镜像 head/空 body,不阻塞主链路。
+    /// `mirror` 流量镜像规则。当前基础版只镜像 head/空 body,不阻塞主链路。
     pub mirrors: Vec<MirrorPolicy>,
     /// 当前快照的变量计划,供 route 级模板渲染。
     pub variables: Arc<VariablePlan>,
@@ -292,6 +327,7 @@ pub struct Route {
 #[derive(Clone, Copy)]
 pub(crate) struct InferencePoolPolicy {
     /// 单次 EPP 决策可携带的最大 endpoint 数。
+    #[cfg(feature = "inference-gateway")]
     pub(crate) max_selected_endpoints: usize,
 }
 
@@ -299,8 +335,10 @@ impl InferencePoolPolicy {
     /// 业务作用：把控制器生成的 InferencePool 标记与标准 ext_proc 计划绑定，确保 EPP
     /// 决策只能在完整请求体处理后生效，并保留响应阶段的实际 endpoint 回报能力。
     ///
-    /// 参数说明：`cfg` 是池选择预算；`route` 提供后端与 ext_proc 原始声明；`ext_proc`
-    /// 表示标准协议计划已经通过通用构建校验。
+    /// 参数说明：
+    /// - `cfg`：是池选择预算
+    /// - `route`：提供后端与 ext_proc 原始声明
+    /// - `ext_proc`：表示标准协议计划已经通过通用构建校验。
     ///
     /// 返回：全部协议相位和权限满足 Inference Extension 合同时返回计划，否则拒绝候选。
     fn build(
@@ -370,7 +408,10 @@ impl HedgePolicy {
     /// 业务作用：把 route hedging 声明收敛为严格有界的执行计划，阻止动态 URI、隐式幂等
     /// 或多副本扇出进入数据面。
     ///
-    /// 参数说明：`cfg` 是 route 声明；`route_id` 用于错误定位；`upstream` 是声明的终端 URI。
+    /// 参数说明：
+    /// - `cfg`：是 route 声明
+    /// - `route_id`：用于错误定位
+    /// - `upstream`：是声明的终端 URI。
     ///
     /// 返回：安全门全部满足时返回双 attempt 计划，否则拒绝整份候选快照。
     fn build(cfg: &HedgeCfg, route_id: &str, upstream: &str) -> Result<Self> {
@@ -404,8 +445,11 @@ pub struct Router {
     /// 整个 proxy 是否存在响应压缩 route。构建期汇总后，请求入口只读一个 bool；全无压缩的
     /// 常见反代/gRPC proxy 不再为每个请求扫描 `Accept-Encoding`，也不 clone HeaderMap。
     has_response_compression: bool,
+    /// 仅启用 Digest 的入口需要保留规范化前的 URI。
+    pub(crate) has_digest_auth: bool,
     /// 构建期编译的灰度组。请求匹配只做借用查表和整数哈希，不构造候选 Vec。
     weighted_groups: HashMap<String, WeightedRouteGroup>,
+    pub(crate) layers: Option<layers::Plan>,
 }
 
 /// 一个 Weight 组在有序 route 表中的成员与总份额。
@@ -417,8 +461,10 @@ struct WeightedRouteGroup {
 impl Router {
     /// 业务作用：从 yml 路由声明构建使用默认套餐目录的有序数据面路由表。
     ///
-    /// 参数说明：`cfgs` 是 route 列表；`variables` 是已编译变量计划；`config_dir`
-    /// 是主配置目录，用于解析公开资源的相对路径。
+    /// 参数说明：
+    /// - `cfgs`：是 route 列表
+    /// - `variables`：是已编译变量计划
+    /// - `config_dir`：是主配置目录，用于解析公开资源的相对路径。
     ///
     /// 返回：所有声明通过构建期门禁时返回不可变路由表，否则拒绝候选配置。
     pub fn build(
@@ -435,8 +481,11 @@ impl Router {
     /// 套餐目录由整个配置快照共享；route 只持有不可变 `Arc`，避免在每个请求上解析
     /// plan id、复制 consumer 映射或获取配置锁。
     ///
-    /// 参数说明：`cfgs` 是 route 列表；`variables` 是变量计划；`config_dir` 是主配置目录；
-    /// `usage_plans` 是当前快照的套餐目录。
+    /// 参数说明：
+    /// - `cfgs`：是 route 列表
+    /// - `variables`：是变量计划
+    /// - `config_dir`：是主配置目录
+    /// - `usage_plans`：是当前快照的套餐目录。
     ///
     /// 返回：构建成功返回路由表；任何 route 违反协议或安全约束时返回错误。
     pub(crate) fn build_with_usage_plans(
@@ -451,8 +500,12 @@ impl Router {
     /// 业务作用：使用完整本地 listener 拓扑构建路由表，使 CONNECT route 在放宽私网访问时
     /// 仍不能回连数据面或管理面。
     ///
-    /// 参数说明：`cfgs` 是 route 列表；`variables` 是变量计划；`config_dir` 是主配置目录；
-    /// `usage_plans` 是套餐目录；`self_addrs` 是当前候选快照的全部本地监听地址。
+    /// 参数说明：
+    /// - `cfgs`：是 route 列表
+    /// - `variables`：是变量计划
+    /// - `config_dir`：是主配置目录
+    /// - `usage_plans`：是套餐目录
+    /// - `self_addrs`：是当前候选快照的全部本地监听地址。
     ///
     /// 返回：构建成功返回带自访问门禁的路由表；配置矛盾或边界非法时返回错误。
     pub(crate) fn build_with_usage_plans_and_self_addrs(
@@ -462,9 +515,11 @@ impl Router {
         usage_plans: Arc<UsagePlanCatalog>,
         self_addrs: &[std::net::SocketAddr],
     ) -> Result<Router> {
+        let layer_topology = layers::Topology::build(cfgs)?;
         let mut ordered: Vec<(i32, Arc<Route>)> = Vec::with_capacity(cfgs.len());
         let mut geoip_catalog = GeoIpCatalog::default();
         for c in cfgs {
+            let branch = c.layer.as_ref().is_some_and(|layer| layer.branch);
             if c.long_stream_idle_timeout_ms
                 .is_some_and(|value| value > MAX_LONG_STREAM_DURATION_MS)
             {
@@ -483,7 +538,7 @@ impl Router {
             for p in &c.predicates {
                 predicates.push(parse_predicate(p).with_context(|| format!("route `{}`", c.id))?);
             }
-            // P0-1 规则数硬上限:每请求都要线性扫描全部断言,条数必须有界;
+            // 规则数硬上限:每请求都要线性扫描全部断言,条数必须有界;
             // 超限说明该用一条更精确的 Path/Host 而不是堆 header 规则。
             const MAX_PREDICATES_PER_ROUTE: usize = 32;
             const MAX_HEADER_PREDICATES_PER_ROUTE: usize = 16;
@@ -495,7 +550,9 @@ impl Router {
             );
             let header_predicates = predicates
                 .iter()
-                .filter(|predicate| matches!(predicate, Predicate::Header { .. }))
+                .filter(|predicate| matches!(predicate, Predicate::Header {
+                    ..
+                }))
                 .count();
             anyhow::ensure!(
                 header_predicates <= MAX_HEADER_PREDICATES_PER_ROUTE,
@@ -504,6 +561,21 @@ impl Router {
                 c.id
             );
             let mut internal = false;
+            if let Some(cgi) = &c.cgi {
+                cgi.validate()?;
+            }
+            if let Some(webdav) = &c.webdav {
+                webdav.validate()?;
+            }
+            if let Some(media) = &c.media {
+                media.validate()?;
+            }
+            #[cfg(any(feature = "fastcgi", feature = "uwsgi", feature = "scgi"))]
+            let cgi = c
+                .cgi
+                .as_ref()
+                .map(crate::protocols::cgi::Plan::build)
+                .transpose()?;
             let upstream_template = variables
                 .compile_template(&c.uri)
                 .with_context(|| format!("route `{}` uri", c.id))?;
@@ -514,11 +586,13 @@ impl Router {
                 .transpose()
                 .with_context(|| format!("route `{}` llm", c.id))?
                 .map(Arc::new);
-            // V8 gRPC 边缘模式:构建期定型 + 拒绝矩阵。未开启恒为 None,数据面零感知。
-            let grpc_edge = crate::grpc_edge::GrpcEdgePlan::build(c.grpc_edge.as_ref(), &c.id)
+            let agent = crate::ai::agent::Plan::build(c.agent.as_ref(), config_dir)
+                .with_context(|| format!("route `{}` agent", c.id))?;
+            // gRPC 边缘模式:构建期定型 + 拒绝矩阵。未开启恒为 None,数据面零感知。
+            let grpc_edge = crate::edge::config::GrpcEdgePlan::build(c.grpc_edge.as_ref(), &c.id)
                 .with_context(|| format!("route `{}` grpc_edge", c.id))?
                 .map(Arc::new);
-            let grpc_transcoding = crate::grpc_transcoding::GrpcTranscodingPlan::build(
+            let grpc_transcoding = crate::protocols::grpc_transcoding::GrpcTranscodingPlan::build(
                 c.grpc_transcoding.as_ref(),
                 config_dir,
                 c.id.as_str(),
@@ -565,10 +639,33 @@ impl Router {
                     if !c.uri.trim().is_empty() {
                         bail!("route cannot set both `uri` and `serve.static`");
                     }
-                    StaticServe::build(static_cfg, config_dir, variables.as_ref())
+                    let backend = StaticServe::build(static_cfg, config_dir, variables.as_ref())?;
+                    #[cfg(feature = "media-streaming")]
+                    let backend = {
+                        let mut backend = backend;
+                        if let Some(media) = &c.media {
+                            backend.enable_media(media)?;
+                        }
+                        backend
+                    };
+                    Ok::<_, anyhow::Error>(backend)
                 })
                 .transpose()
                 .with_context(|| format!("route `{}` serve.static", c.id))?;
+            #[cfg(feature = "webdav")]
+            let webdav = c
+                .webdav
+                .as_ref()
+                .map(|cfg| {
+                    crate::io::webdav::Plan::build(
+                        cfg,
+                        c.serve.as_ref().and_then(|serve| serve.r#static.as_ref()),
+                        config_dir,
+                        &c.uri,
+                    )
+                })
+                .transpose()
+                .with_context(|| format!("route `{}` webdav", c.id))?;
             let gateway_redirect = c
                 .gateway_redirect
                 .as_ref()
@@ -580,14 +677,15 @@ impl Router {
             let terminal_backends = usize::from(!c.uri.trim().is_empty())
                 + usize::from(static_serve.is_some())
                 + usize::from(llm.is_some())
+                + usize::from(agent.is_some())
                 + usize::from(bff_aggregation.is_some())
                 + usize::from(mock_response.is_some())
                 + usize::from(gateway_redirect.is_some())
                 + usize::from(c.forward_proxy.is_some())
                 + usize::from(c.webtransport.is_some());
-            if terminal_backends != 1 {
+            if terminal_backends != usize::from(!branch) {
                 bail!(
-                    "route `{}` requires exactly one of uri/serve.static/llm/bff_aggregation/mock_response/gateway_redirect/forward_proxy/webtransport",
+                    "route `{}` requires one terminal backend for a leaf or ordinary route, and none for a branch",
                     c.id
                 );
             }
@@ -628,7 +726,7 @@ impl Router {
                 }
             }
             if grpc_edge.is_some() && (c.uri.trim().is_empty() || dubbo.is_some()) {
-                // 边缘 route 的非 edge 消息仍要正常 L7 转发到后端(§25.2 连接模型),
+                // 边缘 route 的非 edge 消息仍要正常 L7 转发到后端( 连接模型),
                 // 因此必须是 HTTP upstream 后端;llm/serve.static/mock/bff/dubbo 均不兼容。
                 bail!(
                     "route `{}` grpc_edge requires an HTTP upstream `uri` and cannot combine with llm/serve.static/mock_response/bff_aggregation/dubbo",
@@ -691,6 +789,8 @@ impl Router {
             let mut sub_filters = Vec::new();
             let mut compression = None;
             let mut compression_defined = false;
+            let mut request_decompression = None;
+            let mut request_decompression_defined = false;
             let mut http_cache = None;
             let mut http_cache_defined = false;
             let mut cache_invalidations = Vec::new();
@@ -700,6 +800,8 @@ impl Router {
             let mut referer = None;
             let mut limit_except = None;
             let mut basic_auth = None;
+            let mut digest_auth = None;
+            let mut digest_declared = false;
             let mut api_keys = Vec::new();
             let mut hmac_auth = Vec::new();
             let mut jwt_auth = Vec::new();
@@ -719,12 +821,23 @@ impl Router {
             let mut mirrors = Vec::new();
             for f in &c.filters {
                 if let Some(n) = parse_strip_prefix(f)? {
+                    anyhow::ensure!(!branch, "route branch cannot rewrite request path");
                     strip_prefix = n;
                     continue;
                 }
-                match parse_filter(f, variables.as_ref(), config_dir)
-                    .with_context(|| format!("route `{}` filter `{f}`", c.id))?
-                {
+                // 声明中可能包含秘密值；错误上下文只保留操作名，不能把原始认证参数写入拒绝记录。
+                let filter =
+                    parse_filter(f, variables.as_ref(), config_dir).with_context(|| {
+                        format!(
+                            "route `{}` filter `{}`",
+                            c.id,
+                            f.split_whitespace().next().unwrap_or("")
+                        )
+                    })?;
+                if branch {
+                    layers::policy::branch_filter(&filter)?;
+                }
+                match filter {
                     ParsedFilter::None => {}
                     ParsedFilter::Internal => internal = true,
                     ParsedFilter::ProxySetHeader(op) => {
@@ -758,6 +871,15 @@ impl Router {
                         compression_defined = true;
                         compression = policy;
                     }
+                    ParsedFilter::RequestDecompression(policy) => {
+                        anyhow::ensure!(
+                            !request_decompression_defined,
+                            "route `{}` repeats request_decompression",
+                            c.id
+                        );
+                        request_decompression_defined = true;
+                        request_decompression = policy;
+                    }
                     ParsedFilter::ProxyCache(policy) => {
                         if http_cache_defined {
                             bail!("route `{}` declares proxy_cache more than once", c.id);
@@ -774,6 +896,11 @@ impl Router {
                     ParsedFilter::ValidReferers(policy) => referer = Some(policy),
                     ParsedFilter::LimitExcept(methods) => limit_except = Some(methods),
                     ParsedFilter::BasicAuth(policy) => basic_auth = policy,
+                    ParsedFilter::DigestAuth(policy) => {
+                        anyhow::ensure!(!digest_declared, "route `{}` repeats auth_digest", c.id);
+                        digest_declared = true;
+                        digest_auth = policy;
+                    }
                     ParsedFilter::ApiKey(policy) => api_keys.push(policy),
                     ParsedFilter::HmacAuth(policy) => hmac_auth.push(policy),
                     ParsedFilter::JwtAuth(policy) => jwt_auth.push(policy),
@@ -807,6 +934,14 @@ impl Router {
                 "route `{}` cannot combine full-path and prefix rewrite",
                 c.id
             );
+            // Digest 计数只能授权一个公开动作；免认证内部跳转和复用凭据的层级执行不能借其身份。
+            if digest_auth.is_some() {
+                anyhow::ensure!(!internal && c.layer.is_none() && c.forward_proxy.is_none() && !matches!(satisfy, SatisfyMode::Any)
+                    && basic_auth.is_none() && jwt_auth.is_empty() && oidc_rp.is_none() && enterprise_auth.is_empty(),
+                    "route `{}` auth_digest requires a public unlayered origin route, satisfy=all and no competing Authorization scheme", c.id);
+                anyhow::ensure!(api_keys.iter().all(|key| !matches!(&key.source, ApiKeySource::Header(header) if header == http::header::AUTHORIZATION)),
+                    "route `{}` auth_digest cannot share Authorization with api_key", c.id);
+            }
             let mut owned_identity_headers = HashSet::new();
             for header in jwt_auth
                 .iter()
@@ -832,7 +967,7 @@ impl Router {
                 }
             }
             if oidc_rp.is_some()
-                && (basic_auth.is_some()
+                && ((basic_auth.is_some() || digest_auth.is_some())
                     || !api_keys.is_empty()
                     || !hmac_auth.is_empty()
                     || !jwt_auth.is_empty()
@@ -869,7 +1004,7 @@ impl Router {
                 );
             }
             if http_cache.is_some()
-                && (basic_auth.is_some()
+                && ((basic_auth.is_some() || digest_auth.is_some())
                     || !api_keys.is_empty()
                     || !hmac_auth.is_empty()
                     || !jwt_auth.is_empty()
@@ -986,60 +1121,51 @@ impl Router {
             let traffic_limit = c
                 .traffic_limit
                 .as_ref()
-                .map(build_traffic_limit)
+                .map(|cfg| build_traffic_limit(cfg, &c.uri))
                 .transpose()
                 .with_context(|| format!("route `{}` traffic_limit", c.id))?
                 .map(Arc::new);
             let forward_proxy = c
                 .forward_proxy
                 .as_ref()
-                .map(|cfg| -> Result<crate::forward_proxy::ForwardProxyPolicy> {
-                    let mut policy = crate::forward_proxy::ForwardProxyPolicy::build(
-                        &cfg.allowed_ports,
-                        &cfg.allowed_hosts,
-                        &cfg.allowed_cidrs,
-                        cfg.allow_private,
-                    )?;
-                    policy.idle_timeout_ms = cfg.idle_timeout_ms;
-                    policy.max_lifetime_ms = cfg.max_lifetime_ms;
-                    policy.max_bytes = cfg.max_bytes;
-                    policy.connect_timeout_ms = cfg.connect_timeout_ms;
-                    policy.set_self_addrs(self_addrs.to_vec());
-                    Ok(policy)
-                })
+                .map(
+                    |cfg| -> Result<crate::protocols::forward_proxy::ForwardProxyPolicy> {
+                        let mut policy =
+                            crate::protocols::forward_proxy::ForwardProxyPolicy::build(
+                                &cfg.allowed_ports,
+                                &cfg.allowed_hosts,
+                                &cfg.allowed_cidrs,
+                                cfg.allow_private,
+                            )?;
+                        policy.idle_timeout_ms = cfg.idle_timeout_ms;
+                        policy.max_lifetime_ms = cfg.max_lifetime_ms;
+                        policy.max_bytes = cfg.max_bytes;
+                        policy.connect_timeout_ms = cfg.connect_timeout_ms;
+                        policy.set_self_addrs(self_addrs.to_vec());
+                        Ok(policy)
+                    },
+                )
                 .transpose()
                 .with_context(|| format!("route `{}` forward_proxy", c.id))?
                 .map(Arc::new);
             let webtransport = c
                 .webtransport
                 .as_ref()
-                .map(|cfg| crate::masque::WebTransportPolicy::build(cfg, config_dir))
+                .map(|cfg| crate::protocols::masque::WebTransportPolicy::build(cfg, config_dir))
                 .transpose()
                 .with_context(|| format!("route `{}` webtransport", c.id))?
                 .map(Arc::new);
             let early_data = c
                 .early_data
                 .as_ref()
-                .map(crate::masque::EarlyDataRoutePolicy::build)
+                .map(crate::protocols::masque::EarlyDataRoutePolicy::build)
                 .transpose()
                 .with_context(|| format!("route `{}` early_data", c.id))?
                 .flatten();
             let ws_frame = c
                 .ws_frame
                 .as_ref()
-                .map(|cfg| -> Result<crate::ws_frame::FramePolicy> {
-                    let policy = crate::ws_frame::FramePolicy {
-                        max_frame_bytes: cfg.max_frame_bytes,
-                        max_message_bytes: cfg.max_message_bytes,
-                        max_fragments: cfg.max_fragments,
-                        max_plugin_payload_bytes: cfg.max_plugin_payload_bytes,
-                        plugin_timeout_ms: cfg.plugin_timeout_ms,
-                        max_decompress_ratio: cfg.max_decompress_ratio,
-                        on_violation: crate::ws_frame::MessageAction::parse(&cfg.on_violation)?,
-                    };
-                    policy.validate()?;
-                    Ok(policy)
-                })
+                .map(|cfg| crate::protocols::ws_frame::FramePolicy::build(cfg, config_dir))
                 .transpose()
                 .with_context(|| format!("route `{}` ws_frame", c.id))?
                 .map(Arc::new);
@@ -1075,6 +1201,43 @@ impl Router {
                 .then(|| WasmPluginChain::build(&c.wasm_plugins, config_dir, c.id.as_str()))
                 .transpose()
                 .with_context(|| format!("route `{}` wasm_plugins", c.id))?
+                .map(Arc::new);
+            for script in &c.script_plugins {
+                script.validate()?;
+            }
+            anyhow::ensure!(
+                c.script_plugins.len() + c.wasm_plugins.len() <= 16,
+                "combined script and Wasm plugin count exceeds 16"
+            );
+            #[cfg(feature = "lua-scripts")]
+            let script_plugins = (!c.script_plugins.is_empty())
+                .then(|| {
+                    // 客体不能读取或覆盖认证凭据与签名字段；这些名称可能由业务配置而不是固定协议定义。
+                    let mut protected_headers = owned_identity_headers.clone();
+                    for policy in &api_keys {
+                        if let ApiKeySource::Header(name) = &policy.source {
+                            protected_headers.insert(name.clone());
+                        }
+                    }
+                    for policy in &jwt_auth {
+                        if let JwtTokenSource::Header(name) = &policy.source {
+                            protected_headers.insert(name.clone());
+                        }
+                    }
+                    for policy in &hmac_auth {
+                        protected_headers.insert(policy.signature_header.clone());
+                        protected_headers.insert(policy.timestamp_header.clone());
+                        protected_headers.extend(policy.nonce_header.iter().cloned());
+                        protected_headers.extend(policy.signed_headers.iter().cloned());
+                    }
+                    crate::extensions::scripts::Chain::build(
+                        &c.script_plugins,
+                        config_dir,
+                        &c.id,
+                        &protected_headers,
+                    )
+                })
+                .transpose()?
                 .map(Arc::new);
             let external_plugins = (!c.external_plugins.is_empty())
                 .then(|| ExternalPluginChain::build(&c.external_plugins, config_dir, c.id.as_str()))
@@ -1114,6 +1277,60 @@ impl Router {
                     "route `{}` graphql_guard requires an HTTP upstream and cannot combine with llm/serve.static/return/if-return",
                     c.id
                 );
+            }
+            if traffic_limit.as_ref().is_some_and(|policy| {
+                matches!(
+                    policy.cost_source,
+                    crate::runtime::traffic_limit::CostSource::GraphqlCost
+                )
+            }) {
+                // 成本必须对应真正发送的查询；握手没有消息成本，解析后的正文改写会使证据失效。
+                anyhow::ensure!(
+                    graphql_guard.is_some()
+                        && !c.graphql_guard.as_ref().is_some_and(|guard| {
+                            guard.allow_websocket_subscriptions
+                        })
+                        && request_transform.is_none()
+                        && pass_request_body
+                        && !internal
+                        && error_pages.is_empty()
+                        && !x_accel_redirect,
+                    "route `{}` graphql_cost requires graphql_guard, unchanged forwarded body and no WebSocket subscriptions or internal redirects",
+                    c.id
+                );
+            }
+            if let Some(plan) = traffic_limit
+                .as_ref()
+                .and_then(|policy| policy.usage.as_ref())
+            {
+                // 内部改投与多个终端会改变计费权威；完整候选必须先绑定唯一、实际执行的来源。
+                anyhow::ensure!(
+                    agent.is_none() && dubbo.is_none() && grpc_edge.is_none()
+                        && c.cgi.is_none() && c.webdav.is_none() && c.media.is_none()
+                        && static_serve.is_none() && bff_aggregation.is_none()
+                        && mock_response.is_none() && direct_response.is_none()
+                        && conditional_returns.is_empty() && !internal
+                        && error_pages.is_empty() && !x_accel_redirect && mirrors.is_empty(),
+                    "route `{}` trusted_usage requires one upstream authority without local terminals, mirrors or internal redirects", c.id
+                );
+                match plan.source {
+                    crate::runtime::traffic_limit::usage::Source::ProviderTokens => {
+                        anyhow::ensure!(
+                            llm.as_ref().is_some_and(|policy| policy.api_type
+                                == crate::ai::llm::LlmApiType::ChatCompletions)
+                                && c.llm.as_ref().is_some_and(|raw| raw
+                                    .models
+                                    .iter()
+                                    .all(|model| !model.native_passthrough)),
+                            "route `{}` provider_tokens requires parsed Chat Completions models",
+                            c.id
+                        );
+                    }
+                    crate::runtime::traffic_limit::usage::Source::ResponseHeader(_) => {
+                        anyhow::ensure!(llm.is_none(),
+                            "route `{}` response_header requires an HTTP upstream; LLM uses provider_tokens", c.id);
+                    }
+                }
             }
             if degraphql.is_some()
                 && (request_validation.is_some()
@@ -1257,12 +1474,13 @@ impl Router {
                 .as_ref()
                 .is_some_and(|policy| policy.requires_identity())
                 && basic_auth.is_none()
+                && digest_auth.is_none()
                 && jwt_auth.is_empty()
                 && enterprise_auth.is_empty()
                 && !api_keys.iter().any(|policy| policy.consumer.is_some())
             {
                 bail!(
-                    "route `{}` opa_authorization require_identity=true needs Basic, JWT, or API-Key with consumer",
+                    "route `{}` opa_authorization require_identity=true needs Basic, Digest, JWT, or API-Key with consumer",
                     c.id
                 );
             }
@@ -1270,12 +1488,16 @@ impl Router {
                 .as_ref()
                 .is_some_and(|policy| policy.requires_identity())
                 && basic_auth.is_none()
+                && digest_auth.is_none()
                 && jwt_auth.is_empty()
                 && enterprise_auth.is_empty()
                 && !api_keys.iter().any(|policy| policy.consumer.is_some())
+                && c.layer
+                    .as_ref()
+                    .is_none_or(|layer| layer.parent_ref.is_none())
             {
                 bail!(
-                    "route `{}` casbin_authorization require_identity=true needs Basic, JWT, or API-Key with consumer",
+                    "route `{}` casbin_authorization require_identity=true needs Basic, Digest, JWT, or API-Key with consumer",
                     c.id
                 );
             }
@@ -1283,12 +1505,58 @@ impl Router {
                 .as_ref()
                 .is_some_and(|policy| policy.require_consumer)
                 && basic_auth.is_none()
+                && digest_auth.is_none()
                 && jwt_auth.is_empty()
                 && enterprise_auth.is_empty()
                 && !api_keys.iter().any(|policy| policy.consumer.is_some())
+                && c.layer
+                    .as_ref()
+                    .is_none_or(|layer| layer.parent_ref.is_none())
             {
                 bail!(
-                    "route `{}` usage_plan require_consumer=true needs Basic, JWT, or API-Key with consumer",
+                    "route `{}` usage_plan require_consumer=true needs Basic, Digest, JWT, or API-Key with consumer",
+                    c.id
+                );
+            }
+            if agent.is_some() {
+                // Agent 自己持有会话和工具授权边界；通用重路由、缓存与重复外呼不能绕过动作级门禁。
+                anyhow::ensure!(request_validation.is_none() && request_transform.is_none() && response_transform.is_none()
+                    && response_contract.is_none() && http_cache.is_none() && graphql_guard.is_none() && degraphql.is_none()
+                    && direct_response.is_none() && conditional_returns.is_empty() && mirrors.is_empty() && hedge.is_none()
+                    && !x_accel_redirect && error_pages.is_empty() && !internal && ext_proc.is_none()
+                    && wasm_plugins.is_none() && external_plugins.is_none() && pass_request_body && pass_request_headers
+                    && request_headers.is_empty() && response_headers.is_empty() && c.resolved_upstream_credentials.is_empty(),
+                    "route `{}` agent cannot combine body-owning filters, cache, reroute, mirror, hedge or internal return", c.id);
+                anyhow::ensure!(
+                    (basic_auth.is_some() || digest_auth.is_some())
+                        || !jwt_auth.is_empty()
+                        || !enterprise_auth.is_empty()
+                        || api_keys.iter().any(|policy| policy.consumer.is_some())
+                        || oidc_rp.is_some()
+                        || c.layer
+                            .as_ref()
+                            .is_some_and(|layer| layer.parent_ref.is_some()),
+                    "route `{}` agent requires a locally verified subject",
+                    c.id
+                );
+            }
+            if c.llm.as_ref().is_some_and(|llm| llm.governance.is_some()) {
+                // 治理结果已经受身份、来源和输出策略裁决，后置内容改写或共享缓存不能改变其安全含义。
+                anyhow::ensure!(wasm_plugins.is_none() && external_plugins.is_none() && ext_proc.is_none()
+                    && http_cache.is_none() && mirrors.is_empty() && hedge.is_none() && !internal
+                    && !x_accel_redirect && error_pages.is_empty() && pass_request_body && pass_request_headers
+                    && request_headers.is_empty() && response_headers.is_empty() && c.resolved_upstream_credentials.is_empty(),
+                    "route `{}` AI governance cannot combine plugins, shared cache, reroute, header mutation or duplicated calls", c.id);
+                anyhow::ensure!(
+                    (basic_auth.is_some() || digest_auth.is_some())
+                        || !jwt_auth.is_empty()
+                        || !enterprise_auth.is_empty()
+                        || api_keys.iter().any(|policy| policy.consumer.is_some())
+                        || oidc_rp.is_some()
+                        || c.layer
+                            .as_ref()
+                            .is_some_and(|layer| layer.parent_ref.is_some()),
+                    "route `{}` AI governance requires a locally verified subject",
                     c.id
                 );
             }
@@ -1341,7 +1609,7 @@ impl Router {
                     || !error_pages.is_empty())
             {
                 bail!(
-                    "route `{}` llm cannot combine proxy_cache/return/static/mirror/x_accel_redirect/error_page; V6 uses its own model fallback and semantic cache pipeline",
+                    "route `{}` llm cannot combine proxy_cache/return/static/mirror/x_accel_redirect/error_page; LLM routes use their own model fallback and semantic cache pipeline",
                     c.id
                 );
             }
@@ -1352,6 +1620,9 @@ impl Router {
                     quota.dimension == crate::config::model::LlmQuotaDimensionCfg::ApiKey
                 })
                 && api_keys.is_empty()
+                && c.layer
+                    .as_ref()
+                    .is_none_or(|layer| layer.parent_ref.is_none())
             {
                 bail!(
                     "route `{}` llm.token_quota.dimension=api_key requires at least one api_key auth filter",
@@ -1363,6 +1634,9 @@ impl Router {
                 .and_then(|policy| policy.semantic_cache.as_ref())
                 .is_some_and(|cache| cache.scope == crate::config::model::LlmCacheScopeCfg::ApiKey)
                 && api_keys.is_empty()
+                && c.layer
+                    .as_ref()
+                    .is_none_or(|layer| layer.parent_ref.is_none())
             {
                 bail!(
                     "route `{}` llm.semantic_cache.scope=api_key requires at least one api_key auth filter",
@@ -1531,6 +1805,7 @@ impl Router {
                 );
                 anyhow::ensure!(
                     basic_auth.is_none()
+                && digest_auth.is_none()
                         && api_keys.is_empty()
                         && hmac_auth.is_empty()
                         && jwt_auth.is_empty()
@@ -1566,16 +1841,204 @@ impl Router {
                 );
             }
             let signature = predicates_signature(&predicates);
+            if request_decompression.is_some() {
+                // 普通实体只能由公共请求管线解码一次，专用协议、内部及层级入口不得继承错误的表示边界。
+                anyhow::ensure!(!branch && c.layer.is_none() && !internal
+                    && c.cgi.is_none() && c.media.is_none() && c.webdav.is_none() && static_serve.is_none()
+                    && gateway_redirect.is_none() && mock_response.is_none() && direct_response.is_none()
+                    && llm.is_none() && agent.is_none() && grpc_edge.is_none() && grpc_transcoding.is_none()
+                    && dubbo.is_none() && bff_aggregation.is_none() && forward_proxy.is_none() && webtransport.is_none()
+                    && early_data.is_none() && pass_request_body && pass_request_headers,
+                    "request_decompression requires ordinary public HTTP forwarding without special terminals or discarded request entity");
+                anyhow::ensure!(request_headers.iter().all(|operation| {
+                    let name = match operation {
+                        RequestHeaderOp::Set(value) | RequestHeaderOp::Add(value) => &value.name,
+                        RequestHeaderOp::Remove(name) => name,
+                    };
+                    !matches!(name.as_str(), "content-encoding" | "content-length" | "transfer-encoding" | "content-md5" | "digest" | "content-digest" | "repr-digest" | "trailer")
+                }), "request_decompression entity headers cannot be overridden by request header policies");
+            }
+            if !c.script_plugins.is_empty() {
+                // 扩展只属于普通公开代理路由；不允许绕过专用协议、层级身份、内部跳转及缓存的所有权边界。
+                anyhow::ensure!(!branch && c.layer.is_none() && !internal && !x_accel_redirect && error_pages.is_empty()
+                    && c.cgi.is_none() && c.media.is_none() && c.webdav.is_none() && static_serve.is_none()
+                    && gateway_redirect.is_none() && mock_response.is_none() && direct_response.is_none()
+                    && conditional_returns.is_empty() && llm.is_none() && agent.is_none() && grpc_edge.is_none()
+                    && grpc_transcoding.is_none() && dubbo.is_none() && bff_aggregation.is_none()
+                    && forward_proxy.is_none() && webtransport.is_none() && early_data.is_none()
+                    && mirrors.is_empty() && hedge.is_none() && http_cache.is_none() && cache_invalidations.is_empty()
+                    && c.inference_pool.is_none() && ext_proc.is_none() && external_plugins.is_none()
+                    && degraphql.is_none() && pass_request_body && pass_request_headers,
+                    "script_plugins require ordinary public HTTP forwarding without layered/special terminals, shared cache, alternate execution or external processors");
+                // 每个方向只允许一个运行时拥有实体；头部扩展可跨语言串联，数量与工作集仍共享硬门。
+                let request_script_body = c.script_plugins.iter().any(|p| {
+                    matches!(
+                        p.phase,
+                        crate::config::scripts::Phase::RequestBody
+                            | crate::config::scripts::Phase::RequestBodyStream
+                    )
+                });
+                let response_script_body = c.script_plugins.iter().any(|p| {
+                    matches!(
+                        p.phase,
+                        crate::config::scripts::Phase::ResponseBody
+                            | crate::config::scripts::Phase::ResponseBodyStream
+                    )
+                });
+                anyhow::ensure!(
+                    !wasm_plugins
+                        .as_ref()
+                        .is_some_and(|chain| (request_script_body
+                            && (chain.has_request_body() || chain.has_request_body_stream()))
+                            || (response_script_body
+                                && (chain.has_response_body()
+                                    || chain.has_response_body_stream()))),
+                    "script and Wasm cannot both own the same body direction"
+                );
+                anyhow::ensure!(
+                    !request_script_body || request_transform.is_none(),
+                    "request body script conflicts with request transform"
+                );
+                anyhow::ensure!(
+                    !response_script_body
+                        || (response_transform.is_none() && sub_filters.is_empty()),
+                    "response body script conflicts with response transforms"
+                );
+            }
+            if c.cgi.is_some() {
+                // 固定脚本入口不能被其它终端、URI/body 变换、镜像或升级机制改变执行目标。
+                anyhow::ensure!(c.uri.starts_with("lb://") && upstream_template.static_literal().is_some()
+                    && static_serve.is_none() && gateway_redirect.is_none() && mock_response.is_none()
+                    && llm.is_none() && agent.is_none() && grpc_edge.is_none() && grpc_transcoding.is_none()
+                    && dubbo.is_none() && bff_aggregation.is_none() && forward_proxy.is_none() && webtransport.is_none()
+                    && early_data.is_none() && mirrors.is_empty() && c.hedge.is_none()
+                    && request_transform.is_none() && c.degraphql.is_none() && pass_request_body
+                    && c.ext_proc.is_none() && c.wasm_plugins.is_empty() && c.external_plugins.is_empty()
+                    && c.dlp.as_ref().is_none_or(|policy| policy.action != "redact")
+                    && strip_prefix == 0 && rewrite_prefix.is_none() && gateway_rewrite_full_path.is_none()
+                    && c.upstream_credentials.is_empty(), "CGI route requires a fixed service and unmodified request entity/path without alternative terminals or callout mirroring");
+                anyhow::ensure!(
+                    request_headers.iter().all(|operation| {
+                        let name = match operation {
+                            RequestHeaderOp::Set(value) | RequestHeaderOp::Add(value) => {
+                                &value.name
+                            }
+                            RequestHeaderOp::Remove(name) => name,
+                        };
+                        !matches!(name.as_str(), "content-length" | "transfer-encoding")
+                    }),
+                    "CGI entity framing cannot be changed by request header policies"
+                );
+            }
+            if c.media.is_some() {
+                // 媒体索引与实体必须作为同一表示输出，不能被其它终端、共享缓存或正文插件重新解释。
+                anyhow::ensure!(static_serve.is_some() && c.webdav.is_none() && c.cgi.is_none() && !branch && !internal
+                    && gateway_redirect.is_none() && mock_response.is_none() && direct_response.is_none()
+                    && llm.is_none() && agent.is_none() && grpc_edge.is_none() && grpc_transcoding.is_none()
+                    && dubbo.is_none() && bff_aggregation.is_none() && forward_proxy.is_none() && webtransport.is_none()
+                    && early_data.is_none() && mirrors.is_empty() && hedge.is_none() && c.inference_pool.is_none()
+                    && request_validation.is_none() && request_transform.is_none() && response_transform.is_none()
+                    && response_contract.is_none() && degraphql.is_none() && graphql_guard.is_none()
+                    && c.ext_proc.is_none() && wasm_plugins.is_none() && external_plugins.is_none()
+                    && c.dlp.as_ref().is_none_or(|policy| policy.action != "redact")
+                    && strip_prefix == 0 && rewrite_prefix.is_none() && gateway_rewrite_full_path.is_none()
+                    && http_cache.is_none() && cache_invalidations.is_empty() && !x_accel_redirect && error_pages.is_empty()
+                    && sub_filters.is_empty() && compression.is_none() && response_headers.is_empty(),
+                    "media requires an exact static backend without alternate terminals, entity mutation, compression or shared proxy cache");
+                anyhow::ensure!(
+                    request_headers.iter().all(|operation| {
+                        let name = match operation {
+                            RequestHeaderOp::Set(value) | RequestHeaderOp::Add(value) => {
+                                &value.name
+                            }
+                            RequestHeaderOp::Remove(name) => name,
+                        };
+                        !matches!(
+                            name.as_str(),
+                            "range"
+                                | "if-range"
+                                | "if-none-match"
+                                | "if-modified-since"
+                                | "accept-encoding"
+                        )
+                    }),
+                    "media conditional and representation headers cannot be changed by policies"
+                );
+            }
+            if c.webdav.is_some() {
+                // DAV 的资源归属、条件头和实体 framing 必须由唯一协议计划决定，不能在执行前后被其它终端改变。
+                anyhow::ensure!(c.cgi.is_none() && !branch && !internal
+                    && (static_serve.is_some() || (!c.uri.is_empty() && upstream_template.static_literal().is_some()))
+                    && gateway_redirect.is_none() && mock_response.is_none() && direct_response.is_none()
+                    && llm.is_none() && agent.is_none() && grpc_edge.is_none() && grpc_transcoding.is_none()
+                    && dubbo.is_none() && bff_aggregation.is_none() && forward_proxy.is_none() && webtransport.is_none()
+                    && early_data.is_none() && mirrors.is_empty() && hedge.is_none() && c.inference_pool.is_none()
+                    && request_validation.is_none() && request_transform.is_none() && response_transform.is_none()
+                    && response_contract.is_none() && degraphql.is_none() && graphql_guard.is_none()
+                    && c.ext_proc.is_none() && wasm_plugins.is_none() && external_plugins.is_none()
+                    && c.dlp.as_ref().is_none_or(|policy| policy.action != "redact")
+                    && strip_prefix == 0 && rewrite_prefix.is_none() && gateway_rewrite_full_path.is_none()
+                    && http_cache.is_none() && cache_invalidations.is_empty() && !x_accel_redirect && error_pages.is_empty()
+                    && sub_filters.is_empty() && compression.is_none() && response_headers.is_empty()
+                    && pass_request_body && pass_request_headers && c.resolved_upstream_credentials.is_empty(),
+                    "WebDAV requires one exact resource backend without body/path/response mutation, plugins, shared cache or alternate execution");
+                anyhow::ensure!(
+                    request_headers.iter().all(|operation| {
+                        let name = match operation {
+                            RequestHeaderOp::Set(value) | RequestHeaderOp::Add(value) => {
+                                &value.name
+                            }
+                            RequestHeaderOp::Remove(name) => name,
+                        };
+                        !matches!(
+                            name.as_str(),
+                            "host"
+                                | "destination"
+                                | "if"
+                                | "depth"
+                                | "overwrite"
+                                | "lock-token"
+                                | "timeout"
+                                | "content-length"
+                                | "transfer-encoding"
+                                | "content-type"
+                                | "content-encoding"
+                                | "accept-encoding"
+                                | "if-match"
+                                | "if-none-match"
+                                | "if-modified-since"
+                                | "if-unmodified-since"
+                                | "range"
+                                | "if-range"
+                                | "connection"
+                                | "trailer"
+                                | "te"
+                                | "upgrade"
+                        )
+                    }),
+                    "WebDAV resource, condition and entity headers cannot be changed by policies"
+                );
+            }
             let has_weight = predicates
                 .iter()
-                .any(|predicate| matches!(predicate, Predicate::Weight { .. }));
-            if let Some((_, existing)) = (!has_weight)
-                .then(|| {
-                    ordered.iter().find(|(order, route)| {
-                        *order == c.order && predicates_signature(&route.predicates) == signature
-                    })
+                .any(|predicate| matches!(predicate, Predicate::Weight {
+                    ..
+                }));
+            // 子层只参与同父级的受信上下文选择；公开入口冲突检查不能把父子或互斥 claim 当成同一入口。
+            if let Some((_, existing)) = (!has_weight
+                && !layer_topology
+                    .as_ref()
+                    .is_some_and(|plan| plan.is_child(&c.id)))
+            .then(|| {
+                ordered.iter().find(|(order, route)| {
+                    !layer_topology
+                        .as_ref()
+                        .is_some_and(|plan| plan.is_child(&route.id))
+                        && *order == c.order
+                        && predicates_signature(&route.predicates) == signature
                 })
-                .flatten()
+            })
+            .flatten()
             {
                 bail!(
                     "route `{}` conflicts with route `{}` at same order {} and same predicates",
@@ -1589,6 +2052,15 @@ impl Router {
                 Arc::new(Route {
                     id: c.id.clone(),
                     id_shared: Arc::from(c.id.as_str()),
+                    traffic: Arc::default(),
+                    order: c.order,
+                    layer: c.layer.clone().map(Arc::new),
+                    #[cfg(any(feature = "fastcgi", feature = "uwsgi", feature = "scgi"))]
+                    cgi,
+                    #[cfg(feature = "webdav")]
+                    webdav,
+                    #[cfg(feature = "config-providers")]
+                    provider_deadline: c.provider_deadline,
                     upstream: c.uri.clone(),
                     upstream_template,
                     predicates,
@@ -1605,6 +2077,7 @@ impl Router {
                     response_headers,
                     sub_filters,
                     compression,
+                    request_decompression,
                     http_cache,
                     request_validation,
                     request_transform,
@@ -1620,6 +2093,8 @@ impl Router {
                     opa_authorization,
                     casbin_authorization,
                     wasm_plugins,
+                    #[cfg(feature = "lua-scripts")]
+                    script_plugins,
                     external_plugins,
                     ext_proc,
                     inference_pool,
@@ -1629,6 +2104,7 @@ impl Router {
                     fault_injection,
                     usage_plan,
                     llm,
+                    agent,
                     grpc_edge,
                     grpc_transcoding,
                     cache_invalidations,
@@ -1638,6 +2114,7 @@ impl Router {
                     referer,
                     limit_except,
                     basic_auth,
+                    digest_auth,
                     api_keys,
                     hmac_auth,
                     jwt_auth,
@@ -1670,7 +2147,7 @@ impl Router {
                 }),
             ));
         }
-        // ★L5:按 order 稳定排序(数值小者优先);同 order 保持配置书写顺序(SCG 有序语义)。
+        // 按 order 稳定排序，数值小者优先；同 order 保持配置书写顺序。
         ordered.sort_by_key(|(order, _)| *order);
         let weighted_groups = compile_weighted_groups(ordered.as_slice())?;
         let routes = ordered
@@ -1697,22 +2174,34 @@ impl Router {
             }
         }
         let has_response_compression = routes.iter().any(|route| route.compression.is_some());
+        let has_digest_auth = routes.iter().any(|route| route.digest_auth.is_some());
+        let layers = layer_topology
+            .map(|topology| layers::Plan::build(topology, cfgs, &routes))
+            .transpose()?;
         Ok(Router {
             routes,
             has_response_compression,
+            has_digest_auth,
             weighted_groups,
+            layers,
         })
     }
 
-    /// 顺序匹配,第一个全命中的路由胜出。
+    /// 业务作用：顺序匹配,第一个全命中的路由胜出。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求的 head parts。
     pub fn match_route(&self, parts: &Parts) -> Option<Arc<Route>> {
         self.match_route_with_key(parts, b"")
     }
 
-    /// 使用请求稳定键执行普通匹配与成组权重灰度。
+    /// 业务作用：只选择公开根入口或普通路由，子层必须先经过父层安全策略才能进入。
+    ///
+    /// 参数说明：
+    /// - `parts`：是规范化公开请求
+    /// - `request_key`：是本次请求的稳定灰度键。
+    ///
+    /// 返回：首个满足入口约束的路由或权重组成员；无匹配为 None，不执行策略或后端。
     ///
     /// Weight route 在 build 阶段已保证同组具有相同 order 与非权重 predicates。运行时先按
     /// 原有顺序找到首个可用组，再用 `group + request_key` 的稳定哈希落桶；相同 key 在配置
@@ -1720,10 +2209,16 @@ impl Router {
     pub fn match_route_with_key(&self, parts: &Parts, request_key: &[u8]) -> Option<Arc<Route>> {
         for route in &self.routes {
             if route.internal
+                || self
+                    .layers
+                    .as_ref()
+                    .is_some_and(|plan| plan.topology.is_child(&route.id))
                 || !route
                     .predicates
                     .iter()
-                    .filter(|predicate| !matches!(predicate, Predicate::Weight { .. }))
+                    .filter(|predicate| !matches!(predicate, Predicate::Weight {
+                        ..
+                    }))
                     .all(|predicate| predicate.matches(parts))
             {
                 continue;
@@ -1749,9 +2244,9 @@ impl Router {
         None
     }
 
-    /// 顺序匹配内部 route,仅供 error_page/reroute/X-Accel 类内部跳转使用。
+    /// 业务作用：顺序匹配内部 route,仅供 error_page/reroute/X-Accel 类内部跳转使用。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 内部重写后的请求 head。
     pub fn match_internal_route(&self, parts: &Parts) -> Option<Arc<Route>> {
         self.routes
@@ -1760,7 +2255,7 @@ impl Router {
             .cloned()
     }
 
-    /// 返回静态 `lb://service` 引用,供 admin 发现视图展示 service 被哪些 route 使用。
+    /// 业务作用：返回静态 `lb://service` 引用,供 admin 发现视图展示 service 被哪些 route 使用。
     ///
     /// 动态 upstream 模板运行期才可求值,此处不猜测,避免把 header/query 驱动的路由误归属到某个 service。
     pub fn upstream_service_refs(&self) -> Vec<(String, String)> {
@@ -1777,17 +2272,17 @@ impl Router {
             .collect()
     }
 
-    /// 当前不可变 route slice。只供低频管理/失效对账遍历，不暴露可变入口。
+    /// 业务作用：当前不可变 route slice。只供低频管理/失效对账遍历，不暴露可变入口。
     pub(crate) fn routes(&self) -> &[Arc<Route>] {
         &self.routes
     }
 
-    /// 按稳定 id 定位 route；管理面 PURGE/失效消息使用，非请求匹配热路径。
+    /// 业务作用：按稳定 id 定位 route；管理面 PURGE/失效消息使用，非请求匹配热路径。
     pub(crate) fn route_by_id(&self, route_id: &str) -> Option<&Arc<Route>> {
         self.routes.iter().find(|route| route.id == route_id)
     }
 
-    /// 是否至少一条 route 启用响应压缩。
+    /// 业务作用：是否至少一条 route 启用响应压缩。
     ///
     /// internal reroute 也来自同一 Router，因此用 proxy 级汇总而不是只看首条命中 route，避免
     /// `error_page`/`X-Accel-Redirect` 跳到压缩 route 后丢失原客户端协商能力。
@@ -1796,7 +2291,7 @@ impl Router {
         self.has_response_compression
     }
 
-    /// 是否有 route 显式要求 Redis L2；快照构建期用来交叉校验 runtime backend。
+    /// 业务作用：是否有 route 显式要求 Redis L2；快照构建期用来交叉校验 runtime backend。
     pub(crate) fn uses_http_cache_l2(&self) -> bool {
         self.routes.iter().any(|route| {
             route
@@ -1808,7 +2303,7 @@ impl Router {
 
     /// 业务作用：统计启用 gRPC 边缘模式的 route 数，供管理面展示快照接线情况。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：已编译 edge route 数；0 表示当前快照全部走普通 L7。
     pub(crate) fn grpc_edge_route_count(&self) -> usize {
@@ -1835,7 +2330,7 @@ impl Router {
         })
     }
 
-    /// 是否有 LLM route 显式要求 Redis 语义缓存；与 HTTP cache 共用 bootstrap Redis 连接。
+    /// 业务作用：是否有 LLM route 显式要求 Redis 语义缓存；与 HTTP cache 共用 bootstrap Redis 连接。
     pub(crate) fn uses_llm_cache_l2(&self) -> bool {
         self.routes.iter().any(|route| {
             route
@@ -1849,7 +2344,7 @@ impl Router {
     /// 业务作用：汇总本 listener 下 WebTransport route 声明的最大 stream 并发预算，
     /// 供 QUIC transport 在发布前核对底层 `MAX_STREAMS` 硬门。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回所有 WebTransport route 中最大的双向与单向 stream 上限；
     /// 未配置 WebTransport 时返回 `(0, 0)`。
@@ -1868,19 +2363,19 @@ impl Router {
     /// 业务作用：判断 listener 的路由表是否真正消费 0-RTT，供 TLS 能力声明与
     /// route 显式授权做双向一致性校验。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：至少一条 route 含有已启用 early-data 计划时返回 `true`。
     pub(crate) fn uses_early_data(&self) -> bool {
         self.routes.iter().any(|route| route.early_data.is_some())
     }
 
-    /// 返回当前路由数量,主要用于健康检查和单测断言。
+    /// 业务作用：返回当前快照的路由数量，供健康检查和运行状态展示。
     pub fn len(&self) -> usize {
         self.routes.len()
     }
 
-    /// 判断路由表是否为空。
+    /// 业务作用：判断路由表是否为空。
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
     }
@@ -1889,12 +2384,13 @@ impl Router {
 impl Route {
     /// 业务作用：为管理面语义 diff 产生稳定、低敏的 route 结构摘要。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：包含断言签名、upstream、rewrite 和已启用 filter 名称；不包含 API key、token、证书或其它 SecretSource 解析值。
     pub(crate) fn admin_semantic_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let value = serde_json::json!({
             "id": self.id,
+            "order": self.order,
             "upstream": self.upstream,
             "internal": self.internal,
             "predicates": self.predicates.iter().map(Predicate::signature).collect::<Vec<_>>(),
@@ -1906,12 +2402,56 @@ impl Route {
             "rewrite_full_path": self.gateway_rewrite_full_path,
             "preserve_host": self.preserve_host,
             "filters": self.admin_filter_chain(),
-        })
+            "layer": self.layer.as_ref().map(|layer| serde_json::json!({
+                "parent_ref": layer.parent_ref,
+                "branch": layer.branch,
+                "match_count": layer.matches.len(),
+                "context_names": layer.context.keys().collect::<Vec<_>>(),
+                "policy_fingerprint": nasa::crypto::sha256(&serde_json::to_string(layer.as_ref()).expect("serializable layer configuration")),
+            })),
+        });
+        #[cfg(any(feature = "fastcgi", feature = "uwsgi", feature = "scgi"))]
+        let value = {
+            let mut value = value;
+            if let Some(cgi) = &self.cgi {
+                value["cgi"] = cgi.semantic();
+            }
+            value
+        };
+        #[cfg(feature = "webdav")]
+        let value = {
+            let mut value = value;
+            if let Some(webdav) = &self.webdav {
+                value["webdav"] = webdav.semantic();
+            }
+            value
+        };
+        #[cfg(feature = "media-streaming")]
+        let value = {
+            let mut value = value;
+            if let Some(media) = self
+                .static_serve
+                .as_ref()
+                .and_then(StaticServe::media_semantic)
+            {
+                value["media"] = media;
+            }
+            value
+        };
+        #[cfg(feature = "lua-scripts")]
+        let value = {
+            let mut value = value;
+            if let Some(scripts) = &self.script_plugins {
+                value["script_plugins"] = scripts.semantic();
+            }
+            value
+        };
+        value
     }
 
     /// 业务作用：按数据面执行类别输出不含密钥的 filter 链，供路由推演和审查展示。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：返回已实际编译进 route 的功能名称；同类多条策略只显示一次，并按固定顺序产生结果。
     pub(crate) fn admin_filter_chain(&self) -> Vec<&'static str> {
@@ -1925,6 +2465,7 @@ impl Route {
         push(self.referer.is_some(), "referer");
         push(self.limit_except.is_some(), "limit_except");
         push(self.basic_auth.is_some(), "basic_auth");
+        push(self.digest_auth.is_some(), "digest_auth");
         push(!self.api_keys.is_empty(), "api_key");
         push(!self.hmac_auth.is_empty(), "hmac_auth");
         push(!self.jwt_auth.is_empty(), "jwt_auth");
@@ -1948,9 +2489,15 @@ impl Route {
         push(self.graphql_guard.is_some(), "graphql_guard");
         push(self.usage_plan.is_some(), "usage_plan");
         push(self.wasm_plugins.is_some(), "wasm");
+        #[cfg(feature = "lua-scripts")]
+        push(self.script_plugins.is_some(), "lua");
         push(self.external_plugins.is_some(), "external_plugin");
         push(self.http_cache.is_some(), "http_cache");
         push(self.compression.is_some(), "compression");
+        push(
+            self.request_decompression.is_some(),
+            "request_decompression",
+        );
         push(!self.mirrors.is_empty(), "mirror");
         push(self.grpc_edge.is_some(), "grpc_edge");
         push(self.grpc_transcoding.is_some(), "grpc_transcoding");
@@ -1959,9 +2506,9 @@ impl Route {
         filters
     }
 
-    /// 按本 route 的 allow/deny 规则判断客户端 IP 是否允许访问。
+    /// 业务作用：按本 route 的 allow/deny 规则判断客户端 IP 是否允许访问。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `ip`: 真实客户端 IP。
     pub fn permits_ip(&self, ip: IpAddr) -> bool {
         for rule in &self.access_rules {
@@ -1972,9 +2519,9 @@ impl Route {
         true
     }
 
-    /// 按 `valid_referers` 判断请求 Referer 是否允许。
+    /// 业务作用：按 `valid_referers` 判断请求 Referer 是否允许。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     pub fn permits_referer(&self, parts: &Parts) -> bool {
         self.referer
@@ -1983,9 +2530,9 @@ impl Route {
             .unwrap_or(true)
     }
 
-    /// 按 `limit_except` 判断请求方法是否允许。
+    /// 业务作用：按 `limit_except` 判断请求方法是否允许。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     pub fn permits_method(&self, parts: &Parts) -> bool {
         self.limit_except
@@ -1994,27 +2541,33 @@ impl Route {
             .unwrap_or(true)
     }
 
-    /// 按 V4 数据面同步鉴权子链判断请求是否通过认证。
+    /// 业务作用：按 数据面同步鉴权子链判断请求是否通过认证。
     ///
-    /// ext_authz 需要异步外呼,由代理层拿 [`SyncAuthState`] 后继续执行;本函数保留给纯同步策略和单测使用。
+    /// ext_authz 需要异步外呼，由代理层拿 [`SyncAuthState`] 后继续执行；本函数仅处理纯同步策略。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     pub fn permits_auth(&self, parts: &Parts) -> bool {
         self.ext_authz.is_empty() && self.sync_auth_state(parts).ok
     }
 
-    /// 计算 Basic/API-Key/HMAC/JWT 这组同步鉴权策略的组合结果。
+    /// 业务作用：计算本地认证组合；Digest 只承认已完成严格重放登记的请求凭证。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     pub fn sync_auth_state(&self, parts: &Parts) -> SyncAuthState {
         let has_basic = self.basic_auth.is_some();
+        let has_digest = self.digest_auth.is_some();
+        let digest_ok = self
+            .digest_auth
+            .as_ref()
+            .and_then(|policy| policy.consumer(parts))
+            .is_some();
         let has_api_key = !self.api_keys.is_empty();
         let has_hmac = !self.hmac_auth.is_empty();
         let has_jwt = !self.jwt_auth.is_empty();
         let has_enterprise = !self.enterprise_auth.is_empty();
-        if !has_basic && !has_api_key && !has_hmac && !has_jwt && !has_enterprise {
+        if !has_basic && !has_digest && !has_api_key && !has_hmac && !has_jwt && !has_enterprise {
             return SyncAuthState {
                 configured: false,
                 ok: true,
@@ -2032,6 +2585,7 @@ impl Route {
         let ok = match self.satisfy {
             SatisfyMode::All => {
                 (!has_basic || basic_ok)
+                    && (!has_digest || digest_ok)
                     && (!has_api_key || api_key_ok)
                     && (!has_hmac || hmac_ok)
                     && (!has_jwt || jwt_ok)
@@ -2039,6 +2593,7 @@ impl Route {
             }
             SatisfyMode::Any => {
                 (has_basic && basic_ok)
+                    || (has_digest && digest_ok)
                     || (has_api_key && api_key_ok)
                     || (has_hmac && hmac_ok)
                     || (has_jwt && jwt_ok)
@@ -2053,8 +2608,10 @@ impl Route {
 
     /// 业务作用：执行包含远端 JWKS/OIDC 刷新的完整本地认证组合，供数据面在 ext_authz 前冻结可信身份。
     ///
-    /// 参数说明：`parts` 是尚未接受外部鉴权 header 注入的请求 head，`saml_response` 是可选的
-    /// 标准 HTTP-POST form 凭据，已由代理层按 route 上限提取并保留原 body。
+    /// 参数说明：
+    /// - `parts`：尚未接受外部鉴权头注入的原始请求 head。
+    /// - `saml_response`：代理按路由预算提取的可选 SAML HTTP-POST 凭据。
+    /// - `body`：代理按共同鉴权预算聚合并保留的原始请求正文。
     ///
     /// 返回：返回本地认证是否配置及 satisfy 组合结果；远端元数据不可用、过期或 token 非法均按未通过处理。
     pub(crate) async fn resolved_auth_state(
@@ -2064,11 +2621,17 @@ impl Route {
         body: Option<&[u8]>,
     ) -> ResolvedAuthState {
         let has_basic = self.basic_auth.is_some();
+        let has_digest = self.digest_auth.is_some();
+        let digest_ok = self
+            .digest_auth
+            .as_ref()
+            .and_then(|policy| policy.consumer(parts))
+            .is_some();
         let has_api_key = !self.api_keys.is_empty();
         let has_hmac = !self.hmac_auth.is_empty();
         let has_jwt = !self.jwt_auth.is_empty();
         let has_enterprise = !self.enterprise_auth.is_empty();
-        if !has_basic && !has_api_key && !has_hmac && !has_jwt && !has_enterprise {
+        if !has_basic && !has_digest && !has_api_key && !has_hmac && !has_jwt && !has_enterprise {
             return ResolvedAuthState {
                 configured: false,
                 ok: true,
@@ -2102,7 +2665,10 @@ impl Route {
         let mut enterprise_ok = false;
         for policy in &self.enterprise_auth {
             match policy.authenticate(parts, saml_response).await {
-                EnterpriseAuthResult::Authenticated { consumer, headers } => {
+                EnterpriseAuthResult::Authenticated {
+                    consumer,
+                    headers,
+                } => {
                     enterprise_ok = true;
                     enterprise_consumer = Some(consumer);
                     enterprise_headers = headers;
@@ -2114,6 +2680,7 @@ impl Route {
         let ok = match self.satisfy {
             SatisfyMode::All => {
                 (!has_basic || basic_ok)
+                    && (!has_digest || digest_ok)
                     && (!has_api_key || api_key_ok)
                     && (!has_hmac || hmac_ok)
                     && (!has_jwt || jwt_ok)
@@ -2121,6 +2688,7 @@ impl Route {
             }
             SatisfyMode::Any => {
                 (has_basic && basic_ok)
+                    || (has_digest && digest_ok)
                     || (has_api_key && api_key_ok)
                     || (has_hmac && hmac_ok)
                     || (has_jwt && jwt_ok)
@@ -2152,6 +2720,14 @@ impl Route {
                     .then_some(enterprise_consumer)
                     .flatten()
             });
+        let consumer = consumer.or_else(|| {
+            ok.then(|| {
+                self.digest_auth
+                    .as_ref()
+                    .and_then(|policy| policy.consumer(parts))
+            })
+            .flatten()
+        });
         let jwt_claims = ok
             .then(|| verified_jwt.as_ref().map(|(_, payload)| payload.clone()))
             .flatten();
@@ -2203,7 +2779,7 @@ impl Route {
 
     /// 业务作用：汇总 HMAC 与 ext_authz 显式 body 慢路径的共同硬上限，确保原请求最多聚合一次。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：至少一项需要实体时返回所有声明上限中的最小值；未启用 body 鉴权返回 None。
     pub(crate) fn auth_body_limit(&self) -> Option<u64> {
@@ -2220,7 +2796,8 @@ impl Route {
 
     /// 业务作用：在代理本地认证阶段执行本 route 的浏览器 OIDC RP，并保持未配置 route 的零成本旁路。
     ///
-    /// 参数说明：`parts` 是客户端原始请求 head，尚未经过 ext_authz 修改。
+    /// 参数说明：
+    /// - `parts`：是客户端原始请求 head，尚未经过 ext_authz 修改。
     ///
     /// 返回：未配置时返回 None；已配置时返回可信 session 身份，或必须立即短路的登录/回调/失败响应。
     pub(crate) async fn oidc_rp_authenticate(&self, parts: &Parts) -> Option<OidcRpDecision> {
@@ -2229,7 +2806,9 @@ impl Route {
 
     /// 业务作用：先删除所有由网关拥有的身份头，再提交认证阶段冻结的可信身份值。
     ///
-    /// 参数说明：`parts` 是可能已被 ext_authz 修改的请求 head，`identity_headers` 只来自外呼前冻结的本地认证结果。
+    /// 参数说明：
+    /// - `parts`：是可能已被 ext_authz 修改的请求 head
+    /// - `identity_headers`：只来自外呼前冻结的本地认证结果。
     ///
     /// 返回：无；客户端或 ext_authz 的同名值先被删除，只有已验证 JWT/SAML/LDAP 值会重新注入。
     pub(crate) fn apply_identity_headers(
@@ -2257,7 +2836,7 @@ impl Route {
         }
     }
 
-    /// 提取已通过认证请求的长连接 consumer 标识。
+    /// 业务作用：提取已通过认证请求的长连接 consumer 标识。
     ///
     /// 只应在鉴权链已放行且请求将升级/进入 gRPC 长流时调用。优先级为 JWT `sub`、显式
     /// API-Key `consumer=`、Basic user；HMAC/ext_authz 未声明稳定主体时返回 None。
@@ -2265,8 +2844,19 @@ impl Route {
         self.authenticated_consumer(parts)
     }
 
-    /// 提取已通过认证请求的稳定 consumer；LLM 配额与长连接维度共用同一可信身份来源。
+    /// 业务作用：提取已认证且已按路由归属冻结的 consumer，供 LLM 配额和长连接共享身份。
+    ///
+    /// 参数说明：
+    /// - `parts`：是认证管线处理后的请求；未经过管线时只解析本地凭据。
+    ///
+    /// 返回：可信工作区主体或本地认证主体；无稳定身份返回 None。
     pub fn authenticated_consumer(&self, parts: &Parts) -> Option<Arc<str>> {
+        if let Some(consumer) = parts
+            .extensions
+            .get::<crate::control::ownership::Consumer>()
+        {
+            return consumer.0.clone();
+        }
         self.jwt_auth
             .iter()
             .find_map(|policy| policy.authenticated_subject(parts))
@@ -2285,7 +2875,7 @@ impl Route {
             })
     }
 
-    /// V8 edge:从任一命中的 JWT 策略提取指定 claim(§25.2.3:tenant/user 身份只来自
+    /// 业务作用：edge:从任一命中的 JWT 策略提取指定 claim(tenant/user 身份只来自
     /// 已验证 principal 的 claim,客户端自报 header 永不是权威身份)。
     pub fn authenticated_edge_claim(&self, parts: &Parts, claim: &str) -> Option<Arc<str>> {
         self.jwt_auth
@@ -2293,52 +2883,69 @@ impl Route {
             .find_map(|policy| policy.authenticated_claim(parts, claim))
     }
 
-    /// 返回命中 API-Key 策略的稳定 SHA-256 指纹。指纹只用于 LLM 配额 key；原始 key 永不
+    /// 业务作用：返回命中 API-Key 策略的稳定 SHA-256 指纹，供受信额度身份使用；原始 key 永不
     /// 拼入进程 HashMap/Redis key，也不进入日志或 metrics label。
+    ///
+    /// 参数说明：
+    /// - `parts`：凭据未经外部授权或插件改写的请求。
+    ///
+    /// 返回：匹配成功时复制已编译指纹；凭据缺失或不匹配返回 None。
     pub fn authenticated_api_key_fingerprint(&self, parts: &Parts) -> Option<String> {
-        let policy = self.api_keys.iter().find(|policy| policy.matches(parts))?;
-        let digest: [u8; 32] = match &policy.expected {
-            ApiKeyExpected::Plain(value) => Sha256::digest(value).into(),
-            ApiKeyExpected::Sha256(digest) => *digest,
-        };
-        let mut encoded = String::with_capacity(32);
-        use std::fmt::Write as _;
-        for byte in &digest[..16] {
-            write!(&mut encoded, "{byte:02x}").expect("writing SHA-256 hex to String cannot fail");
-        }
-        Some(encoded)
+        self.authenticated_api_key_identity(parts)
+            .map(|identity| identity.to_string())
     }
 
-    /// 当前 route 是否配置了异步 ext_authz 外部鉴权策略。
+    /// 业务作用：借用构建期预计算的凭据指纹，认证后冻结身份无需重复摘要或字符串编码。
+    ///
+    /// 参数说明：
+    /// - `parts`：本地认证原始请求，必须在外部授权或插件改写前读取。
+    ///
+    /// 返回：命中本地 API-Key 策略时共享其指纹；凭据缺失或不匹配返回 None。
+    pub(crate) fn authenticated_api_key_identity(&self, parts: &Parts) -> Option<Arc<str>> {
+        let policy = self.api_keys.iter().find(|policy| policy.matches(parts))?;
+        Some(policy.fingerprint.clone())
+    }
+
+    /// 业务作用：当前 route 是否配置了异步 ext_authz 外部鉴权策略。
     pub fn has_ext_authz(&self) -> bool {
         !self.ext_authz.is_empty()
     }
 
-    /// 本 route 是否配置了任一开启防重放的 HMAC 策略(§20)。
+    /// 业务作用：本 route 是否配置了任一开启防重放的 HMAC 策略。
     pub fn has_hmac_replay(&self) -> bool {
         self.hmac_auth.iter().any(HmacAuthPolicy::replay_enabled)
     }
 
-    /// 检测 HMAC 重放:对每个【开启防重放且签名有效】的策略,消费其 nonce;nonce 已用过则判重放。
+    /// 业务作用：在路由归属与工作区预算内登记签名有效的 nonce，避免同名路由跨域污染防重放事实。
     ///
     /// 只有签名先有效才消费 nonce(`matches` 已含签名 + 时间戳 + nonce 存在校验),避免无效请求污染去重表。
     /// 消费一个 fresh nonce 无副作用;返回 `true` 表示检测到重放,调用方应拒绝。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     /// - `guard`: 防重放守卫后端(local/redis)。
+    /// - `body`: 已按签名协议有界读取的请求实体。
+    ///
+    /// 返回：nonce 已消费、容量不足或后端拒绝时为 true；没有需要拒绝的有效签名为 false。
     pub async fn hmac_replay_detected(
         &self,
         parts: &Parts,
         body: Option<&[u8]>,
-        guard: &dyn crate::runtime_state::ReplayGuard,
+        guard: &dyn crate::runtime::state::ReplayGuard,
     ) -> bool {
         for policy in &self.hmac_auth {
             if policy.replay_enabled() && policy.matches_body(parts, body) {
                 if let Some(nonce) = policy.nonce_value(parts) {
-                    // 按 route id + nonce 生成去重 key,避免不同 route 的 nonce 相互撞车。
-                    let key = format!("{}:{}", self.id, nonce);
-                    if !guard.check_and_set(&key, policy.replay_ttl()).await {
+                    // 归属域来自配置扩展；原始 nonce 只进入摘要，不能选择其它路由的账本。
+                    let scope = parts
+                        .extensions
+                        .get::<crate::control::ownership::RequestScope>()
+                        .map_or(self.id.as_str(), |scope| scope.0.as_str());
+                    let key = format!("{scope}:{}", nasa::crypto::sha256(nonce));
+                    if !guard
+                        .check_and_set_scoped(&key, policy.replay_ttl(), parts.extensions.get())
+                        .await
+                    {
                         return true;
                     }
                 }
@@ -2347,19 +2954,19 @@ impl Route {
         false
     }
 
-    /// 返回认证失败响应的 `WWW-Authenticate` challenge 值。
+    /// 业务作用：返回认证失败响应的 `WWW-Authenticate` challenge 值。
     ///
-    /// # 参数
-    /// - `parts`: 下游请求 head;当前只用于保持 API 与其它 route 判断一致。
+    /// 参数说明：
+    /// - `_parts`：保留的下游请求 head 参数；challenge 只由当前路由的认证策略决定。
     pub fn auth_challenge(&self, _parts: &Parts) -> Option<String> {
         self.basic_auth
             .as_ref()
             .map(BasicAuthPolicy::challenge_value)
     }
 
-    /// 按 nginx `if` 安全子集判断是否需要固定响应短路。
+    /// 业务作用：按 nginx `if` 安全子集判断是否需要固定响应短路。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     /// - `client_ip`: 已解析真实客户端 IP。
     /// - `downstream_proto`: 下游协议 scheme。
@@ -2371,7 +2978,7 @@ impl Route {
         downstream_proto: &'static str,
         request_id: &str,
     ) -> Option<DirectResponse> {
-        let eval_ctx = crate::variable::EvalContext {
+        let eval_ctx = crate::routing::variable::EvalContext {
             parts,
             client_ip,
             downstream_proto,
@@ -2433,7 +3040,7 @@ pub enum ResponseHeaderOp {
 /// nginx `sub_filter` 的单条流式替换规则。
 #[derive(Clone)]
 pub struct SubFilterRule {
-    /// 要查找的原始字节串。V3 基础按 bytes 匹配,不做字符集转换。
+    /// 要查找的原始字节串。基础按 bytes 匹配,不做字符集转换。
     pub needle: Vec<u8>,
     /// 替换后的字节串。允许为空,用于删除命中的片段。
     pub replacement: Vec<u8>,
@@ -2449,7 +3056,7 @@ pub enum ContentCoding {
 }
 
 impl ContentCoding {
-    /// 返回写入 `Content-Encoding` 和匹配 `Accept-Encoding` 的标准 token。
+    /// 业务作用：返回写入 `Content-Encoding` 和匹配 `Accept-Encoding` 的标准 token。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Gzip => "gzip",
@@ -2458,7 +3065,7 @@ impl ContentCoding {
     }
 }
 
-/// V5 route 级响应压缩策略。
+/// route 级响应压缩策略。
 ///
 /// 所有字符串与数值都在快照构建期完成校验；单请求只做 header 借用扫描、MIME
 /// 匹配和小枚举选择。未知 `Content-Length` 的响应不会为判定阈值而聚合 body。
@@ -2478,9 +3085,9 @@ pub struct CompressionPolicy {
 }
 
 impl CompressionPolicy {
-    /// 判断响应媒体类型是否允许压缩。
+    /// 业务作用：判断响应媒体类型是否允许压缩。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `content_type`: 响应 `Content-Type` 的原始值；函数只借用并忽略 `; charset=...` 参数。
     pub(crate) fn permits_content_type(&self, content_type: Option<&str>) -> bool {
         let Some(media_type) = content_type
@@ -2507,9 +3114,9 @@ enum CompressionContentType {
 }
 
 impl CompressionContentType {
-    /// 对一个已去除参数的媒体类型做 ASCII 大小写无关匹配。
+    /// 业务作用：对一个已去除参数的媒体类型做 ASCII 大小写无关匹配。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `media_type`: 例如 `text/plain`，来自响应头借用，不分配新字符串。
     fn matches(&self, media_type: &str) -> bool {
         match self {
@@ -2524,7 +3131,7 @@ impl CompressionContentType {
 }
 
 impl ResponseHeaderOp {
-    /// 响应阶段是否需要保留请求上下文。
+    /// 业务作用：响应阶段是否需要保留请求上下文。
     ///
     /// 动态 `add_header` 需要原始请求变量;纯静态响应头操作不让热路径额外 clone `Parts`。
     pub fn needs_request_context(&self) -> bool {
@@ -2663,7 +3270,9 @@ enum CorsOriginHost {
 impl CorsAllowOrigin {
     /// 业务作用：为当前请求选择可安全写入 CORS 响应的 origin，Gateway API 列表只回显已匹配值。
     ///
-    /// 参数说明：`request_origin` 是下游原始 `Origin`；`allow_credentials` 决定通配符能否直接返回。
+    /// 参数说明：
+    /// - `request_origin`：是下游原始 `Origin`
+    /// - `allow_credentials`：决定通配符能否直接返回。
     ///
     /// 返回：匹配时返回响应值；缺少或未授权的 origin 返回 `None`，调用方不得发布 CORS 头。
     pub(crate) fn response_value(
@@ -2688,7 +3297,8 @@ impl CorsAllowOrigin {
 
     /// 业务作用：判断 CORS 响应是否随请求 `Origin` 变化，供缓存隔离和 `Vary` 发布共用。
     ///
-    /// 参数说明：`allow_credentials` 决定全 origin 通配符是否必须改为回显。
+    /// 参数说明：
+    /// - `allow_credentials`：决定全 origin 通配符是否必须改为回显。
     ///
     /// 返回：动态回显或列表匹配返回 `true`，固定响应返回 `false`。
     pub(crate) fn varies_by_origin(&self, allow_credentials: bool) -> bool {
@@ -2700,7 +3310,8 @@ impl CorsAllowOrigin {
 impl CorsOriginPattern {
     /// 业务作用：匹配一个规范化 Gateway API origin，避免把路径、用户信息或错误端口当成同源。
     ///
-    /// 参数说明：`request_origin` 是浏览器提供的原始 `Origin` header。
+    /// 参数说明：
+    /// - `request_origin`：是浏览器提供的原始 `Origin` header。
     ///
     /// 返回：scheme、规范化端口与主机规则全部命中时返回 `true`；非法 header 一律不匹配。
     fn matches(&self, request_origin: &HeaderValue) -> bool {
@@ -2746,7 +3357,8 @@ pub struct GatewayRedirectPolicy {
 impl GatewayRedirectPolicy {
     /// 业务作用：把控制面重定向声明编译为不会产生非法 Location 或歧义 path 变换的计划。
     ///
-    /// 参数说明：`cfg` 是 Gateway API RequestRedirect 映射后的声明。
+    /// 参数说明：
+    /// - `cfg`：是 Gateway API RequestRedirect 映射后的声明。
     ///
     /// 返回：字段组合、scheme、authority、状态码与 path 均合法时返回计划，否则拒绝候选快照。
     fn build(cfg: &GatewayRedirectCfg) -> Result<Self> {
@@ -2804,7 +3416,9 @@ impl GatewayRedirectPolicy {
 
     /// 业务作用：基于当前请求生成最终 Location，同时严格保留未被策略覆盖的 path/query 信息。
     ///
-    /// 参数说明：`parts` 提供规范化 URI 与 authority；`downstream_proto` 是可信监听协议。
+    /// 参数说明：
+    /// - `parts`：提供规范化 URI 与 authority
+    /// - `downstream_proto`：是可信监听协议。
     ///
     /// 返回：authority 与 Location 可编码时返回状态码和目标；缺失或非法 Host 时拒绝本次重定向。
     pub fn location(&self, parts: &Parts, downstream_proto: &str) -> Result<(StatusCode, String)> {
@@ -2870,7 +3484,8 @@ impl GatewayRedirectPolicy {
 
 /// 业务作用：校验重定向目标 hostname，阻断 userinfo、path 与控制字符注入 Location。
 ///
-/// 参数说明：`hostname` 是不含端口的 DNS 名、IPv4 或方括号 IPv6。
+/// 参数说明：
+/// - `hostname`：是不含端口的 DNS 名、IPv4 或方括号 IPv6。
 ///
 /// 返回：可安全组成 HTTP authority 时成功，否则返回错误。
 fn validate_redirect_hostname(hostname: &str) -> Result<()> {
@@ -2891,7 +3506,9 @@ fn validate_redirect_hostname(hostname: &str) -> Result<()> {
 
 /// 业务作用：在不破坏 IPv6 方括号语义的前提下拼出带端口 authority。
 ///
-/// 参数说明：`hostname` 已通过目标主机校验；`port` 是非零 TCP 端口。
+/// 参数说明：
+/// - `hostname`：已通过目标主机校验
+/// - `port`：是非零 TCP 端口。
 ///
 /// 返回：返回可供 URI 使用的 authority 文本。
 fn format_authority(hostname: &str, port: u16) -> String {
@@ -2921,6 +3538,7 @@ pub(crate) struct BffTargetPolicy {
 }
 
 impl BffAggregationPolicy {
+    /// 业务作用：编译有限的只读聚合目标、并发和响应预算，禁止任意目标或无界扇出。
     fn build(cfg: &BffAggregationCfg) -> Result<Self> {
         anyhow::ensure!(
             (1..=16).contains(&cfg.targets.len()),
@@ -3005,19 +3623,23 @@ impl BffAggregationPolicy {
     }
 }
 
+/// 业务作用：限制聚合目标标识，使输出字段和诊断归因具有稳定边界。
 fn validate_bff_id(value: &str) -> Result<()> {
     anyhow::ensure!(
         !value.is_empty()
             && value.len() <= 64
             && value
                 .bytes()
-                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') })
+                .all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                })
             && value != "_errors",
         "BFF target id must be 1..=64 safe ASCII and cannot be `_errors`"
     );
     Ok(())
 }
 
+/// 业务作用：验证固定聚合后端，阻止客户端输入控制外部请求目的地。
 fn validate_bff_uri(raw: &str) -> Result<()> {
     if let Some(service) = raw.strip_prefix("lb://") {
         anyhow::ensure!(
@@ -3041,6 +3663,7 @@ fn validate_bff_uri(raw: &str) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：识别聚合请求不能透传或覆盖的敏感头，避免凭据跨后端泄漏。
 fn is_sensitive_bff_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -3067,6 +3690,7 @@ pub(crate) struct MockResponsePolicy {
 }
 
 impl MockResponsePolicy {
+    /// 业务作用：冻结 mock 的状态码、头部和实体，拒绝不合法的静态响应合同。
     fn build(cfg: &MockResponseCfg) -> Result<Self> {
         let status = StatusCode::from_u16(cfg.status).context("invalid mock status")?;
         anyhow::ensure!(
@@ -3122,6 +3746,7 @@ pub(crate) struct FaultInjectionPolicy {
 }
 
 impl FaultInjectionPolicy {
+    /// 业务作用：编译有界延迟和错误采样策略，拒绝不可执行的故障注入参数。
     fn build(cfg: &FaultInjectionCfg) -> Result<Self> {
         anyhow::ensure!(
             (1..=10_000).contains(&cfg.percentage_bps),
@@ -3178,7 +3803,12 @@ pub(crate) struct UsagePlanPolicy {
 }
 
 impl UsagePlanCatalog {
-    /// 构建全局套餐与 consumer 绑定。所有引用在快照发布前解析，运行期不查字符串 plan id。
+    /// 业务作用：在快照发布前冻结套餐与 consumer/group 绑定，拒绝未显式裁决的重叠套餐。
+    ///
+    /// 参数说明：
+    /// - `cfg`：提供套餐、consumer 显式绑定与 group 成员关系。
+    ///
+    /// 返回：共享只读目录；引用、容量或套餐冲突时拒绝整个候选。
     pub(crate) fn build(cfg: &crate::config::model::UsagePlansCfg) -> Result<Arc<Self>> {
         anyhow::ensure!(
             cfg.plans.len() <= 128,
@@ -3213,8 +3843,45 @@ impl UsagePlanCatalog {
                 }),
             );
         }
-        let mut consumers = HashMap::with_capacity(cfg.consumers.len());
-        for (consumer, plan_id) in &cfg.consumers {
+        anyhow::ensure!(cfg.groups.len() <= 256, "consumer group capacity exceeded");
+        let mut assignments = std::collections::BTreeMap::new();
+        let mut memberships = 0_usize;
+        for (id, group) in &cfg.groups {
+            validate_usage_token(id, "consumer group")?;
+            memberships = memberships.saturating_add(group.consumers.len());
+            anyhow::ensure!(
+                !group.consumers.is_empty() && memberships <= 100_000,
+                "consumer group membership budget exceeded"
+            );
+            if let Some(plan) = &group.plan {
+                anyhow::ensure!(
+                    plans.contains_key(plan.as_str()),
+                    "group references unknown usage plan"
+                );
+            }
+            for consumer in &group.consumers {
+                validate_usage_token(consumer, "group consumer")?;
+                if cfg.consumers.contains_key(consumer) {
+                    continue;
+                }
+                if let Some(plan) = &group.plan {
+                    // consumer 显式绑定优先于 group；多个 group 的不同套餐没有安全默认值，必须明确选择。
+                    if let Some(prior) = assignments.insert(consumer, plan) {
+                        anyhow::ensure!(
+                            prior == plan,
+                            "consumer belongs to groups with conflicting plans"
+                        );
+                    }
+                }
+            }
+        }
+        assignments.extend(cfg.consumers.iter());
+        anyhow::ensure!(
+            assignments.len() <= 100_000,
+            "expanded consumer plan capacity exceeded"
+        );
+        let mut consumers = HashMap::with_capacity(assignments.len());
+        for (consumer, plan_id) in assignments {
             anyhow::ensure!(
                 !consumer.is_empty()
                     && consumer.len() <= 256
@@ -3235,6 +3902,13 @@ impl UsagePlanCatalog {
         }))
     }
 
+    /// 业务作用：将路由套餐引用绑定到已验证目录，避免请求期解析不可信套餐名。
+    ///
+    /// 参数说明：
+    /// - `cfg`：为路由套餐声明
+    /// - `route_id`：用于定位无效引用。
+    ///
+    /// 返回：固定绑定和匿名请求边界；套餐不存在时拒绝候选。
     fn bind(
         &self,
         cfg: &crate::config::model::UsagePlanRouteCfg,
@@ -3262,7 +3936,7 @@ impl UsagePlanCatalog {
 }
 
 impl UsagePlanPolicy {
-    /// 选择已验证 consumer 的套餐；None 表示该身份未映射且无 default。
+    /// 业务作用：选择已验证 consumer 的套餐；None 表示该身份未映射且无 default。
     pub(crate) fn select(&self, consumer: Option<&str>) -> Option<&Arc<UsagePlan>> {
         consumer
             .and_then(|consumer| self.consumers.get(consumer))
@@ -3270,6 +3944,7 @@ impl UsagePlanPolicy {
     }
 }
 
+/// 业务作用：限制用量套餐和主体映射中的标识，避免高基数或含糊键进入额度目录。
 fn validate_usage_token(value: &str, label: &str) -> Result<()> {
     anyhow::ensure!(
         !value.is_empty()
@@ -3291,7 +3966,7 @@ pub struct DirectResponse {
     pub value: Option<String>,
 }
 
-/// V4 `auth_basic` 已编译策略。
+/// `auth_basic` 已编译策略。
 ///
 /// 数据面只读取 `Authorization` header 并做常量时间字节比较;用户名/密码不暴露为 public 字段。
 #[derive(Clone)]
@@ -3304,11 +3979,13 @@ pub struct BasicAuthPolicy {
     expected: Vec<u8>,
 }
 
-/// V4 API-Key 已编译策略。
+/// API-Key 已编译策略。
 ///
 /// 数据面只读取一个 header 或 query 参数,并与构建期保存的 key 做常量时间比较。
 #[derive(Clone)]
 pub struct ApiKeyPolicy {
+    /// SHA-256 前128位的稳定十六进制身份；构建期生成，不保存原始秘密于账本键。
+    fingerprint: Arc<str>,
     /// API-Key 来源。
     source: ApiKeySource,
     /// 构建期保存的明文 SecretSource 结果或管理面生成的不可逆摘要。
@@ -3329,7 +4006,7 @@ enum ApiKeyExpected {
 /// HMAC-SHA256 已编译策略。
 #[derive(Clone)]
 pub struct HmacAuthPolicy {
-    /// 共享密钥;V4 基础版仍来自 route 配置,SecretStore 热更后续补齐。
+    /// 构建期从 SecretSource 解析的共享密钥；随所属不可变路由快照交接。
     secret: String,
     /// 客户端提交小写或大写 hex 签名的请求头。
     signature_header: HeaderName,
@@ -3398,7 +4075,7 @@ struct JwtIdentityHeader {
 }
 
 /// OAuth2/OIDC Authorization Code RP 的已编译策略与有界会话状态。
-struct OidcRpPolicy {
+pub(crate) struct OidcRpPolicy {
     authorization_endpoint: Arc<str>,
     token_endpoint: Arc<str>,
     userinfo_endpoint: Option<Arc<str>>,
@@ -3425,6 +4102,36 @@ struct OidcRpPolicy {
     sessions: parking_lot::Mutex<HashMap<String, OidcSession>>,
 }
 
+impl OidcRpPolicy {
+    /// 业务作用：将复用的 OIDC RP 收紧到门户独占入口与预算，避免 DSL 重复参数覆盖固定身份边界。
+    ///
+    /// 参数说明：
+    /// - `origins`：是批准的门户 HTTPS origin
+    /// - `capacity`：是管理会话硬上限。
+    /// - `ttl`：是管理会话硬上限。
+    ///
+    /// 返回：回调、注销、Cookie 和 origin 均匹配时收紧资源；不匹配拒绝候选。
+    pub(crate) fn bind_portal(
+        &mut self,
+        origins: &[String],
+        capacity: usize,
+        ttl: Duration,
+    ) -> Result<()> {
+        let redirect = reqwest::Url::parse(&self.redirect_uri)?;
+        anyhow::ensure!(
+            self.callback_path.as_ref() == "/api/developer/account/callback"
+                && self.logout_path.as_ref() == "/api/developer/account/logout"
+                && self.cookie_name.as_ref() == "naway_portal_oidc"
+                && origins.contains(&redirect.origin().ascii_serialization()),
+            "portal OIDC requires dedicated callback, logout, cookie and trusted redirect origin"
+        );
+        self.max_pending = self.max_pending.min(capacity);
+        self.max_sessions = self.max_sessions.min(capacity);
+        self.session_ttl = self.session_ttl.min(ttl);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum OidcClientAuth {
     SecretBasic,
@@ -3432,6 +4139,7 @@ enum OidcClientAuth {
 }
 
 struct OidcPendingLogin {
+    workspace_lease: Option<crate::control::ownership::state::Lease>,
     nonce: String,
     verifier: String,
     browser_binding: String,
@@ -3441,6 +4149,7 @@ struct OidcPendingLogin {
 
 #[derive(Clone)]
 struct OidcSession {
+    _workspace_lease: Option<crate::control::ownership::state::Lease>,
     consumer: Arc<str>,
     claims: serde_json::Value,
     identity_headers: Vec<(HeaderName, HeaderValue)>,
@@ -3486,14 +4195,15 @@ struct RemoteJwksState {
     next_retry: Instant,
 }
 
+// Discovery 包含 authorization_endpoint、token_endpoint 等标准元数据；只使用固定 issuer/JWKS
+// 字段，其余元数据不参与目标选择，不能因正常附加字段而拒绝整个 IdP 文档。
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct OidcDiscoveryDocument {
     issuer: String,
     jwks_uri: String,
 }
 
-/// V4 ext_authz / nginx auth_request 基础版已编译策略。
+/// ext_authz / nginx auth_request 基础版已编译策略。
 ///
 /// 策略只构造一个无请求体的鉴权子请求;原始下游 body 继续留给主链路流式转发。
 #[derive(Clone)]
@@ -3542,7 +4252,7 @@ enum JwtTokenSource {
     Header(HeaderName),
 }
 
-/// V4 多认证策略组合方式。
+/// 多认证策略组合方式。
 #[derive(Clone, Copy)]
 pub enum SatisfyMode {
     /// 所有已配置认证方式都必须通过。
@@ -3575,15 +4285,15 @@ pub(crate) struct ResolvedAuthState {
 }
 
 impl BasicAuthPolicy {
-    /// 判断请求是否携带正确 Basic 凭据。
+    /// 业务作用：判断请求是否携带正确 Basic 凭据。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     fn matches(&self, parts: &Parts) -> bool {
         basic_authorization_matches(&parts.headers, self.expected.as_slice())
     }
 
-    /// 生成 `WWW-Authenticate` 响应头值。
+    /// 业务作用：生成 `WWW-Authenticate` 响应头值。
     fn challenge_value(&self) -> String {
         format!("Basic realm=\"{}\"", escape_header_quote(&self.realm))
     }
@@ -3592,7 +4302,8 @@ impl BasicAuthPolicy {
 impl ApiKeyPolicy {
     /// 业务作用：验证请求携带的 API-Key，并统一兼容 SecretSource 明文和 Console 不可逆摘要两种事实。
     ///
-    /// 参数说明：`parts` 是下游请求 head。
+    /// 参数说明：
+    /// - `parts`：是下游请求 head。
     ///
     /// 返回：指定 header/query 的单值与期望材料常量时间一致时返回 true；缺失、编码非法或摘要不一致
     /// 均返回 false。
@@ -3621,7 +4332,8 @@ impl ApiKeyPolicy {
 impl HmacAuthPolicy {
     /// 业务作用：验证不读取实体的兼容 HMAC-SHA256 请求；body 策略必须走有界认证慢路径。
     ///
-    /// 参数说明：`parts` 是下游请求 head。
+    /// 参数说明：
+    /// - `parts`：是下游请求 head。
     ///
     /// 返回：未启用 body 签名且 canonical contract 匹配时返回 true；其它情况返回 false。
     fn matches(&self, parts: &Parts) -> bool {
@@ -3630,7 +4342,9 @@ impl HmacAuthPolicy {
 
     /// 业务作用：按策略声明决定是否把已聚合原始实体的 SHA-256 纳入 HMAC canonical contract。
     ///
-    /// 参数说明：`parts` 是请求 head；`body` 仅由有界认证慢路径提供，未启用 body 签名时忽略。
+    /// 参数说明：
+    /// - `parts`：是请求 head
+    /// - `body`：仅由有界认证慢路径提供，未启用 body 签名时忽略。
     ///
     /// 返回：时间、nonce、header、可选 body 摘要和签名全部匹配时返回 true。
     fn matches_body(&self, parts: &Parts, body: Option<&[u8]>) -> bool {
@@ -3658,7 +4372,11 @@ impl HmacAuthPolicy {
 
     /// 业务作用：构造稳定 HMAC canonical string，并在显式启用时追加原始实体 SHA-256。
     ///
-    /// 参数说明：`parts` 是请求 head；`timestamp`/`nonce` 是签名字段；`body` 是有界收集的原始实体。
+    /// 参数说明：
+    /// - `parts`：是请求 head
+    /// - `timestamp`：是签名字段
+    /// - `nonce`：是签名字段
+    /// - `body`：是有界收集的原始实体。
     ///
     /// 返回：所需 header/body 完整时返回 canonical 文本；缺少声明字段时返回 None。
     fn canonical_request(
@@ -3701,21 +4419,21 @@ impl HmacAuthPolicy {
         Some(canonical)
     }
 
-    /// 是否开启防重放(需已配 nonce_header)。
+    /// 业务作用：是否开启防重放(需已配 nonce_header)。
     fn replay_enabled(&self) -> bool {
         self.replay_protection && self.nonce_header.is_some()
     }
 
-    /// 读取请求里的 nonce 值(仅当配置了 nonce_header)。
+    /// 业务作用：读取请求里的 nonce 值(仅当配置了 nonce_header)。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     fn nonce_value<'a>(&self, parts: &'a Parts) -> Option<&'a str> {
         let name = self.nonce_header.as_ref()?;
         header_str(parts, name)
     }
 
-    /// 防重放去重的时间窗口(= 允许的时间戳偏差,超窗时间戳本就被拒)。
+    /// 业务作用：防重放去重的时间窗口(= 允许的时间戳偏差,超窗时间戳本就被拒)。
     fn replay_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.max_skew_ms.max(1))
     }
@@ -3724,7 +4442,8 @@ impl HmacAuthPolicy {
 impl JwtAuthPolicy {
     /// 业务作用：使用当前已缓存 key 同步判断 JWT；静态 key 与热 JWKS 命中不发生网络 I/O。
     ///
-    /// 参数说明：`parts` 是下游请求 head。
+    /// 参数说明：
+    /// - `parts`：是下游请求 head。
     ///
     /// 返回：token 签名、算法与 claims 全部通过时返回 true；远端 key 尚未拉取时返回 false。
     fn matches(&self, parts: &Parts) -> bool {
@@ -3733,7 +4452,8 @@ impl JwtAuthPolicy {
 
     /// 业务作用：从 route 固定 token source 提取 compact JWT，不读取 query/cookie 等未声明位置。
     ///
-    /// 参数说明：`parts` 是下游请求 head。
+    /// 参数说明：
+    /// - `parts`：是下游请求 head。
     ///
     /// 返回：Bearer 或指定 header 中的非空 token；缺失/非法 UTF-8 返回 None。
     fn token<'a>(&self, parts: &'a Parts) -> Option<&'a str> {
@@ -3745,7 +4465,8 @@ impl JwtAuthPolicy {
 
     /// 业务作用：从请求执行同步签名与 claims 验证，供认证后身份/claims 提取复用同一信任边界。
     ///
-    /// 参数说明：`parts` 是已经完成远端 key 解析的请求 head。
+    /// 参数说明：
+    /// - `parts`：是已经完成远端 key 解析的请求 head。
     ///
     /// 返回：合法 JWT payload object；缺失 token 或验证失败返回 None。
     fn verified_payload_from_parts(&self, parts: &Parts) -> Option<serde_json::Value> {
@@ -3754,7 +4475,8 @@ impl JwtAuthPolicy {
 
     /// 业务作用：使用本地 key 状态验证 compact JWS，并拒绝 token 自带的远端 key 指针。
     ///
-    /// 参数说明：`token` 是未经信任的 compact serialization。
+    /// 参数说明：
+    /// - `token`：是未经信任的 compact serialization。
     ///
     /// 返回：算法、签名与 claims 均通过时返回 JSON object；任何错误返回 None。
     fn verified_payload(&self, token: &str) -> Option<serde_json::Value> {
@@ -3775,7 +4497,8 @@ impl JwtAuthPolicy {
 
     /// 业务作用：为 remote verifier 执行单飞 refresh/rotation，再复用统一签名与 claims 校验。
     ///
-    /// 参数说明：`token` 是未经信任的 compact serialization。
+    /// 参数说明：
+    /// - `token`：是未经信任的 compact serialization。
     ///
     /// 返回：可用 key 验证成功返回 payload；依赖、kid、算法或 claims 错误返回 None。
     async fn verified_payload_resolved(&self, token: &str) -> Option<serde_json::Value> {
@@ -3795,7 +4518,8 @@ impl JwtAuthPolicy {
 
     /// 业务作用：在配置 JWE 时先严格解密 compact envelope，再把 plaintext 作为嵌套 JWS 验证输入。
     ///
-    /// 参数说明：`token` 是客户端提交的 JWS 或 JWE compact serialization。
+    /// 参数说明：
+    /// - `token`：是客户端提交的 JWS 或 JWE compact serialization。
     ///
     /// 返回：未启用 JWE 时借用原 token；启用时仅接受 RSA-OAEP-256/A256GCM、`cty=JWT` 且无动态 key/zip 的有界 UTF-8 plaintext。
     fn prepare_signed_token<'a>(&self, token: &'a str) -> Option<Cow<'a, str>> {
@@ -3828,7 +4552,8 @@ impl JwtAuthPolicy {
 
     /// 业务作用：固定 JWS header 信任边界，只接受 route 声明算法并拒绝 `jku/x5u/jwk/x5c/crit`。
     ///
-    /// 参数说明：`token` 是 compact JWT。
+    /// 参数说明：
+    /// - `token`：是 compact JWT。
     ///
     /// 返回：长度、段数和 header 合法时返回解析结果；动态 key 指针或算法混淆返回 None。
     fn validate_header(&self, token: &str) -> Option<jsonwebtoken::Header> {
@@ -3850,7 +4575,9 @@ impl JwtAuthPolicy {
 
     /// 业务作用：用固定 family 的静态/JWKS key 验证 RS256/ES256，不让库自动选择其它算法或 claims 语义。
     ///
-    /// 参数说明：`token` 是 compact JWT，`key` 已通过 PEM/JWK key type 与 alg pinning。
+    /// 参数说明：
+    /// - `token`：是 compact JWT
+    /// - `key`：已通过 PEM/JWK key type 与 alg pinning。
     ///
     /// 返回：密码学签名有效时返回 payload；库错误或 payload 非 object 返回 None。
     fn verify_asymmetric(&self, token: &str, key: &DecodingKey) -> Option<serde_json::Value> {
@@ -3867,7 +4594,8 @@ impl JwtAuthPolicy {
 
     /// 业务作用：从签名、时效与 issuer/audience 均有效的 JWT 中提取有界 `sub`。
     ///
-    /// 参数说明：`parts` 是下游请求 head。
+    /// 参数说明：
+    /// - `parts`：是下游请求 head。
     ///
     /// 返回：合法非空 `sub` 返回共享字符串，否则返回 None。
     fn authenticated_subject(&self, parts: &Parts) -> Option<Arc<str>> {
@@ -3876,7 +4604,9 @@ impl JwtAuthPolicy {
 
     /// 业务作用：从已验证 payload 提取边缘路由声明的字符串 claim，禁止客户端身份头替代 JWT 权威。
     ///
-    /// 参数说明：`parts` 是请求 head，`claim` 是配置固定字段名。
+    /// 参数说明：
+    /// - `parts`：是请求 head
+    /// - `claim`：是配置固定字段名。
     ///
     /// 返回：非空、≤256 字节、无控制字符的字符串返回共享值，否则返回 None。
     fn authenticated_claim(&self, parts: &Parts, claim: &str) -> Option<Arc<str>> {
@@ -3886,7 +4616,8 @@ impl JwtAuthPolicy {
 
     /// 业务作用：执行公共 JWT 与 OIDC claims 约束，包含时间、issuer、audience/azp、nonce 与主体。
     ///
-    /// 参数说明：`payload` 是密码学签名已通过的 JSON object。
+    /// 参数说明：
+    /// - `payload`：是密码学签名已通过的 JSON object。
     ///
     /// 返回：全部声明满足 route pinning 时返回 true；缺失必需项、类型错误或时间越界返回 false。
     fn claims_match(&self, payload: &serde_json::Value) -> bool {
@@ -3953,10 +4684,11 @@ impl JwtAuthPolicy {
 impl OidcRpPolicy {
     /// 业务作用：执行 OIDC 浏览器入口的 session、回调、退出或登录跳转，只有已验证 IdP 结果能形成身份。
     ///
-    /// 参数说明：`parts` 是尚未注入身份头的原始请求 head。
+    /// 参数说明：
+    /// - `parts`：是尚未注入身份头的原始请求 head。
     ///
     /// 返回：有效 session 返回可信身份；回调/退出/登录和任何失败返回应立即短路的响应。
-    async fn authenticate(&self, parts: &Parts) -> OidcRpDecision {
+    pub(crate) async fn authenticate(&self, parts: &Parts) -> OidcRpDecision {
         self.prune_expired();
         if parts.uri.path() == self.logout_path.as_ref() {
             return self.logout(parts);
@@ -3981,7 +4713,8 @@ impl OidcRpPolicy {
 
     /// 业务作用：建立一次绑定浏览器、state、nonce 与 PKCE verifier 的短期授权事务。
     ///
-    /// 参数说明：`parts` 提供原始 origin-form URI，成功登录后只允许返回该本地 URI。
+    /// 参数说明：
+    /// - `parts`：提供原始 origin-form URI，成功登录后只允许返回该本地 URI。
     ///
     /// 返回：容量与随机源可用时返回 302 到固定授权 endpoint；失败返回 503，绝不匿名放行。
     fn begin_login(&self, parts: &Parts) -> OidcRpDecision {
@@ -3992,6 +4725,21 @@ impl OidcRpPolicy {
                 "OIDC login capacity reached",
             ));
         }
+        // 授权跳转前取得归属名额；认证中的临时事务不能挤占其它工作区的会话空间。
+        let workspace_lease = match parts
+            .extensions
+            .get::<crate::control::ownership::state::Budget>()
+            .map(|budget| budget.acquire())
+            .transpose()
+        {
+            Ok(lease) => lease,
+            Err(_) => {
+                return OidcRpDecision::Response(crate::text_status(
+                    503,
+                    "workspace identity capacity reached",
+                ))
+            }
+        };
         let state = match oidc_random_token() {
             Ok(value) => value,
             Err(_) => {
@@ -4052,6 +4800,7 @@ impl OidcRpPolicy {
         pending.insert(
             state,
             OidcPendingLogin {
+                workspace_lease,
                 nonce,
                 verifier,
                 browser_binding: browser_binding.clone(),
@@ -4071,7 +4820,8 @@ impl OidcRpPolicy {
     /// 业务作用：消费一次性授权码回调，复验浏览器绑定/state/nonce/PKCE、token、可选 introspection
     /// 与 userinfo 后建立受保护 session。
     ///
-    /// 参数说明：`parts` 必须是固定 callback path 的 GET 请求。
+    /// 参数说明：
+    /// - `parts`：必须是固定 callback path 的 GET 请求。
     ///
     /// 返回：全部证据通过返回 303 到原本地 URI并设置 session cookie；任何缺失或依赖失败返回 401/502。
     async fn callback(&self, parts: &Parts) -> OidcRpDecision {
@@ -4158,7 +4908,9 @@ impl OidcRpPolicy {
     /// 业务作用：以固定 token endpoint 和客户端认证交换授权码，并把 token/introspection/userinfo
     /// 证据合并成受限 session 身份。
     ///
-    /// 参数说明：`code` 是一次性回调码；`pending` 冻结 nonce、verifier 和原始本地 URI。
+    /// 参数说明：
+    /// - `code`：是一次性回调码
+    /// - `pending`：冻结 nonce、verifier 和原始本地 URI。
     ///
     /// 返回：全部远端与 claims 证据通过时返回 session；任何协议、签名、issuer/audience/sub 失败返回错误。
     async fn exchange_code(&self, code: &str, pending: &OidcPendingLogin) -> Result<OidcSession> {
@@ -4238,6 +4990,8 @@ impl OidcRpPolicy {
         let ttl = self.session_ttl.min(token_remaining).min(advertised);
         anyhow::ensure!(!ttl.is_zero(), "OIDC session TTL is zero");
         Ok(OidcSession {
+            // 回调已经消费 pending，身份验证完成后由同一名额承接 session，不产生容量空窗。
+            _workspace_lease: pending.workspace_lease.clone(),
             consumer: subject,
             claims,
             identity_headers,
@@ -4248,8 +5002,10 @@ impl OidcRpPolicy {
     /// 业务作用：调用固定 introspection endpoint 复验 access token 仍 active 且 issuer/audience/sub
     /// 与已验证 ID token 一致。
     ///
-    /// 参数说明：`endpoint` 是构建期固定 HTTPS URL；`token` 是 token endpoint 返回值；`subject`
-    /// 来自已验签 ID token。
+    /// 参数说明：
+    /// - `endpoint`：是构建期固定 HTTPS URL
+    /// - `token`：是 token endpoint 返回值
+    /// - `subject`：来自已验签 ID token。
     ///
     /// 返回：所有字段严格匹配时成功；不活跃、身份不一致或依赖失败均返回错误。
     async fn verify_introspection(&self, endpoint: &str, token: &str, subject: &str) -> Result<()> {
@@ -4288,7 +5044,8 @@ impl OidcRpPolicy {
 
     /// 业务作用：撤销当前浏览器 session，并只重定向到构建期固定的本地退出后 URI。
     ///
-    /// 参数说明：`parts` 提供可选 session cookie。
+    /// 参数说明：
+    /// - `parts`：提供可选 session cookie。
     ///
     /// 返回：返回 303 并清除 session/state cookie；不存在 session 也保持幂等。
     fn logout(&self, parts: &Parts) -> OidcRpDecision {
@@ -4315,7 +5072,7 @@ impl OidcRpPolicy {
 
     /// 业务作用：回收过期登录事务和 session，确保长期运行下内存仍受配置容量约束。
     ///
-    /// 参数说明：无。
+    /// 参数说明: 无。
     ///
     /// 返回：无；只删除当前单调时钟已到期记录。
     fn prune_expired(&self) {
@@ -4340,7 +5097,10 @@ struct OidcTokenResponse {
 
 /// 业务作用：有界读取固定 IdP endpoint 的 JSON 响应，统一执行总 deadline、status、media 和实体上限。
 ///
-/// 参数说明：`request` 已由固定 HTTPS client 构建；`timeout` 覆盖 head/body；`kind` 仅用于低敏错误。
+/// 参数说明：
+/// - `request`：已由固定 HTTPS client 构建
+/// - `timeout`：覆盖 head/body
+/// - `kind`：仅用于低敏错误。
 ///
 /// 返回：合法 JSON 解码为 T；网络、非 2xx、媒体类型、长度、超时或 schema 错误返回失败。
 async fn fetch_oidc_json<T: serde::de::DeserializeOwned>(
@@ -4388,7 +5148,9 @@ async fn fetch_oidc_json<T: serde::de::DeserializeOwned>(
 
 /// 业务作用：将受信 userinfo 的补充 claim 合入已验签 ID token，同时禁止覆盖核心权威字段。
 ///
-/// 参数说明：`claims` 是已验签 token object；`userinfo` 已从固定 HTTPS endpoint 有界取得且 sub 已匹配。
+/// 参数说明：
+/// - `claims`：是已验签 token object
+/// - `userinfo`：已从固定 HTTPS endpoint 有界取得且 sub 已匹配。
 ///
 /// 返回：两个值均为 object 时合并非核心字段；类型错误返回失败。
 fn merge_oidc_userinfo(claims: &mut serde_json::Value, userinfo: serde_json::Value) -> Result<()> {
@@ -4412,7 +5174,9 @@ fn merge_oidc_userinfo(claims: &mut serde_json::Value, userinfo: serde_json::Val
 
 /// 业务作用：只从已验证 OIDC claims 生成配置声明的身份头，非法或非字符串 claim 不注入。
 ///
-/// 参数说明：`claims` 是 token/userinfo 合并后的受信 object；`mappings` 已在构建期校验 header 名。
+/// 参数说明：
+/// - `claims`：是 token/userinfo 合并后的受信 object
+/// - `mappings`：已在构建期校验 header 名。
 ///
 /// 返回：返回长度和 header 编码均合法的身份头集合。
 fn oidc_identity_headers(
@@ -4438,7 +5202,7 @@ fn oidc_identity_headers(
 
 /// 业务作用：生成 OAuth state/nonce/verifier/session 的 256 位不可预测 URL-safe token。
 ///
-/// 参数说明：无。
+/// 参数说明: 无。
 ///
 /// 返回：系统随机源可用时返回无 padding Base64URL；失败返回错误并阻止登录。
 fn oidc_random_token() -> Result<String> {
@@ -4449,7 +5213,9 @@ fn oidc_random_token() -> Result<String> {
 
 /// 业务作用：从所有 Cookie header 中提取唯一指定 cookie，拒绝重复同名值造成解析歧义。
 ///
-/// 参数说明：`parts` 是原始请求 head；`name` 是构建期安全 cookie 名。
+/// 参数说明：
+/// - `parts`：是原始请求 head
+/// - `name`：是构建期安全 cookie 名。
 ///
 /// 返回：恰好一个非空且有界值时返回借用；缺失、重复或非法返回 None。
 fn oidc_cookie<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
@@ -4473,7 +5239,9 @@ fn oidc_cookie<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
 
 /// 业务作用：读取回调 query 中恰好一个参数并按标准 form 规则解码，重复值一律拒绝。
 ///
-/// 参数说明：`query` 是原始 query；`name` 固定为 state 或 code。
+/// 参数说明：
+/// - `query`：是原始 query
+/// - `name`：固定为 state 或 code。
 ///
 /// 返回：唯一值返回 owned String；缺失、重复或解码结果含控制字符时返回 None。
 fn oidc_unique_query_param(query: &str, name: &str) -> Option<String> {
@@ -4491,7 +5259,9 @@ fn oidc_unique_query_param(query: &str, name: &str) -> Option<String> {
 
 /// 业务作用：构造只指向构建期固定 IdP URL 或已保存本地 origin URI 的重定向响应。
 ///
-/// 参数说明：`location` 已由安全来源生成；`cookie` 是可选受保护 Set-Cookie 值。
+/// 参数说明：
+/// - `location`：已由安全来源生成
+/// - `cookie`：是可选受保护 Set-Cookie 值。
 ///
 /// 返回：header 可编码时返回 302；防御性编码失败返回 500。
 fn oidc_redirect(location: &str, cookie: Option<&str>) -> Response<crate::BoxBody> {
@@ -4509,7 +5279,9 @@ fn oidc_redirect(location: &str, cookie: Option<&str>) -> Response<crate::BoxBod
 
 /// 业务作用：从已验签 payload 提取可作为授权主体或身份头来源的有界字符串 claim。
 ///
-/// 参数说明：`payload` 是完成签名与 claims 门的 JSON object，`claim` 是 route 固定字段名。
+/// 参数说明：
+/// - `payload`：是完成签名与 claims 门的 JSON object
+/// - `claim`：是 route 固定字段名。
 ///
 /// 返回：非空、长度受限且无控制字符时返回共享值；其它类型或非法文本返回 None。
 fn bounded_jwt_claim(payload: &serde_json::Value, claim: &str) -> Option<Arc<str>> {
@@ -4522,7 +5294,9 @@ fn bounded_jwt_claim(payload: &serde_json::Value, claim: &str) -> Option<Arc<str
 
 /// 业务作用：验证兼容 HS256 token，并与 asymmetric 路径共用外层 header 与 claims 门。
 ///
-/// 参数说明：`token` 是 compact JWT，`secret` 是构建期解析并冻结的 route secret。
+/// 参数说明：
+/// - `token`：是 compact JWT
+/// - `secret`：是构建期解析并冻结的 route secret。
 ///
 /// 返回：签名正确且 payload 是 JSON object 时返回 payload；格式或签名错误返回 None。
 fn verify_hs256_token(token: &str, secret: &str) -> Option<serde_json::Value> {
@@ -4548,7 +5322,8 @@ fn verify_hs256_token(token: &str, secret: &str) -> Option<serde_json::Value> {
 impl RemoteJwks {
     /// 业务作用：从当前未过期或 stale 窗内状态读取 key，供认证后身份提取保持同步且零网络 I/O。
     ///
-    /// 参数说明：`kid` 是已通过长度检查的受信查找键。
+    /// 参数说明：
+    /// - `kid`：是已通过长度检查的受信查找键。
     ///
     /// 返回：fresh key 或仍在 stale 窗内的已知 key；未知/过期返回 None。
     fn cached_key(&self, kid: &str) -> Option<Arc<DecodingKey>> {
@@ -4561,7 +5336,8 @@ impl RemoteJwks {
 
     /// 业务作用：按 kid 解析可轮换 JWKS key，使用单飞 refresh、负缓存、退避和有界 stale 策略抑制风暴。
     ///
-    /// 参数说明：`kid` 来自已验证 JWS header，必须精确匹配固定 endpoint 返回的 key。
+    /// 参数说明：
+    /// - `kid`：来自已验证 JWS header，必须精确匹配固定 endpoint 返回的 key。
     ///
     /// 返回：fresh/允许 stale 的 key 返回 Some；未知 kid 返回 None；网络/协议错误返回错误并 fail closed。
     async fn resolve_key(&self, kid: &str) -> Result<Option<Arc<DecodingKey>>> {
@@ -4714,7 +5490,10 @@ impl RemoteJwks {
 
 /// 业务作用：有界下载 JSON identity metadata，先验证 HTTPS/status/media/Content-Length，再流式限制实体。
 ///
-/// 参数说明：`client` 是无重定向客户端，`url` 是固定 endpoint，`timeout` 是 head+body 总期限。
+/// 参数说明：
+/// - `client`：是无重定向客户端
+/// - `url`：是固定 endpoint
+/// - `timeout`：是 head+body 总期限。
 ///
 /// 返回：返回严格 JSON 文档与 Cache-Control max-age；任何网络、协议、大小或解析错误返回失败。
 async fn fetch_bounded_json<T>(
@@ -4768,7 +5547,8 @@ where
 
 /// 业务作用：解析响应的 `Cache-Control: max-age`，其余 directive 不参与 key 生命周期。
 ///
-/// 参数说明：`headers` 是 JWKS/discovery 响应头。
+/// 参数说明：
+/// - `headers`：是 JWKS/discovery 响应头。
 ///
 /// 返回：合法秒数返回 Duration；缺失、重复或非法值返回 None 并使用 route 默认值。
 fn parse_cache_control_max_age(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -4788,7 +5568,9 @@ fn parse_cache_control_max_age(headers: &reqwest::header::HeaderMap) -> Option<D
 
 /// 业务作用：固定 identity metadata URL 为 HTTPS origin，拒绝凭据、缺 authority 与非根绝对 URI。
 ///
-/// 参数说明：`url` 是配置或 discovery 返回值，`field` 用于错误定位。
+/// 参数说明：
+/// - `url`：是配置或 discovery 返回值
+/// - `field`：用于错误定位。
 ///
 /// 返回：安全 HTTPS URL 成功；其它 scheme、userinfo 或非法 URI 返回错误。
 fn validate_https_url(url: &str, field: &str) -> Result<()> {
@@ -4808,7 +5590,8 @@ fn validate_https_url(url: &str, field: &str) -> Result<()> {
 
 /// 业务作用：提取 HTTPS URI authority，供 discovery issuer/JWKS 主机固定比较。
 ///
-/// 参数说明：`url` 已经过 HTTPS URL 基础验证。
+/// 参数说明：
+/// - `url`：已经过 HTTPS URL 基础验证。
 ///
 /// 返回：返回规范 authority 文本；缺失时返回错误。
 fn uri_authority(url: &str) -> Result<String> {
@@ -4822,7 +5605,9 @@ fn uri_authority(url: &str) -> Result<String> {
 
 /// 业务作用：固定 JWK key type 与算法 family，阻止 RSA/EC 算法混淆。
 ///
-/// 参数说明：`jwk` 是未信任 key，`algorithm` 只允许 RS256 或 ES256。
+/// 参数说明：
+/// - `jwk`：是未信任 key
+/// - `algorithm`：只允许 RS256 或 ES256。
 ///
 /// 返回：算法对应 RSA 或 P-256 EC 参数时返回 true。
 fn jwk_type_matches_algorithm(jwk: &jsonwebtoken::jwk::Jwk, algorithm: Algorithm) -> bool {
@@ -4878,10 +5663,16 @@ struct ConditionExpr {
 impl ConditionalReturn {
     /// 业务作用：按 AND 高于 OR 的固定优先级判断请求是否应短路返回。
     ///
-    /// 参数说明：`ctx` 是当前请求变量上下文；`variables` 是 route 的变量计划。
+    /// 参数说明：
+    /// - `ctx`：是当前请求变量上下文
+    /// - `variables`：是 route 的变量计划。
     ///
     /// 返回：任一 OR 分组内的全部比较命中时返回 true。
-    fn matches(&self, ctx: &crate::variable::EvalContext<'_>, variables: &VariablePlan) -> bool {
+    fn matches(
+        &self,
+        ctx: &crate::routing::variable::EvalContext<'_>,
+        variables: &VariablePlan,
+    ) -> bool {
         self.condition.any.iter().any(|all| {
             all.iter().all(|comparison| {
                 let left = comparison.left.render(ctx, variables);
@@ -4927,9 +5718,9 @@ enum RefererHost {
 }
 
 impl RefererPolicy {
-    /// 判断请求 Referer 是否命中策略。
+    /// 业务作用：判断请求 Referer 是否命中策略。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `parts`: 下游请求 head。
     fn matches(&self, parts: &Parts) -> bool {
         let Some(raw) = parts
@@ -4954,9 +5745,9 @@ impl RefererPolicy {
 }
 
 impl RefererHost {
-    /// 判断 host 是否命中当前模式。
+    /// 业务作用：判断 host 是否命中当前模式。
     ///
-    /// # 参数
+    /// 参数说明：
     /// - `host`: 已规范化的小写 host。
     fn matches(&self, host: &str) -> bool {
         match self {
@@ -4966,24 +5757,7 @@ impl RefererHost {
     }
 }
 
-/// V3 `limit_req` 流控规则的已编译形态。数据面只求维度值并调用 `RateLimiter`,不再解析 DSL。
-#[derive(Clone)]
-pub struct LimitReqPolicy {
-    /// 限流维度,如真实客户端 IP、指定请求头、query 参数或 route。
-    pub key: LimitReqKey,
-    /// 一个窗口内的稳定放行量,由 `rate=<N>r/s|r/m|r/h` 编译得到。
-    pub limit: u64,
-    /// 限流窗口,与 `limit` 共同表达补充速率。
-    pub window: Duration,
-    /// 额外突发容量,对齐 nginx `limit_req burst=` 的运维心智。
-    pub burst: u64,
-    /// 本规则允许同时存在的维度桶上限，防止轮换 IP/header/query 值打爆本地内存或 Redis key。
-    pub max_active_keys: usize,
-    /// 达到维度上限时是否 fail-open；false 表示 fail-closed 返回 429。
-    pub active_keys_fail_open: bool,
-}
-
-/// V3 `limit_conn` 并发限制规则。释放绑定响应 body 生命周期,避免流式响应提前归还名额。
+/// `limit_conn` 并发限制规则。释放绑定响应 body 生命周期,避免流式响应提前归还名额。
 #[derive(Clone)]
 pub struct LimitConnPolicy {
     /// 并发维度,与 `limit_req` 共用低成本维度集合。
@@ -4992,7 +5766,7 @@ pub struct LimitConnPolicy {
     pub limit: u64,
 }
 
-/// V3 nginx `limit_rate` 响应带宽限制。只包响应 body,不缓冲完整响应。
+/// nginx `limit_rate` 响应带宽限制。只包响应 body,不缓冲完整响应。
 #[derive(Clone, Copy)]
 pub struct LimitRatePolicy {
     /// 限速字节/秒。
@@ -5001,26 +5775,7 @@ pub struct LimitRatePolicy {
     pub after_bytes: u64,
 }
 
-/// V3 Sentinel 熔断规则。V3 起步按 route 资源统计 5xx/网关错误,Open 时直接走 fallback。
-#[derive(Clone)]
-pub struct CircuitBreakerPolicy {
-    /// 规则 id,用于状态 key 与日志定位。
-    pub id: String,
-    /// 滑动窗口内失败次数达到该阈值后打开熔断。
-    pub failure_threshold: u64,
-    /// 统计窗口。
-    pub window: Duration,
-    /// 窗口内至少有多少请求才允许打开熔断,避免低流量偶发错误过敏。
-    pub min_requests: u64,
-    /// Open 持续时长;到期进入 Half-Open,放一个探测请求。
-    pub break_duration: Duration,
-    /// 熔断打开时返回的状态码。
-    pub fallback_status: StatusCode,
-    /// 熔断打开时返回的短文本 body。
-    pub fallback_body: String,
-}
-
-/// V3/V4 nginx `error_page` 形态:状态码集合 -> 固定响应或内部 reroute。
+/// nginx `error_page` 形态:状态码集合 -> 固定响应或内部 reroute。
 #[derive(Clone)]
 pub struct ErrorPagePolicy {
     /// 触发映射的源状态码集合。
@@ -5039,7 +5794,7 @@ pub enum ErrorPageAction {
 }
 
 impl ErrorPagePolicy {
-    /// 当前 error_page 规则是否执行内部重路由。
+    /// 业务作用：当前 error_page 规则是否执行内部重路由。
     pub fn is_reroute(&self) -> bool {
         matches!(self.action, ErrorPageAction::Reroute(_))
     }
@@ -5075,6 +5830,7 @@ enum AccessMatcher {
 }
 
 impl AccessRule {
+    /// 业务作用：按已编译访问规则判定当前地址，运行期不重新解析网段或表达式。
     fn matches(&self, ip: IpAddr) -> bool {
         match &self.matcher {
             AccessMatcher::All => true,
@@ -5098,6 +5854,7 @@ enum ParsedFilter {
     DedupeHeader(DedupeResponseHeader),
     SubFilter(SubFilterRule),
     Compression(Option<CompressionPolicy>),
+    RequestDecompression(Option<crate::io::request_decompression::Policy>),
     ProxyCache(Option<Arc<HttpCachePolicy>>),
     ProxyCachePurge(Vec<String>),
     Cors(CorsPolicy),
@@ -5106,6 +5863,7 @@ enum ParsedFilter {
     ValidReferers(RefererPolicy),
     LimitExcept(Vec<Method>),
     BasicAuth(Option<BasicAuthPolicy>),
+    DigestAuth(Option<crate::security::digest::Policy>),
     ApiKey(ApiKeyPolicy),
     HmacAuth(HmacAuthPolicy),
     JwtAuth(JwtAuthPolicy),
@@ -5127,6 +5885,7 @@ enum ParsedFilter {
     Mirror(MirrorPolicy),
 }
 
+/// 业务作用：把单条原生过滤声明编译为确定操作，未知指令必须在构建期拒绝。
 fn parse_filter(spec: &str, variables: &VariablePlan, config_dir: &Path) -> Result<ParsedFilter> {
     let trimmed = spec.trim();
     if trimmed.is_empty() {
@@ -5215,6 +5974,13 @@ fn parse_filter(spec: &str, variables: &VariablePlan, config_dir: &Path) -> Resu
     if starts_filter(trimmed, "compression") {
         return parse_compression(trimmed, "compression", None).map(ParsedFilter::Compression);
     }
+    if starts_filter(trimmed, "request_decompression") {
+        return crate::io::request_decompression::parse(filter_args(
+            trimmed,
+            "request_decompression",
+        ))
+        .map(ParsedFilter::RequestDecompression);
+    }
     if starts_filter(trimmed, "gzip") {
         return parse_compression(trimmed, "gzip", Some(ContentCoding::Gzip))
             .map(ParsedFilter::Compression);
@@ -5263,6 +6029,10 @@ fn parse_filter(spec: &str, variables: &VariablePlan, config_dir: &Path) -> Resu
     if starts_filter(trimmed, "auth_basic") {
         return parse_auth_basic(trimmed, config_dir).map(ParsedFilter::BasicAuth);
     }
+    if starts_filter(trimmed, "auth_digest") {
+        return crate::security::digest::parse(filter_args(trimmed, "auth_digest"), config_dir)
+            .map(ParsedFilter::DigestAuth);
+    }
     if starts_filter(trimmed, "api_key") {
         return parse_api_key(trimmed, config_dir).map(ParsedFilter::ApiKey);
     }
@@ -5283,11 +6053,11 @@ fn parse_filter(spec: &str, variables: &VariablePlan, config_dir: &Path) -> Resu
             .map(|policy| ParsedFilter::OidcRp(Box::new(policy)));
     }
     if starts_filter(trimmed, "saml_auth") {
-        return crate::enterprise_identity::parse_saml_auth(trimmed, config_dir)
+        return crate::security::enterprise_identity::parse_saml_auth(trimmed, config_dir)
             .map(ParsedFilter::EnterpriseAuth);
     }
     if starts_filter(trimmed, "ldap_auth") {
-        return crate::enterprise_identity::parse_ldap_auth(trimmed, config_dir)
+        return crate::security::enterprise_identity::parse_ldap_auth(trimmed, config_dir)
             .map(ParsedFilter::EnterpriseAuth);
     }
     if starts_filter(trimmed, "ext_authz") {
@@ -5344,7 +6114,7 @@ fn parse_filter(spec: &str, variables: &VariablePlan, config_dir: &Path) -> Resu
     bail!("unsupported filter `{trimmed}`");
 }
 
-/// 解析 nginx `on|off` 风格开关指令。
+/// 业务作用：解析 nginx `on|off` 风格开关指令。
 ///
 /// 参数说明：
 /// - `spec`: route filter 原始字符串。
@@ -5358,6 +6128,7 @@ fn parse_on_off_directive(spec: &str, cmd: &str) -> Result<bool> {
     }
 }
 
+/// 业务作用：计算路由公开断言的稳定身份，供冲突检测与共享匹配组判断。
 fn predicates_signature(predicates: &[Predicate]) -> String {
     let mut parts = predicates
         .iter()
@@ -5367,7 +6138,7 @@ fn predicates_signature(predicates: &[Predicate]) -> String {
     parts.join("|")
 }
 
-/// 编译并交叉校验所有 Weight 路由。
+/// 业务作用：编译并交叉校验所有 Weight 路由。
 ///
 /// 同组必须拥有完全相同的非权重断言和 order，才能把“先顺序匹配、再组内分桶”的语义
 /// 固定下来；否则配置书写顺序会悄悄改变灰度覆盖范围。组和成员都有硬上限，避免配置把每
@@ -5391,7 +6162,10 @@ fn compile_weighted_groups(
             .predicates
             .iter()
             .filter_map(|predicate| match predicate {
-                Predicate::Weight { group, weight } => Some((group.as_str(), *weight)),
+                Predicate::Weight {
+                    group,
+                    weight,
+                } => Some((group.as_str(), *weight)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -5461,27 +6235,34 @@ fn compile_weighted_groups(
         .collect()
 }
 
+/// 业务作用：提取并验证路由权重声明，不让同一路由同时具有含糊的权重值。
 fn route_weight(route: &Route) -> Option<(&str, u32)> {
     route
         .predicates
         .iter()
         .find_map(|predicate| match predicate {
-            Predicate::Weight { group, weight } => Some((group.as_str(), *weight)),
+            Predicate::Weight {
+                group,
+                weight,
+            } => Some((group.as_str(), *weight)),
             _ => None,
         })
 }
 
+/// 业务作用：计算去除权重后的匹配域身份，使加权路由只在相同公开条件下分组。
 fn non_weight_predicates_signature(predicates: &[Predicate]) -> String {
     let mut parts = predicates
         .iter()
-        .filter(|predicate| !matches!(predicate, Predicate::Weight { .. }))
+        .filter(|predicate| !matches!(predicate, Predicate::Weight {
+            ..
+        }))
         .map(Predicate::signature)
         .collect::<Vec<_>>();
     parts.sort_unstable();
     parts.join("|")
 }
 
-/// FNV-1a 足以做非安全流量分桶：输入是网关生成的 request-id，不承担认证或签名职责。
+/// 业务作用：FNV-1a 足以做非安全流量分桶：输入是网关生成的 request-id，不承担认证或签名职责。
 /// 分段喂入避免 `group + key` 临时字符串分配；固定分隔字节防连接歧义。
 fn stable_weight_hash(group: &[u8], request_key: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -5497,6 +6278,7 @@ fn stable_weight_hash(group: &[u8], request_key: &[u8]) -> u64 {
     hash
 }
 
+/// 业务作用：识别过滤器名称与参数的边界，避免名称前缀误匹配其它指令。
 fn starts_filter(spec: &str, name: &str) -> bool {
     spec == name
         || spec
@@ -5521,8 +6303,10 @@ enum HeaderMutationMode {
 
 /// 业务作用：解码 Gateway API 生成的请求头字面量，使外部 `${...}` 文本不会获得配置变量能力。
 ///
-/// 参数说明：`spec` 含 header 名和 URL-safe Base64 值；`command` 是固定内部命令；
-/// `mode` 只能为 add 或 set。
+/// 参数说明：
+/// - `spec`：含 header 名和 URL-safe Base64 值
+/// - `command`：是固定内部命令
+/// - `mode`：只能为 add 或 set。
 ///
 /// 返回：UTF-8 与 HeaderValue 均合法时返回字面量操作，否则拒绝候选快照。
 fn parse_gateway_literal_request_header(
@@ -5546,8 +6330,10 @@ fn parse_gateway_literal_request_header(
 
 /// 业务作用：解码 Gateway API 生成的响应头字面量，并保留协议定义的 add/set 差异。
 ///
-/// 参数说明：`spec` 含 header 名和 URL-safe Base64 值；`command` 是固定内部命令；
-/// `mode` 只能为 add 或 set。
+/// 参数说明：
+/// - `spec`：含 header 名和 URL-safe Base64 值
+/// - `command`：是固定内部命令
+/// - `mode`：只能为 add 或 set。
 ///
 /// 返回：UTF-8 与 HeaderValue 均合法时返回字面量操作，否则拒绝候选快照。
 fn parse_gateway_literal_response_header(
@@ -5569,7 +6355,9 @@ fn parse_gateway_literal_response_header(
 
 /// 业务作用：解析内部 Base64 header 载荷并一次完成名称、UTF-8 与 HTTP 值校验。
 ///
-/// 参数说明：`spec` 是完整命令；`command` 用于安全截取参数和错误上下文。
+/// 参数说明：
+/// - `spec`：是完整命令
+/// - `command`：用于安全截取参数和错误上下文。
 ///
 /// 返回：成功时返回可直接复用的 header 名和纯字面量模板。
 fn parse_gateway_literal_header(spec: &str, command: &str) -> Result<RequestHeaderSet> {
@@ -5600,8 +6388,11 @@ fn parse_gateway_literal_header(spec: &str, command: &str) -> Result<RequestHead
 
 /// 业务作用：解析 Gateway API 请求头 add/set/remove，并在构建期固定 header 名与值模板。
 ///
-/// 参数说明：`spec` 是完整 filter；`command` 是已命中的命令；`mode` 决定变更语义；
-/// `variables` 用于编译允许的 Naway value 模板。
+/// 参数说明：
+/// - `spec`：是完整 filter
+/// - `command`：是已命中的命令
+/// - `mode`：决定变更语义
+/// - `variables`：用于编译允许的 Naway value 模板。
 ///
 /// 返回：语法和 HeaderValue 合法时返回统一请求头操作，否则拒绝候选快照。
 fn parse_gateway_request_header(
@@ -5634,8 +6425,11 @@ fn parse_gateway_request_header(
 
 /// 业务作用：解析 Gateway API 响应头 add/set/remove，并复用统一响应过滤执行点。
 ///
-/// 参数说明：`spec` 是完整 filter；`command` 是已命中的命令；`mode` 决定变更语义；
-/// `variables` 用于编译允许的 Naway value 模板。
+/// 参数说明：
+/// - `spec`：是完整 filter
+/// - `command`：是已命中的命令
+/// - `mode`：决定变更语义
+/// - `variables`：用于编译允许的 Naway value 模板。
 ///
 /// 返回：语法和 HeaderValue 合法时返回响应头操作，否则拒绝候选快照。
 fn parse_gateway_response_header(
@@ -5666,6 +6460,7 @@ fn parse_gateway_response_header(
     })
 }
 
+/// 业务作用：编译请求头设置规则，名称和值在快照构建期完成合法性检查。
 fn parse_request_header_set(
     spec: &str,
     cmd: &str,
@@ -5684,9 +6479,13 @@ fn parse_request_header_set(
         http::HeaderValue::from_str(literal)
             .with_context(|| format!("{cmd} invalid header value `{literal}`"))?;
     }
-    Ok(RequestHeaderSet { name, value })
+    Ok(RequestHeaderSet {
+        name,
+        value,
+    })
 }
 
+/// 业务作用：编译响应头设置规则，保持协议头和静态值的约束。
 fn parse_response_header_set(
     spec: &str,
     cmd: &str,
@@ -5705,10 +6504,13 @@ fn parse_response_header_set(
         http::HeaderValue::from_str(literal)
             .with_context(|| format!("{cmd} invalid header value `{literal}`"))?;
     }
-    Ok(ResponseHeaderSet { name, value })
+    Ok(ResponseHeaderSet {
+        name,
+        value,
+    })
 }
 
-/// 解析 nginx `mirror` 基础规则。
+/// 业务作用：解析 nginx `mirror` 基础规则。
 ///
 /// 参数说明：
 /// - `spec`: route filter 原始字符串,如 `mirror lb://shadow` 或 `mirror uri=lb://shadow body=off`。
@@ -5766,9 +6568,9 @@ fn parse_mirror(spec: &str) -> Result<MirrorPolicy> {
     })
 }
 
-/// 解析 nginx `proxy_redirect` 规则。
+/// 业务作用：解析 nginx `proxy_redirect` 规则。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串,如 `proxy_redirect http://upstream /gw` 或 `proxy_redirect off`。
 fn parse_proxy_redirect(spec: &str) -> Result<Option<ProxyRedirectRule>> {
     let rest = spec.trim_start_matches("proxy_redirect ").trim();
@@ -5791,9 +6593,9 @@ fn parse_proxy_redirect(spec: &str) -> Result<Option<ProxyRedirectRule>> {
     }))
 }
 
-/// 解析 nginx `proxy_cookie_domain` / `proxy_cookie_path` 规则。
+/// 业务作用：解析 nginx `proxy_cookie_domain` / `proxy_cookie_path` 规则。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串。
 /// - `cmd`: 指令名,用于截取参数和错误上下文。
 /// - `domain`: true 表示解析 Domain 改写,false 表示解析 Path 改写。
@@ -5819,9 +6621,9 @@ fn parse_proxy_cookie_rewrite(spec: &str, cmd: &str, domain: bool) -> Result<Coo
     }
 }
 
-/// 校验 cookie 属性改写值。
+/// 业务作用：校验 cookie 属性改写值。
 ///
-/// # 参数
+/// 参数说明：
 /// - `cmd`: 指令名。
 /// - `field`: `from` 或 `to`,用于错误上下文。
 /// - `value`: 待校验属性值。
@@ -5834,9 +6636,9 @@ fn validate_cookie_attr_value(cmd: &str, field: &str, value: &str) -> Result<()>
     Ok(())
 }
 
-/// 解析 nginx `proxy_cookie_flags` 规则。
+/// 业务作用：解析 nginx `proxy_cookie_flags` 规则。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串。
 fn parse_proxy_cookie_flags(spec: &str) -> Result<CookieRewriteRule> {
     let rest = spec.trim_start_matches("proxy_cookie_flags ").trim();
@@ -5894,9 +6696,9 @@ fn parse_proxy_cookie_flags(spec: &str) -> Result<CookieRewriteRule> {
     Ok(CookieRewriteRule::Flags(rule))
 }
 
-/// 校验 `proxy_cookie_flags` 的 cookie 匹配名。
+/// 业务作用：校验 `proxy_cookie_flags` 的 cookie 匹配名。
 ///
-/// # 参数
+/// 参数说明：
 /// - `cookie`: cookie 名或 `*`。
 fn validate_cookie_flag_cookie(cookie: &str) -> Result<()> {
     if cookie.is_empty()
@@ -5908,6 +6710,7 @@ fn validate_cookie_flag_cookie(cookie: &str) -> Result<()> {
     Ok(())
 }
 
+/// 业务作用：验证固定终端响应的状态与内容，非法重定向值不能进入数据面。
 fn parse_return(spec: &str) -> Result<DirectResponse> {
     let rest = spec.trim_start_matches("return ").trim();
     let (status, value) = rest
@@ -5919,8 +6722,8 @@ fn parse_return(spec: &str) -> Result<DirectResponse> {
         .with_context(|| format!("invalid return status `{status}`"))?;
     let status = StatusCode::from_u16(status_u16)
         .with_context(|| format!("invalid return status `{status_u16}`"))?;
-    // ★重定向的 value 会在运行时作为 Location 响应头,必须在【构建期】校验为合法 header 值,
-    //   否则 direct_response 的 `.expect()` 会在该请求上 panic(据 review F2:非 ASCII/控制字符 Location)。
+    // 重定向的 value 会在运行时作为 Location 响应头，必须在构建期校验为合法 header 值，
+    //   否则 direct_response 的 `.expect` 会在该请求上 panic（如非 ASCII 或含控制字符的 Location）。
     if status.is_redirection() {
         if let Some(v) = &value {
             http::HeaderValue::from_str(v).with_context(|| {
@@ -5928,9 +6731,13 @@ fn parse_return(spec: &str) -> Result<DirectResponse> {
             })?;
         }
     }
-    Ok(DirectResponse { status, value })
+    Ok(DirectResponse {
+        status,
+        value,
+    })
 }
 
+/// 业务作用：编译响应头去重字段及保留策略，不隐式修改其它多值头。
 fn parse_dedupe_response_header(spec: &str) -> Result<DedupeResponseHeader> {
     let rest = filter_args(spec, "DedupeResponseHeader");
     if rest.is_empty() {
@@ -5953,6 +6760,7 @@ fn parse_dedupe_response_header(spec: &str) -> Result<DedupeResponseHeader> {
     })
 }
 
+/// 业务作用：解析明确的头部去重模式，未知策略在构建期拒绝。
 fn parse_dedupe_mode(raw: &str) -> Result<DedupeMode> {
     match raw.trim().to_ascii_uppercase().as_str() {
         "" | "FIRST" | "RETAIN_FIRST" => Ok(DedupeMode::RetainFirst),
@@ -5964,9 +6772,9 @@ fn parse_dedupe_mode(raw: &str) -> Result<DedupeMode> {
     }
 }
 
-/// 解析 nginx `sub_filter` 基础规则。
+/// 业务作用：解析 nginx `sub_filter` 基础规则。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串,如 `sub_filter upstream gateway`。
 fn parse_sub_filter(spec: &str) -> Result<SubFilterRule> {
     let rest = filter_args(spec, "sub_filter");
@@ -5990,14 +6798,14 @@ fn parse_sub_filter(spec: &str) -> Result<SubFilterRule> {
     })
 }
 
-/// 解析 V5 route 级响应压缩配置。
+/// 业务作用：解析 route 级响应压缩配置。
 ///
 /// 支持统一形式
 /// `compression algorithms=br,gzip min_length=1k types=text/*,application/json
 /// gzip_level=6 brotli_quality=5 chunk_bytes=16k`，并接受 nginx 心智兼容别名
 /// `gzip on ...` / `brotli on ...`。同一 route 只能声明一次，避免多个指令的覆盖顺序含糊。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串。
 /// - `command`: 已命中的指令名(`compression`、`gzip` 或 `brotli`)。
 /// - `forced_coding`: 别名强制的单一算法；统一形式传 `None`。
@@ -6081,9 +6889,9 @@ fn parse_compression(
     }))
 }
 
-/// 解析服务端允许的内容编码列表并保留配置顺序。
+/// 业务作用：解析服务端允许的内容编码列表并保留配置顺序。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 逗号分隔的 `br` / `brotli` / `gzip` 列表。
 fn parse_compression_algorithms(raw: &str) -> Result<Vec<ContentCoding>> {
     let mut algorithms = Vec::with_capacity(2);
@@ -6107,7 +6915,7 @@ fn parse_compression_algorithms(raw: &str) -> Result<Vec<ContentCoding>> {
     Ok(algorithms)
 }
 
-/// 生成缺省可压缩 MIME 集合。
+/// 业务作用：生成缺省可压缩 MIME 集合。
 ///
 /// 默认排除图片、视频、归档和 `text/event-stream`；这些格式通常已压缩或对首帧延迟敏感。
 /// 运维可用 `types=*` 明确覆盖。
@@ -6128,9 +6936,9 @@ fn default_compression_content_types() -> Vec<CompressionContentType> {
     .collect()
 }
 
-/// 解析逗号分隔的 MIME 匹配列表。
+/// 业务作用：解析逗号分隔的 MIME 匹配列表。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: `types=` 的原始值；支持 `*`、`type/*` 和完整 `type/subtype`。
 fn parse_compression_content_types(raw: &str) -> Result<Vec<CompressionContentType>> {
     let values = raw
@@ -6150,9 +6958,9 @@ fn parse_compression_content_types(raw: &str) -> Result<Vec<CompressionContentTy
         .collect()
 }
 
-/// 编译单个 MIME 匹配项。
+/// 业务作用：编译单个 MIME 匹配项。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 已去空白的 `*`、`type/*` 或 `type/subtype`。
 fn parse_compression_content_type(raw: &str) -> Result<CompressionContentType> {
     if raw == "*" {
@@ -6177,9 +6985,9 @@ fn parse_compression_content_type(raw: &str) -> Result<CompressionContentType> {
     Ok(CompressionContentType::Exact(raw.into()))
 }
 
-/// 解析 V5 公共 HTTP L1/L2 响应缓存策略。
+/// 业务作用：解析 公共 HTTP L1/L2 响应缓存策略。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: `proxy_cache public=true ttl_ms=60000 max_body_bytes=1m max_entries=10000
 ///   statuses=200,301,404 vary=Accept-Language l2=true`；`proxy_cache off` 关闭。
 fn parse_proxy_cache(spec: &str) -> Result<Option<Arc<HttpCachePolicy>>> {
@@ -6349,7 +7157,7 @@ fn parse_proxy_cache(spec: &str) -> Result<Option<Arc<HttpCachePolicy>>> {
     ))))
 }
 
-/// 解析写路由的 cache generation 失效目标。
+/// 业务作用：解析写路由的 cache generation 失效目标。
 ///
 /// 形式：`proxy_cache_purge routes=product-list,product-detail`，别名
 /// `proxy_cache_invalidate route=product-list`。目标必须位于同一个 proxy 且声明了
@@ -6388,6 +7196,7 @@ fn parse_proxy_cache_purge(spec: &str) -> Result<Vec<String>> {
     Ok(targets)
 }
 
+/// 业务作用：冻结降级响应允许附加的上下文头，避免运行期解释动态权限。
 fn parse_fallback_headers(spec: &str) -> Result<()> {
     let rest = filter_args(spec, "FallbackHeaders");
     match rest {
@@ -6396,6 +7205,7 @@ fn parse_fallback_headers(spec: &str) -> Result<()> {
     }
 }
 
+/// 业务作用：把允许或拒绝声明编译为地址匹配规则，保持顺序裁决语义。
 fn parse_access_rule(spec: &str, cmd: &str, action: AccessAction) -> Result<AccessRule> {
     let raw = spec.trim_start_matches(cmd).trim();
     if raw == "all" {
@@ -6410,9 +7220,9 @@ fn parse_access_rule(spec: &str, cmd: &str, action: AccessAction) -> Result<Acce
     })
 }
 
-/// 解析 nginx `valid_referers` 基础规则。
+/// 业务作用：解析 nginx `valid_referers` 基础规则。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串。
 fn parse_valid_referers(spec: &str) -> Result<RefererPolicy> {
     let rest = filter_args(spec, "valid_referers").trim();
@@ -6442,9 +7252,9 @@ fn parse_valid_referers(spec: &str) -> Result<RefererPolicy> {
     })
 }
 
-/// 解析 Referer host 模式。
+/// 业务作用：解析 Referer host 模式。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: host 模式,如 `example.com` 或 `*.example.com`。
 fn parse_referer_host(raw: &str) -> Result<RefererHost> {
     let host = raw.trim_end_matches('.').to_ascii_lowercase();
@@ -6463,9 +7273,9 @@ fn parse_referer_host(raw: &str) -> Result<RefererHost> {
     }
 }
 
-/// 从 Referer URL 中提取小写 host。
+/// 业务作用：从 Referer URL 中提取小写 host。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: Referer header 原始值。
 fn referer_host(raw: &str) -> Option<String> {
     let uri = raw.parse::<http::Uri>().ok()?;
@@ -6473,18 +7283,18 @@ fn referer_host(raw: &str) -> Option<String> {
     normalize_host(host)
 }
 
-/// 判断 Referer 是否属于 nginx `blocked` 语义。
+/// 业务作用：判断 Referer 是否属于 nginx `blocked` 语义。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: Referer header 原始值。
 fn is_blocked_referer(raw: &str) -> bool {
     let lower = raw.trim().to_ascii_lowercase();
     !lower.starts_with("http://") && !lower.starts_with("https://")
 }
 
-/// 提取当前请求 Host,用于 `valid_referers server_names`。
+/// 业务作用：提取当前请求 Host,用于 `valid_referers server_names`。
 ///
-/// # 参数
+/// 参数说明：
 /// - `parts`: 下游请求 head。
 fn request_host(parts: &Parts) -> Option<String> {
     parts
@@ -6494,9 +7304,9 @@ fn request_host(parts: &Parts) -> Option<String> {
         .and_then(normalize_host)
 }
 
-/// 规范化 host:去端口、去尾点、小写。
+/// 业务作用：规范化 host:去端口、去尾点、小写。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: Host 或 URI host 原始文本。
 fn normalize_host(raw: &str) -> Option<String> {
     let raw = raw.trim().trim_end_matches('.');
@@ -6516,9 +7326,9 @@ fn normalize_host(raw: &str) -> Option<String> {
     }
 }
 
-/// 解析 nginx `limit_except` 基础规则。
+/// 业务作用：解析 nginx `limit_except` 基础规则。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串。
 fn parse_limit_except(spec: &str) -> Result<Vec<Method>> {
     let rest = filter_args(spec, "limit_except").trim();
@@ -6545,8 +7355,9 @@ fn parse_limit_except(spec: &str) -> Result<Vec<Method>> {
 
 /// 业务作用：解析 `auth_basic` 基础认证规则，冻结用户名、凭据与对外 challenge realm。
 ///
-/// 参数说明：`spec` 是 route filter 原始字符串，例如
-/// `auth_basic user=admin password=secret realm=ops`；`config_dir` 用于解析 SecretSource 相对路径。
+/// 参数说明：
+/// - `spec`：是 route filter 原始字符串，例如 `auth_basic user=admin password=secret realm=ops`
+/// - `config_dir`：用于解析 SecretSource 相对路径。
 ///
 /// 返回：规则关闭时返回 None；配置合法时返回认证策略；缺少凭据、未知选项或非法 realm 时拒绝候选。
 fn parse_auth_basic(spec: &str, config_dir: &Path) -> Result<Option<BasicAuthPolicy>> {
@@ -6585,7 +7396,8 @@ fn parse_auth_basic(spec: &str, config_dir: &Path) -> Result<Option<BasicAuthPol
     }
     let user = user.context("auth_basic requires user")?;
     let password = password.context("auth_basic requires password")?;
-    let password = crate::secret::resolve_text(&password, config_dir, "auth_basic password")?;
+    let password =
+        crate::security::secret::resolve_text(&password, config_dir, "auth_basic password")?;
     validate_basic_auth_user(&user)?;
     validate_basic_auth_secret("password", &password)?;
     validate_basic_auth_secret("realm", &realm)?;
@@ -6601,7 +7413,9 @@ fn parse_auth_basic(spec: &str, config_dir: &Path) -> Result<Option<BasicAuthPol
 
 /// 业务作用：把 route 的 `api_key` 声明编译为固定来源和校验材料，拒绝混合明文/摘要或不完整规则。
 ///
-/// 参数说明：`spec` 是 route filter 原始字符串；`config_dir` 限定 SecretSource 相对路径。
+/// 参数说明：
+/// - `spec`：是 route filter 原始字符串
+/// - `config_dir`：限定 SecretSource 相对路径。
 ///
 /// 返回：合法声明返回可共享策略；来源、consumer、SecretSource 或 SHA-256 非法时拒绝整个候选。
 fn parse_api_key(spec: &str, config_dir: &Path) -> Result<ApiKeyPolicy> {
@@ -6641,7 +7455,7 @@ fn parse_api_key(spec: &str, config_dir: &Path) -> Result<ApiKeyPolicy> {
         "api_key requires exactly one of value or sha256"
     );
     let expected = if let Some(value) = value {
-        let value = crate::secret::resolve_text(&value, config_dir, "api_key value")?;
+        let value = crate::security::secret::resolve_text(&value, config_dir, "api_key value")?;
         validate_basic_auth_secret("api_key value", &value)?;
         ApiKeyExpected::Plain(value.into_bytes())
     } else {
@@ -6652,7 +7466,17 @@ fn parse_api_key(spec: &str, config_dir: &Path) -> Result<ApiKeyPolicy> {
     if let Some(consumer) = &consumer {
         validate_basic_auth_user(consumer)?;
     }
+    let digest: [u8; 32] = match &expected {
+        ApiKeyExpected::Plain(value) => Sha256::digest(value).into(),
+        ApiKeyExpected::Sha256(digest) => *digest,
+    };
+    let mut fingerprint = String::with_capacity(32);
+    use std::fmt::Write as _;
+    for byte in &digest[..16] {
+        write!(&mut fingerprint, "{byte:02x}").expect("SHA-256 hex formatting");
+    }
     Ok(ApiKeyPolicy {
+        fingerprint: Arc::from(fingerprint),
         source,
         expected,
         consumer: consumer.map(Arc::from),
@@ -6661,7 +7485,8 @@ fn parse_api_key(spec: &str, config_dir: &Path) -> Result<ApiKeyPolicy> {
 
 /// 业务作用：解析管理面生成 API-Key 的固定长度 SHA-256，避免宽松 hex 语义产生不同配置解释。
 ///
-/// 参数说明：`value` 必须是 64 个 ASCII 十六进制字符。
+/// 参数说明：
+/// - `value`：必须是 64 个 ASCII 十六进制字符。
 ///
 /// 返回：严格解码为 32 字节；长度或任一字符非法时拒绝候选。
 fn parse_api_key_sha256(value: &str) -> Result<[u8; 32]> {
@@ -6678,11 +7503,12 @@ fn parse_api_key_sha256(value: &str) -> Result<[u8; 32]> {
     Ok(digest)
 }
 
-/// 解析 V4 HMAC-SHA256 签名规则。
+/// 业务作用：解析 HMAC-SHA256 签名规则。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串,如 `hmac_auth secret=s signature_header=X-Signature`。
 /// - `cmd`: 实际命中的指令名。
+/// - `config_dir`：共享密钥 SecretSource 相对路径解析根。
 fn parse_hmac_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<HmacAuthPolicy> {
     let rest = filter_args(spec, cmd).trim();
     if rest.is_empty() {
@@ -6735,7 +7561,7 @@ fn parse_hmac_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<HmacAuthP
                     raw_value.to_ascii_lowercase().as_str(),
                     "sha256" | "hmac-sha256"
                 ) {
-                    bail!("{cmd} only supports HMAC-SHA256 in V4 basic mode");
+                    bail!("{cmd} only supports HMAC-SHA256");
                 }
             }
             "body" | "include_body" => {
@@ -6756,7 +7582,7 @@ fn parse_hmac_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<HmacAuthP
         }
     }
     let secret = secret.with_context(|| format!("{cmd} requires secret"))?;
-    let secret = crate::secret::resolve_text(&secret, config_dir, "hmac secret")?;
+    let secret = crate::security::secret::resolve_text(&secret, config_dir, "hmac secret")?;
     validate_basic_auth_secret("hmac secret", &secret)?;
     // 防重放依赖 nonce 去重:开启但没配 nonce_header 无从去重,构建期拒绝,防上线后静默失效。
     if replay_protection && nonce_header.is_none() {
@@ -6777,9 +7603,9 @@ fn parse_hmac_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<HmacAuthP
     })
 }
 
-/// 解析 HMAC 使用的请求头名。
+/// 业务作用：解析 HMAC 使用的请求头名。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 配置中的 header 名。
 /// - `field`: 字段名,用于错误上下文。
 fn parse_hmac_header_name(raw: &str, field: &str) -> Result<HeaderName> {
@@ -6787,9 +7613,9 @@ fn parse_hmac_header_name(raw: &str, field: &str) -> Result<HeaderName> {
         .with_context(|| format!("hmac_auth invalid {field} `{raw}`"))
 }
 
-/// 解析参与 HMAC 签名的额外请求头列表。
+/// 业务作用：解析参与 HMAC 签名的额外请求头列表。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 逗号分隔的 header 名列表。
 fn parse_hmac_signed_headers(raw: &str) -> Result<Vec<HeaderName>> {
     let mut headers = Vec::new();
@@ -6805,11 +7631,13 @@ fn parse_hmac_signed_headers(raw: &str) -> Result<Vec<HeaderName>> {
 
 /// 业务作用：把浏览器 OAuth2/OIDC Authorization Code 配置编译为固定 endpoint、PKCE 和有界会话策略。
 ///
-/// 参数说明：`spec` 是 route filter 原文，`config_dir` 是 client secret 与 CA 的 SecretSource 相对目录。
+/// 参数说明：
+/// - `spec`：是 route filter 原文
+/// - `config_dir`：是 client secret 与 CA 的 SecretSource 相对目录。
 ///
 /// 返回：所有信任锚点、重定向和资源上限合法时返回 RP 策略；弱 URL、跨 IdP authority、开放重定向
 /// 或无界容量在快照构建阶段返回错误。
-fn parse_oidc_rp(spec: &str, config_dir: &Path) -> Result<OidcRpPolicy> {
+pub(crate) fn parse_oidc_rp(spec: &str, config_dir: &Path) -> Result<OidcRpPolicy> {
     let cmd = "oidc_rp";
     let rest = filter_args(spec, cmd).trim();
     if rest.is_empty() {
@@ -6974,8 +7802,11 @@ fn parse_oidc_rp(spec: &str, config_dir: &Path) -> Result<OidcRpPolicy> {
     if !(1..=10_000).contains(&max_pending) || !(1..=1_000_000).contains(&max_sessions) {
         bail!("oidc_rp max_pending or max_sessions is outside its bounded range");
     }
-    let client_secret =
-        crate::secret::resolve_text(&client_secret_source, config_dir, "OIDC client secret")?;
+    let client_secret = crate::security::secret::resolve_text(
+        &client_secret_source,
+        config_dir,
+        "OIDC client secret",
+    )?;
     validate_basic_auth_secret("OIDC client secret", &client_secret)?;
     let mut verifier_spec = format!(
         "jwt_auth alg={} oidc_discovery={} issuer={} audience={} timeout_ms={}",
@@ -6998,9 +7829,9 @@ fn parse_oidc_rp(spec: &str, config_dir: &Path) -> Result<OidcRpPolicy> {
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true);
     if let Some(source) = ca_certificate {
-        let pem = crate::secret::resolve_text(&source, config_dir, "OIDC IdP CA")?;
+        let pem = crate::security::secret::resolve_text(&source, config_dir, "OIDC IdP CA")?;
         let certificate =
-            reqwest::Certificate::from_pem(pem.as_bytes()).context("parse OIDC IdP CA PEM")?;
+            crate::tls::trust::http_ca(pem.as_bytes()).context("parse OIDC IdP CA PEM")?;
         client_builder = client_builder.add_root_certificate(certificate);
     }
     Ok(OidcRpPolicy {
@@ -7033,7 +7864,10 @@ fn parse_oidc_rp(spec: &str, config_dir: &Path) -> Result<OidcRpPolicy> {
 
 /// 业务作用：把所有 IdP 网络端点固定到配置 issuer 的 HTTPS authority，阻止重定向或 endpoint SSRF。
 ///
-/// 参数说明：`endpoint` 是待验证地址，`issuer` 是信任锚点，`field` 用于错误定位。
+/// 参数说明：
+/// - `endpoint`：是待验证地址
+/// - `issuer`：是信任锚点
+/// - `field`：用于错误定位。
 ///
 /// 返回：HTTPS 且 authority 与 issuer 相同返回成功；其它地址返回错误。
 fn validate_oidc_idp_endpoint(endpoint: &str, issuer: &str, field: &str) -> Result<()> {
@@ -7049,7 +7883,8 @@ fn validate_oidc_idp_endpoint(endpoint: &str, issuer: &str, field: &str) -> Resu
 
 /// 业务作用：限制 OIDC 回调、退出和登录后返回值为本地 origin-form URI，杜绝开放重定向。
 ///
-/// 参数说明：`value` 是配置或已保存的本地 URI。
+/// 参数说明：
+/// - `value`：是配置或已保存的本地 URI。
 ///
 /// 返回：以单斜杠开头、无控制字符且长度不超过 8192 字节时返回 true。
 fn valid_oidc_local_path(value: &str) -> bool {
@@ -7062,7 +7897,10 @@ fn valid_oidc_local_path(value: &str) -> bool {
 
 /// 业务作用：把 JWT/JWKS/OIDC route DSL 编译为算法与 endpoint 均固定的认证策略。
 ///
-/// 参数说明：`spec` 是 route filter 原文，`cmd` 是实际指令名，`config_dir` 是 SecretSource 相对目录。
+/// 参数说明：
+/// - `spec`：是 route filter 原文
+/// - `cmd`：是实际指令名
+/// - `config_dir`：是 SecretSource 相对目录。
 ///
 /// 返回：返回可直接用于数据面的验证器；算法/key 来源冲突、弱 URL、无界参数或非法身份映射会拒绝快照。
 fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPolicy> {
@@ -7228,7 +8066,7 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
                 bail!("{cmd} HS256 accepts only secret/key and cannot use PEM/JWKS/OIDC options");
             }
             let secret = secret.with_context(|| format!("{cmd} HS256 requires secret"))?;
-            let secret = crate::secret::resolve_text(&secret, config_dir, "jwt secret")?;
+            let secret = crate::security::secret::resolve_text(&secret, config_dir, "jwt secret")?;
             validate_basic_auth_secret("jwt secret", &secret)?;
             JwtVerifier::Hs256(Arc::from(secret))
         }
@@ -7243,7 +8081,11 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
                 if ca_certificate.is_some() {
                     bail!("{cmd} ca_certificate is only valid with JWKS/OIDC");
                 }
-                let pem = crate::secret::resolve_text(&public_key, config_dir, "jwt public key")?;
+                let pem = crate::security::secret::resolve_text(
+                    &public_key,
+                    config_dir,
+                    "jwt public key",
+                )?;
                 let key = if algorithm == Algorithm::RS256 {
                     DecodingKey::from_rsa_pem(pem.as_bytes())
                 } else {
@@ -7276,12 +8118,12 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
                     .redirect(reqwest::redirect::Policy::none())
                     .https_only(true);
                 if let Some(source) = ca_certificate {
-                    let pem = crate::secret::resolve_text(
+                    let pem = crate::security::secret::resolve_text(
                         &source,
                         config_dir,
                         "JWT identity metadata CA",
                     )?;
-                    let certificate = reqwest::Certificate::from_pem(pem.as_bytes())
+                    let certificate = crate::tls::trust::http_ca(pem.as_bytes())
                         .context("parse JWT identity metadata CA PEM")?;
                     client = client.add_root_certificate(certificate);
                 }
@@ -7312,7 +8154,7 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
         _ => unreachable!("parse_jwt_algorithm only permits three algorithms"),
     };
     let nonce = nonce
-        .map(|value| crate::secret::resolve_text(&value, config_dir, "OIDC nonce"))
+        .map(|value| crate::security::secret::resolve_text(&value, config_dir, "OIDC nonce"))
         .transpose()?;
     if nonce.as_ref().is_some_and(|value| {
         value.is_empty()
@@ -7324,7 +8166,8 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
     #[cfg(feature = "enterprise-jwe")]
     let jwe = jwe_private_key
         .map(|source| -> Result<Arc<JweLayer>> {
-            let pem = crate::secret::resolve_text(&source, config_dir, "JWE private key")?;
+            let pem =
+                crate::security::secret::resolve_text(&source, config_dir, "JWE private key")?;
             let decrypter = josekit::jwe::RSA_OAEP_256
                 .decrypter_from_pem(pem.as_bytes())
                 .context("compile JWE RSA-OAEP-256 private key")?;
@@ -7362,7 +8205,9 @@ fn parse_jwt_auth(spec: &str, cmd: &str, config_dir: &Path) -> Result<JwtAuthPol
 
 /// 业务作用：把配置中的 JWS 算法限制到经过实现和 key-type 约束的集合。
 ///
-/// 参数说明：`raw` 是算法文本，`cmd` 用于错误定位。
+/// 参数说明：
+/// - `raw`：是算法文本
+/// - `cmd`：用于错误定位。
 ///
 /// 返回：返回 HS256、RS256 或 ES256；其它算法在构建期拒绝。
 fn parse_jwt_algorithm(raw: &str, cmd: &str) -> Result<Algorithm> {
@@ -7376,7 +8221,11 @@ fn parse_jwt_algorithm(raw: &str, cmd: &str) -> Result<Algorithm> {
 
 /// 业务作用：解析 JWKS 生命周期秒数并施加非零硬上限，防止配置形成永久 key 或刷新风暴。
 ///
-/// 参数说明：`raw` 是秒数字符串，`cmd` 与 `field` 用于错误定位，`maximum` 是字段硬上限。
+/// 参数说明：
+/// - `raw`：是秒数字符串
+/// - `cmd`：用于错误定位
+/// - `field`：用于错误定位
+/// - `maximum`：是字段硬上限。
 ///
 /// 返回：范围内秒数；零、超限或非数字返回错误。
 fn parse_jwt_ttl(raw: &str, cmd: &str, field: &str, maximum: u64) -> Result<u64> {
@@ -7391,7 +8240,9 @@ fn parse_jwt_ttl(raw: &str, cmd: &str, field: &str, maximum: u64) -> Result<u64>
 
 /// 业务作用：编译受信 JWT claim 到上游身份 header 的显式 allowlist，并拒绝凭据/传输控制头。
 ///
-/// 参数说明：`raw` 是逗号分隔的 `claim:Header-Name`，`cmd` 用于错误定位。
+/// 参数说明：
+/// - `raw`：是逗号分隔的 `claim:Header-Name`
+/// - `cmd`：用于错误定位。
 ///
 /// 返回：返回去重后的映射；非法 claim、重复 header 或安全敏感 header 返回错误。
 fn parse_jwt_identity_headers(raw: &str, cmd: &str) -> Result<Vec<JwtIdentityHeader>> {
@@ -7431,7 +8282,8 @@ fn parse_jwt_identity_headers(raw: &str, cmd: &str) -> Result<Vec<JwtIdentityHea
 
 /// 业务作用：识别不能由身份 claim 覆盖的凭据、路由与 HTTP framing header。
 ///
-/// 参数说明：`name` 是已经完成语法校验的 header 名。
+/// 参数说明：
+/// - `name`：是已经完成语法校验的 header 名。
 ///
 /// 返回：安全敏感 header 返回 true，普通业务身份 header 返回 false。
 pub(crate) fn is_forbidden_identity_header(name: &HeaderName) -> bool {
@@ -7452,9 +8304,9 @@ pub(crate) fn is_forbidden_identity_header(name: &HeaderName) -> bool {
     )
 }
 
-/// 解析 V4 ext_authz / nginx auth_request 基础规则。
+/// 业务作用：解析 ext_authz / nginx auth_request 基础规则。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串,如 `ext_authz uri=lb://auth path=/check`。
 /// - `cmd`: 实际命中的指令名。
 fn parse_ext_authz(spec: &str, cmd: &str) -> Result<ExtAuthzPolicy> {
@@ -7571,9 +8423,9 @@ fn parse_ext_authz(spec: &str, cmd: &str) -> Result<ExtAuthzPolicy> {
     })
 }
 
-/// 校验 ext_authz 目标 URI。
+/// 业务作用：校验 ext_authz 目标 URI。
 ///
-/// # 参数
+/// 参数说明：
 /// - `target`: 配置中的 `uri` / `target`。
 /// - `path`: 可选外置 path。
 /// - `cmd`: 指令名,用于错误上下文。
@@ -7604,9 +8456,9 @@ fn validate_ext_authz_target(target: &str, path: Option<&str>, cmd: &str) -> Res
     Ok(())
 }
 
-/// 解析 ext_authz 子请求方法。
+/// 业务作用：解析 ext_authz 子请求方法。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 配置中的 method。
 fn parse_ext_authz_method(raw: &str) -> Result<Method> {
     let method = raw
@@ -7618,9 +8470,9 @@ fn parse_ext_authz_method(raw: &str) -> Result<Method> {
     Ok(method)
 }
 
-/// 解析 ext_authz path,允许携带 query。
+/// 业务作用：解析 ext_authz path,允许携带 query。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: path 或 path?query。
 fn parse_ext_authz_path(raw: &str) -> Result<String> {
     if raw.is_empty() || !raw.starts_with('/') || raw.bytes().any(|b| b <= 0x20) {
@@ -7631,9 +8483,9 @@ fn parse_ext_authz_path(raw: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
-/// 解析 ext_authz header allowlist。
+/// 业务作用：解析 ext_authz header allowlist。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 逗号分隔 header 名列表。
 /// - `field`: 字段名,用于错误上下文。
 fn parse_ext_authz_header_list(raw: &str, field: &str) -> Result<Vec<HeaderName>> {
@@ -7656,9 +8508,9 @@ fn parse_ext_authz_header_list(raw: &str, field: &str) -> Result<Vec<HeaderName>
     Ok(headers)
 }
 
-/// 判断 header 是否允许进入 ext_authz allowlist。
+/// 业务作用：判断 header 是否允许进入 ext_authz allowlist。
 ///
-/// # 参数
+/// 参数说明：
 /// - `name`: 已解析 header 名。
 fn ext_authz_header_is_safe(name: &HeaderName) -> bool {
     let name = name.as_str();
@@ -7683,9 +8535,9 @@ fn ext_authz_header_is_safe(name: &HeaderName) -> bool {
         )
 }
 
-/// 取请求头的 UTF-8 文本值。
+/// 业务作用：取请求头的 UTF-8 文本值。
 ///
-/// # 参数
+/// 参数说明：
 /// - `parts`: 下游请求 head。
 /// - `name`: 请求头名。
 fn header_str<'a>(parts: &'a Parts, name: &HeaderName) -> Option<&'a str> {
@@ -7695,9 +8547,9 @@ fn header_str<'a>(parts: &'a Parts, name: &HeaderName) -> Option<&'a str> {
         .and_then(|value| value.to_str().ok())
 }
 
-/// 从 `Authorization: Bearer` 中提取 token。
+/// 业务作用：从 `Authorization: Bearer` 中提取 token。
 ///
-/// # 参数
+/// 参数说明：
 /// - `parts`: 下游请求 head。
 fn bearer_token(parts: &Parts) -> Option<&str> {
     let value = parts
@@ -7715,18 +8567,18 @@ fn bearer_token(parts: &Parts) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
-/// 解码 JWT base64url JSON 段。
+/// 业务作用：解码 JWT base64url JSON 段。
 ///
-/// # 参数
+/// 参数说明：
 /// - `encoded`: JWT header 或 payload 的 base64url 段。
 fn decode_jwt_json(encoded: &str) -> Option<serde_json::Value> {
     let bytes = nasa::crypto::base64_url_decode(encoded).ok()?;
     serde_json::from_slice(bytes.as_slice()).ok()
 }
 
-/// 把字节串转为小写 hex。
+/// 业务作用：把字节串转为小写 hex。
 ///
-/// # 参数
+/// 参数说明：
 /// - `bytes`: 输入字节串。
 fn hex_lower_bytes(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -7738,7 +8590,7 @@ fn hex_lower_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// 取当前 Unix 秒。
+/// 业务作用：取当前 Unix 秒。
 fn unix_now_secs() -> Option<i64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7746,9 +8598,9 @@ fn unix_now_secs() -> Option<i64> {
         .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
 }
 
-/// 从 JSON number 读取 i64。
+/// 业务作用：从 JSON number 读取 i64。
 ///
-/// # 参数
+/// 参数说明：
 /// - `value`: JSON claim 值。
 fn json_i64(value: &serde_json::Value) -> Option<i64> {
     value
@@ -7756,9 +8608,9 @@ fn json_i64(value: &serde_json::Value) -> Option<i64> {
         .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
 }
 
-/// 判断 JWT audience 是否匹配期望值。
+/// 业务作用：判断 JWT audience 是否匹配期望值。
 ///
-/// # 参数
+/// 参数说明：
 /// - `claim`: payload 中的 `aud` claim。
 /// - `expected`: 配置中的 audience。
 fn jwt_audience_matches(claim: Option<&serde_json::Value>, expected: &str) -> bool {
@@ -7773,7 +8625,8 @@ fn jwt_audience_matches(claim: Option<&serde_json::Value>, expected: &str) -> bo
 
 /// 业务作用：计算 JWT `aud` 的有效字符串成员数，供 OIDC `azp` 歧义门判断。
 ///
-/// 参数说明：`claim` 是 payload 中尚未信任的 `aud` 值。
+/// 参数说明：
+/// - `claim`：是 payload 中尚未信任的 `aud` 值。
 ///
 /// 返回：字符串返回一，纯字符串数组返回成员数；缺失或类型不合法返回零。
 fn jwt_audience_count(claim: Option<&serde_json::Value>) -> usize {
@@ -7788,9 +8641,9 @@ fn jwt_audience_count(claim: Option<&serde_json::Value>) -> usize {
     }
 }
 
-/// 判断 HMAC 时间戳是否处于允许偏差内。
+/// 业务作用：判断 HMAC 时间戳是否处于允许偏差内。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 请求头里的 Unix 秒或毫秒时间戳。
 /// - `max_skew_ms`: 最大允许偏差,单位毫秒。
 fn timestamp_within_skew(raw: &str, max_skew_ms: u64) -> bool {
@@ -7815,9 +8668,9 @@ fn timestamp_within_skew(raw: &str, max_skew_ms: u64) -> bool {
     delta <= i128::from(max_skew_ms)
 }
 
-/// 解析 HMAC 时间戳为 Unix 毫秒。
+/// 业务作用：解析 HMAC 时间戳为 Unix 毫秒。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: Unix 秒或毫秒时间戳文本。
 fn parse_hmac_timestamp_ms(raw: &str) -> Option<i128> {
     let value = raw.trim().parse::<i128>().ok()?;
@@ -7828,9 +8681,9 @@ fn parse_hmac_timestamp_ms(raw: &str) -> Option<i128> {
     }
 }
 
-/// 解析 nginx `satisfy any|all` 的数据面鉴权子集。
+/// 业务作用：解析 nginx `satisfy any|all` 的数据面鉴权子集。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串。
 fn parse_satisfy(spec: &str) -> Result<SatisfyMode> {
     match filter_args(spec, "satisfy").trim() {
@@ -7840,9 +8693,9 @@ fn parse_satisfy(spec: &str) -> Result<SatisfyMode> {
     }
 }
 
-/// 校验 Basic 用户名。
+/// 业务作用：校验 Basic 用户名。
 ///
-/// # 参数
+/// 参数说明：
 /// - `user`: 配置中的用户名。
 fn validate_basic_auth_user(user: &str) -> Result<()> {
     if user.is_empty() || user.bytes().any(|b| b == b':' || b < 0x20) {
@@ -7851,9 +8704,9 @@ fn validate_basic_auth_user(user: &str) -> Result<()> {
     Ok(())
 }
 
-/// 校验 Basic 密码或 realm。
+/// 业务作用：校验 Basic 密码或 realm。
 ///
-/// # 参数
+/// 参数说明：
 /// - `field`: 字段名,用于错误上下文。
 /// - `value`: 待校验文本。
 fn validate_basic_auth_secret(field: &str, value: &str) -> Result<()> {
@@ -7863,9 +8716,9 @@ fn validate_basic_auth_secret(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// 校验 API-Key query 参数名。
+/// 业务作用：校验 API-Key query 参数名。
 ///
-/// # 参数
+/// 参数说明：
 /// - `name`: query 参数名。
 fn validate_query_key_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 128 {
@@ -7879,7 +8732,9 @@ fn validate_query_key_name(name: &str) -> Result<()> {
 
 /// 业务作用：把 nginx `if` 安全子集编译成有界、无脚本能力的短路返回计划。
 ///
-/// 参数说明：`spec` 是 route filter 原始字符串；`variables` 用于构建期编译比较两侧模板。
+/// 参数说明：
+/// - `spec`：是 route filter 原始字符串
+/// - `variables`：用于构建期编译比较两侧模板。
 ///
 /// 返回：语法、操作符、复杂度和响应均合法时返回固定执行计划，否则拒绝候选快照。
 fn parse_if_return(spec: &str, variables: &VariablePlan) -> Result<ConditionalReturn> {
@@ -7917,7 +8772,11 @@ fn parse_if_return(spec: &str, variables: &VariablePlan) -> Result<ConditionalRe
         let right = variables.compile_template(unquote_token(expression_tokens[cursor + 2]))?;
         any.last_mut()
             .expect("condition expression always has one group")
-            .push(ConditionComparison { left, op, right });
+            .push(ConditionComparison {
+                left,
+                op,
+                right,
+            });
         comparisons += 1;
         anyhow::ensure!(comparisons <= 16, "if expression exceeds comparison limit");
         cursor += 3;
@@ -7949,14 +8808,19 @@ fn parse_if_return(spec: &str, variables: &VariablePlan) -> Result<ConditionalRe
         }
     }
     Ok(ConditionalReturn {
-        condition: ConditionExpr { any },
-        response: DirectResponse { status, value },
+        condition: ConditionExpr {
+            any,
+        },
+        response: DirectResponse {
+            status,
+            value,
+        },
     })
 }
 
-/// 去掉单个 token 外层的成对引号,方便表达空串或含特殊字符的静态值。
+/// 业务作用：去掉单个 token 外层的成对引号,方便表达空串或含特殊字符的静态值。
 ///
-/// # 参数
+/// 参数说明：
 /// - `value`: 通过空白分词取得的原始 token。
 fn unquote_token(value: &str) -> &str {
     if value.len() >= 2 {
@@ -7970,9 +8834,9 @@ fn unquote_token(value: &str) -> &str {
     value
 }
 
-/// 从原始 query 中读取未解码参数值。
+/// 业务作用：从原始 query 中读取未解码参数值。
 ///
-/// # 参数
+/// 参数说明：
 /// - `query`: URI 中 `?` 后的原始 query。
 /// - `name`: 待读取的参数名。
 fn query_param_raw<'a>(query: &'a str, name: &str) -> Option<&'a str> {
@@ -7986,61 +8850,7 @@ fn query_param_raw<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-fn parse_limit_req(spec: &str) -> Result<LimitReqPolicy> {
-    let rest = filter_args(spec, "limit_req");
-    if rest.is_empty() {
-        bail!("limit_req requires `key=<dimension> rate=<N>r/s`");
-    }
-    let mut key = None;
-    let mut rate = None;
-    let mut burst = 0_u64;
-    let mut max_active_keys = DEFAULT_LIMIT_REQ_MAX_ACTIVE_KEYS;
-    let mut active_keys_fail_open = true;
-    for token in rest.split_whitespace() {
-        if token == "nodelay" {
-            continue;
-        }
-        let (name, value) = token
-            .split_once('=')
-            .with_context(|| format!("limit_req option `{token}` must be key=value"))?;
-        match name {
-            "key" | "dimension" | "by" => key = Some(parse_limit_key(value)?),
-            "rate" | "qps" => rate = Some(parse_limit_req_rate(value)?),
-            "burst" => {
-                burst = value
-                    .parse::<u64>()
-                    .with_context(|| format!("limit_req invalid burst `{value}`"))?;
-            }
-            "max_active_keys" => {
-                max_active_keys = value
-                    .parse::<usize>()
-                    .with_context(|| format!("limit_req invalid max_active_keys `{value}`"))?;
-                if max_active_keys == 0 {
-                    bail!("limit_req max_active_keys must be positive");
-                }
-            }
-            "active_keys_fail" | "key_overflow" => match value {
-                "open" | "allow" => active_keys_fail_open = true,
-                "closed" | "close" | "reject" => active_keys_fail_open = false,
-                _ => bail!("limit_req active_keys_fail expects open|closed, got `{value}`"),
-            },
-            other => bail!("unsupported limit_req option `{other}`"),
-        }
-    }
-    let (limit, window) = rate.context("limit_req requires `rate=<N>r/s`")?;
-    if limit == 0 {
-        bail!("limit_req rate must be positive");
-    }
-    Ok(LimitReqPolicy {
-        key: key.unwrap_or(LimitReqKey::Ip),
-        limit,
-        window,
-        burst,
-        max_active_keys,
-        active_keys_fail_open,
-    })
-}
-
+/// 业务作用：冻结并发上限与维度，释放责任由响应生命周期承担。
 fn parse_limit_conn(spec: &str) -> Result<LimitConnPolicy> {
     let rest = filter_args(spec, "limit_conn");
     if rest.is_empty() {
@@ -8081,9 +8891,9 @@ fn parse_limit_conn(spec: &str) -> Result<LimitConnPolicy> {
     })
 }
 
-/// 解析 nginx `limit_rate` / `LimitRate` 响应限速规则。
+/// 业务作用：解析 nginx `limit_rate` / `LimitRate` 响应限速规则。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串,支持 `LimitRate=1m,after=10m` 或 `limit_rate rate=1m after=10m`。
 fn parse_limit_rate(spec: &str) -> Result<LimitRatePolicy> {
     let name = if starts_filter(spec, "LimitRate") {
@@ -8126,6 +8936,7 @@ fn parse_limit_rate(spec: &str) -> Result<LimitRatePolicy> {
     })
 }
 
+/// 业务作用：解析受支持的限额维度，拒绝任意表达式生成无界或不可信的身份键。
 fn parse_limit_key(raw: &str) -> Result<LimitReqKey> {
     let value = raw.trim();
     match value {
@@ -8158,91 +8969,9 @@ fn parse_limit_key(raw: &str) -> Result<LimitReqKey> {
     }
 }
 
-fn parse_circuit_breaker(spec: &str) -> Result<CircuitBreakerPolicy> {
-    let rest = filter_args(spec, "circuit_breaker");
-    if rest.is_empty() {
-        bail!("circuit_breaker requires `id=<id> failure_threshold=<N>`");
-    }
-    let mut id = None;
-    let mut failure_threshold = None;
-    let mut window_ms = 10_000_u64;
-    let mut min_requests = 1_u64;
-    let mut break_ms = 30_000_u64;
-    let mut fallback_status = StatusCode::SERVICE_UNAVAILABLE;
-    let mut fallback_body = "circuit open".to_string();
-    for token in rest.split_whitespace() {
-        let (name, value) = token
-            .split_once('=')
-            .with_context(|| format!("circuit_breaker option `{token}` must be key=value"))?;
-        match name {
-            "id" => {
-                if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
-                    bail!(
-                        "circuit_breaker id `{value}` must be non-empty and contain no whitespace"
-                    );
-                }
-                id = Some(value.to_string());
-            }
-            "failure_threshold" | "failures" | "threshold" => {
-                failure_threshold = Some(value.parse::<u64>().with_context(|| {
-                    format!("circuit_breaker invalid failure_threshold `{value}`")
-                })?);
-            }
-            "window_ms" => {
-                window_ms = value
-                    .parse::<u64>()
-                    .with_context(|| format!("circuit_breaker invalid window_ms `{value}`"))?;
-            }
-            "min_requests" => {
-                min_requests = value
-                    .parse::<u64>()
-                    .with_context(|| format!("circuit_breaker invalid min_requests `{value}`"))?;
-            }
-            "break_ms" | "open_ms" => {
-                break_ms = value
-                    .parse::<u64>()
-                    .with_context(|| format!("circuit_breaker invalid break_ms `{value}`"))?;
-            }
-            "fallback_status" | "status" => {
-                let code = value.parse::<u16>().with_context(|| {
-                    format!("circuit_breaker invalid fallback_status `{value}`")
-                })?;
-                fallback_status = StatusCode::from_u16(code)
-                    .with_context(|| format!("circuit_breaker invalid fallback_status `{code}`"))?;
-            }
-            "fallback_body" | "body" => {
-                fallback_body = value.replace('_', " ");
-            }
-            other => bail!("unsupported circuit_breaker option `{other}`"),
-        }
-    }
-    let failure_threshold =
-        failure_threshold.context("circuit_breaker requires `failure_threshold=<N>`")?;
-    if failure_threshold == 0 {
-        bail!("circuit_breaker failure_threshold must be positive");
-    }
-    if !(1..=MAX_LONG_STREAM_DURATION_MS).contains(&window_ms)
-        || !(1..=MAX_LONG_STREAM_DURATION_MS).contains(&break_ms)
-        || min_requests == 0
-    {
-        bail!(
-            "circuit_breaker window_ms/break_ms must be within 1..={MAX_LONG_STREAM_DURATION_MS} and min_requests must be positive"
-        );
-    }
-    Ok(CircuitBreakerPolicy {
-        id: id.unwrap_or_else(|| "default".to_string()),
-        failure_threshold,
-        window: Duration::from_millis(window_ms),
-        min_requests,
-        break_duration: Duration::from_millis(break_ms),
-        fallback_status,
-        fallback_body,
-    })
-}
-
-/// 解析 `error_page` 响应映射。
+/// 业务作用：解析 `error_page` 响应映射。
 ///
-/// # 参数
+/// 参数说明：
 /// - `spec`: route filter 原始字符串,如 `error_page statuses=500 status=200 body=fallback`
 ///   或 `error_page statuses=500 reroute=/__error`。
 fn parse_error_page(spec: &str) -> Result<ErrorPagePolicy> {
@@ -8307,9 +9036,9 @@ fn parse_error_page(spec: &str) -> Result<ErrorPagePolicy> {
     })
 }
 
-/// 校验内部重路由目标。
+/// 业务作用：校验内部重路由目标。
 ///
-/// # 参数
+/// 参数说明：
 /// - `target`: `error_page reroute=` 目标 path。
 fn validate_internal_reroute_target(target: &str) -> Result<()> {
     if !target.starts_with('/') {
@@ -8324,9 +9053,9 @@ fn validate_internal_reroute_target(target: &str) -> Result<()> {
     Ok(())
 }
 
-/// 解析逗号分隔的 HTTP 状态码列表。
+/// 业务作用：解析逗号分隔的 HTTP 状态码列表。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 逗号分隔状态码。
 /// - `label`: 错误上下文标签。
 fn parse_status_list(raw: &str, label: &str) -> Result<Vec<StatusCode>> {
@@ -8336,9 +9065,9 @@ fn parse_status_list(raw: &str, label: &str) -> Result<Vec<StatusCode>> {
         .collect()
 }
 
-/// 解析单个 HTTP 状态码。
+/// 业务作用：解析单个 HTTP 状态码。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 状态码文本。
 /// - `label`: 错误上下文标签。
 fn parse_status_code(raw: &str, label: &str) -> Result<StatusCode> {
@@ -8348,6 +9077,7 @@ fn parse_status_code(raw: &str, label: &str) -> Result<StatusCode> {
     StatusCode::from_u16(status).with_context(|| format!("{label} invalid status `{status}`"))
 }
 
+/// 业务作用：把速率文本转换为明确的容量与时间单位，拒绝零值和溢出。
 fn parse_limit_req_rate(raw: &str) -> Result<(u64, Duration)> {
     let value = raw.trim();
     for (suffix, window) in [
@@ -8373,9 +9103,9 @@ fn parse_limit_req_rate(raw: &str) -> Result<(u64, Duration)> {
     Ok((limit, Duration::from_secs(1)))
 }
 
-/// 解析字节大小,支持 `k/m/g` 后缀。
+/// 业务作用：解析字节大小,支持 `k/m/g` 后缀。
 ///
-/// # 参数
+/// 参数说明：
 /// - `raw`: 字节大小文本,例如 `1024` / `1m`。
 fn parse_byte_size(raw: &str) -> Result<u64> {
     let value = raw.trim();
@@ -8396,6 +9126,7 @@ fn parse_byte_size(raw: &str) -> Result<u64> {
         .with_context(|| format!("byte size `{raw}` overflows u64"))
 }
 
+/// 业务作用：编译跨站来源、方法和凭据合同，拒绝会产生含糊授权的组合。
 fn parse_cors(spec: &str) -> Result<CorsPolicy> {
     let mut policy = CorsPolicy {
         allow_origin: CorsAllowOrigin::Any,
@@ -8461,7 +9192,8 @@ fn parse_cors(spec: &str) -> Result<CorsPolicy> {
 
 /// 业务作用：解码控制器生成的 Gateway API CORS 策略，并在数据面快照构建前再次执行安全校验。
 ///
-/// 参数说明：`spec` 是 `gateway_cors_b64 <base64url-json>` 形式的内部生成配置。
+/// 参数说明：
+/// - `spec`：是 `gateway_cors_b64 <base64url-json>` 形式的内部生成配置。
 ///
 /// 返回：字段、数量、origin、method 和 header 全部合法时返回编译策略；畸形输入拒绝整个候选快照。
 fn parse_gateway_cors(spec: &str) -> Result<CorsPolicy> {
@@ -8545,7 +9277,10 @@ fn parse_gateway_cors(spec: &str) -> Result<CorsPolicy> {
 
 /// 业务作用：读取 Gateway CORS 的有界字符串数组，统一拒绝缺失类型和空白元素。
 ///
-/// 参数说明：`object` 是内部策略对象；`field` 是字段名；`max_items` 是协议硬上限。
+/// 参数说明：
+/// - `object`：是内部策略对象
+/// - `field`：是字段名
+/// - `max_items`：是协议硬上限。
 ///
 /// 返回：字段缺省时返回空列表；类型、数量与元素合法时返回拥有所有权的字符串。
 fn gateway_cors_string_list(
@@ -8579,7 +9314,10 @@ fn gateway_cors_string_list(
 
 /// 业务作用：校验并合并 Gateway CORS method 列表，确保凭证分支不会发布畸形 header。
 ///
-/// 参数说明：`object`、`field` 和 `max_items` 描述待读取数组及协议上限。
+/// 参数说明：
+/// - `object`：描述待读取数组及协议上限。
+/// - `field`：描述待读取数组及协议上限。
+/// - `max_items`：描述待读取数组及协议上限。
 ///
 /// 返回：合法 method 列表；`*` 与其它值并存或非法 token 时失败。
 fn gateway_cors_method_list(
@@ -8603,7 +9341,10 @@ fn gateway_cors_method_list(
 
 /// 业务作用：校验并规范化 Gateway CORS header 名列表，避免响应分隔符注入。
 ///
-/// 参数说明：`object`、`field` 和 `max_items` 描述待读取数组及协议上限。
+/// 参数说明：
+/// - `object`：描述待读取数组及协议上限。
+/// - `field`：描述待读取数组及协议上限。
+/// - `max_items`：描述待读取数组及协议上限。
 ///
 /// 返回：合法且转为小写的 header 列表；`*` 与其它值并存或非法名称时失败。
 fn gateway_cors_header_list(
@@ -8629,7 +9370,8 @@ fn gateway_cors_header_list(
 
 /// 业务作用：把 Gateway API origin 规范化为 scheme、默认端口和精确/左侧通配主机计划。
 ///
-/// 参数说明：`origin` 是 CRD 中单个 `allowOrigins` 值，`*` 已由上层单独处理。
+/// 参数说明：
+/// - `origin`：CRD 中单个 allowOrigins 值，通配符 * 已由调用方单独处理。
 ///
 /// 返回：符合 HTTP(S) origin 语法时返回匹配计划；路径、凭据和非法通配符一律拒绝。
 pub(crate) fn parse_gateway_cors_origin(origin: &str) -> Result<CorsOriginPattern> {
@@ -8674,7 +9416,9 @@ pub(crate) fn parse_gateway_cors_origin(origin: &str) -> Result<CorsOriginPatter
 
 /// 业务作用：解析无路径的 DNS authority，并补齐 HTTP(S) 默认端口供通配 origin 比较。
 ///
-/// 参数说明：`authority` 不含 scheme；`scheme` 已由调用方验证为 `http` 或 `https`。
+/// 参数说明：
+/// - `authority`：不含 scheme
+/// - `scheme`：已由调用方验证为 `http` 或 `https`。
 ///
 /// 返回：返回小写 DNS host 与有效端口；非法端口、空 host 或 IP 通配输入失败。
 fn split_cors_dns_authority(authority: &str, scheme: &str) -> Result<(String, u16)> {
@@ -8688,13 +9432,22 @@ fn split_cors_dns_authority(authority: &str, scheme: &str) -> Result<(String, u1
             anyhow::ensure!(port > 0, "gateway CORS origin port must be non-zero");
             (host, port)
         }
-        _ => (authority, if scheme == "http" { 80 } else { 443 }),
+        _ => (
+            authority,
+            if scheme == "http" {
+                80
+            } else {
+                443
+            },
+        ),
     };
     anyhow::ensure!(
         !host.is_empty()
             && host
                 .bytes()
-                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.') }),
+                .all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.')
+                }),
         "gateway CORS wildcard host is invalid"
     );
     Ok((host.to_ascii_lowercase(), port))
@@ -8702,7 +9455,8 @@ fn split_cors_dns_authority(authority: &str, scheme: &str) -> Result<(String, u1
 
 /// 业务作用：规范化请求 `Origin`，让显式默认端口与省略默认端口按同一 origin 比较。
 ///
-/// 参数说明：`origin` 是 CRD 精确 origin 或下游浏览器 `Origin` 值。
+/// 参数说明：
+/// - `origin`：是 CRD 精确 origin 或下游浏览器 `Origin` 值。
 ///
 /// 返回：合法、无路径、无凭据的 HTTP(S) origin 返回 `(scheme, host, port)`；其它输入失败。
 fn parse_cors_request_origin(origin: &str) -> Result<(String, String, u16)> {
@@ -8734,6 +9488,7 @@ fn parse_cors_request_origin(origin: &str) -> Result<(String, String, u16)> {
     Ok((scheme.to_owned(), host, port))
 }
 
+/// 业务作用：按指令分隔规则提取参数，避免把相似名称或缺失参数当作合法声明。
 fn filter_args<'a>(spec: &'a str, name: &str) -> &'a str {
     let rest = spec
         .strip_prefix(name)
@@ -8743,12 +9498,14 @@ fn filter_args<'a>(spec: &'a str, name: &str) -> &'a str {
     rest.strip_prefix('=').unwrap_or(rest).trim()
 }
 
+/// 业务作用：在构建期验证静态头值，控制字符不得进入请求或响应协议。
 fn validate_header_value(label: &str, value: &str) -> Result<()> {
     HeaderValue::from_str(value)
         .with_context(|| format!("{label} invalid header value `{value}`"))?;
     Ok(())
 }
 
+/// 业务作用：只接受明确的布尔声明，拒绝拼写错误被静默当作关闭。
 fn parse_bool(value: &str) -> Result<bool> {
     match value {
         "true" | "on" | "1" | "yes" => Ok(true),
@@ -8757,6 +9514,7 @@ fn parse_bool(value: &str) -> Result<bool> {
     }
 }
 
+/// 业务作用：编译字面路径前缀改写，保持匹配边界与目标路径合法性。
 fn parse_rewrite_prefix(spec: &str) -> Result<RewritePrefix> {
     let rest = spec.trim_start_matches("rewrite ").trim();
     let (from, to) = rest
@@ -8764,9 +9522,7 @@ fn parse_rewrite_prefix(spec: &str) -> Result<RewritePrefix> {
         .with_context(|| "rewrite requires `from to`")?;
     let from = from.trim();
     if contains_regex_meta(from) {
-        bail!(
-            "rewrite regex is disabled in V2; use a plain prefix or PathGlob/PathExact predicates"
-        );
+        bail!("rewrite regex is unsupported; use a plain prefix or PathGlob/PathExact predicates");
     }
     Ok(RewritePrefix {
         from: from.to_string(),
@@ -8776,7 +9532,8 @@ fn parse_rewrite_prefix(spec: &str) -> Result<RewritePrefix> {
 
 /// 业务作用：解析 Gateway API ReplaceFullPath 的内部 filter，并在构建期固定安全 origin path。
 ///
-/// 参数说明：`spec` 是 `gateway_rewrite_full_path /path` 形式的生成配置。
+/// 参数说明：
+/// - `spec`：是 `gateway_rewrite_full_path /path` 形式的生成配置。
 ///
 /// 返回：path 合法时返回完整替换值；空白、query、fragment、控制字符或超长值返回错误。
 fn parse_gateway_rewrite_full_path(spec: &str) -> Result<String> {
@@ -8792,6 +9549,7 @@ fn parse_gateway_rewrite_full_path(spec: &str) -> Result<String> {
     Ok(path.to_owned())
 }
 
+/// 业务作用：识别不能按字面前缀解释的正则元字符，避免误承诺不支持的改写语义。
 fn contains_regex_meta(value: &str) -> bool {
     value.as_bytes().iter().any(|b| {
         matches!(
@@ -8801,7 +9559,7 @@ fn contains_regex_meta(value: &str) -> bool {
     })
 }
 
-/// 去掉 path 前 n 段:`/api/order/1` strip 2 → `/1`;段数不足则回退到 `/`。
+/// 业务作用：去掉 path 前 n 段:`/api/order/1` strip 2 → `/1`;段数不足则回退到 `/`。
 ///
 /// `n=0` 是普通代理默认热路径，直接借用原始规范化 path，不为随后 URI 组装预先复制一次。
 /// 真正配置 StripPrefix 时才构造 owned 结果。
@@ -8829,42 +9587,72 @@ pub fn strip_n_segments(path: &str, n: usize) -> Cow<'_, str> {
 /// 全部在快照构建期完成解析与校验:数据面拿到的是可直接使用的策略对象,
 /// 请求路径上不再做任何字符串解析,配置错误也不会拖到运行期才暴露。
 pub struct TrafficLimitPolicy {
+    /// 持久开始确认必须先于额度与上游副作用，结束事件沿用同一个有限名额。
+    pub(crate) events: bool,
+    /// 共享后端选择；只有带宽而没有窗口时仍保持远端调度语义。
+    #[cfg(feature = "redis-runtime")]
+    pub(crate) redis_backend: bool,
+    /// 显式声明共享账本时保存预编码参数，不经过请求次数批领层。
+    #[cfg(feature = "redis-runtime")]
+    pub(crate) redis_quota: Option<Arc<crate::runtime::traffic_limit::redis::Policy>>,
+    /// 逐帧只编码字节数，其余远端方向参数在构建期冻结。
+    #[cfg(feature = "redis-runtime")]
+    pub(crate) redis_request: Option<Arc<crate::runtime::traffic_limit::redis::bandwidth::Policy>>,
+    /// 响应方向独立于请求方向的共享时间债务。
+    #[cfg(feature = "redis-runtime")]
+    pub(crate) redis_response: Option<Arc<crate::runtime::traffic_limit::redis::bandwidth::Policy>>,
+    /// 构建期确定的共享边界，不从客户端声明推导服务或工作区。
+    pub(crate) scope: traffic::Scope,
+    /// 完整候选的跨入口一致性与归属验证通过后填入；请求路径只借用此身份。
+    pub(crate) bound_scope: std::sync::OnceLock<Arc<traffic::BoundScope>>,
     /// 编译后策略语义指纹；热更新改变限额定义时隔离旧窗口，未变化时继续沿用账本。
     pub state_key: u64,
-    /// 限额维度键,与 `limit_req` 共用 DSL。
-    pub key: LimitReqKey,
+    /// 普通请求维度或冻结的 consumer/API-Key 身份，不把客户端声明当作认证事实。
+    pub(crate) key: traffic::Key,
     /// 请求方向带宽策略。
-    pub request_bandwidth: Option<crate::traffic_limit::BandwidthPolicy>,
+    pub request_bandwidth: Option<crate::runtime::traffic_limit::BandwidthPolicy>,
     /// 响应方向带宽策略。
-    pub response_bandwidth: Option<crate::traffic_limit::BandwidthPolicy>,
+    pub response_bandwidth: Option<crate::runtime::traffic_limit::BandwidthPolicy>,
     /// 多窗口限额策略。
-    pub quota: Option<crate::traffic_limit::QuotaPolicy>,
+    pub quota: Option<crate::runtime::traffic_limit::QuotaPolicy>,
     /// 成本来源。
-    pub cost_source: crate::traffic_limit::CostSource,
+    pub cost_source: crate::runtime::traffic_limit::CostSource,
+    /// 只接受构建期声明且已绑定真实上游入口的用量来源。
+    pub(crate) usage: Option<Arc<crate::runtime::traffic_limit::usage::Plan>>,
     /// 计数不可用时的处置。
-    pub fail_mode: crate::traffic_limit::QuotaFailMode,
+    pub fail_mode: crate::runtime::traffic_limit::QuotaFailMode,
 }
 
 /// 业务作用：把 route 的 traffic_limit 配置编译成数据面策略。
 ///
 /// 参数说明：
 /// - `cfg`: route 上的原始配置。
+/// - `upstream`：路由固定目标；service 作用域只允许静态 lb://service。
 ///
 /// 返回：编译后的策略;任一取值非法时返回错误,阻止该快照生效——
 /// 带宽为 0 或 delay 队列无界这类配置一旦放行,表现分别是连接挂死和内存耗尽,
 /// 都必须在配置期拦住。
-fn build_traffic_limit(cfg: &crate::config::model::TrafficLimitCfg) -> Result<TrafficLimitPolicy> {
-    use crate::traffic_limit::{
+fn build_traffic_limit(
+    cfg: &crate::config::model::TrafficLimitCfg,
+    upstream: &str,
+) -> Result<TrafficLimitPolicy> {
+    use crate::runtime::traffic_limit::{
         BandwidthPolicy, CostSource, LimitAlgorithm, LimitWindow, OverflowAction, QuotaFailMode,
         QuotaPolicy,
     };
 
-    let key = parse_limit_key(&cfg.key)?;
+    let key = traffic::Key::parse(&cfg.key)?;
+    anyhow::ensure!(
+        !cfg.events || cfg.quota.is_some(),
+        "traffic_limit.events requires a quota cost source"
+    );
+    let scope = traffic::Scope::parse(&cfg.scope, upstream)?;
     let build_bandwidth = |raw: &crate::config::model::BandwidthCfg| -> Result<BandwidthPolicy> {
         let policy = BandwidthPolicy {
             bytes_per_second: raw.bytes_per_second,
             burst_bytes: raw.burst_bytes,
             after_bytes: raw.after_bytes,
+            max_wait: Duration::from_millis(raw.max_wait_ms),
         };
         policy.validate()?;
         Ok(policy)
@@ -8883,6 +9671,7 @@ fn build_traffic_limit(cfg: &crate::config::model::TrafficLimitCfg) -> Result<Tr
         .context("traffic_limit.response_bandwidth")?;
 
     let mut cost_source = CostSource::PerRequest(1);
+    let mut usage = None;
     let quota = match cfg.quota.as_ref() {
         None => None,
         Some(raw) => {
@@ -8919,28 +9708,110 @@ fn build_traffic_limit(cfg: &crate::config::model::TrafficLimitCfg) -> Result<Tr
                 "grpc_messages" => CostSource::GrpcMessages {
                     reserve: raw.reserve,
                 },
-                "graphql_cost" => bail!(
-                    "traffic_limit quota.cost_source=graphql_cost 尚无可信查询成本结算入口，不能静默按 fallback 扣费"
-                ),
-                "trusted_usage" => bail!(
-                    "traffic_limit quota.cost_source=trusted_usage 尚无绑定上游解析器的可信 usage 入口，不能接受未验证数据结算"
-                ),
+                "graphql_cost" => CostSource::GraphqlCost,
+                "trusted_usage" => {
+                    let declared = raw
+                        .usage
+                        .as_ref()
+                        .context("trusted_usage requires quota.usage")?;
+                    usage = Some(crate::runtime::traffic_limit::usage::Plan::build(
+                        &declared.source,
+                        &declared.header,
+                        raw.reserve,
+                        raw.max_actual,
+                    )?);
+                    CostSource::TrustedUsage {
+                        reserve: raw.reserve,
+                        max_actual: raw.max_actual,
+                    }
+                }
                 other => bail!("未知 cost_source `{other}`"),
             };
+            anyhow::ensure!(
+                raw.usage.is_none() || usage.is_some(),
+                "quota.usage requires cost_source=trusted_usage"
+            );
             Some(policy)
         }
     };
 
+    #[cfg(feature = "redis-runtime")]
+    let mut redis_quota = None;
+    #[cfg(feature = "redis-runtime")]
+    let (mut redis_request, mut redis_response) = (None, None);
+    match cfg.backend.as_str() {
+        "" | "local" => {}
+        "redis" => {
+            #[cfg(not(feature = "redis-runtime"))]
+            bail!("traffic_limit backend=redis requires redis-runtime");
+            #[cfg(feature = "redis-runtime")]
+            {
+                if let Some(quota) = quota.as_ref() {
+                    let compiled = match cost_source {
+                        CostSource::ResponseBytes {
+                            reserve,
+                            ..
+                        }
+                        | CostSource::GrpcMessages {
+                            reserve,
+                        }
+                        | CostSource::TrustedUsage {
+                            reserve,
+                            ..
+                        } => {
+                            let raw = cfg.quota.as_ref().expect("compiled quota source");
+                            crate::runtime::traffic_limit::redis::Policy::build_response(
+                                quota,
+                                reserve,
+                                raw.max_actual,
+                                raw.settlement_idle_ms,
+                            )?
+                        }
+                        _ => crate::runtime::traffic_limit::redis::Policy::build(quota)?,
+                    };
+                    redis_quota = Some(Arc::new(compiled));
+                }
+                let encode = |value: BandwidthPolicy| {
+                    crate::runtime::traffic_limit::redis::bandwidth::Policy::build(&value)
+                        .map(Arc::new)
+                };
+                redis_request = request_bandwidth.map(encode).transpose()?;
+                redis_response = response_bandwidth.map(encode).transpose()?;
+                if let CostSource::PerRequest(cost) = cost_source {
+                    anyhow::ensure!(
+                        cost <= crate::runtime::traffic_limit::redis::MAX_COST,
+                        "Redis traffic per-request cost exceeds exact integer bound"
+                    );
+                }
+            }
+        }
+        _ => bail!("traffic_limit backend must be local|redis"),
+    }
     // 状态键覆盖完整声明，使窗口数量相同但额度、周期或算法变化时也不会沿用旧账本。
     // 同一配置重载得到同一键，避免借热更新反复获得一份全新额度。
-    let state_key = crate::lb_hash::stable_hash(format!("{cfg:?}").as_bytes());
+    // 计量开关不改变额度语义，切换可观测性不能清空仍有效的共享债务。
+    let mut accounting_policy = cfg.clone();
+    accounting_policy.events = false;
+    let state_key = crate::upstream::hash::stable_hash(format!("{accounting_policy:?}").as_bytes());
     Ok(TrafficLimitPolicy {
+        events: cfg.events,
+        #[cfg(feature = "redis-runtime")]
+        redis_backend: cfg.backend == "redis",
+        #[cfg(feature = "redis-runtime")]
+        redis_quota,
+        #[cfg(feature = "redis-runtime")]
+        redis_request,
+        #[cfg(feature = "redis-runtime")]
+        redis_response,
+        scope,
+        bound_scope: std::sync::OnceLock::new(),
         state_key,
         key,
         request_bandwidth,
         response_bandwidth,
         quota,
         cost_source,
+        usage,
         fail_mode: QuotaFailMode::parse(&cfg.fail_mode)?,
     })
 }

@@ -28,8 +28,8 @@ wire 契约见 [`../proto/naway/edge/v1/edge.proto`](../proto/naway/edge/v1/edge
   **精确**方法路径)、回执解析(proto3 省零 ⇒ **字段缺失即 0,不是"未知"**)、
   订阅断线后的退避重连(且授权类错误**不重试**)。
 
-> 一个真实踩过的坑:定向 push 的默认头名是 `x-naway-target-user`,**不是**
-> `x-naway-target`。两个 SDK 的默认值都已对齐网关,手写客户端请注意。
+> 定向 push 的默认头名是 `x-naway-target-user`，不是 `x-naway-target`。
+> 手写客户端也必须使用与网关相同的头名，否则请求会因缺少目标身份而拒绝。
 
 ## Rust
 
@@ -38,7 +38,10 @@ use naway_edge_client::{Auth, EdgeClient, EdgeConfig};
 
 let client = EdgeClient::new(
     EdgeConfig::new("http://127.0.0.1:8080", "edge.example.com")
-        .with_auth(Auth::ApiKey { header: "x-api-key".into(), value: "sub-key".into() }),
+        .with_auth(Auth::ApiKey {
+            header: "x-api-key".into(),
+            value: "sub-key".into(),
+        }),
 );
 
 // 订阅(自动重连;授权被拒会直接返回而不是无声打转)
@@ -51,9 +54,8 @@ while let Ok(message) = stream.next().await {
 let summary = client.publish("room.1", payload).await?;
 ```
 
-构建与测试:`cd sdk/rust/naway-edge-client && cargo test`
-(端到端用例需要先在仓库根 `cargo build --features grpc-edge --bin naway`,
-否则会**跳过并打印原因**,不会静默通过)。
+构建 SDK：在 `sdk/rust/naway-edge-client` 目录执行 `cargo build`。
+网关需启用 `grpc-edge`，并为精确方法路径配置对应的认证、授权与消息上限。
 
 ## Java
 
@@ -67,8 +69,15 @@ EdgeClient client = new EdgeClient(channel, EdgeConfig.builder()
 
 // 订阅(带自动重连;授权类错误走 onError,不重试)
 client.subscribeWithReconnect("room.1", new StreamObserver<byte[]>() {
-    public void onNext(byte[] message) { handle(message); }
-    public void onError(Throwable t) { /* PERMISSION_DENIED 等不可重试错误 */ }
+    /** 业务作用：将完整业务 payload 交给应用处理。 */
+    public void onNext(byte[] message) {
+        handle(message);
+    }
+    /** 业务作用：接收授权拒绝等不可重试结果，由应用决定后续动作。 */
+    public void onError(Throwable t) {
+        reportFailure(t);
+    }
+    /** 业务作用：通知应用订阅已正常结束。 */
     public void onCompleted() {}
 });
 
@@ -77,7 +86,7 @@ EdgeSummaries.PublishSummary summary = client.publish("room.1", payload);
 
 channel 交给使用方自建,是为了让 TLS、名字解析、拦截器、连接池策略沿用其既有约定。
 
-构建与测试:`cd sdk/java && mvn test`。
+构建 SDK：在 `sdk/java` 目录执行 `mvn package`。
 **不使用 protobuf 代码生成**——回执是平坦 varint 结构,手写 marshaller 避免了 protoc
 这个平台相关的构建期依赖,也与 Rust SDK 解析同一份契约。
 
