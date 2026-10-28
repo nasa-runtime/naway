@@ -3529,6 +3529,7 @@ fn format_authority(hostname: &str, port: u16) -> String {
 }
 
 /// 一个已编译 BFF 聚合计划。全部预算在快照构建期固定，执行时不再解析配置字符串。
+#[derive(PartialEq, Eq)]
 pub(crate) struct BffAggregationPolicy {
     pub targets: Arc<[BffTargetPolicy]>,
     pub max_total_response_bytes: usize,
@@ -3536,6 +3537,7 @@ pub(crate) struct BffAggregationPolicy {
 }
 
 /// BFF 单子请求的不可变计划。
+#[derive(PartialEq, Eq)]
 pub(crate) struct BffTargetPolicy {
     pub id: Arc<str>,
     pub uri: Arc<str>,

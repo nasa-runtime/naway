@@ -18,7 +18,7 @@ const MAX_STRING_CHUNK_UNITS: usize = 32 * 1024;
 const MAX_BINARY_CHUNK_BYTES: usize = u16::MAX as usize;
 
 /// Hessian2 编解码的 route 级硬资源预算。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct HessianLimits {
     pub(super) max_depth: usize,
     pub(super) max_collection_items: usize,

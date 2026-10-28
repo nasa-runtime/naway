@@ -6,6 +6,7 @@
 
 #[cfg(feature = "dubbo-hessian2")]
 mod hessian2;
+mod semantic;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -32,7 +33,7 @@ const MAX_PARAMETER_COUNT: usize = 64;
 const MAX_POOL_ENDPOINTS: usize = 256;
 const GENERIC_DESCRIPTOR: &str = "Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/Object;";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum DubboWireSerialization {
     Json,
     #[cfg(feature = "dubbo-hessian2")]

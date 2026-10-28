@@ -3043,7 +3043,12 @@ impl GatewayProxy {
         Some(response)
     }
 
-    /// 业务作用：执行 多模型统一入口：一次有界读取/解析，下游凭据隔离，然后按配置顺序 fallback。
+    /// 业务作用：并发执行固定只读子请求，只转发显式授权的头，并在总时限与响应预算内聚合 JSON。
+    ///
+    /// 参数说明：
+    /// - `ctx`：同代路由计划、已认证请求事实和上游选择上下文。
+    ///
+    /// 返回：全部必需目标成功时返回聚合对象；可选目标失败写入空值及固定错误类别，必需目标失败或超时终止聚合。
     async fn forward_bff(&self, ctx: BffForwardRequest<'_>) -> Response<BoxBody> {
         if ctx.parts.method != Method::GET {
             self.metrics.inc_bff_request("error");

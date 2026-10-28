@@ -2,6 +2,7 @@
 
 use super::Route;
 mod authentication;
+mod backends;
 mod content;
 mod external;
 mod resources;
