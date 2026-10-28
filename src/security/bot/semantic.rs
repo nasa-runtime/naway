@@ -13,7 +13,7 @@ impl GlobPlan {
     /// 参数说明：
     /// - `user_agent`：经过长度与文本格式校验的请求 User-Agent。
     ///
-    /// 返回：任一已编译 pattern 命中时为真，不分配或计算摘要。
+    /// 返回：任一已编译 pattern 命中时为真，不重新解析表达式或计算摘要。
     pub(super) fn is_match(&self, user_agent: &str) -> bool {
         self.matcher.is_match(user_agent)
     }

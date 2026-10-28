@@ -34,6 +34,8 @@ use tokio::sync::Notify;
 use crate::config::model::{OpaAuthorizationCfg, OpaBundleCfg, OpaEngineCfg, OpaObligationsCfg};
 use crate::BoxBody;
 
+mod semantic;
+
 const MAX_OPA_TIMEOUT_MS: u64 = 60_000;
 const MAX_OPA_HEADERS: usize = 32;
 const MAX_OPA_HEADER_VALUE_BYTES: usize = 64 * 1024;
@@ -111,7 +113,7 @@ struct CachedDecision {
     expires_at: Instant,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct OpaInputPlan {
     include_body: bool,
     max_body_bytes: usize,
@@ -119,7 +121,7 @@ struct OpaInputPlan {
     include_jwt_claims: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct OpaObligationPlan {
     request_headers: Arc<HashSet<HeaderName>>,
     response_headers: Arc<HashSet<HeaderName>>,
@@ -129,6 +131,7 @@ struct OpaObligationPlan {
     max_bytes: usize,
 }
 
+#[derive(PartialEq, Eq)]
 enum OpaEngine {
     External,
     #[cfg(feature = "opa-embedded")]
@@ -139,8 +142,10 @@ enum OpaEngine {
 struct EmbeddedOpa {
     template: regorus::Engine,
     query: Arc<str>,
+    bundle: BundleIdentity,
 }
 
+#[derive(PartialEq, Eq)]
 struct OpaDistributedCache {
     collection: Arc<str>,
     max_entries: usize,
@@ -363,8 +368,9 @@ impl OpaPolicy {
                         revision,
                         modules,
                         data,
+                        identity,
                     } = loaded;
-                    drop((revision, modules, data));
+                    drop((revision, modules, data, identity));
                     bail!(
                         "route `{route_id}` engine=embedded requires binary feature `opa-embedded`"
                     );
@@ -1394,6 +1400,17 @@ struct LoadedOpaBundle {
     revision: Arc<str>,
     modules: BTreeMap<String, String>,
     data: serde_json::Value,
+    identity: BundleIdentity,
+}
+
+/// 签名 bundle 的真实材料与构建边界；只用于候选比较，不代替签名或 Rego 验证。
+#[derive(PartialEq, Eq)]
+struct BundleIdentity {
+    material: [u8; 32],
+    signing_key: [u8; 32],
+    max_bundle_bytes: usize,
+    max_expanded_bytes: usize,
+    max_files: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1628,7 +1645,15 @@ fn load_signed_bundle(
         cfg.max_bundle_bytes,
         &format!("route `{route_id}` OPA bundle"),
     )?;
-    verify_bundle_signature(&compressed, cfg, config_dir, route_id)?;
+    let signing_key = verify_bundle_signature(&compressed, cfg, config_dir, route_id)?;
+    // 材料身份与验签、解包使用同一份字节，避免比较期间重读文件或序列化 Rego/data。
+    let identity = BundleIdentity {
+        material: Sha256::digest(&compressed).into(),
+        signing_key,
+        max_bundle_bytes: cfg.max_bundle_bytes,
+        max_expanded_bytes: cfg.max_expanded_bytes,
+        max_files: cfg.max_files,
+    };
 
     let mut archive = tar::Archive::new(GzDecoder::new(Cursor::new(compressed.as_slice())));
     let mut modules = BTreeMap::new();
@@ -1694,8 +1719,7 @@ fn load_signed_bundle(
     if modules.is_empty() {
         bail!("route `{route_id}` OPA bundle contains no Rego module");
     }
-    let digest = Sha256::digest(compressed.as_slice());
-    let digest_hex = hex_digest(digest.as_slice());
+    let digest_hex = hex_digest(&identity.material);
     let revision = manifest
         .map(|manifest| manifest.revision)
         .filter(|revision| !revision.trim().is_empty())
@@ -1705,6 +1729,7 @@ fn load_signed_bundle(
         revision: Arc::from(revision),
         modules,
         data,
+        identity,
     })
 }
 
@@ -1716,13 +1741,13 @@ fn load_signed_bundle(
 /// - `config_dir`：SecretSource 相对路径解析根。
 /// - `route_id`：用于低敏错误定位的 route 标识。
 ///
-/// 返回：签名严格匹配时成功；长度、Base64、key 或签名错误均拒绝候选。
+/// 返回：签名严格匹配时返回实际固定公钥；长度、Base64、key 或签名错误均拒绝候选。
 fn verify_bundle_signature(
     bundle: &[u8],
     cfg: &OpaBundleCfg,
     config_dir: &Path,
     route_id: &str,
-) -> Result<()> {
+) -> Result<[u8; 32]> {
     let signature = crate::security::secret::resolve_text(
         cfg.signature.as_str(),
         config_dir,
@@ -1747,7 +1772,8 @@ fn verify_bundle_signature(
     let key =
         VerifyingKey::from_bytes(&key_bytes).context("decode OPA bundle Ed25519 public key")?;
     key.verify_strict(bundle, &signature)
-        .context("verify OPA bundle Ed25519 signature")
+        .context("verify OPA bundle Ed25519 signature")?;
+    Ok(key_bytes)
 }
 
 #[cfg(feature = "opa-embedded")]
@@ -1784,6 +1810,7 @@ fn build_embedded_engine(
     Ok(EmbeddedOpa {
         template: engine,
         query: Arc::from(query),
+        bundle: bundle.identity,
     })
 }
 

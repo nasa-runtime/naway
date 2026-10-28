@@ -13,6 +13,9 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use maxminddb::{geoip2, Reader};
+use sha2::{Digest, Sha256};
+
+mod semantic;
 
 use crate::config::model::GeoIpCfg;
 
@@ -79,7 +82,7 @@ impl GeoIpDecision {
 }
 
 /// 失败或陈旧数据的固定二元动作。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum BinaryAction {
     /// 允许请求继续。
     Allow,
@@ -88,7 +91,7 @@ enum BinaryAction {
 }
 
 /// 过期数据库的候选发布动作。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum StaleAction {
     /// 候选构建失败，保留上一份有效快照。
     Reject,
@@ -156,6 +159,7 @@ impl AnonymousTrait {
 struct DatabaseSnapshot {
     /// 不可变 reader；内部字节随 snapshot 生命周期保持稳定。
     reader: Reader<Vec<u8>>,
+    material_identity: [u8; 32],
     /// MMDB 元数据中的数据库类型。
     database_type: String,
     /// MMDB 元数据中的构建时间。
@@ -206,6 +210,8 @@ impl GeoIpCatalog {
                 canonical.display()
             );
         }
+        // 数据库可能在同一路径被替换；材料身份与 reader 使用本次有界读取的同一份字节。
+        let material_identity = Sha256::digest(&bytes).into();
         let reader = Reader::from_source(bytes)
             .with_context(|| format!("parse GeoIP database {}", canonical.display()))?;
         let database_type = reader.metadata().database_type.clone();
@@ -215,6 +221,7 @@ impl GeoIpCatalog {
             .with_context(|| format!("read GeoIP build epoch {}", canonical.display()))?;
         let snapshot = Arc::new(DatabaseSnapshot {
             reader,
+            material_identity,
             database_type,
             build_time,
         });
@@ -224,6 +231,7 @@ impl GeoIpCatalog {
 }
 
 /// 快照内只读的 route GeoIP 策略。
+#[derive(PartialEq, Eq)]
 pub(crate) struct GeoIpPolicy {
     /// 可选国家数据库与规范化国家规则。
     country_database: Option<Arc<DatabaseSnapshot>>,
@@ -240,6 +248,10 @@ pub(crate) struct GeoIpPolicy {
     on_not_found: BinaryAction,
     /// 查询或 record 解码失败时的明确动作。
     on_lookup_error: BinaryAction,
+    /// 构建时最大允许数据库年龄；即使材料尚新鲜也属于声明边界。
+    max_database_age_secs: u64,
+    /// 过期时的候选发布与数据面处置策略。
+    on_stale: StaleAction,
     /// 任一必需数据库过期时的 route 级固定结果。
     stale_decision: Option<GeoIpDecision>,
 }
@@ -355,6 +367,8 @@ impl GeoIpPolicy {
             denied_anonymous_traits,
             on_not_found,
             on_lookup_error,
+            max_database_age_secs: cfg.max_database_age_secs,
+            on_stale,
             stale_decision,
         })
     }

@@ -10,7 +10,7 @@ impl Route {
     /// 参数说明：
     /// - `candidate`：同代理、同路由身份下已完成构建的候选计划。
     ///
-    /// 返回：头部、正文、接入、预算与超时策略一致时为真；复杂安全及扩展仍由各自摘要比较。
+    /// 返回：头部、正文、接入、预算与超时策略一致时为真；其它领域由独立比较入口处理。
     pub(crate) fn same_basic_configuration(&self, candidate: &Self) -> bool {
         self.upstream_template == candidate.upstream_template
             && self.pass_request_headers == candidate.pass_request_headers
