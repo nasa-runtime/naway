@@ -9,6 +9,7 @@ mod grpc;
 mod resources;
 mod sandbox;
 mod security;
+mod selection;
 mod traffic;
 mod tunnels;
 

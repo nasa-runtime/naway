@@ -7,7 +7,7 @@ use crate::{config::GatewaySnapshot, routing::Route};
 type Identity<'a> = (&'a str, &'a str);
 type Index<'a> = BTreeMap<Identity<'a>, (usize, &'a Route)>;
 
-/// 业务作用：比较路由摘要、基础策略参数与有效选择次序，避免拼接身份覆盖其它合法对象。
+/// 业务作用：比较路由固定策略与有效选择次序，避免拼接身份覆盖其它合法对象。
 ///
 /// 参数说明：
 /// - `current`：冻结的活动快照。
@@ -37,6 +37,7 @@ pub(super) fn changes(
             let (next_position, next) = candidate.get(key)?;
             (variables_changed
                 || position != next_position
+                || !current.same_selection_configuration(next)
                 || !current.same_basic_configuration(next)
                 || !current.same_authentication_configuration(next)
                 || !current.same_local_security_configuration(next)
@@ -47,8 +48,7 @@ pub(super) fn changes(
                 || !current.same_external_configuration(next)
                 || !current.same_sandbox_configuration(next)
                 || !current.same_backend_configuration(next)
-                || !current.same_grpc_configuration(next)
-                || current.admin_semantic_json() != next.admin_semantic_json())
+                || !current.same_grpc_configuration(next))
             .then(|| name(key))
         })
         .collect();

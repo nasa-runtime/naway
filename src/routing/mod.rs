@@ -2383,7 +2383,7 @@ impl Router {
 }
 
 impl Route {
-    /// 业务作用：为管理面语义 diff 产生稳定、低敏的 route 结构摘要。
+    /// 业务作用：为管理面展示路由结构、断言与过滤器信息，便于解释当前生效计划。
     ///
     /// 参数说明: 无。
     ///
@@ -3344,6 +3344,7 @@ impl CorsOriginPattern {
 
 /// path 前缀改写规则,对应轻量 `rewrite` 子集。
 #[derive(Clone)]
+#[derive(PartialEq, Eq)]
 pub struct RewritePrefix {
     /// 需要匹配的原始前缀。
     pub from: String,

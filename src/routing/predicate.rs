@@ -1,5 +1,7 @@
 //! 路由断言 + DSL 解析。支持低成本 `Path`/`Host`/`Method` 组合,复杂正则默认不进入热路径。
 
+mod semantic;
+
 use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
@@ -114,6 +116,7 @@ pub enum ValueOp {
 }
 
 /// 已归一化的 Host 断言。
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub enum HostPattern {
     /// ASCII 大小写不敏感的精确主机名。
     Exact(String),
@@ -310,21 +313,24 @@ pub(crate) fn parse_predicate(spec: &str) -> Result<Predicate> {
         "PathGlob" => parse_path_glob(args.trim()),
         "PathTemplate" => parse_path_template(args.trim()),
         "Method" => {
-            let ms = args
+            let mut ms = args
                 .split(',')
                 .map(|s| Method::from_str(s.trim()))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .with_context(|| format!("invalid Method predicate `{args}`"))?;
+            // OR 列表的次序不改变匹配结果；构建期就地规范化使配置比较无需分配排序副本。
+            ms.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
             Ok(Predicate::Method(ms))
         }
         "Host" => {
-            let patterns = args
+            let mut patterns = args
                 .split(',')
                 .map(|s| parse_host_pattern(s.trim()))
                 .collect::<Result<Vec<_>>>()?;
             if patterns.is_empty() {
                 bail!("Host predicate requires at least one host");
             }
+            patterns.sort_unstable();
             Ok(Predicate::Host(patterns))
         }
         "Header" => parse_header(args),
@@ -495,6 +501,7 @@ fn parse_weight(raw: &str) -> Result<Predicate> {
 }
 
 /// 构建期拆分后的 OpenAPI path-template segment。
+#[derive(PartialEq, Eq)]
 pub enum PathTemplateSegment {
     /// 必须逐字匹配的静态 segment。
     Literal(String),
