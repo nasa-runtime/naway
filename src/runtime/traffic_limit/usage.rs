@@ -12,11 +12,13 @@ const KNOWN: u64 = 1 << 33;
 const INVALID: u64 = 1 << 34;
 const AMOUNT: u64 = KNOWN - 1;
 
+#[derive(PartialEq, Eq)]
 pub(crate) enum Source {
     ProviderTokens,
     ResponseHeader(HeaderName),
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct Plan {
     pub(crate) source: Source,
     maximum: u64,

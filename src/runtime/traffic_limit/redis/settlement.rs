@@ -12,6 +12,7 @@ const SCRIPT: &str = include_str!("settlement.lua");
 static SHA: LazyLock<String> =
     LazyLock::new(|| format!("{:x}", sha1::Sha1::digest(SCRIPT.as_bytes())));
 
+#[derive(PartialEq, Eq)]
 pub(super) struct Limits {
     pub(super) maximum: u64,
     pub(super) maximum_arg: String,

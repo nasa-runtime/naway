@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 只有路由作用域包含入口与路由；其它作用域在同一归属域内有明确共享身份。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Scope {
     Route,
     Service(Arc<str>),
@@ -15,6 +15,7 @@ pub(crate) enum Scope {
 }
 
 /// 完整候选验证后冻结的状态身份；同一共享域的所有路由共用一份字符串。
+#[derive(PartialEq, Eq)]
 pub(crate) struct BoundScope {
     pub(crate) quota: Arc<str>,
     pub(crate) request: Arc<str>,
@@ -94,6 +95,7 @@ impl Scope {
 }
 
 /// 流量主体可使用普通请求维度，或只能从认证完成后的内部事实取得的主体。
+#[derive(PartialEq, Eq)]
 pub(crate) enum Key {
     Request(LimitReqKey),
     Consumer,

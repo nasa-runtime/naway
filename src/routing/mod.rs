@@ -3691,7 +3691,7 @@ fn is_sensitive_bff_header(name: &HeaderName) -> bool {
 }
 
 /// 已编译 mock 响应。HeaderMap clone 共享 HeaderValue backing，body clone 只增 Bytes 引用计数。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MockResponsePolicy {
     pub status: StatusCode,
     pub headers: http::HeaderMap,
@@ -3746,7 +3746,7 @@ impl MockResponsePolicy {
 }
 
 /// 编译后的 chaos 注入策略。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct FaultInjectionPolicy {
     pub percentage_bps: u16,
     pub delay: Duration,
@@ -3795,6 +3795,7 @@ pub(crate) struct UsagePlanCatalog {
 }
 
 /// 已编译的固定窗口套餐。
+#[derive(PartialEq, Eq)]
 pub(crate) struct UsagePlan {
     pub id: Arc<str>,
     pub limit: u64,
@@ -3805,6 +3806,7 @@ pub(crate) struct UsagePlan {
 }
 
 /// route 对全局 catalog 的只读绑定。
+#[derive(PartialEq, Eq)]
 pub(crate) struct UsagePlanPolicy {
     consumers: Arc<HashMap<Arc<str>, Arc<UsagePlan>>>,
     default: Option<Arc<UsagePlan>>,
@@ -9614,6 +9616,7 @@ pub fn strip_n_segments(path: &str, n: usize) -> Cow<'_, str> {
 ///
 /// 全部在快照构建期完成解析与校验:数据面拿到的是可直接使用的策略对象,
 /// 请求路径上不再做任何字符串解析,配置错误也不会拖到运行期才暴露。
+#[derive(PartialEq, Eq)]
 pub struct TrafficLimitPolicy {
     /// 持久开始确认必须先于额度与上游副作用，结束事件沿用同一个有限名额。
     pub(crate) events: bool,

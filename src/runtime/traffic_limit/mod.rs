@@ -35,7 +35,7 @@ pub const MAX_ACTIVE_KEYS: usize = 65_536;
 // ---------------------------------------------------------------------------
 
 /// 单方向带宽策略。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BandwidthPolicy {
     /// 稳态速率(字节/秒)。
     pub bytes_per_second: u64,
@@ -435,7 +435,7 @@ pub enum OverflowAction {
 }
 
 /// 单个限额窗口的定义。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LimitWindow {
     /// 窗口内允许的额度。
     pub limit: u64,
@@ -463,7 +463,7 @@ impl LimitWindow {
 }
 
 /// 多窗口限额策略:所有窗口必须同时通过。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuotaPolicy {
     /// 算法。
     pub algorithm: LimitAlgorithm,
@@ -1045,7 +1045,7 @@ fn settle_counter(counter: &mut u64, reserved: u64, actual: u64) {
 // ---------------------------------------------------------------------------
 
 /// 成本来源。决定"一次请求消耗多少额度"。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CostSource {
     /// 每请求固定成本,等价于传统 QPS 限流。
     PerRequest(u64),

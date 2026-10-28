@@ -12,6 +12,7 @@ const SCRIPT: &str = include_str!("bandwidth.lua");
 static SHA: LazyLock<String> =
     LazyLock::new(|| format!("{:x}", sha1::Sha1::digest(SCRIPT.as_bytes())));
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct Policy {
     args: [String; 3],
 }

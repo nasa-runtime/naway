@@ -20,6 +20,7 @@ const MAX_WINDOW_MS: u64 = 31 * 86_400_000;
 pub(crate) const MAX_COST: u64 = 1 << 32;
 
 /// 运行期只编码成本与容量，固定窗口参数在候选构建时编码一次。
+#[derive(PartialEq, Eq)]
 pub(crate) struct Policy {
     args: Arc<[String]>,
     settlement: Option<settlement::Limits>,
