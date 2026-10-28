@@ -47,6 +47,7 @@ pub(super) fn changes(
                 || !current.same_external_configuration(next)
                 || !current.same_sandbox_configuration(next)
                 || !current.same_backend_configuration(next)
+                || !current.same_grpc_configuration(next)
                 || current.admin_semantic_json() != next.admin_semantic_json())
             .then(|| name(key))
         })

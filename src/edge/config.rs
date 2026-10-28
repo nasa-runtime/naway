@@ -87,6 +87,7 @@ pub const RELAY_FANOUT_MAX_MSG_BYTES: usize = MAX_MSG_BYTES;
 
 /// 每 action 的已编译精确方法路径(edge 只能由精确 `:path` + allowed_actions
 /// + 鉴权三者同时命中触发,header action 只是 v1 的二次确认)。
+#[derive(PartialEq, Eq)]
 pub struct GrpcEdgeMethodPlan {
     /// Subscribe 精确路径;允许 subscribe 时必有。
     pub subscribe: Option<Box<str>>,
@@ -99,6 +100,7 @@ pub struct GrpcEdgeMethodPlan {
 }
 
 /// 已编译身份映射:tenant/user 一律来自已验证 principal 的 claim。
+#[derive(PartialEq, Eq)]
 pub struct GrpcEdgeIdentityPlan {
     /// 租户 claim;None = 单租户。
     pub tenant_claim: Option<Box<str>>,
@@ -107,7 +109,7 @@ pub struct GrpcEdgeIdentityPlan {
 }
 
 /// 已编译节点级预算与基数上限。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GrpcEdgeLimitsPlan {
     /// 单条 message body 字节上限(不含 5 字节前缀)。
     pub max_msg_bytes: usize,
@@ -177,6 +179,7 @@ enum AuthzSegment {
 }
 
 /// 一条已编译的授权模式。
+#[derive(PartialEq, Eq)]
 pub struct AuthzPattern {
     segments: Vec<AuthzSegment>,
 }
@@ -223,6 +226,7 @@ impl AuthzPattern {
 /// 已编译的 route 级发布/订阅授权策略( 相位 4 之后执行)。
 ///
 /// enabled route 的授权段由构建器强制存在；结构内一律 deny-by-default。
+#[derive(PartialEq, Eq)]
 pub struct GrpcEdgeAuthzPlan {
     /// 允许 subscribe 的 group 模式;空 = 该 action 全拒。
     pub subscribe_groups: Vec<AuthzPattern>,
@@ -260,6 +264,7 @@ impl GrpcEdgeAuthzPlan {
 
 /// 已编译发布面 PublishStream 单流四门(执行语义见 model 层 rustdoc:
 /// rate=背压节流,lifetime/messages/bytes=优雅轮转返聚合 summary)。
+#[derive(PartialEq, Eq)]
 pub struct GrpcEdgePublishStreamPlan {
     /// 单流生命周期上限。
     pub max_lifetime: Duration,
@@ -299,6 +304,7 @@ impl GrpcEdgeAction {
 ///
 /// 字段在构建期定型为运行期可直接使用的类型(如 `HeaderName`/精确路径),请求热路径
 /// 不再做字符串校验。数据面据此执行方法匹配、身份校验、授权和资源准入。
+#[derive(PartialEq, Eq)]
 pub struct GrpcEdgePlan {
     /// 允许的 action 集(平面隔离):公网面只放 subscribe,发布面只放 publish/push。
     pub allow_subscribe: bool,

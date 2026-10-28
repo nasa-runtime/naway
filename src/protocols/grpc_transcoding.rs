@@ -3,6 +3,8 @@
 //! 文件读取、descriptor 校验和 RPC 白名单编译只发生在快照 build/reload。普通 route 不创建
 //! 本计划；未编 `grpc-descriptor` feature 的制品遇到配置会在任何数据面副作用前 fail closed。
 
+mod semantic;
+
 use std::path::Path;
 
 use anyhow::Result;
@@ -33,6 +35,8 @@ use prost_reflect::{
 };
 #[cfg(feature = "grpc-descriptor")]
 use regex::Regex;
+#[cfg(feature = "grpc-descriptor")]
+use sha2::{Digest, Sha256};
 
 #[cfg(feature = "grpc-descriptor")]
 const MAX_DESCRIPTOR_FILES: usize = 256;
@@ -60,6 +64,10 @@ const MAX_HTTP_PATH_VARIABLES: usize = 32;
 /// 快照内只读的 descriptor/RPC 白名单计划。
 #[derive(Debug)]
 pub(crate) struct GrpcTranscodingPlan {
+    #[cfg(feature = "grpc-descriptor")]
+    descriptor_identity: [u8; 32],
+    #[cfg(feature = "grpc-descriptor")]
+    max_descriptor_bytes: usize,
     #[cfg(feature = "grpc-descriptor")]
     methods: Arc<[Arc<ResolvedGrpcMethod>]>,
     #[cfg(feature = "grpc-descriptor")]
@@ -205,6 +213,8 @@ impl GrpcTranscodingPlan {
                 source_path.display()
             )
         })?;
+        // 反射计划与比较身份必须来自同一份有界输入，不能在比较时重新读文件或重新编码 descriptor。
+        let descriptor_identity = Sha256::digest(&bytes).into();
         validate_pool_shape(&pool, route_id)?;
         let methods = select_methods(&pool, cfg, route_id)?;
         let mut compiled = Vec::with_capacity(methods.len());
@@ -228,6 +238,8 @@ impl GrpcTranscodingPlan {
             }));
         }
         Ok(Self {
+            descriptor_identity,
+            max_descriptor_bytes: cfg.max_descriptor_bytes,
             methods: compiled.into(),
             connect_json: cfg.connect_json,
             google_http: cfg.google_http,

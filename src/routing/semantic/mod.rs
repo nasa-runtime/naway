@@ -5,6 +5,7 @@ mod authentication;
 mod backends;
 mod content;
 mod external;
+mod grpc;
 mod resources;
 mod sandbox;
 mod security;
