@@ -17,7 +17,7 @@ const V2_SIGNATURE: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
 const V1_MAX_LEN: usize = 108;
 
 /// 写给上游的 PROXY protocol 版本。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProxyProtocolWriteVersion {
     /// 文本 v1 头。
     V1,

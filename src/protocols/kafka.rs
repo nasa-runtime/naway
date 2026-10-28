@@ -60,14 +60,14 @@ const SUPPORTED_APIS: &[(i16, i16, i16)] = &[
 ];
 
 /// Kafka broker response endpoint 的运行期改写目标。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct BrokerEndpoint {
     host: Arc<str>,
     port: u16,
 }
 
 /// 构建期冻结的 Kafka ACL、资源门与 endpoint rewrite 计划。
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct KafkaPolicy {
     max_connections: usize,
     max_frame_bytes: usize,

@@ -29,25 +29,8 @@ pub(super) fn compare(current: &GatewaySnapshot, candidate: &GatewaySnapshot) ->
     let (upstreams_added, upstreams_removed, upstreams_changed) = current
         .upstreams
         .configuration_changes(&candidate.upstreams);
-    let listener_index = |snapshot: &GatewaySnapshot| {
-        snapshot
-            .listen_topology()
-            .into_iter()
-            .map(|listener| {
-                (
-                    listener.id,
-                    serde_json::json!({
-                        "listen": listener.listen,
-                        "plain": listener.plain_enabled,
-                        "tls": listener.tls.is_some(),
-                        "http3": listener.http3.enabled,
-                    }),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>()
-    };
     let (listeners_added, listeners_removed, listeners_changed) =
-        map_semantic_changes(&listener_index(current), &listener_index(candidate));
+        super::listener::changes(current, candidate);
     let (sentinel_added, sentinel_removed, sentinel_changed) =
         super::sentinel::changes(&current.sentinel_rules, &candidate.sentinel_rules);
     serde_json::json!({

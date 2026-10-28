@@ -21,7 +21,7 @@ const MAX_BUFFERED_BYTES_HARD: usize = 512 * 1024 * 1024;
 const MAX_SUBSCRIPTIONS_HARD: usize = 1_000_000;
 
 /// 构建期编译的 MQTT listener 治理计划。
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct MqttPolicy {
     max_connections: usize,
     max_packet_bytes: usize,

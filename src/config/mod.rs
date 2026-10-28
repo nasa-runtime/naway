@@ -573,7 +573,7 @@ pub struct SniCertRuntime {
     pub ocsp_stapling: Option<OcspStaplingRuntime>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 /// 代理协议运行期开关及可信来源。
 pub struct ProxyProtocolRuntimeCfg {
     /// 是否接受 PROXY 协议。
@@ -625,7 +625,7 @@ pub struct ProxyRuntime {
 }
 
 /// 已规范化、可直接执行精确/通配优先级选择的 Gateway API HTTP/HTTPS listener。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GatewayListenerRuntime {
     /// listener 稳定身份，用于比较 SNI 与 Host 是否落到同一权威边界。
     pub id: Arc<str>,
@@ -634,7 +634,7 @@ pub struct GatewayListenerRuntime {
 }
 
 /// HTTP→HTTPS 跳转运行期:明文入口收到请求即跳到本 proxy 的 TLS 端口。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RedirectHttps {
     /// 跳转目标端口(取自本 proxy 的 TLS 监听端口)。
     pub to_port: u16,
@@ -731,7 +731,7 @@ impl AdminPrincipalRuntime {
 }
 
 /// L4 stream TCP listener 运行期配置。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StreamRuntime {
     /// listener 唯一标识。
     pub id: String,
@@ -768,7 +768,7 @@ pub struct StreamRuntime {
 }
 
 /// L4 stream preread 运行期配置。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StreamPrereadRuntime {
     /// 是否启用 TLS ClientHello SNI preread。
     pub ssl_preread: bool,
@@ -781,7 +781,7 @@ pub struct StreamPrereadRuntime {
 }
 
 /// stream 发往上游的 PROXY protocol 头运行期配置。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StreamProxyProtocolUpstreamRuntime {
     /// 是否向上游写 PROXY protocol 头。
     pub enabled: bool,
@@ -790,7 +790,7 @@ pub struct StreamProxyProtocolUpstreamRuntime {
 }
 
 /// L4 stream route 运行期配置。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StreamRouteRuntime {
     /// route 唯一标识。
     pub id: String,
@@ -820,7 +820,7 @@ pub enum StreamProtocolRuntime {
 }
 
 /// 构建期校验后的 UDP session table 资源预算。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct StreamUdpRuntime {
     /// 对端连续未发送下游数据报达到此毫秒数后回收会话。
     pub idle_timeout_ms: u64,
@@ -999,19 +999,38 @@ pub struct ProxyListenTopology {
 
 impl PartialEq for TlsRuntimeCfg {
     /// 业务作用：比较监听入口的协议接入约束，用于判断配置热更是否需要重建入口资源。
+    ///
+    /// 参数说明：
+    /// - `other`：完整候选监听策略；证书文件在原路径的轮换由 watcher 单独处理。
+    ///
+    /// 返回：全部声明策略相同时为真；OCSP 缓存和 SPIRE 当前材料不参与配置比较。
     fn eq(&self, other: &Self) -> bool {
-        self.listen == other.listen
-            && self.cert_file == other.cert_file
-            && self.key_file == other.key_file
-            && self.private_key_provider == other.private_key_provider
-            && self.spire == other.spire
-            && self.keypair_manifest_file == other.keypair_manifest_file
-            && self.certs == other.certs
-            && self.client_auth == other.client_auth
-            && self.ocsp_stapling == other.ocsp_stapling
-            && self.session_tickets == other.session_tickets
-            && self.acme == other.acme
-            && self.in_memory == other.in_memory
+        let Self {
+            listen,
+            cert_file,
+            key_file,
+            private_key_provider,
+            spire,
+            keypair_manifest_file,
+            certs,
+            client_auth,
+            ocsp_stapling,
+            session_tickets,
+            acme,
+            in_memory,
+        } = self;
+        listen == &other.listen
+            && cert_file == &other.cert_file
+            && key_file == &other.key_file
+            && private_key_provider == &other.private_key_provider
+            && spire == &other.spire
+            && keypair_manifest_file == &other.keypair_manifest_file
+            && certs == &other.certs
+            && client_auth == &other.client_auth
+            && ocsp_stapling == &other.ocsp_stapling
+            && session_tickets == &other.session_tickets
+            && acme == &other.acme
+            && in_memory == &other.in_memory
     }
 }
 

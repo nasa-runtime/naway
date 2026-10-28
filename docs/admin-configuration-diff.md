@@ -26,7 +26,15 @@ Sentinel 差异按 `flow/id` 和 `degrade/id` 返回 `added`、`removed`、`chan
 比较直接借用不可变策略，不复制实例或凭据；动态发现刷新、实际健康变化、实例加入时刻和反馈
 代际属于运行事实，不作为配置差异。上游响应仍只包含服务名，不返回地址、metadata 或凭据。
 
-路由和监听当前只比较所公开的摘要字段，不能证明全部策略字段等价。
+业务监听差异覆盖 HTTP proxy 和 TCP/UDP stream，名称分别是 `proxy:id` 和
+`stream:id:协议`。HTTP 比较完整接入策略、TLS/HTTP3、可信代理、PROXY protocol、资源上限、
+超时、HTTPS 跳转与 HSTS；HTTP 路由内容归属路由域。stream 同时比较 preread、UDP 预算、
+上下游 PROXY protocol、MQTT/Kafka 治理及路由策略。比较直接借用已编译计划，响应只输出名称。
+TLS 比较包含证书来源、SNI、mTLS、OCSP、session ticket、ACME、SPIRE、外部签名和内存材料的
+声明策略，不输出证书或密钥；OCSP 缓存和 SPIRE 当前轮换状态不作为配置变化，同路径文件的
+原地证书轮换由 watcher 处理。此监听域不包括管理认证和其它控制通道。
+
+HTTP 路由当前只比较所公开的摘要字段，不能证明全部策略字段等价。
 
 同一管理实例最多同时执行两个候选工作单元。归档读取、构建、比较和私有工作区清理共用该预算；
 HTTP 等待者取消不会提前释放仍在运行的工作单元。容量不足返回 `503`，归档不可用返回 `409`，

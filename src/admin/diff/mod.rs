@@ -1,5 +1,6 @@
 //! 配置差异绑定单一活动基线，并在有界构建结束后复验当前身份。
 
+mod listener;
 mod sentinel;
 mod snapshot;
 
