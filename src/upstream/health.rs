@@ -54,7 +54,7 @@ pub enum HealthKind {
 }
 
 /// 从 yml `health_check` 编译出的主动健康策略。无 `health_check` 段 = 关闭。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ActiveHealthPolicy {
     kind: HealthKind,
     path: String,

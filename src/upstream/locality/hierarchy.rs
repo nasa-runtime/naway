@@ -7,12 +7,13 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[derive(PartialEq, Eq)]
 struct Target {
     priority: usize,
     multiplier: u32,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 struct Zone {
     all: Option<Target>,
     subzones: HashMap<Arc<str>, Target>,
@@ -20,6 +21,7 @@ struct Zone {
 
 type Zones = HashMap<Arc<str>, Zone>;
 
+#[derive(PartialEq, Eq)]
 pub(super) struct Policy {
     local_region: Arc<str>,
     local_zone: Arc<str>,

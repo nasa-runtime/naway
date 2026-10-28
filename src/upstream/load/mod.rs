@@ -107,7 +107,7 @@ impl LoadFeedback {
 }
 
 /// 已校验的负载反馈策略。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LoadFeedbackPolicy {
     /// 反馈口径。
     pub feedback: LoadFeedback,

@@ -51,7 +51,7 @@ impl AdmissionOutcome {
 }
 
 /// backend 级 retry budget 策略。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetryBudgetPolicy {
     /// 允许的活动重试数占滚动请求数的百分比(1..=100)。
     pub budget_percent: u32,
@@ -234,7 +234,7 @@ impl Drop for RetryPermit {
 }
 
 /// 自适应并发策略。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdaptiveConcurrencyPolicy {
     /// 在途上限下界:再拥塞也保留这么多并发,避免把后端彻底饿死。
     pub min_concurrency: u64,

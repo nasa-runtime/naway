@@ -26,16 +26,9 @@ pub(super) fn compare(current: &GatewaySnapshot, candidate: &GatewaySnapshot) ->
     let candidate_routes = route_index(candidate);
     let (routes_added, routes_removed, routes_changed) =
         map_semantic_changes(&current_routes, &candidate_routes);
-    let current_upstreams = current
+    let (upstreams_added, upstreams_removed, upstreams_changed) = current
         .upstreams
-        .service_names()
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let candidate_upstreams = candidate
-        .upstreams
-        .service_names()
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
+        .configuration_changes(&candidate.upstreams);
     let listener_index = |snapshot: &GatewaySnapshot| {
         snapshot
             .listen_topology()
@@ -66,8 +59,9 @@ pub(super) fn compare(current: &GatewaySnapshot, candidate: &GatewaySnapshot) ->
             "changed": routes_changed
         },
         "upstreams": {
-            "added": candidate_upstreams.difference(&current_upstreams).cloned().collect::<Vec<_>>(),
-            "removed": current_upstreams.difference(&candidate_upstreams).cloned().collect::<Vec<_>>(),
+            "added": upstreams_added,
+            "removed": upstreams_removed,
+            "changed": upstreams_changed,
         },
         "listeners": {
             "added": listeners_added,

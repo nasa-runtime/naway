@@ -9,6 +9,7 @@ pub mod health;
 pub mod load;
 mod locality;
 pub mod passive;
+mod semantic;
 
 use locality::Policy as UpstreamLocalityPolicy;
 
@@ -1136,17 +1137,6 @@ impl UpstreamDirectory {
         self.services.len()
     }
 
-    /// 业务作用：返回当前快照声明的逻辑上游名集，供管理面语义 diff 识别服务增删。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：按字典序排列的服务名；不包含动态实例、metadata 或连接凭据。
-    pub(crate) fn service_names(&self) -> Vec<String> {
-        let mut names = self.services.keys().cloned().collect::<Vec<_>>();
-        names.sort();
-        names
-    }
-
     /// 业务作用：向有界管理目录借用声明服务身份，避免为了遍历而复制全部服务名。
     ///
     /// 参数说明: 无。
@@ -1558,7 +1548,7 @@ pub struct ServiceSnapshot {
 }
 
 /// 构建期校验后的连接预热策略。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UpstreamPrewarmPolicy {
     /// 每个实例期望预建的空闲连接数。
     pub connections: usize,
@@ -1892,7 +1882,7 @@ impl LbHashSource {
 }
 
 /// 一致性哈希策略的键来源与表参数。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LbHashPolicy {
     /// 哈希键来源。
     pub source: LbHashSource,
@@ -1903,7 +1893,7 @@ pub struct LbHashPolicy {
 }
 
 /// 会话保持的载体形态。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SessionAffinityMode {
     /// 由网关生成并下发 cookie;客户端后续请求带回。
     Cookie {
@@ -1932,7 +1922,7 @@ pub enum SessionAffinityMode {
 }
 
 /// 已校验的会话保持策略。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionAffinityPolicy {
     /// 载体形态与属性。
     pub mode: SessionAffinityMode,
@@ -2097,7 +2087,7 @@ pub struct LbSelectHints {
 }
 
 /// `proxy_next_upstream` 的触发条件、尝试预算和退避策略。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NextUpstreamPolicy {
     /// 连接或传输错误是否换实例。
     pub error: bool,
@@ -2189,7 +2179,7 @@ impl NextUpstreamPolicy {
 }
 
 /// 实例连续失败达到阈值后的临时摘除策略。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PassiveHealthPolicy {
     /// 触发摘除所需的连续失败数；0 关闭。
     pub max_fails: u32,

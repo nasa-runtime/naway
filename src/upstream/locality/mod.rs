@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 const MAX_TARGETS: usize = 256;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct Policy(Arc<Kind>);
 
+#[derive(PartialEq, Eq)]
 enum Kind {
     Zone(zone::Policy),
     Hierarchy(hierarchy::Policy),

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 /// 已校验的 zone-aware locality 与 failover 顺序。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct Policy {
     local_zone: Arc<str>,
     failover_zones: Arc<[Arc<str>]>,
@@ -99,6 +99,10 @@ impl Policy {
             degraded_zones.push(Arc::<str>::from(zone));
         }
         let degraded_weight_percent = cfg.degraded_weight_percent.unwrap_or(20);
+        // 权重和劣化集合没有优先级含义，构建期归一使同义配置不会因 HashMap 顺序产生变化。
+        zone_weights.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        degraded_zones.sort_unstable();
+        degraded_zones.dedup();
         anyhow::ensure!(
             (1..=100).contains(&degraded_weight_percent),
             "service `{service}` locality.degraded_weight_percent 必须在 1..=100"
