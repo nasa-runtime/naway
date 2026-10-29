@@ -4,6 +4,7 @@ mod api;
 mod authorization;
 mod capacity;
 mod connection;
+mod draft;
 mod execution;
 mod model;
 mod reading;

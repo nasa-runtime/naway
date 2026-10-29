@@ -37,10 +37,11 @@ pub(in crate::admin) async fn handle(
     let (request, body) = req.into_parts();
     let identity = match admin::authenticate_admin_request(&request, &state) {
         Ok(identity) => identity,
-        Err(response) => return *response,
+        // 认证拒绝也属于当前主体的管理响应，不能被共享缓存复用于其它会话。
+        Err(response) => return private(*response),
     };
     if let Some(response) = admin::reject_untrusted_admin_browser_origin(&request, &state) {
-        return response;
+        return private(response);
     }
     let Some(store) = state.operations.get() else {
         return failure(Error::Missing);
@@ -85,6 +86,25 @@ pub(in crate::admin) async fn handle(
     let suffix = path
         .strip_prefix("/api/operations/proposals")
         .unwrap_or("invalid");
+    let draft = write && suffix == "/draft";
+    if draft {
+        // 草稿不产生执行权威，但编辑入口仍要求当前范围的写资格，不能借读取权限扩大管理能力。
+        if query
+            .scope
+            .check(
+                &snapshot,
+                &identity.principal_id,
+                query.domain,
+                Action::Write,
+            )
+            .is_err()
+        {
+            return failure(Error::Denied);
+        }
+        if !admin::request_content_type(&request, "application/json") {
+            return failure(Error::Invalid);
+        }
+    }
     let execution_id = suffix
         .strip_prefix('/')
         .and_then(|path| path.strip_suffix("/execute"))
@@ -204,7 +224,17 @@ pub(in crate::admin) async fn handle(
         if !Arc::ptr_eq(&state.snap.load_full(), &snapshot) {
             return failure(Error::Conflict);
         }
-        if let Some(id) = execution_id {
+        if draft {
+            super::draft::handle(
+                &state,
+                query.domain,
+                bytes,
+                plan.config.max_candidate_bytes as usize,
+                &store.plan.config.cluster_id,
+                &query.scope.key,
+            )
+            .await
+        } else if let Some(id) = execution_id {
             Box::pin(execution::execute(&execution_context, id, &bytes))
                 .await
                 .map(|value| admin::json(StatusCode::OK, value))
@@ -225,7 +255,7 @@ pub(in crate::admin) async fn handle(
         Err(Error::Invalid)
     };
     if !Arc::ptr_eq(&state.snap.load_full(), &snapshot) {
-        return failure(if write {
+        return failure(if write && !draft {
             Error::OutcomeUnknown
         } else {
             Error::Conflict
