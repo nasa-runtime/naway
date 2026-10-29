@@ -1,5 +1,6 @@
 import { element } from "../../core/dom.js";
 import { baselineDescription, targetPicker } from "./targets.js";
+import { draftEditor } from "./draft/editor.js";
 
 /**
  * 业务作用：将可编辑值与可读标签绑定，避免字段只依赖占位提示。
@@ -20,9 +21,17 @@ export function field(title, input) {
  * - `capacity`：后端公开的单候选和目标上限。
  * - `submit`：用户明确提交后的页面协调回调。
  * - `loadTargets`：按当前范围读取一次集群目标的协调回调。
+ * - `domain`：当前已授权领域的读取回调。
+ * - `requestDraft`：绑定范围与原文身份的草稿请求协调器。
  * 返回：可读取、锁定和清空的表单；不创建网络或后台任务。
  */
-export function proposalForm(capacity, submit, loadTargets) {
+export function proposalForm(
+  capacity,
+  submit,
+  loadTargets,
+  domain,
+  requestDraft,
+) {
   const form = element("form", "", "panel proposal-form");
   const fields = element("fieldset");
   fields.append(element("legend", "保存新提案"));
@@ -40,6 +49,12 @@ export function proposalForm(capacity, submit, loadTargets) {
   candidate.required = true;
   candidate.autocomplete = "off";
   candidate.setAttribute("aria-label", "候选 YAML");
+  const draft = draftEditor(
+    candidate,
+    capacity.max_candidate_bytes,
+    domain,
+    requestDraft,
+  );
   const ttl = element("input");
   ttl.type = "number";
   ttl.min = String(capacity.min_ttl_seconds);
@@ -58,6 +73,7 @@ export function proposalForm(capacity, submit, loadTargets) {
   save.type = "submit";
   fields.append(
     field("候选 YAML", candidate),
+    draft.node,
     field("提案有效期（秒）", ttl),
     element(
       "p",
@@ -246,6 +262,7 @@ export function proposalForm(capacity, submit, loadTargets) {
    */
   function clear() {
     candidate.value = "";
+    draft.clear();
     ttl.value = "600";
     for (const row of rows) {
       for (const input of Object.values(row.values)) {
@@ -280,5 +297,7 @@ export function proposalForm(capacity, submit, loadTargets) {
     showTargets: picker.show,
 
     clearTargets: picker.clear,
+
+    clearDraft: draft.clear,
   };
 }

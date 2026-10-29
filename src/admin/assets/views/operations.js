@@ -103,7 +103,13 @@ export function mount(root, session) {
   let pages = [""];
   let page = 0;
   let nextAfter = null;
-  const form = proposalForm(session.operations, submit, loadTargets);
+  const form = proposalForm(
+    session.operations,
+    submit,
+    loadTargets,
+    () => selectedDomain,
+    editDraft,
+  );
   root.replaceChildren(
     element(
       "p",
@@ -146,6 +152,7 @@ export function mount(root, session) {
       domain.append(option);
     }
     selectedDomain = domain.value;
+    form.clearDraft();
   }
 
   /**
@@ -243,6 +250,90 @@ export function mount(root, session) {
   }
 
   /**
+   * 业务作用：将草稿处理接入唯一请求链，完整复验当前范围和原文字节后才允许回填。
+   * 参数说明：
+   * - `candidate`：用户在本次操作开始时的原文。
+   * - `action`：明确对象和字段动作。
+   * - `receive`：当前页面的同步回填函数，不写任何目标文件。
+   * 返回：仅当前且摘要一致的结果进入表单；失败不保存提案或重试写入。
+   */
+  async function editDraft(candidate, action, receive) {
+    if (pending || !permissions.write || !accepting) {
+      return;
+    }
+    await run(async (signal, guard) => {
+      if (
+        !candidate ||
+        new TextEncoder().encode(candidate).byteLength >
+          session.operations.max_candidate_bytes
+      ) {
+        throw new Error("候选为空或超过 UTF-8 字节上限。");
+      }
+      const originalDomain = selectedDomain;
+      const originalScope = workspace ? `workspace.${workspace}` : "platform";
+      const digest = await draftDigest(candidate);
+      guard();
+      const data = checked(
+        (
+          await request(path("/draft"), {
+            method: "POST",
+
+            headers: { "content-type": "application/json" },
+
+            body: JSON.stringify({
+              candidate,
+              action,
+            }),
+
+            signal,
+          })
+        ).data,
+      );
+      guard();
+      if (
+        data.schema_version !== 1 ||
+        data.validation !== "declaration_only" ||
+        data.published !== false ||
+        data.domain !== originalDomain ||
+        data.scope !== originalScope ||
+        data.base_sha256 !== digest
+      ) {
+        throw new Error("草稿响应的范围或原文身份不一致，已丢弃结果。");
+      }
+      if (action.type !== "inspect") {
+        if (
+          typeof data.candidate !== "string" ||
+          typeof data.changed !== "boolean" ||
+          new TextEncoder().encode(data.candidate).byteLength >
+            session.operations.max_candidate_bytes ||
+          (await draftDigest(data.candidate)) !== data.candidate_sha256
+        ) {
+          throw new Error("生成候选的容量或摘要不一致，已丢弃结果。");
+        }
+        guard();
+      }
+      receive(data);
+      status.textContent = "草稿处理完成；候选尚未保存、预检或发布到任何目标。";
+    });
+  }
+
+  /**
+   * 业务作用：绑定草稿请求及回复的完整 UTF-8 字节，显示摘要不代替目标动作授权。
+   * 参数说明：
+   * - `value`：有界候选原文。
+   * 返回：完整 SHA-256 小写十六进制身份。
+   */
+  async function draftDigest(value) {
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(value),
+    );
+    return Array.from(new Uint8Array(digest), (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
+  }
+
+  /**
    * 业务作用：集中限制页面为一个在途请求链，并在取消或范围换代后撤销旧响应显示权威。
    * 参数说明：
    * - `work`：只在当前信号及资格复验下运行的请求步骤。
@@ -285,6 +376,13 @@ export function mount(root, session) {
         error.name !== "AbortError"
       ) {
         clearDetail();
+        form.clearDraft();
+        if (error.status === 403) {
+          // 当前授权已拒绝后不能留下原文或沿用旧按钮资格。
+          permissions = {};
+          accepting = false;
+          form.clear();
+        }
         status.textContent = `${error.message}${pending ? " 原请求身份保留，请先查找或按原身份重试。" : ""}`;
       }
       return null;
@@ -404,6 +502,9 @@ export function mount(root, session) {
       permissions = context.permissions;
       accepting = context.accept_proposals === true;
       executionCapability = capability(context);
+      if (!permissions.write || !accepting) {
+        form.clear();
+      }
       const { data } = await request(path("", pages[page]), { signal });
       guard();
       draw(checked(data));
@@ -508,6 +609,7 @@ export function mount(root, session) {
     await run(async (signal, guard) => {
       unresolvedExecution = {
         id: record.id,
+
         digest: record.candidate_sha256,
       };
       status.textContent = `正在创建执行；结果未知时请读取原提案 ${record.id}。`;
@@ -902,6 +1004,7 @@ export function mount(root, session) {
       domainOptions();
     } else {
       selectedDomain = domain.value;
+      form.clearDraft();
     }
     list.replaceChildren();
     reload();

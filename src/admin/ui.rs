@@ -64,6 +64,18 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "application/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/form.js"),
         ),
+        "/ui/views/operations/draft/editor.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/editor.js"),
+        ),
+        "/ui/views/operations/draft/fields.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/fields.js"),
+        ),
+        "/ui/views/operations/draft/schema.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/schema.js"),
+        ),
         "/ui/views/operations/detail.js" => (
             "application/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/detail.js"),

@@ -103,7 +103,8 @@ export async function request(path, options = {}) {
     let length = 0;
     const capacity =
       target.pathname === "/api/cluster/catalog" ||
-      target.pathname === "/api/operations/proposals"
+      target.pathname === "/api/operations/proposals" ||
+      target.pathname === "/api/operations/proposals/draft"
         ? 4 * 1024 * 1024
         : 1024 * 1024;
     try {
