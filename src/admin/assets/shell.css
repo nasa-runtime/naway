@@ -57,7 +57,8 @@
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
   gap: 16px;
 }
-.draft-fields > details {
+.draft-fields > details,
+.draft-nested {
   grid-column: 1 / -1;
 }
 .draft-field {

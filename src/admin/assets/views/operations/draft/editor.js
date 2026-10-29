@@ -1,6 +1,7 @@
 import { element } from "../../../core/dom.js";
 import { draftFieldPanel } from "./fields.js";
 import { objectKinds, objectLabel } from "./schema.js";
+import { fieldAction } from "./nested.js";
 
 /**
  * 业务作用：围绕当前候选提供显式对象编辑，所有结果仍须进入共享提案和原目标执行。
@@ -202,6 +203,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
     perform(
       {
         type: "inspect",
+
         object,
       },
       (data) => {
@@ -230,16 +232,20 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
         kind.value === "service"
           ? {
               kind: kind.value,
+
               name: name.value,
             }
           : kind.value === "route"
             ? {
                 kind: kind.value,
+
                 proxy: parent.value,
+
                 id: name.value,
               }
             : {
                 kind: kind.value,
+
                 id: name.value,
               };
       show(object, {}, true);
@@ -253,23 +259,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
     }
     try {
       const patch = fields.read();
-      if (creating && patch.remove.length) {
-        throw new Error("新增对象不能移除字段，请将不需要的字段保持未声明。");
-      }
-      perform(
-        creating
-          ? {
-              type: "create",
-              object: selected,
-              fields: patch.fields,
-            }
-          : {
-              type: "patch",
-              object: selected,
-              ...patch,
-            },
-        publish,
-      );
+      perform(fieldAction(selected, patch, creating), publish);
     } catch (error) {
       notice.textContent = error.message;
     }
@@ -282,6 +272,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
       perform(
         {
           type: "delete",
+
           object: selected,
         },
         publish,

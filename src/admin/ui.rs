@@ -76,6 +76,14 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/schema.js"),
         ),
+        "/ui/views/operations/draft/controls.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/controls.js"),
+        ),
+        "/ui/views/operations/draft/nested.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/nested.js"),
+        ),
         "/ui/views/operations/detail.js" => (
             "application/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/detail.js"),

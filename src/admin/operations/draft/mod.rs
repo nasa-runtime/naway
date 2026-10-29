@@ -1,5 +1,6 @@
 //! 只编辑调用者提交的原始声明，结果继续交给共享提案和原目标的完整构建器。
 
+mod nested;
 mod objects;
 
 use super::model::{hex, Domain, Error};
@@ -34,6 +35,10 @@ enum Action {
         fields: Map<String, Value>,
         #[serde(default)]
         remove: Vec<String>,
+    },
+    PatchNested {
+        object: Object,
+        edits: Vec<nested::Edit>,
     },
     Create {
         object: Object,
@@ -145,6 +150,15 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
                 return Err(Error::Missing);
             }
             patch(objects::find_mut(&mut document, &object)?, fields, remove)?
+        }
+        Action::PatchNested {
+            object,
+            edits,
+        } => {
+            if !catalog.contains(&object) {
+                return Err(Error::Missing);
+            }
+            nested::patch(objects::find_mut(&mut document, &object)?, edits)?
         }
         Action::Create {
             object,
