@@ -16,6 +16,8 @@ use http::Uri;
 use crate::config::model::{GatewayConfig, UpstreamCredentialCfg, UpstreamTlsCfg};
 use crate::routing::RequestHeaderOp;
 
+mod semantic;
+
 const MAX_CREDENTIALS: usize = 256;
 const MAX_CREDENTIAL_REFS: usize = 16;
 const MAX_ALLOWED_BACKENDS: usize = 64;
@@ -26,6 +28,8 @@ pub(crate) struct UpstreamCredentialPlan {
     headers: Vec<(HeaderName, HeaderValue)>,
     query: Vec<(String, String)>,
     not_after: Option<std::time::Instant>,
+    /// 名称、类型、覆盖权限、backend 归属与远程来源身份；实际注入值由上方字段直接承载。
+    binding_identity: [u8; 32],
 }
 
 impl UpstreamCredentialPlan {
@@ -111,6 +115,7 @@ impl UpstreamCredentialPlan {
             headers,
             query,
             not_after,
+            binding_identity: semantic::binding_identity(cfgs),
         })))
     }
 
@@ -230,7 +235,7 @@ pub(crate) fn resolve_references(
         }
     }
     let mut definitions = HashMap::with_capacity(cfg.upstream_credentials.len());
-    for credential in &cfg.upstream_credentials {
+    for credential in &mut cfg.upstream_credentials {
         validate_definition(credential, config_dir)?;
         if definitions
             .insert(credential.name.clone(), credential.clone())
@@ -374,6 +379,12 @@ fn resolve_llm_remote_fields(
     model: &mut crate::config::model::LlmModelCfg,
     resolution: &crate::security::remote_secret::RemoteSecretResolution,
 ) -> Result<()> {
+    model.resolved_policy_identity = resolution.policy_identity([
+        model.api_key.as_str(),
+        model.aws_access_key_id.as_str(),
+        model.aws_secret_access_key.as_str(),
+        model.aws_session_token.as_str(),
+    ])?;
     if crate::security::remote_secret::is_remote_reference(model.api_key.as_str()) {
         let resolved = resolution.get(model.api_key.as_str())?;
         model.resolved_api_key = Some(resolved.value());
@@ -412,6 +423,11 @@ fn resolve_remote_fields(
     credential: &mut UpstreamCredentialCfg,
     resolution: &crate::security::remote_secret::RemoteSecretResolution,
 ) -> Result<()> {
+    credential.resolved_policy_identity = resolution.policy_identity([
+        credential.value.as_str(),
+        credential.client_certificate.as_str(),
+        credential.client_private_key.as_str(),
+    ])?;
     if crate::security::remote_secret::is_remote_reference(credential.value.as_str()) {
         let resolved = resolution.get(credential.value.as_str())?;
         credential.resolved_value = Some(resolved.value());
@@ -502,8 +518,8 @@ fn resolved_tls_material(
 /// - `cfg`：是单一凭据
 /// - `config_dir`：是 SecretSource 路径基准。
 ///
-/// 返回：声明自洽且所有本地 secret 可读取时成功，否则返回错误。
-fn validate_definition(cfg: &UpstreamCredentialCfg, config_dir: &Path) -> Result<()> {
+/// 返回：声明自洽且本地 secret 可读取时成功，并冻结规范排序的 backend 集；否则拒绝候选。
+fn validate_definition(cfg: &mut UpstreamCredentialCfg, config_dir: &Path) -> Result<()> {
     validate_name(cfg.name.as_str())?;
     if cfg.allowed_backends.is_empty() || cfg.allowed_backends.len() > MAX_ALLOWED_BACKENDS {
         bail!(
@@ -511,17 +527,22 @@ fn validate_definition(cfg: &UpstreamCredentialCfg, config_dir: &Path) -> Result
             cfg.name
         );
     }
-    let mut allowed = HashSet::new();
-    for backend in &cfg.allowed_backends {
-        let backend = normalize_allowed_backend(backend)
-            .with_context(|| format!("upstream credential `{}` allowed backend", cfg.name))?;
-        if !allowed.insert(backend) {
-            bail!(
-                "upstream credential `{}` has duplicate allowed backend",
-                cfg.name
-            );
-        }
+    let mut allowed = cfg
+        .allowed_backends
+        .iter()
+        .map(|backend| {
+            normalize_allowed_backend(backend)
+                .with_context(|| format!("upstream credential `{}` allowed backend", cfg.name))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    allowed.sort_unstable();
+    if allowed.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!(
+            "upstream credential `{}` has duplicate allowed backend",
+            cfg.name
+        );
     }
+    cfg.allowed_backends = allowed;
     match cfg.kind.as_str() {
         "api_key" | "header" | "query" => {
             if cfg.overwrite.is_none()
@@ -660,6 +681,8 @@ fn attach_tls_identity(
         ),
     )?);
     tls.client_identity_not_after = credential.resolved_not_after;
+    tls.client_identity_policy_identity =
+        Some(semantic::binding_identity(std::slice::from_ref(credential)));
     Ok(())
 }
 
@@ -871,17 +894,17 @@ fn route_query_contains(uri: &str, target: &str) -> Result<bool> {
 /// 业务作用：复验凭据只会到达定义时声明的 backend。
 ///
 /// 参数说明：
-/// - `credential`：是全局定义
+/// - `credential`：是已校验且 backend 集已规范排序的全局定义
 /// - `backend`：是 route/service 规范身份。
 ///
 /// 返回：allowlist 精确命中时成功，未命中拒绝候选。
 fn ensure_backend_allowed(credential: &UpstreamCredentialCfg, backend: &str) -> Result<()> {
-    let allowed = credential
+    // 归属门只信任定义阶段冻结的规范 origin，不能按请求内容扩大凭据的可达范围。
+    if credential
         .allowed_backends
-        .iter()
-        .map(|candidate| normalize_allowed_backend(candidate))
-        .collect::<Result<Vec<_>>>()?;
-    if !allowed.iter().any(|candidate| candidate == backend) {
+        .binary_search_by(|candidate| candidate.as_str().cmp(backend))
+        .is_err()
+    {
         bail!(
             "upstream credential `{}` is not allowed for backend `{backend}`",
             credential.name

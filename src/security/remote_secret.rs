@@ -41,6 +41,8 @@ const MAX_CACHE_ENTRIES: usize = 1024;
 pub(crate) struct ResolvedRemoteSecret {
     value: String,
     not_after: Instant,
+    /// 实际获得该值的固定 provider 策略，独立于刷新时间与对象数据版本。
+    policy_identity: [u8; 32],
 }
 
 impl ResolvedRemoteSecret {
@@ -794,6 +796,7 @@ async fn resolve_one(
             return Ok(ResolvedRemoteSecret {
                 value: cached.value,
                 not_after: cached.not_after,
+                policy_identity: cached.policy_identity,
             });
         }
     }
@@ -833,6 +836,7 @@ async fn resolve_one(
     let resolved = ResolvedRemoteSecret {
         value: fetched.value.clone(),
         not_after,
+        policy_identity: provider.policy_identity,
     };
     // 配置反复切换 endpoint/path 时缓存键会变化；先清理过期代，再按最近成功时间回收最旧
     // 非活动项，确保控制面 LKG 不会因配置 churn 无界增长。
@@ -904,6 +908,7 @@ fn fallback_after_failure(
     Ok(ResolvedRemoteSecret {
         value: cached.value.clone(),
         not_after: cached.not_after,
+        policy_identity: cached.policy_identity,
     })
 }
 

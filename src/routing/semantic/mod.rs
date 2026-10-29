@@ -5,6 +5,7 @@ mod agent;
 mod authentication;
 mod backends;
 mod content;
+mod credentials;
 mod external;
 mod grpc;
 mod llm;

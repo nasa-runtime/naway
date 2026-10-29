@@ -3380,6 +3380,7 @@ fn build_service_tls_profile(
     }
     .with_context(|| format!("build upstream tls profile for service `{name}`"))?;
     profile.client_identity_not_after = tls.client_identity_not_after;
+    profile.client_identity_policy_identity = tls.client_identity_policy_identity;
     Ok(Some(profile))
 }
 

@@ -3,6 +3,35 @@
 use super::{PreparedAdapter, PreparedProvider};
 use sha2::{Digest, Sha256};
 
+impl super::RemoteSecretResolution {
+    /// 业务作用：把组合凭据各字段的远程对象与实际信任策略绑定到消费计划，识别同值不同来源。
+    ///
+    /// 参数说明：
+    /// - `references`：按业务字段固定顺序排列的来源；本地来源只占位，其值由消费计划比较。
+    ///
+    /// 返回：存在远程字段时返回组合身份；全部本地时为空；缺少已验证远程结果时拒绝候选。
+    pub(crate) fn policy_identity<const N: usize>(
+        &self,
+        references: [&str; N],
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        let mut digest = Sha256::new();
+        digest.update(b"naway-remote-secret-consumer\0");
+        digest.update((N as u64).to_be_bytes());
+        let mut has_remote = false;
+        for reference in references {
+            let remote = super::is_remote_reference(reference);
+            digest.update([u8::from(remote)]);
+            if remote {
+                let resolved = self.get(reference)?;
+                has_remote = true;
+                part(&mut digest, reference.as_bytes());
+                digest.update(resolved.policy_identity);
+            }
+        }
+        Ok(has_remote.then(|| digest.finalize().into()))
+    }
+}
+
 /// 只在候选构建期间使用的长度分隔摘要，不保留认证、证书或私钥副本。
 pub(super) struct Material(Sha256);
 

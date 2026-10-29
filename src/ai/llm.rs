@@ -166,6 +166,8 @@ pub struct LlmEmbeddingModel {
 /// 已解析 SecretSource 与 provider 默认值的单模型计划。
 #[derive(PartialEq, Eq)]
 pub struct LlmModel {
+    /// 实际远程对象与 provider 策略身份；不包含刷新时刻或缓存运行状态。
+    remote_policy_identity: Option<[u8; 32]>,
     /// 低基数配置 id。
     pub(crate) id: Arc<str>,
     /// Wire provider。
@@ -1339,6 +1341,7 @@ impl LlmModel {
             id: Arc::from(cfg.id.as_str()),
             provider,
             api_type,
+            remote_policy_identity: cfg.resolved_policy_identity,
             upstream: Arc::from(cfg.uri.as_str()),
             model: Arc::from(cfg.model.as_str()),
             path: Arc::from(path),

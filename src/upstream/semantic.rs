@@ -164,12 +164,19 @@ fn same_instance(current: &UpstreamInstance, candidate: &UpstreamInstance) -> bo
 /// - `current`：活动连接策略，缺省表示无上游 TLS profile。
 /// - `candidate`：候选连接策略。
 ///
-/// 返回：池身份与显式主机名一致时为真；身份租约的时钟流逝由传输授权门处理，不作为配置修改。
+/// 返回：池身份、显式主机名与命名凭据授权策略一致时为真；租约时钟由传输门处理，不作为配置修改。
 fn same_tls(current: &Option<UpstreamTlsProfile>, candidate: &Option<UpstreamTlsProfile>) -> bool {
-    current
-        .as_ref()
-        .map(|profile| (&profile.key, &profile.server_name))
-        == candidate
-            .as_ref()
-            .map(|profile| (&profile.key, &profile.server_name))
+    current.as_ref().map(|profile| {
+        (
+            &profile.key,
+            &profile.server_name,
+            profile.client_identity_policy_identity,
+        )
+    }) == candidate.as_ref().map(|profile| {
+        (
+            &profile.key,
+            &profile.server_name,
+            profile.client_identity_policy_identity,
+        )
+    })
 }

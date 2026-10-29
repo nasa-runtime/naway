@@ -242,6 +242,9 @@ pub struct LlmModelCfg {
     /// 组合云凭据的最早有效截止点；reload 调度不得让其中任一项过期后继续使用旧快照。
     #[serde(skip, default)]
     pub resolved_not_after: Option<std::time::Instant>,
+    /// API key 与云签名材料的远程对象和实际 provider 策略；只用于冻结配置身份。
+    #[serde(skip, default)]
+    pub(crate) resolved_policy_identity: Option<[u8; 32]>,
     /// 是否直接使用 provider 原生 request/response，不执行跨 provider 字段转换。
     #[serde(default)]
     pub native_passthrough: bool,

@@ -41,6 +41,9 @@ pub struct UpstreamCredentialCfg {
     /// 远程凭据允许用于新请求的单调时钟截止点；本地来源没有该限制。
     #[serde(skip)]
     pub(crate) resolved_not_after: Option<std::time::Instant>,
+    /// 普通值、证书与私钥对应的远程对象和实际 provider 策略；不包含移动截止点。
+    #[serde(skip)]
+    pub(crate) resolved_policy_identity: Option<[u8; 32]>,
 }
 
 /// HTTPS keyless/KMS 或 PKCS#11/HSM 密码 provider 的传输、认证与资源预算。

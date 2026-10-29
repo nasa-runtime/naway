@@ -234,6 +234,8 @@ pub struct UpstreamTlsProfile {
     pub client_config: Arc<ClientConfig>,
     /// 远程客户端身份允许建立新请求的单调时钟截止点；本地身份为空。
     pub(crate) client_identity_not_after: Option<std::time::Instant>,
+    /// 命名身份的完整授权策略，不代替材料池键或请求时的有效期复验。
+    pub(crate) client_identity_policy_identity: Option<[u8; 32]>,
     /// 可选动态 SPIRE 身份来源；存在时新请求与握手都复验当前授权和到期状态。
     pub(crate) spire: Option<Arc<crate::tls::spire::SpireTlsSource>>,
 }
@@ -937,6 +939,7 @@ pub(crate) fn build_encryption_only_upstream_tls_profile(
         server_name: server_name.map(Arc::from),
         client_config: Arc::new(client_config),
         client_identity_not_after: None,
+        client_identity_policy_identity: None,
         spire: None,
     })
 }
@@ -1141,6 +1144,7 @@ fn build_upstream_tls_profile_inner(
         server_name: server_name.map(Arc::from),
         client_config: Arc::new(client_config),
         client_identity_not_after: None,
+        client_identity_policy_identity: None,
         spire,
     })
 }

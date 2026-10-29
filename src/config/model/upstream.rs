@@ -487,6 +487,9 @@ pub struct UpstreamTlsCfg {
     /// 远程身份允许创建新上游请求的截止点；仅由候选构建器写入。
     #[serde(skip)]
     pub(crate) client_identity_not_after: Option<std::time::Instant>,
+    /// 命名客户端身份的归属与远程来源策略；只由已验证的凭据绑定器写入。
+    #[serde(skip)]
+    pub(crate) client_identity_policy_identity: Option<[u8; 32]>,
 }
 
 /// 业务作用：为未显式声明的 `weight` 提供统一缺省策略，使配置反序列化与手动构造使用相同初值。
