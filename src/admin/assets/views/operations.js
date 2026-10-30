@@ -282,6 +282,7 @@ export function mount(root, session) {
 
             body: JSON.stringify({
               candidate,
+
               action,
             }),
 
@@ -430,6 +431,7 @@ export function mount(root, session) {
       loadSource,
       review,
       execute,
+      preview,
     );
     controls();
   }
@@ -581,12 +583,43 @@ export function mount(root, session) {
    */
   function capability(context) {
     return {
+      preview_supported: context.preview_supported === true,
+
+      preview_ready: context.preview_ready === true,
+
+      preview_allowed: context.preview_allowed === true,
+
       execution_supported: context.execution_supported === true,
 
       execution_enabled: context.execution_enabled === true,
 
       execution_ready: context.execution_ready === true,
     };
+  }
+
+  /**
+   * 业务作用：显式请求原提案全部目标的只读预览，范围换代或隐藏后不交付迟到事实。
+   * 参数说明：
+   * - `record`：当前详情的原提案身份。
+   * 返回：仅显示本次有界结果，不自动审批、执行或重试。
+   */
+  async function preview(record) {
+    await run(async (signal, guard) => {
+      const { data } = await request(path(`/${record.id}/preview`), {
+        method: "POST",
+
+        headers: { "content-type": "application/json" },
+
+        body: "{}",
+
+        signal,
+      });
+      guard();
+      if (detailRecord === record) {
+        detailView.preview(checked(data));
+        status.textContent = "全部原目标预览已返回；失败节点仍计入原目标范围。";
+      }
+    });
   }
 
   /**

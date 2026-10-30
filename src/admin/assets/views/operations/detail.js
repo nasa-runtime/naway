@@ -2,6 +2,7 @@ import { element } from "../../core/dom.js";
 import { field } from "./form.js";
 import { baselineDescription } from "./targets.js";
 import { renderExecution } from "./execution.js";
+import { previewView } from "./preview.js";
 
 /**
  * 业务作用：展示一个集群提案的真实审阅状态，并要求读取原文后才允许确认审阅。
@@ -12,9 +13,18 @@ import { renderExecution } from "./execution.js";
  * - `load`：加载该记录原文并核对页面代的协调回调。
  * - `review`：按原摘要提交一次审阅的协调回调。
  * - `execute`：按原摘要创建一次持久执行的协调回调。
+ * - `preview`：显式读取全部原目标短期差异的协调回调。
  * 返回：锁定和清空详情的句柄；离开时撤销所有迟到回填资格。
  */
-export function proposalDetail(root, record, access, load, review, execute) {
+export function proposalDetail(
+  root,
+  record,
+  access,
+  load,
+  review,
+  execute,
+  preview,
+) {
   let alive = true;
   let busy = false;
   let loaded = false;
@@ -30,6 +40,10 @@ export function proposalDetail(root, record, access, load, review, execute) {
   const actions = element("div", "", "monitor-toolbar");
   const buttons = [];
   const progress = element("section", "", "proposal-execution");
+  const previewRoot = element("section", "", "proposal-preview");
+  const previewPanel = previewView(previewRoot, record);
+  const previewButton = element("button", "预览全部原目标差异");
+  previewButton.type = "button";
   const executeButton = element("button", "执行已批准提案");
   executeButton.type = "button";
   const canRead =
@@ -81,6 +95,8 @@ export function proposalDetail(root, record, access, load, review, execute) {
     agreement,
     actions,
     progress,
+    previewButton,
+    previewRoot,
   );
   if (!canRead) {
     root.append(
@@ -91,6 +107,19 @@ export function proposalDetail(root, record, access, load, review, execute) {
       ),
     );
   }
+  previewButton.addEventListener("click", () => {
+    if (
+      alive &&
+      !busy &&
+      access.preview_ready &&
+      access.preview_allowed &&
+      !record.execution_started &&
+      ["awaiting_approval", "approved"].includes(record.status)
+    ) {
+      previewPanel.pending();
+      preview(record);
+    }
+  });
   actions.append(executeButton);
   executeButton.addEventListener("click", () => {
     if (
@@ -144,6 +173,7 @@ export function proposalDetail(root, record, access, load, review, execute) {
     actions.append(button);
     buttons.push({
       button,
+
       decision,
     });
   }
@@ -154,6 +184,12 @@ export function proposalDetail(root, record, access, load, review, execute) {
    * 返回：更新当前详情控件；执行资格和提案受理开关保持独立。
    */
   function update() {
+    previewButton.hidden =
+      !access.preview_supported ||
+      !access.preview_allowed ||
+      record.execution_started ||
+      !["awaiting_approval", "approved"].includes(record.status);
+    previewButton.disabled = busy || !alive || !access.preview_ready;
     open.disabled = busy || !alive;
     checked.disabled = busy || !loaded || !alive;
     executeButton.hidden =
@@ -234,6 +270,7 @@ export function proposalDetail(root, record, access, load, review, execute) {
    */
   function clear() {
     alive = false;
+    previewPanel.clear();
     loaded = false;
     checked.checked = false;
     body.textContent = "";
@@ -251,8 +288,12 @@ export function proposalDetail(root, record, access, load, review, execute) {
   function authorize(current) {
     access = {
       ...access,
+
       ...current,
     };
+    if (!access.preview_ready || !access.preview_allowed) {
+      previewPanel.clear();
+    }
     open.hidden = !(
       access.review ||
       (access.write && record.creator === access.principal)
@@ -293,5 +334,18 @@ export function proposalDetail(root, record, access, load, review, execute) {
     authorize,
 
     execution,
+
+    /**
+     * 业务作用：只向仍有效的原详情交付短期完整差异，退出后不得重新挂载。
+     * 参数说明：
+     * - `value`：本次全部原目标的服务端结果。
+     * 返回：更新当前预览并设置到期清除。
+     */
+
+    preview(value) {
+      if (alive) {
+        previewPanel.show(value);
+      }
+    },
   };
 }

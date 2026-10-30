@@ -92,6 +92,13 @@ naml watcher 只观察主配置、活动 profile 候选和已构建快照声明�
 改变代际、安装或移除存储都会阻止后续配置写入及热更。存储维护不创建默认配置或监听，普通数据
 节点不依赖 PostgreSQL。节点命令接收与集群执行分别使用独立开关；共享提案经双人审阅后仍须显式执行。
 
+### 原目标配置预览
+
+已保存的共享提案支持[原目标配置预览](docs/admin-target-preview.md)。各原 Data 或 all-in-one
+使用自己的完整构建器返回语义差异，三个配置文档领域均保留全部原目标及明确失败原因。
+目标通过 `admin.management.reporter.previews` 独立开启，只读预览不依赖持久动作或执行开关；
+结果短期有效、不保存历史，审批和执行仍需重新验证。
+
 ### 节点命令接收
 
 `node-actions` 在节点持久存储之上提供类型化动作接收，`admin.management.reporter.actions` 默认

@@ -21,6 +21,13 @@ pub struct Manager {
     pub(super) sample_memory: Arc<tokio::sync::Semaphore>,
     #[cfg(feature = "node-actions")]
     pub(super) action_permits: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "node-actions")]
+    pub(super) preview_permits: Arc<tokio::sync::Semaphore>,
+    #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+    pub(super) preview_requests: Arc<tokio::sync::Semaphore>,
+    #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+    pub(super) preview_deliveries:
+        parking_lot::Mutex<std::collections::BTreeMap<String, Arc<super::preview::Offer>>>,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
     pub(super) action_deliveries:
         parking_lot::Mutex<std::collections::BTreeMap<String, Arc<super::actions::Offer>>>,
@@ -188,6 +195,12 @@ impl Manager {
             sample_memory: Arc::new(tokio::sync::Semaphore::new(telemetry::STORE_BYTES)),
             #[cfg(feature = "node-actions")]
             action_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(feature = "node-actions")]
+            preview_permits: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+            preview_requests: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+            preview_deliveries: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
             action_deliveries: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             mode,
@@ -397,6 +410,8 @@ async fn bind(
         "Sample",
         "ActionData",
         "ActionResult",
+        "PreviewData",
+        "PreviewResult",
     ] {
         config.method_policies.insert(
             format!("/naway.management.v1.NodeManagement/{method}"),

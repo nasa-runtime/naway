@@ -5,12 +5,12 @@ use crate::{
     config::{model::AdminAction, GatewaySnapshot},
     control::ownership::config::Action,
 };
-#[cfg(feature = "admin-operations-pgsql")]
+#[cfg(any(feature = "admin-operations-pgsql", feature = "node-actions"))]
 use sha2::{Digest, Sha256};
 
 /// 借用原始权限域，平台与工作区键不能相互冒充。
 pub(crate) struct Scope<'a> {
-    #[cfg(feature = "admin-operations-pgsql")]
+    #[cfg(any(feature = "admin-operations-pgsql", feature = "node-actions"))]
     key: &'a str,
     workspace: Option<&'a str>,
 }
@@ -33,7 +33,7 @@ impl<'a> Scope<'a> {
             Some(value)
         };
         Some(Self {
-            #[cfg(feature = "admin-operations-pgsql")]
+            #[cfg(any(feature = "admin-operations-pgsql", feature = "node-actions"))]
             key,
             workspace,
         })
@@ -85,7 +85,7 @@ impl<'a> Scope<'a> {
     /// - `snapshot`：创建或审阅时的已发布主体与工作区目录。
     ///
     /// 返回：保持排序、长度分帧和原始凭据贡献的摘要；缺失工作区返回空，秘密不进入输出字段。
-    #[cfg(feature = "admin-operations-pgsql")]
+    #[cfg(any(feature = "admin-operations-pgsql", feature = "node-actions"))]
     pub(crate) fn authority(&self, snapshot: &GatewaySnapshot) -> Option<[u8; 32]> {
         let mut digest = Sha256::new();
         digest.update(b"naway-operation-proposal-authority\0");
@@ -126,7 +126,7 @@ impl<'a> Scope<'a> {
 /// - `bytes`：当前字段的借用原字节。
 ///
 /// 返回：只推进摘要，不复制或输出凭据。
-#[cfg(feature = "admin-operations-pgsql")]
+#[cfg(any(feature = "admin-operations-pgsql", feature = "node-actions"))]
 fn field(digest: &mut Sha256, bytes: &[u8]) {
     digest.update((bytes.len() as u64).to_be_bytes());
     digest.update(bytes);

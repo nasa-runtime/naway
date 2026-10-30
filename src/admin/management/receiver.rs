@@ -10,6 +10,8 @@ use std::time::Instant;
 
 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
 mod actions;
+#[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+mod preview;
 
 #[derive(Default)]
 pub(super) struct Store {
@@ -29,6 +31,10 @@ struct Entry {
     metrics_enabled: bool,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
     actions_enabled: bool,
+    #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+    previews_supported: bool,
+    #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+    previews_enabled: bool,
     baseline_supported: bool,
     baseline: Option<Arc<crate::control::baseline::NodeBaseline>>,
     publication: Arc<crate::control::publication_status::PublicationStatus>,
@@ -106,6 +112,10 @@ impl Store {
                 metrics_enabled: false,
                 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
                 actions_enabled: false,
+                #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+                previews_supported: false,
+                #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+                previews_enabled: false,
                 baseline_supported: false,
                 baseline: None,
                 publication: Arc::new(
@@ -564,7 +574,9 @@ impl protocol::node_management_server::NodeManagement for Service {
             request.extensions().get::<PeerIdentity>(),
         )?;
         let value = request.into_inner();
-        if value.actions_enabled && !value.actions_supported {
+        if value.actions_enabled && !value.actions_supported
+            || value.previews_enabled && !value.previews_supported
+        {
             return Err(Status::invalid_argument("node action capability differs"));
         }
         let facts = protocol::decode(value.facts.expect("checked facts"))?;
@@ -603,6 +615,8 @@ impl protocol::node_management_server::NodeManagement for Service {
         #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
         {
             entry.actions_enabled = value.actions_supported && value.actions_enabled;
+            entry.previews_supported = value.previews_supported;
+            entry.previews_enabled = value.previews_supported && value.previews_enabled;
         }
         let interest = manager.metrics_interest();
         if !entry.metrics_enabled || interest == 0 {
@@ -638,13 +652,82 @@ impl protocol::node_management_server::NodeManagement for Service {
         #[cfg(not(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql")))]
         // 节点接收能力没有共享执行 owner，心跳不能自行创建可写动作或释放声明。
         let (action, release) = (None, None);
+        #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+        let preview = if action.is_none() && release.is_none() {
+            manager
+                .preview_deliveries
+                .lock()
+                .get(&node_id)
+                .filter(|offer| {
+                    store
+                        .preview_session(&plan, &offer.command.intent)
+                        .is_ok_and(|session| session.as_slice() == value.session.as_slice())
+                        && offer
+                            .authorize(
+                                &manager,
+                                &node_id,
+                                &offer.command.intent.boot,
+                                &value.session,
+                                None,
+                            )
+                            .is_ok()
+                })
+                .and_then(|offer| offer.wire().ok())
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql")))]
+        let preview = None;
         Ok(Response::new(protocol::ReportResponse {
             accepted_sequence: value.sequence,
             action,
             release,
             metrics_interest_ms,
             service_metrics_supported: true,
+            preview,
         }))
+    }
+
+    /// 业务作用：只向当前已获权原目标交付预览候选，未装配共享预览发行端的制品不提供正文。
+    ///
+    /// 参数说明：
+    /// - `request`：当前 mTLS 节点提交的原会话、投递摘要和偏移。
+    ///
+    /// 返回：已授权的有界片段；能力关闭或任何身份不符都拒绝。
+    async fn preview_data(
+        &self,
+        request: Request<protocol::PreviewDataRequest>,
+    ) -> Result<Response<protocol::PreviewDataResponse>, Status> {
+        #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+        {
+            self.read_preview_data(request)
+        }
+        #[cfg(not(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql")))]
+        {
+            let _ = request;
+            Err(Status::unimplemented("node previews unavailable"))
+        }
+    }
+
+    /// 业务作用：接收一次完整只读差异，不把网络确认解释为配置发布或持久效果。
+    ///
+    /// 参数说明：
+    /// - `request`：原目标与原会话绑定的有限结果。
+    ///
+    /// 返回：原等待者接收结果后确认；无发行能力、旧结果或非法摘要拒绝。
+    async fn preview_result(
+        &self,
+        request: Request<protocol::PreviewResultRequest>,
+    ) -> Result<Response<protocol::PreviewResultResponse>, Status> {
+        #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+        {
+            self.receive_preview_result(request)
+        }
+        #[cfg(not(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql")))]
+        {
+            let _ = request;
+            Err(Status::unimplemented("node previews unavailable"))
+        }
     }
 
     /// 业务作用：只向当前节点交付原签名动作的有限正文，未包含发行适配器的制品不提供候选读取。

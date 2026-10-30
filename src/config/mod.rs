@@ -1280,6 +1280,14 @@ fn build_snapshot_from_config(
                 && !cfg.config_source.nacos.enabled),
         "management reporter actions require authenticated RBAC, audit and local file source"
     );
+    #[cfg(feature = "admin-grpc")]
+    anyhow::ensure!(
+        !admin_management
+            .as_ref()
+            .is_some_and(|plan| plan.previews_enabled)
+            || (admin_auth.enabled && admin_auth.rbac_enabled && !cfg.config_source.nacos.enabled),
+        "management reporter previews require authenticated RBAC and local file source"
+    );
     validate_admin_rollout(
         &cfg.admin.rollout,
         &cfg.config_source,

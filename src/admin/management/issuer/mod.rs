@@ -2,6 +2,8 @@
 
 #[cfg(feature = "node-actions")]
 mod command;
+#[cfg(feature = "node-actions")]
+mod preview;
 mod proof;
 #[cfg(feature = "node-actions")]
 mod release;

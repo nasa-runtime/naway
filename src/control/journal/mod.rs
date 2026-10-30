@@ -217,9 +217,9 @@ impl Journal {
             !snapshot
                 .admin_management
                 .as_ref()
-                .is_some_and(|plan| plan.actions_enabled)
+                .is_some_and(|plan| plan.actions_enabled || plan.previews_enabled)
                 || storage.is_some(),
-            "node actions require initialized journal storage"
+            "node actions and previews require initialized journal storage"
         );
         // 身份握手关闭或跨集群后不能继承该目录的永久节点权威，普通热更也必须在资源准备前拒绝。
         ensure!(

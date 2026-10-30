@@ -96,6 +96,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "application/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/detail.js"),
         ),
+        "/ui/views/operations/preview.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/preview.js"),
+        ),
         "/ui/views/operations/execution.js" => (
             "application/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/execution.js"),

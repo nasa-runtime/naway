@@ -1,10 +1,10 @@
 //! 配置差异绑定单一活动基线，并在有界构建结束后复验当前身份。
 
 mod listener;
-mod model;
+pub(in crate::admin) mod model;
 mod route;
 mod sentinel;
-mod snapshot;
+pub(in crate::admin) mod snapshot;
 
 use super::{
     authenticate_admin_request, candidate, collect_bounded_admin_body, config_etag, full_body,

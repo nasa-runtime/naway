@@ -14,6 +14,7 @@ use std::time::Duration;
 
 pub(crate) struct Plan {
     pub(crate) actions_enabled: bool,
+    pub(crate) previews_enabled: bool,
     pub(super) report_metrics: bool,
     pub(super) authority: [u8; 32],
     pub(in crate::admin) node_id: String,
@@ -177,7 +178,12 @@ impl Plan {
                 !reporter.actions || cfg!(feature = "node-actions"),
                 "management reporter actions require node-actions"
             );
+            ensure!(
+                !reporter.previews || cfg!(feature = "node-actions"),
+                "management reporter previews require node-actions"
+            );
             stamp(&mut authority, &[u8::from(reporter.actions)]);
+            stamp(&mut authority, &[u8::from(reporter.previews)]);
             stamp(&mut authority, &[u8::from(reporter.metrics)]);
             ensure!(
                 !reporter.targets.is_empty() && reporter.targets.len() <= 8,
@@ -212,8 +218,8 @@ impl Plan {
                 stamp(&mut authority, target.authority.as_bytes());
                 let issuer = issuer::Verifier::build(&target.issuer, root, &mut authority)?;
                 ensure!(
-                    !reporter.actions || issuer.is_some(),
-                    "management reporter actions require trusted issuers"
+                    !(reporter.actions || reporter.previews) || issuer.is_some(),
+                    "management reporter actions and previews require trusted issuers"
                 );
                 ensure!(
                     !target.authority.is_empty()
@@ -246,6 +252,10 @@ impl Plan {
                 .reporter
                 .as_ref()
                 .is_some_and(|reporter| reporter.actions),
+            previews_enabled: cfg
+                .reporter
+                .as_ref()
+                .is_some_and(|reporter| reporter.previews),
             report_metrics: cfg
                 .reporter
                 .as_ref()

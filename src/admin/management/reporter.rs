@@ -23,6 +23,8 @@ struct Target {
     issuer: Option<Arc<super::issuer::Verifier>>,
     #[cfg(feature = "node-actions")]
     actions: super::actions::Channel,
+    #[cfg(feature = "node-actions")]
+    previews: super::preview::Channel,
 }
 
 /// 同次报告借用唯一事实和样本，各目标只保留自己的会话与传输进度。
@@ -100,6 +102,8 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     issuer: target.issuer.clone(),
                     #[cfg(feature = "node-actions")]
                     actions: super::actions::Channel::default(),
+                    #[cfg(feature = "node-actions")]
+                    previews: super::preview::Channel::default(),
                 })
                 .collect();
             generation = Arc::downgrade(&plan);
@@ -236,8 +240,8 @@ async fn send(target: &mut Target, round: &Round<'_>) {
         target.failures = 0;
         target.next = Instant::now();
         #[cfg(feature = "node-actions")]
-        if target.actions.busy() {
-            // 动作已经占用第二条 RPC，心跳独立继续，目录和样本不能挤占动作或突破连接预算。
+        if target.actions.busy() || target.previews.busy() {
+            // 动作或预览已经占用第二条 RPC，心跳独立继续，目录和样本不能挤占工作或突破连接预算。
             return;
         }
         // 心跳取得当前会话后，目录与当前样本共享剩余期限并发；任一故障不拖延另一类事实。
@@ -278,6 +282,8 @@ async fn send(target: &mut Target, round: &Round<'_>) {
             target.catalog_generation = None;
             #[cfg(feature = "node-actions")]
             target.actions.clear();
+            #[cfg(feature = "node-actions")]
+            target.previews.clear();
         }
     }
 }
@@ -433,6 +439,11 @@ async fn exchange(
             .actions
             .open(plan.clone(), target.issuer.clone(), &session)
             .map_err(|_| Status::permission_denied("node action session denied"))?;
+        #[cfg(feature = "node-actions")]
+        target
+            .previews
+            .open(plan.clone(), target.issuer.clone(), &session)
+            .map_err(|_| Status::permission_denied("node preview session denied"))?;
         target.session = session;
     }
     let request = timed_request(
@@ -452,6 +463,10 @@ async fn exchange(
             actions_enabled: cfg!(feature = "node-actions")
                 && plan.actions_enabled
                 && state.mode.runs_data(),
+            previews_supported: cfg!(feature = "node-actions"),
+            previews_enabled: cfg!(feature = "node-actions")
+                && plan.previews_enabled
+                && state.mode.runs_data(),
         },
         deadline,
     )?;
@@ -467,19 +482,24 @@ async fn exchange(
     // 每次成功心跳重新取得能力；目标降级或切换后不能继续发送新字段及其摘要。
     target.service_metrics_supported = response.service_metrics_supported;
     #[cfg(feature = "node-actions")]
-    match (response.action, response.release) {
-        (Some(offer), None) => {
+    match (response.action, response.release, response.preview) {
+        (Some(offer), None, None) if !target.previews.busy() => {
             // 无效或忙碌命令不撤销已经成功的心跳；发行端仍须依靠持久结果判断是否重投。
             let _ = target
                 .actions
                 .start(state.clone(), target.client.clone(), offer);
         }
-        (None, Some(offer)) => {
+        (None, Some(offer), None) if !target.previews.busy() => {
             let _ = target
                 .actions
                 .start_release(state.clone(), target.client.clone(), offer);
         }
-        // 单槽不可能合法地同时产生两类声明，矛盾响应不选择其中任意一个执行。
+        (None, None, Some(offer)) if !target.actions.busy() => {
+            let _ = target
+                .previews
+                .start(state.clone(), target.client.clone(), offer);
+        }
+        // 单槽不可能合法地同时产生多类声明，矛盾响应不选择其中任意一个执行。
         _ => {}
     }
     Ok(())

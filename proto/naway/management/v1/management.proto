@@ -11,6 +11,8 @@ service NodeManagement {
   rpc ActionData(ActionDataRequest) returns (ActionDataResponse);
   rpc ActionResult(ActionResultRequest) returns (ActionResultResponse);
   rpc ReleaseResult(ReleaseResultRequest) returns (ReleaseResultResponse);
+  rpc PreviewData(PreviewDataRequest) returns (PreviewDataResponse);
+  rpc PreviewResult(PreviewResultRequest) returns (PreviewResultResponse);
 }
 
 message OpenRequest {
@@ -71,6 +73,8 @@ message ReportRequest {
   PublicationObservation local_publication = 8;
   bool actions_supported = 9;
   bool actions_enabled = 10;
+  bool previews_supported = 11;
+  bool previews_enabled = 12;
 }
 
 // 当前本地文件决定与业务就绪分开；没有历史、路径或恢复命令令牌。
@@ -116,6 +120,91 @@ message ReportResponse {
   ActionOffer action = 3;
   ReleaseOffer release = 4;
   bool service_metrics_supported = 5;
+  PreviewOffer preview = 6;
+}
+
+// 独立只读证明不包含 Saga 步骤、文件方向或租约，原目标与候选不能由接收者替换。
+message PreviewOffer {
+  uint32 schema = 1;
+  string proposal = 2;
+  uint64 epoch = 3;
+  uint32 target_index = 4;
+  uint32 target_count = 5;
+  ActionDomain domain = 6;
+  string node_id = 7;
+  string boot_id = 8;
+  NodeBaseline baseline = 9;
+  uint64 base_version = 10;
+  uint64 base_fingerprint = 11;
+  uint32 candidate_bytes = 12;
+  bytes candidate_sha256 = 13;
+  string scope = 14;
+  string creator = 15;
+  string principal = 16;
+  bytes authority_sha256 = 17;
+  string issuer_node_id = 18;
+  bytes session = 19;
+  uint64 issued_at_ms = 20;
+  uint64 expires_at_ms = 21;
+  string signature = 22;
+}
+
+message PreviewDataRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  string offer_id = 4;
+  uint32 offset = 5;
+}
+
+message PreviewDataResponse {
+  string offer_id = 1;
+  uint32 offset = 2;
+  bytes body = 3;
+  bool eof = 4;
+}
+
+// 完整小结果只有对象身份；容量不足不能用截断列表或空差异表示成功。
+message PreviewChanges {
+  repeated string added = 1;
+  repeated string removed = 2;
+  repeated string changed = 3;
+}
+
+message PreviewSummary {
+  uint64 current_version = 1;
+  uint64 candidate_version = 2;
+  PreviewChanges routes = 3;
+  PreviewChanges upstreams = 4;
+  PreviewChanges listeners = 5;
+  PreviewChanges sentinel = 6;
+  PreviewChanges interface_guard = 7;
+}
+
+enum PreviewStatus {
+  PREVIEW_STATUS_UNSPECIFIED = 0;
+  PREVIEW_STATUS_SUCCEEDED = 1;
+  PREVIEW_STATUS_UNSUPPORTED = 2;
+  PREVIEW_STATUS_DISABLED = 3;
+  PREVIEW_STATUS_UNAVAILABLE = 4;
+  PREVIEW_STATUS_CAPACITY = 5;
+  PREVIEW_STATUS_EXPIRED = 6;
+  PREVIEW_STATUS_DENIED = 7;
+  PREVIEW_STATUS_BASELINE_CHANGED = 8;
+  PREVIEW_STATUS_CANDIDATE_INVALID = 9;
+}
+
+message PreviewResultRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  string offer_id = 4;
+  PreviewStatus status = 5;
+  PreviewSummary summary = 6;
+}
+
+message PreviewResultResponse {
+  string accepted_offer_id = 1;
 }
 
 // 命令没有 JSON 或候选正文，固定身份必须由双方重新派生并验证独立签名。

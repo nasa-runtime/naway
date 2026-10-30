@@ -1,6 +1,7 @@
 //! 有界持久提案接口；保存、批准和实际生效使用不同合同。
 
 mod execution;
+mod preview;
 
 use super::{
     authorization::Scope,
@@ -109,7 +110,20 @@ pub(in crate::admin) async fn handle(
         .strip_prefix('/')
         .and_then(|path| path.strip_suffix("/execute"))
         .filter(|id| valid_id(id));
-    if write && execution_id.is_none() && !plan.config.accept_proposals {
+    let preview_id = suffix
+        .strip_prefix('/')
+        .and_then(|path| path.strip_suffix("/preview"))
+        .filter(|id| valid_id(id));
+    if write && preview_id.is_some() {
+        // 只读预览仍可能读取候选依赖，构建授权必须先于正文与共享候选装载。
+        if !preview::allows(&snapshot, &query, &identity.principal_id) {
+            return failure(Error::Denied);
+        }
+        if !admin::request_content_type(&request, "application/json") {
+            return failure(Error::Invalid);
+        }
+    }
+    if write && execution_id.is_none() && preview_id.is_none() && !plan.config.accept_proposals {
         return failure(Error::Unavailable);
     }
     if write
@@ -191,6 +205,12 @@ pub(in crate::admin) async fn handle(
                     ) {
                         target.extend(capability.clone());
                     }
+                    if let (Some(target), Some(capability)) = (
+                        value.as_object_mut(),
+                        preview::capability(&execution_context).as_object(),
+                    ) {
+                        target.extend(capability.clone());
+                    }
                     value["accept_proposals"] = (plan.config.accept_proposals
                         && value["capacity"]["matches_config"] == true)
                         .into();
@@ -205,7 +225,7 @@ pub(in crate::admin) async fn handle(
             })
         }
     } else if write {
-        let max_bytes = if execution_id.is_some() {
+        let max_bytes = if execution_id.is_some() || preview_id.is_some() {
             256
         } else {
             (plan.config.max_candidate_bytes as usize).saturating_mul(6) + 128 * 1024
@@ -234,6 +254,13 @@ pub(in crate::admin) async fn handle(
                 &query.scope.key,
             )
             .await
+        } else if let Some(id) = preview_id {
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                Box::pin(preview::inspect(&state, &execution_context, id, &bytes)),
+            )
+            .await
+            .unwrap_or(Err(Error::Expired))
         } else if let Some(id) = execution_id {
             Box::pin(execution::execute(&execution_context, id, &bytes))
                 .await
@@ -255,7 +282,7 @@ pub(in crate::admin) async fn handle(
         Err(Error::Invalid)
     };
     if !Arc::ptr_eq(&state.snap.load_full(), &snapshot) {
-        return failure(if write && !draft {
+        return failure(if write && !draft && preview_id.is_none() {
             Error::OutcomeUnknown
         } else {
             Error::Conflict

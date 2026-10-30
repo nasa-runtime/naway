@@ -37,6 +37,9 @@ pub struct Reporter {
     #[serde(default)]
     pub actions: bool,
     #[serde(default)]
+    /// 允许受信发行者只读构建原提案候选，独立于持久动作开关且默认关闭。
+    pub previews: bool,
+    #[serde(default)]
     pub metrics: bool,
     pub tls: Tls,
     pub targets: Vec<Target>,

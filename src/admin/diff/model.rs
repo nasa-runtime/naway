@@ -3,13 +3,14 @@
 use serde::Serialize;
 
 #[derive(Serialize)]
-pub(super) struct Changes {
+pub(in crate::admin) struct Changes {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub changed: Vec<String>,
 }
 
-pub(super) struct Summary {
+#[derive(Serialize)]
+pub(in crate::admin) struct Summary {
     pub current_version: u64,
     pub candidate_version: u64,
     pub routes: Changes,
@@ -59,7 +60,7 @@ impl Summary {
     /// - `domain`：管理请求已识别的差异领域，All 包含全部比较领域。
     ///
     /// 返回：保留两个配置版本的借用视图，未选择的领域不参与响应编码。
-    pub fn view(&self, domain: Domain) -> View<'_> {
+    pub(super) fn view(&self, domain: Domain) -> View<'_> {
         View {
             current_version: self.current_version,
             candidate_version: self.candidate_version,

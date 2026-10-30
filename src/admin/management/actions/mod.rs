@@ -12,7 +12,7 @@ pub(in crate::admin) mod local;
 mod release;
 mod release_wire;
 mod result;
-mod window;
+pub(in crate::admin::management) mod window;
 
 pub(in crate::admin) use admission::Work;
 pub(super) use client::Channel;

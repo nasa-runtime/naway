@@ -104,6 +104,9 @@ export async function request(path, options = {}) {
     const capacity =
       target.pathname === "/api/cluster/catalog" ||
       target.pathname === "/api/operations/proposals" ||
+      /^\/api\/operations\/proposals\/[0-9a-f]{32}\/preview$/.test(
+        target.pathname,
+      ) ||
       target.pathname === "/api/operations/proposals/draft"
         ? 4 * 1024 * 1024
         : 1024 * 1024;

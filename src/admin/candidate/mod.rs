@@ -20,6 +20,8 @@ use crate::config::GatewaySnapshot;
 use crate::control::history::ArchivedDocs;
 pub(super) use admission::Admission;
 pub(super) use error::BuildError;
+#[cfg(feature = "node-actions")]
+pub(in crate::admin) use inspection::inspect_guarded;
 pub(super) use inspection::{inspect_archived, DocumentKind};
 use workspace::Workspace;
 

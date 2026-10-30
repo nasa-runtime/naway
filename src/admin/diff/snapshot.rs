@@ -10,7 +10,7 @@ use crate::config::GatewaySnapshot;
 /// - `candidate`：已经通过完整构建器的候选快照。
 ///
 /// 返回：各领域稳定排序的对象增删改摘要，只比较同代实际计划，不重新读取或编码原文。
-pub(super) fn compare(current: &GatewaySnapshot, candidate: &GatewaySnapshot) -> Summary {
+pub(in crate::admin) fn compare(current: &GatewaySnapshot, candidate: &GatewaySnapshot) -> Summary {
     let (routes_added, routes_removed, routes_changed) = super::route::changes(current, candidate);
     let (upstreams_added, upstreams_removed, upstreams_changed) = current
         .upstreams

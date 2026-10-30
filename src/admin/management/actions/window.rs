@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MAX_SPAN_MS: u64 = 20_000;
 const CLOCK_MARGIN_MS: u64 = 1_000;
 
-pub(super) struct Window {
+pub(in crate::admin::management) struct Window {
     received_at: Instant,
     received_wall_ms: u64,
     deadline: Instant,
@@ -25,6 +25,20 @@ impl Window {
         Self::at(delivery, unix_millis()?, Instant::now())
     }
 
+    /// 业务作用：为独立预览证明建立同样不可续期的短时窗口，不引入持久动作或文件写权。
+    ///
+    /// 参数说明：
+    /// - `issued_at_ms`：当前预览签名绑定的签发时刻。
+    /// - `expires_at_ms`：当前预览签名绑定的绝对截止时刻。
+    ///
+    /// 返回：同时满足墙钟与单调期限的窗口；过期、倒退或跨度超限时拒绝。
+    pub(in crate::admin::management) fn preview(
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<Self> {
+        Self::bounds(issued_at_ms, expires_at_ms, unix_millis()?, Instant::now())
+    }
+
     /// 业务作用：将一次实际时钟采样转换为不能续期的执行截止，保守扣除发行者与节点时钟误差。
     ///
     /// 参数说明：
@@ -34,21 +48,32 @@ impl Window {
     ///
     /// 返回：余量充足时建立窗口；时钟偏差或期限算术异常拒绝，不生成宽松默认值。
     fn at(delivery: &Delivery, wall_ms: u64, now: Instant) -> Result<Self> {
-        let span = delivery
-            .expires_at_ms
-            .checked_sub(delivery.issued_at_ms)
+        Self::bounds(delivery.issued_at_ms, delivery.expires_at_ms, wall_ms, now)
+    }
+
+    /// 业务作用：让动作与只读预览复用相同的时钟连续性规则，消息用途不改变截止计算。
+    ///
+    /// 参数说明：
+    /// - `issued_at_ms`：已验签的起始 Unix 毫秒。
+    /// - `expires_at_ms`：已验签的终止 Unix 毫秒。
+    /// - `wall_ms`：本次接收采样的墙钟。
+    /// - `now`：同次接收采样的单调时刻。
+    ///
+    /// 返回：保守扣除时钟容差的窗口；任一时间门不成立都不产生受理期限。
+    fn bounds(issued_at_ms: u64, expires_at_ms: u64, wall_ms: u64, now: Instant) -> Result<Self> {
+        let span = expires_at_ms
+            .checked_sub(issued_at_ms)
             .context("node action time range is reversed")?;
-        let end = delivery
-            .expires_at_ms
+        let end = expires_at_ms
             .checked_sub(CLOCK_MARGIN_MS)
             .context("node action has no clock margin")?;
         ensure!(
-            delivery.issued_at_ms > 0
+            issued_at_ms > 0
                 && (1..=MAX_SPAN_MS).contains(&span)
-                && delivery.expires_at_ms <= i64::MAX as u64
+                && expires_at_ms <= i64::MAX as u64
                 && wall_ms > 0
                 && wall_ms < end
-                && delivery.issued_at_ms.saturating_sub(wall_ms) <= CLOCK_MARGIN_MS,
+                && issued_at_ms.saturating_sub(wall_ms) <= CLOCK_MARGIN_MS,
             "node action time authority is unavailable"
         );
         let deadline = now
@@ -67,7 +92,7 @@ impl Window {
     /// 参数说明: 无。
     ///
     /// 返回：两个截止和时钟连续性都成立时成功；失败只关闭新的决定，不撤销已持久文件方向。
-    pub(super) fn check(&self) -> Result<()> {
+    pub(in crate::admin::management) fn check(&self) -> Result<()> {
         self.check_at(unix_millis()?, Instant::now())
     }
 
