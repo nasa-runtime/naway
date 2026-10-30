@@ -1,5 +1,6 @@
 //! 发现写者在串行门内领取和复验发布权，读者一次取得绑定、实例与新鲜度。
 
+mod credentials;
 mod identity;
 mod publisher;
 pub(crate) use identity::BindingIdentity;
@@ -167,6 +168,8 @@ pub(super) struct DynamicServiceState {
     pub(super) updated_at: Instant,
     pub(super) binding: BindingIdentity,
     pub(super) confirmed: bool,
+    /// 已发布配置授予的当前凭据；未对账时使用本代转换规格中的初始材料。
+    tls_authority: Option<credentials::TlsAuthority>,
     owner: Arc<()>,
 }
 
@@ -235,6 +238,7 @@ fn install_owner(
             updated_at: Instant::now(),
             binding,
             confirmed: false,
+            tls_authority: None,
             owner: owner.clone(),
         },
     );
@@ -256,6 +260,10 @@ fn freeze_instances(
     instances
         .into_iter()
         .map(|mut instance| {
+            if let Some(authority) = &previous.tls_authority {
+                // 固定绑定已经核对材料及授权策略；旧订阅规格不能把成功续租的截止点倒退。
+                instance.tls_profile = authority.profile.clone();
+            }
             if let Some(old) = previous
                 .instances
                 .iter()

@@ -694,6 +694,8 @@ impl NacosDiscoveryManager {
     ///
     /// 返回：先撤销退休订阅的同步写权，再建立缺少的发布者；外部订阅在后台完成。
     pub fn reconcile(&self, snap: &GatewaySnapshot) {
+        // 配置已提交后先推进同绑定凭据权限；保留订阅不能延续旧 lease，也不能伪造一次发现确认。
+        self.dynamic.reconcile_credentials(&snap.upstreams);
         let cfg = snap.discovery.nacos.clone();
         let cfg_key = NacosTaskKey::from(&cfg);
         let mut desired = if cfg.enabled {

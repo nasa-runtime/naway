@@ -11,10 +11,15 @@ use std::sync::atomic::Ordering;
 /// - `state`：管理面与数据面共享的事实源。
 /// - `runtime`：采样器的进程身份与单调时钟。
 /// - `sample_id`：本次递增采样序号。
+/// - `snapshot`：本轮事实、服务归属和采样配置的唯一冻结来源。
 ///
 /// 返回：完整固定目录；没有的数据不根据配置阈值推算。
-pub(super) fn sample(state: &AdminState, runtime: &Runtime, sample_id: u64) -> model::Sample {
-    let snapshot = state.snap.load();
+pub(super) fn sample(
+    state: &AdminState,
+    runtime: &Runtime,
+    sample_id: u64,
+    snapshot: &crate::config::GatewaySnapshot,
+) -> model::Sample {
     let summary = snapshot.summary();
     let mut values = crate::observability::metrics::realtime::samples(&state.metrics);
     values.extend(process::samples());
@@ -34,7 +39,7 @@ pub(super) fn sample(state: &AdminState, runtime: &Runtime, sample_id: u64) -> m
     #[cfg(feature = "admin-grpc")]
     values.extend(crate::admin::management::metrics::samples(
         &state.management,
-        &snapshot,
+        snapshot,
     ));
     let (bounds_ms, buckets, sum_micros) =
         crate::observability::metrics::realtime::duration(&state.metrics);
@@ -64,11 +69,9 @@ pub(super) fn sample(state: &AdminState, runtime: &Runtime, sample_id: u64) -> m
             buckets,
             sum_micros,
         },
-        route_traffic: Some(crate::observability::http_stream::routes::capture(
-            &snapshot,
-        )),
+        route_traffic: Some(crate::observability::http_stream::routes::capture(snapshot)),
         service_state: Some(crate::upstream::observation::capture(
-            &snapshot,
+            snapshot,
             &state.active_health.unhealthy_set(),
         )),
         capabilities: [

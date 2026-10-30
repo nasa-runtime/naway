@@ -520,12 +520,20 @@ fn health_jitter_delay(
 /// - `instance`：携带 URI、协议与 TLS 身份的目标实例。
 /// - `policy`：冻结的探测方式、路径、期限与状态码约束。
 ///
-/// 返回：探测在 deadline 内满足策略时为 true，否则为 false。
+/// 返回：凭据仍获权且探测在 deadline 内满足策略时为 true；失权不发送网络请求，其余失败为 false。
 async fn probe_instance(
     client: &ProbeClient,
     instance: &HealthInstanceTarget,
     policy: &ActiveHealthPolicy,
 ) -> bool {
+    if instance
+        .tls_profile
+        .as_ref()
+        .is_some_and(|profile| !profile.allows_new_requests())
+    {
+        // 探测也会使用服务凭据；过期或撤权后不能借后台流量维持未获授权的连接和健康结论。
+        return false;
+    }
     match policy.kind {
         HealthKind::Tcp => probe_tcp(&instance.uri, policy.timeout).await,
         HealthKind::Http => {

@@ -1,6 +1,7 @@
 //! 按需运行的共享实时采样器，只保留当前结果和一个累计基线。
 
 mod buckets;
+mod capture;
 mod circuit;
 mod cluster;
 mod http_stream;
@@ -34,6 +35,7 @@ pub(super) struct Runtime {
     remote_until: AtomicU64,
     wake: Arc<Notify>,
     latest: ArcSwapOption<Publication>,
+    sampling: parking_lot::Mutex<u64>,
     task: OnceLock<AbortOnDropHandle<()>>,
     cluster: cluster::Runtime,
     object_readers: tokio::sync::Semaphore,
@@ -69,6 +71,7 @@ impl Runtime {
             remote_until: AtomicU64::new(0),
             wake: Arc::new(Notify::new()),
             latest: ArcSwapOption::empty(),
+            sampling: parking_lot::Mutex::new(0),
             task: OnceLock::new(),
             cluster: cluster::Runtime::new(),
             object_readers: tokio::sync::Semaphore::new(4),
@@ -121,16 +124,17 @@ impl Runtime {
     /// 业务作用：向已授权上报轮次借出当前结构化样本，配置身份和年龄失效时不传旧数据。
     ///
     /// 参数说明：
+    /// - `state`：采样使用的进程运行态。
     /// - `snapshot`：本轮事实和目标采用的冻结配置。
     ///
     /// 返回：共享样本与原采集时刻；不会编码HTTP响应或延长兴趣。
     #[cfg(feature = "admin-grpc")]
     pub(in crate::admin) fn upload_sample(
         &self,
-        snapshot: &crate::config::GatewaySnapshot,
+        state: &AdminState,
+        snapshot: &Arc<crate::config::GatewaySnapshot>,
     ) -> Option<(Arc<model::Sample>, Instant)> {
-        self.latest
-            .load_full()
+        self.capture(state, snapshot)
             .filter(|value| {
                 snapshot.admin_monitor.enabled
                     && value.at.elapsed() <= snapshot.admin_monitor.period * 3
@@ -169,8 +173,6 @@ pub(super) fn start(state: &Arc<AdminState>) {
 /// 返回：管理状态释放时结束；无任何监控文件、数据库或历史队列副作用。
 async fn run(owner: Weak<AdminState>, wake: Arc<Notify>) {
     let mut next = tokio::time::Instant::now();
-    let mut previous: Option<Arc<model::Sample>> = None;
-    let mut sequence = 0u64;
     loop {
         let scheduled = tokio::select! {
             _ = tokio::time::sleep_until(next) => true,
@@ -180,48 +182,23 @@ async fn run(owner: Weak<AdminState>, wake: Arc<Notify>) {
             return;
         };
         let runtime = &state.monitor;
-        let plan = state.snap.load().admin_monitor.clone();
+        let snapshot = state.snap.load_full();
+        let plan = &snapshot.admin_monitor;
         if scheduled {
             next = tokio::time::Instant::now() + plan.period.min(Duration::from_secs(1));
         }
-        let interest = runtime.last_interest.load(Ordering::Acquire);
-        let now = runtime.elapsed_ms();
-        let local = interest != 0
-            && now.saturating_sub(interest) <= IDLE_MS.max(plan.period.as_millis() as u64 * 3);
-        let remote = now < runtime.remote_until.load(Ordering::Acquire);
-        if !plan.enabled || (!local && !remote) {
+        if !runtime.interested(&snapshot) {
             // 无观察者不保留过去区间；恢复时必须先建立新基线，不能把空档摊薄成低速率。
-            previous = None;
+            let _capture = runtime.sampling.lock();
             runtime.latest.store(None);
             continue;
         }
-        // 周期由定时器负责；若用采样完成时刻再次比较期限，细小处理耗时会错误跳过整轮。
-        // 浏览器唤醒只负责首样本，不能提高已经运行中的采样频率。
-        if !scheduled
-            && previous
-                .as_ref()
-                .is_some_and(|sample| sample.sampling_period_ms == plan.period.as_millis() as u64)
-        {
-            continue;
+        if let Some(value) = runtime.capture(&state, &snapshot) {
+            // 上报和定时器共用原采样时刻；重复唤醒既不提前采集，也不把下次期限不断后移。
+            next = tokio::time::Instant::from_std(value.at + plan.period);
+        } else {
+            next = tokio::time::Instant::now() + plan.period;
         }
-        // 期限从采样开始计，不从编码完成时刻再续期，避免处理耗时累计造成漏采。
-        next = tokio::time::Instant::now() + plan.period;
-        sequence = sequence.saturating_add(1);
-        let at = Instant::now();
-        let mut current = source::sample(&state, runtime, sequence);
-        if !model::validate(&mut current) {
-            previous = None;
-            runtime.latest.store(None);
-            continue;
-        }
-        let current = Arc::new(current);
-        // 先发布通过校验的结构化事实；HTTP编码延迟到对应读面首次访问，纯上传不生成JSON。
-        runtime.latest.store(Some(Arc::new(Publication::new(
-            current.clone(),
-            previous.take(),
-            at,
-        ))));
-        previous = Some(current);
     }
 }
 

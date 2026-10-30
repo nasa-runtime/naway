@@ -120,7 +120,7 @@ pub(super) async fn run(owner: Weak<AdminState>) {
         let catalog = state.catalog.local(&snapshot);
         let metrics_enabled = plan.report_metrics && snapshot.admin_monitor.enabled;
         let sample = metrics_enabled
-            .then(|| state.monitor.upload_sample(&snapshot))
+            .then(|| state.monitor.upload_sample(&state, &snapshot))
             .flatten()
             .map(|(sample, at)| {
                 Arc::new(telemetry::Upload {

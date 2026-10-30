@@ -45,6 +45,7 @@ impl ServicePublisher {
                 updated_at: Instant::now(),
                 binding: self.binding,
                 confirmed: true,
+                tls_authority: previous.tls_authority.clone(),
                 owner: self.owner.clone(),
             },
         );
@@ -187,6 +188,7 @@ impl XdsPublisher {
                     updated_at: Instant::now(),
                     binding: *binding,
                     confirmed: true,
+                    tls_authority: previous.tls_authority.clone(),
                     owner: self.owner.clone(),
                 },
             );

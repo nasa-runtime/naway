@@ -2145,8 +2145,8 @@ pub struct UpstreamInstance {
     pub region: Option<Arc<str>>,
     /// 可信实例 subzone，只有精确声明才享有本 subzone 优先。
     pub subzone: Option<Arc<str>>,
-    /// 注册中心 metadata 或静态空 metadata;只供 admin 只读展示,不进入 metrics label。
-    pub metadata: HashMap<String, String>,
+    /// 共享的注册中心 metadata 或静态空 metadata；控制面续租只复制 Arc，不进入 metrics label。
+    pub metadata: Arc<HashMap<String, String>>,
 }
 
 impl UpstreamInstance {
@@ -2345,7 +2345,7 @@ impl UpstreamInstance {
             zone,
             region,
             subzone,
-            metadata,
+            metadata: Arc::new(metadata),
         })
     }
 

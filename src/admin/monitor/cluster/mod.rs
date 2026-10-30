@@ -230,8 +230,7 @@ async fn run(owner: Weak<AdminState>, wake: Arc<Notify>) {
         round.begin();
         let local = state
             .monitor
-            .latest
-            .load_full()
+            .capture(&state, &snapshot)
             .filter(|value| {
                 value.at.elapsed() <= period * 3
                     && value.sample.state.config_version == snapshot.version

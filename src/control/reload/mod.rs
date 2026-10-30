@@ -529,6 +529,8 @@ async fn apply_reload_input(
     let history = history.for_candidate(candidate_fingerprint);
     match candidate {
         Ok(new_snap) => {
+            #[cfg(feature = "admin-grpc")]
+            let mut new_snap = new_snap;
             if runtime.sidecar_mode {
                 // 必须先复验部署边界，再进入候选 socket prepare；否则恶意热更可能短暂绑定公网地址。
                 if let Err(error) = new_snap.validate_sidecar_listeners() {
@@ -546,6 +548,14 @@ async fn apply_reload_input(
             // 数据面、admin 与 ACME worker 共用同一两阶段 supervisor：先绑定/建锁，发布后才
             // 启动候选并撤销旧权威，任何 prepare 失败都保持旧快照和旧 listener 完整可用。
             let old = snap.load();
+            #[cfg(feature = "admin-grpc")]
+            if crate::admin::management::same_authority(
+                old.admin_management.as_deref(),
+                new_snap.admin_management.as_deref(),
+            ) {
+                // 业务配置换代不撤销仍有效的管理身份；只继承当前 owner，不能从历史计划恢复旧会话。
+                new_snap.admin_management = old.admin_management.clone();
+            }
             // 中心开关属于启动权威；在准备外部资源前拒绝切换，不能让旧订阅继续服务于新声明。
             if let Some(field) = crate::config::centers::restart_field(&old, &new_snap) {
                 history.record_rejected(
