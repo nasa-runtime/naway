@@ -80,8 +80,10 @@ fn same_service(current: &ServiceSnapshot, candidate: &ServiceSnapshot) -> bool 
         clusters,
         slow_start_ms,
         discovery_stale_ttl_ms,
+        discovery_identity,
     } = current;
-    critical == &candidate.critical
+    discovery_identity == &candidate.discovery_identity
+        && critical == &candidate.critical
         && source == &candidate.source
         && lb_policy == &candidate.lb_policy
         && hash == &candidate.hash

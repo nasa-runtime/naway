@@ -38,6 +38,7 @@ use crate::control::xds_resources::{
     XdsPolicySnapshot, XdsResourceExhausted, XdsRouteTablePlan, XdsSecretPlan, XdsUpstreamProtocol,
     CDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL,
 };
+use crate::upstream::dynamic::{BindingIdentity, XdsPublisher};
 use crate::upstream::{DynamicUpstreamStore, UpstreamInstance, XdsWatchSpec};
 
 /// EDS v3 资源的规范 type URL。
@@ -837,6 +838,10 @@ impl PreparedXdsGeneration {
     ///
     /// 返回：无返回值；旧 task 先失去后续写权，新 task 才使用同一发布锁。
     pub fn commit(self) {
+        if self.cfg.is_none() {
+            // 关闭来源先撤销目录发布权，单独 abort 无法约束另一线程已进入的同步发布分支。
+            self.manager.dynamic.revoke_xds();
+        }
         if let Some(old) = self.manager.active.lock().take() {
             old.abort();
         }
@@ -969,8 +974,15 @@ fn spawn_inner_with_status(
     snapshot_runtime: Option<XdsSnapshotRuntime>,
     status: Arc<XdsStatus>,
 ) -> JoinHandle<()> {
+    // 先同步领取整批写权，再启动网络任务；旧 stream 的迟到响应不能通过目录发布门。
+    let publisher = dynamic.claim_xds(
+        specs
+            .iter()
+            .map(|spec| (spec.logical_service.clone(), BindingIdentity::xds(spec)))
+            .collect(),
+    );
     tokio::spawn(async move {
-        run_forever(cfg, specs, dynamic, snapshot_runtime, status).await;
+        run_forever(cfg, specs, publisher, snapshot_runtime, status).await;
     })
 }
 
@@ -979,7 +991,7 @@ fn spawn_inner_with_status(
 /// 参数说明：
 /// - `cfg`：已校验的 xDS bootstrap 配置。
 /// - `specs`：EDS-only 模式的受管服务声明。
-/// - `dynamic`：共享动态实例目录。
+/// - `publisher`：本代 EDS 批次的同步发布权。
 /// - `snapshot_runtime`：routes 或 clusters 由 xDS 持有时使用的快照发布权威。
 /// - `status`：管理面可观察的控制器状态。
 ///
@@ -987,7 +999,7 @@ fn spawn_inner_with_status(
 async fn run_forever(
     cfg: XdsCfg,
     specs: Vec<XdsWatchSpec>,
-    dynamic: Arc<DynamicUpstreamStore>,
+    publisher: XdsPublisher,
     snapshot_runtime: Option<XdsSnapshotRuntime>,
     status: Arc<XdsStatus>,
 ) {
@@ -1006,7 +1018,7 @@ async fn run_forever(
         None
     };
     let mut delta_eds = DeltaResourceCache::default();
-    loop {
+    while publisher.is_current() {
         let acknowledgements_before = status.ack_total.load(Ordering::Relaxed);
         let stream_result =
             if let (Some(policy), Some(runtime)) = (policy.as_mut(), snapshot_runtime.as_ref()) {
@@ -1020,13 +1032,17 @@ async fn run_forever(
                     &cfg,
                     &specs,
                     &mut delta_eds,
-                    dynamic.clone(),
+                    publisher.clone(),
                     status.clone(),
                 )
                 .await
             } else {
-                run_stream(&cfg, &specs, dynamic.clone(), status.clone()).await
+                run_stream(&cfg, &specs, publisher.clone(), status.clone()).await
             };
+        if !publisher.is_current() {
+            // 新代已接管目录，旧连接结束不能重置当前共享连接状态或继续重连。
+            return;
+        }
         match stream_result {
             Ok(()) => status.mark_disconnected("ADS stream ended without status"),
             Err(error) => {
@@ -1047,7 +1063,7 @@ async fn run_forever(
             jittered(sleep_backoff, cfg.reconnect.jitter),
             &specs,
             &mut delta_eds,
-            dynamic.as_ref(),
+            &publisher,
             policy.as_mut(),
             snapshot_runtime.as_ref(),
             status.as_ref(),
@@ -1070,7 +1086,7 @@ async fn run_forever(
 /// - `delay`：本次 jitter 后的重连等待时长。
 /// - `specs`：EDS-only 模式的受管服务声明。
 /// - `delta_eds`：Delta EDS 已接收资源缓存。
-/// - `dynamic`：共享动态实例目录。
+/// - `publisher`：本代 EDS 批次的同步发布权。
 /// - `policy`：受管策略资源缓存。
 /// - `runtime`：快照发布权威与常驻运行态。
 /// - `status`：管理面可观察的控制器状态。
@@ -1082,7 +1098,7 @@ async fn wait_reconnect_delay(
     delay: Duration,
     specs: &[XdsWatchSpec],
     delta_eds: &mut DeltaResourceCache,
-    dynamic: &DynamicUpstreamStore,
+    publisher: &XdsPublisher,
     mut policy: Option<&mut XdsPolicySession>,
     runtime: Option<&XdsSnapshotRuntime>,
     status: &XdsStatus,
@@ -1118,7 +1134,7 @@ async fn wait_reconnect_delay(
             .await
             .map(|_| ())
         } else {
-            apply_delta_eds_expiry(delta_eds, specs, dynamic, status, &cfg.limits).await
+            apply_delta_eds_expiry(delta_eds, specs, publisher, status, &cfg.limits).await
         };
         if let Err(error) = applied {
             // timer 变更也必须先完整翻译再发布；失败时保留 cache/Snapshot，立即重连获取新证据，
@@ -3181,7 +3197,7 @@ fn xds_type_label(type_url: &str) -> &'static str {
 /// - `cfg`：固定订阅与 transport
 /// - `specs`：固定订阅与 transport
 /// - `cache`：跨重连保留 accepted payload/version
-/// - `dynamic`：是数据面发布与观测句柄。
+/// - `publisher`：是数据面发布与观测句柄。
 /// - `status`：是数据面发布与观测句柄。
 ///
 /// 返回：stream 关闭或传输失败时返回错误；资源错误在 stream 内 NACK 且不修改 cache/LKG。
@@ -3189,7 +3205,7 @@ async fn run_delta_stream(
     cfg: &XdsCfg,
     specs: &[XdsWatchSpec],
     cache: &mut DeltaResourceCache,
-    dynamic: Arc<DynamicUpstreamStore>,
+    publisher: XdsPublisher,
     status: Arc<XdsStatus>,
 ) -> Result<()> {
     let channel = connect_channel(cfg).await?;
@@ -3229,7 +3245,7 @@ async fn run_delta_stream(
             tokio::select! {
                 response = responses.message() => response.context("read Delta ADS response")?,
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                    apply_delta_eds_expiry(cache, specs, dynamic.as_ref(), status.as_ref(), &cfg.limits).await?;
+                    apply_delta_eds_expiry(cache, specs, &publisher, status.as_ref(), &cfg.limits).await?;
                     continue;
                 }
             }
@@ -3271,6 +3287,8 @@ async fn run_delta_stream(
         .await;
         status.apply_queue_depth.store(0, Ordering::Release);
         let translated = translated_task.context("join Delta EDS translation task")?;
+        // 重复内容与 warming ACK 同样需要当前批次权威；它们不能绕过没有实际写入的发布分支。
+        anyhow::ensure!(publisher.is_current(), "EDS publication authority changed");
         match translated {
             Ok((next, replacement)) => {
                 let missing = delta_eds_missing(&next, specs);
@@ -3279,13 +3297,12 @@ async fn run_delta_stream(
                     if status.content_unchanged(&fingerprint) {
                         status.mark_duplicate(&system_version, &nonce, next.resources.len());
                     } else {
-                        let managed = specs
-                            .iter()
-                            .map(|spec| spec.logical_service.clone())
-                            .collect::<Vec<_>>();
                         // Delta cache/translation 已全部成功后才执行唯一 RCU publish；cache 与 ACK
                         // 随后推进，坏 response 不可能留下“版本已记住但数据面未应用”的半状态。
-                        dynamic.replace_managed_services(&managed, replacement);
+                        anyhow::ensure!(
+                            publisher.publish(replacement),
+                            "EDS publication authority changed"
+                        );
                         status.mark_accepted(
                             &system_version,
                             &nonce,
@@ -3500,7 +3517,7 @@ fn delta_eds_missing(cache: &DeltaResourceCache, specs: &[XdsWatchSpec]) -> BTre
 /// 参数说明：
 /// - `cache`：是 accepted 状态
 /// - `specs`：是 accepted 状态
-/// - `dynamic`：是发布点
+/// - `publisher`：是发布点
 /// - `status`：是观测
 /// - `limits`：是预算。
 ///
@@ -3508,7 +3525,7 @@ fn delta_eds_missing(cache: &DeltaResourceCache, specs: &[XdsWatchSpec]) -> BTre
 async fn apply_delta_eds_expiry(
     cache: &mut DeltaResourceCache,
     specs: &[XdsWatchSpec],
-    dynamic: &DynamicUpstreamStore,
+    publisher: &XdsPublisher,
     status: &XdsStatus,
     limits: &crate::config::model::XdsLimitsCfg,
 ) -> Result<()> {
@@ -3525,16 +3542,17 @@ async fn apply_delta_eds_expiry(
     })
     .await
     .context("join Delta EDS TTL translation task")??;
+    // timer 的异步转换也可能跨越配置换代，失权后不再推进旧 cache 或 warming 状态。
+    anyhow::ensure!(publisher.is_current(), "EDS publication authority changed");
     let missing = delta_eds_missing(&next, specs);
     if missing.is_empty() {
-        let managed = specs
-            .iter()
-            .map(|spec| spec.logical_service.clone())
-            .collect::<Vec<_>>();
         let fingerprint = replacement_fingerprint(&replacement);
         // TTL 是协议授权的 removal；完整 native 候选构建后才发布并提交 cache，不能先删版本再
         // 因转换失败留下控制面/数据面分叉。
-        dynamic.replace_managed_services(&managed, replacement);
+        anyhow::ensure!(
+            publisher.publish(replacement),
+            "EDS publication authority changed"
+        );
         status.mark_eds_ttl_applied(expired.len(), next.resources.len(), fingerprint);
     } else {
         status.mark_ttl_warming(expired.len(), &missing);
@@ -3548,14 +3566,14 @@ async fn apply_delta_eds_expiry(
 /// 参数说明：
 /// - `cfg`：固定本代订阅
 /// - `specs`：固定本代订阅
-/// - `dynamic`：接收原子 EDS 发布
+/// - `publisher`：接收原子 EDS 发布
 /// - `status`：记录状态。
 ///
 /// 返回：stream 持续期间不返回；连接、协议或 request queue 关闭时返回错误供外层重连。
 async fn run_stream(
     cfg: &XdsCfg,
     specs: &[XdsWatchSpec],
-    dynamic: Arc<DynamicUpstreamStore>,
+    publisher: XdsPublisher,
     status: Arc<XdsStatus>,
 ) -> Result<()> {
     let channel = connect_channel(cfg).await?;
@@ -3607,6 +3625,8 @@ async fn run_stream(
         .await;
         status.apply_queue_depth.store(0, Ordering::Release);
         let translated = translated_task.context("join EDS translation task")?;
+        // 无变化 response 也须有当前发布权，旧 stream 不能借去重路径继续确认已退休订阅。
+        anyhow::ensure!(publisher.is_current(), "EDS publication authority changed");
         match translated {
             Ok(replacement) => {
                 let fingerprint = replacement_fingerprint(&replacement);
@@ -3615,13 +3635,12 @@ async fn run_stream(
                     // 但跳过 ArcSwap 和 pool reconcile，避免更新风暴抢占数据面 CPU。
                     status.mark_duplicate(&version, &nonce, response_resources);
                 } else {
-                    let managed = specs
-                        .iter()
-                        .map(|spec| spec.logical_service.clone())
-                        .collect::<Vec<_>>();
                     // response 已全部解码和验证后才做唯一一次 RCU 发布；ACK 必须在发布之后，
                     // 否则 management server 会误以为 nonce 已经真实进入数据面。
-                    dynamic.replace_managed_services(&managed, replacement);
+                    anyhow::ensure!(
+                        publisher.publish(replacement),
+                        "EDS publication authority changed"
+                    );
                     status.mark_accepted(&version, &nonce, response_resources, fingerprint);
                 }
                 request_tx

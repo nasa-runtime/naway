@@ -22,6 +22,7 @@ use crate::config::model::{
 };
 use crate::config::GatewaySnapshot;
 use crate::observability::metrics::{Metrics, RegistryBackendMetric, RegistryPollMetric};
+use crate::upstream::dynamic::ServicePublisher;
 use crate::upstream::{
     discovery_instances_to_upstreams, registry_instances_to_upstreams, DynamicUpstreamStore,
     NacosWatchSpec, RegistryInstance, RegistryKind, RegistryWatchSpec,
@@ -687,6 +688,11 @@ impl NacosDiscoveryManager {
 
     /// 业务作用：按当前不可变策略快照调整 Nacos watch 任务集合。
     /// 这里只同步安排任务；启动与建连在异步任务内执行，配置重载不等待注册中心 I/O。
+    ///
+    /// 参数说明：
+    /// - `snap`：已经发布、确定当前发现绑定的配置快照。
+    ///
+    /// 返回：先撤销退休订阅的同步写权，再建立缺少的发布者；外部订阅在后台完成。
     pub fn reconcile(&self, snap: &GatewaySnapshot) {
         let cfg = snap.discovery.nacos.clone();
         let cfg_key = NacosTaskKey::from(&cfg);
@@ -703,10 +709,14 @@ impl NacosDiscoveryManager {
                 spec.logical_service == *logical_service
                     && *spec == task.spec
                     && task.cfg_key == cfg_key
+                    && task
+                        .publisher
+                        .is_current_for(snap.upstreams.discovery_binding(logical_service))
             });
             if !keep {
+                // 先在目录发布门撤销原权威，再中止网络任务；旧退出不能删除已被另一来源接管的条目。
+                task.publisher.revoke();
                 task.handle.abort();
-                self.dynamic.remove_service(logical_service);
             }
             keep
         });
@@ -727,12 +737,18 @@ impl NacosDiscoveryManager {
             if tasks.contains_key(&spec.logical_service) {
                 continue;
             }
-            let handle = spawn_nacos_watch(cfg.clone(), spec.clone(), self.dynamic.clone());
+            let binding = snap
+                .upstreams
+                .discovery_binding(&spec.logical_service)
+                .expect("validated Nacos service has a discovery binding");
+            let publisher = self.dynamic.claim_service(&spec.logical_service, binding);
+            let handle = spawn_nacos_watch(cfg.clone(), spec.clone(), publisher.clone());
             tasks.insert(
                 spec.logical_service.clone(),
                 WatchTask {
                     spec,
                     cfg_key: cfg_key.clone(),
+                    publisher,
                     handle,
                 },
             );
@@ -742,6 +758,11 @@ impl NacosDiscoveryManager {
     }
 
     /// 业务作用：对账活动服务的轮询任务，停止不再需要的来源并创建缺少的订阅。
+    ///
+    /// 参数说明：
+    /// - `snap`：已经发布的服务与后端发现配置。
+    ///
+    /// 返回：原 owner 撤销后中止旧任务；仅为合法的当前来源领取新写权。
     fn reconcile_polling_registries(&self, snap: &GatewaySnapshot) {
         let mut desired = snap.upstreams.registry_watch_specs();
         desired.sort_by(|a, b| a.logical_service.cmp(&b.logical_service));
@@ -756,10 +777,14 @@ impl NacosDiscoveryManager {
                     && polling_backend(&snap.discovery, spec.kind)
                         .as_ref()
                         .is_some_and(|backend| backend == &task.backend)
+                    && task
+                        .publisher
+                        .is_current_for(snap.upstreams.discovery_binding(logical_service))
             });
             if !keep {
+                // 先在目录发布门撤销原权威，再中止网络任务；旧退出不能删除已被另一来源接管的条目。
+                task.publisher.revoke();
                 task.handle.abort();
-                self.dynamic.remove_service(logical_service);
             }
             keep
         });
@@ -773,13 +798,18 @@ impl NacosDiscoveryManager {
                     registry = ?spec.kind,
                     "dynamic service references a disabled registry backend"
                 );
-                self.dynamic.remove_service(&spec.logical_service);
+                // 没有当前来源配置就没有领取或删除权，旧 task 已按其原 owner 撤销。
                 continue;
             };
+            let binding = snap
+                .upstreams
+                .discovery_binding(&spec.logical_service)
+                .expect("validated polling service has a discovery binding");
+            let publisher = self.dynamic.claim_service(&spec.logical_service, binding);
             let handle = spawn_registry_poll(
                 backend.clone(),
                 spec.clone(),
-                self.dynamic.clone(),
+                publisher.clone(),
                 self.metrics.clone(),
             );
             tasks.insert(
@@ -787,6 +817,7 @@ impl NacosDiscoveryManager {
                 RegistryTask {
                     spec,
                     backend,
+                    publisher,
                     handle,
                 },
             );
@@ -797,6 +828,7 @@ impl NacosDiscoveryManager {
 struct WatchTask {
     spec: NacosWatchSpec,
     cfg_key: NacosTaskKey,
+    publisher: ServicePublisher,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -833,6 +865,7 @@ impl From<&NacosDiscoveryCfg> for NacosTaskKey {
 struct RegistryTask {
     spec: RegistryWatchSpec,
     backend: PollingBackend,
+    publisher: ServicePublisher,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -862,10 +895,18 @@ fn polling_backend(cfg: &DiscoveryCfg, kind: RegistryKind) -> Option<PollingBack
 }
 
 /// 业务作用：启动具有独立时限和退避的后台轮询，失败时按 freshness 合同保留或撤销旧实例。
+///
+/// 参数说明：
+/// - `backend`：本代已解析的注册中心权限和读取预算。
+/// - `spec`：本代逻辑服务及实例转换策略。
+/// - `publisher`：只对本代服务有效的发布权。
+/// - `metrics`：接收真正获权发布和来源故障的低基数观测。
+///
+/// 返回：后台任务句柄；失权时结束，不再重连或发布。
 fn spawn_registry_poll(
     backend: PollingBackend,
     spec: RegistryWatchSpec,
-    dynamic: Arc<DynamicUpstreamStore>,
+    publisher: ServicePublisher,
     metrics: Arc<Metrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -878,7 +919,7 @@ fn spawn_registry_poll(
         };
         let interval = Duration::from_millis(registry_poll_interval_ms(&backend));
         let timeout = Duration::from_millis(registry_timeout_ms(&backend));
-        loop {
+        while publisher.is_current() {
             let attempt =
                 tokio::time::timeout(timeout, fetch_registry_instances(&client, &backend, &spec))
                     .await;
@@ -886,7 +927,10 @@ fn spawn_registry_poll(
                 Ok(Ok(discovered)) => match registry_instances_to_upstreams(&spec, discovered) {
                     Ok(upstreams) => {
                         let count = upstreams.len();
-                        dynamic.replace_service(&spec.logical_service, upstreams);
+                        if !publisher.publish(upstreams) {
+                            // 当前目录已被接管，旧响应不能发布，也不能计作当前来源的一次成功。
+                            return;
+                        }
                         metrics.inc_registry_poll(
                             registry_metric_backend(spec.kind),
                             RegistryPollMetric::Success,
@@ -1629,15 +1673,22 @@ fn metadata_bool_value(metadata: &HashMap<String, String>, key: &str) -> bool {
 }
 
 /// 业务作用：启动 Nacos 实例订阅并在中断后受控重连，任务生命周期绑定当前发现配置。
+///
+/// 参数说明：
+/// - `cfg`：本代已解析的 Nacos 连接与权限配置。
+/// - `spec`：本代服务映射及实例转换策略。
+/// - `publisher`：对本代目录的唯一发布与保鲜权。
+///
+/// 返回：后台任务句柄；连接失败按原退避重连，失权停止继续工作。
 fn spawn_nacos_watch(
     cfg: NacosDiscoveryCfg,
     spec: NacosWatchSpec,
-    dynamic: Arc<DynamicUpstreamStore>,
+    publisher: ServicePublisher,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let reconnect_backoff = Duration::from_millis(cfg.reconnect_backoff_ms.max(100));
-        loop {
-            if let Err(e) = run_nacos_watch_once(&cfg, &spec, &dynamic).await {
+        while publisher.is_current() {
+            if let Err(e) = run_nacos_watch_once(&cfg, &spec, &publisher).await {
                 tracing::warn!(
                     service = %spec.logical_service,
                     nacos_service = %spec.nacos_service,
@@ -1651,10 +1702,17 @@ fn spawn_nacos_watch(
 }
 
 /// 业务作用：建立一次 Nacos watch 并发布其完整实例事件，订阅失败交给外层退避处理。
+///
+/// 参数说明：
+/// - `cfg`：本次连接使用的固定 Nacos 权限与预算。
+/// - `spec`：本代服务映射。
+/// - `publisher`：发布事件及续期均须复验的原 owner。
+///
+/// 返回：失权时正常结束；连接或订阅失败返回错误，不延长最后确认事实的有效期。
 async fn run_nacos_watch_once(
     cfg: &NacosDiscoveryCfg,
     spec: &NacosWatchSpec,
-    dynamic: &Arc<DynamicUpstreamStore>,
+    publisher: &ServicePublisher,
 ) -> anyhow::Result<()> {
     let props = nacos_props(cfg);
     let client = nasa::discovery::nacos::NacosDiscoveryClient::connect(&props).await?;
@@ -1667,25 +1725,31 @@ async fn run_nacos_watch_once(
     let _guard = guard;
 
     let initial = rx.borrow().clone();
-    apply_discovery_snapshot(dynamic, spec, &initial);
+    apply_discovery_snapshot(publisher, spec, &initial);
     // watch 存活期间周期性更新 last-known-good 的有效时间。Nacos 对稳定不变的服务不会重复推送,
-    //   若不触活,updated_at 会停在上次【变更】时刻,超过 stale_ttl 后 service_fresh 误判 stale →
+    //   若不触活,updated_at 会停在上次【变更】时刻,超过 stale_ttl 后未变更实例也会过期 →
     //   critical readyz 无谓抖到 503、被前置 LB 摘流。触活周期取 poll 间隔;watch 一旦断
     //   (`rx.changed` Err → 本函数返回、交 spawn_nacos_watch 重连退避),触活随之停止 → stale_ttl 正常计时降级。
     let mut liveness = tokio::time::interval(Duration::from_millis(cfg.poll_interval_ms.max(100)));
     liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     liveness.tick().await; // 首个 tick 立即就绪,丢弃——刚 apply 过、不必立即再触活。
     loop {
+        if !publisher.is_current() {
+            // 网络仍连接不构成当前发布权，停止旧订阅而不触碰后来实例。
+            return Ok(());
+        }
         tokio::select! {
             changed = rx.changed() => {
                 // watch 关闭 → Err → 退出本次 run(由外层重连退避);停止触活,让 stale_ttl 正常计时。
                 changed?;
                 let snapshot = rx.borrow().clone();
-                apply_discovery_snapshot(dynamic, spec, &snapshot);
+                apply_discovery_snapshot(publisher, spec, &snapshot);
             }
             _ = liveness.tick() => {
-                // watch 仍连着、服务无变更:仅刷新 fresh 时间戳(不改实例),保持 service_fresh=true。
-                dynamic.touch_service(&spec.logical_service);
+                // watch 仍连着时也必须复验原 owner，不能为已经接管的新来源延长有效期。
+                if !publisher.touch() {
+                    return Ok(());
+                }
             }
         }
     }
@@ -1723,15 +1787,25 @@ pub(crate) fn self_register_service_name(cfg: &NacosDiscoveryCfg) -> Option<Stri
 }
 
 /// 业务作用：验证并原子替换指定服务的完整发现结果，避免数据面观察半份实例目录。
+///
+/// 参数说明：
+/// - `publisher`：当前 SDK 订阅原先取得的发布权。
+/// - `spec`：本代已冻结的转换合同。
+/// - `instances`：SDK 交付的完整实例事件。
+///
+/// 返回：无；有效且仍获权时原子替换，非法或失权结果保持当前目录。
 fn apply_discovery_snapshot(
-    dynamic: &Arc<DynamicUpstreamStore>,
+    publisher: &ServicePublisher,
     spec: &NacosWatchSpec,
     instances: &[nasa::discovery::Instance],
 ) {
     match discovery_instances_to_upstreams(spec, instances) {
         Ok(upstreams) => {
             let count = upstreams.len();
-            dynamic.replace_service(&spec.logical_service, upstreams);
+            if !publisher.publish(upstreams) {
+                // 旧 SDK 事件不能重新取得已被新订阅接管的名称，也不记录成一次有效发布。
+                return;
+            }
             tracing::info!(
                 service = %spec.logical_service,
                 nacos_service = %spec.nacos_service,

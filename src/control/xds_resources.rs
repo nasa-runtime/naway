@@ -810,15 +810,30 @@ fn build_policy_upstreams(
     }))
     .context("materialize xDS upstream config")?;
     let dynamic = DynamicUpstreamStore::new();
-    let managed = clusters.keys().cloned().collect::<Vec<_>>();
-    dynamic.replace_managed_services(&managed, endpoints.clone());
-    UpstreamDirectory::build_with_dynamic_at_discovery(
+    let directory = UpstreamDirectory::build_with_dynamic_at_discovery(
         &upstream_cfg,
-        dynamic,
+        dynamic.clone(),
         &base.discovery,
         cfg_path,
     )
-    .context("compile xDS upstream directory")
+    .context("compile xDS upstream directory")?;
+    let bindings = clusters
+        .keys()
+        .map(|name| {
+            (
+                name.clone(),
+                directory
+                    .discovery_binding(name)
+                    .expect("compiled CDS service has a discovery binding"),
+            )
+        })
+        .collect();
+    // 隔离候选也只接受编译后同一绑定的完整实例；确认发布成功后才允许外层物化活动快照。
+    anyhow::ensure!(
+        dynamic.claim_xds(bindings).publish(endpoints.clone()),
+        "isolated CDS directory publication authority changed"
+    );
+    Ok(directory)
 }
 
 /// 业务作用：把一份 RDS native 计划编译成请求热路径 Router，预检与最终发布共用同一语义门。

@@ -46,7 +46,7 @@ impl Default for DiscoveryCfg {
 }
 
 /// Consul `/v1/health/service/:name` 发现配置。
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
 pub struct ConsulDiscoveryCfg {
     /// 是否启动 Consul 发现 worker。
@@ -104,7 +104,7 @@ impl Default for ConsulDiscoveryCfg {
 }
 
 /// Eureka `/eureka/apps/:app` JSON 发现配置。
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
 pub struct EurekaDiscoveryCfg {
     /// 是否启动 Eureka 发现 worker。
@@ -154,7 +154,7 @@ impl Default for EurekaDiscoveryCfg {
 }
 
 /// 系统 DNS resolver 轮询配置。
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
 pub struct DnsDiscoveryCfg {
     /// 是否启动 DNS 发现 worker。
@@ -188,7 +188,7 @@ impl Default for DnsDiscoveryCfg {
 }
 
 /// Kubernetes core/v1 Endpoints 发现配置。
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
 pub struct KubernetesDiscoveryCfg {
     /// 是否启动 Kubernetes Endpoints 发现 worker。

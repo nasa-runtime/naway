@@ -136,15 +136,17 @@ pub(crate) fn capture(
             ServiceSource::Static => (Availability::Available, Some(service.instances.as_ref())),
             _ => match dynamic.get(name) {
                 None => (Availability::Missing, None),
-                Some(state)
-                    if service.discovery_stale_ttl_ms != 0
-                        && now.saturating_duration_since(state.updated_at).as_millis()
-                            > u128::from(service.discovery_stale_ttl_ms) =>
-                {
-                    // 过期发现不能以旧实例数继续报健康；空但新鲜的发布仍按已知零保留。
-                    (Availability::Stale, None)
-                }
-                Some(state) => (Availability::Available, Some(state.instances.as_ref())),
+                Some(state) => match state.availability(
+                    service.discovery_identity,
+                    service.discovery_stale_ttl_ms,
+                    now,
+                ) {
+                    super::dynamic::Availability::Missing => (Availability::Missing, None),
+                    super::dynamic::Availability::Stale => (Availability::Stale, None),
+                    super::dynamic::Availability::Available => {
+                        (Availability::Available, Some(state.instances.as_ref()))
+                    }
+                },
             },
         };
         let counts = if let Some(instances) = instances {

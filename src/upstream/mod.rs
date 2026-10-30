@@ -4,6 +4,8 @@
 //! [`DynamicUpstreamStore`]。LB 选择逻辑不关心实例来源。
 
 pub mod discovery;
+pub(crate) mod dynamic;
+pub use dynamic::DynamicUpstreamStore;
 pub mod hash;
 pub mod health;
 pub mod load;
@@ -21,7 +23,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use arc_swap::ArcSwap;
 
 use crate::config::model::{
     DiscoveryCfg, StaticInstanceCfg, StaticServiceCfg, UpstreamPrewarmCfg, UpstreamsCfg,
@@ -56,216 +57,6 @@ impl ServiceRegistry for StaticRegistry {
     fn snapshot(&self) -> UpstreamDirectory {
         self.directory.clone()
     }
-}
-
-/// Nacos watch 写入的动态实例表。读路径是 ArcSwap load + Vec clone,没有 await / IO。
-///
-/// WHY `write_lock`:每个 Nacos 服务有一个独立 watch 任务并发写同一张 `services` 表
-/// (`touch_service`/`replace_service`/`remove_service`),而这三者都是 read-copy-update
-/// (load→clone→store)。没有串行化时两个不同服务的并发写会互相丢更新(lost update):
-/// A 读 V0、B 读 V0、A 存 V0+{a}、B 存 V0+{b} → A 的更新被覆盖回退,可能让已摘除的死实例复活
-/// 或让刚删除的服务残留且再无任务维护。写是低频控制面操作,持锁跨 load→store(无 await)开销可忽略;
-/// 读路径仍走 `services.load` 无锁,不受影响。
-pub struct DynamicUpstreamStore {
-    services: ArcSwap<HashMap<String, DynamicServiceState>>,
-    write_lock: std::sync::Mutex<()>,
-}
-
-impl Default for DynamicUpstreamStore {
-    /// 业务作用：建立空的原子发现目录与串行写入门，保证并发更新不会互相覆盖。
-    fn default() -> Self {
-        Self {
-            services: ArcSwap::from_pointee(HashMap::new()),
-            write_lock: std::sync::Mutex::new(()),
-        }
-    }
-}
-
-impl DynamicUpstreamStore {
-    /// 业务作用：创建一个空的动态实例目录，并返回可供发现任务与配置快照共享的句柄。
-    ///
-    /// 返回：内部通过 `ArcSwap` 发布不可变目录，数据面读取不等待发现侧 IO。
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    /// 业务作用：获取一个服务当前的不可变实例切片。
-    ///
-    /// 参数说明：
-    /// - `service`: 配置中的逻辑服务名，而不是 Nacos 的物理 dataId。
-    ///
-    /// 返回：服务存在时只 clone 一次 `Arc`；不存在时返回 `None`。不会按请求深拷贝实例列表。
-    pub fn service_instances(&self, service: &str) -> Option<Arc<[Arc<UpstreamInstance>]>> {
-        self.services
-            .load()
-            .get(service)
-            .map(|state| state.instances.clone())
-    }
-
-    /// 业务作用：判断服务是否仍有实例，且最近一次发现连接确认未超过 stale TTL。
-    pub fn service_fresh(&self, service: &str, stale_ttl_ms: u64) -> bool {
-        let Some(state) = self.services.load().get(service).cloned() else {
-            return false;
-        };
-        if state.instances.is_empty() {
-            return false;
-        }
-        stale_ttl_ms == 0 || state.updated_at.elapsed().as_millis() as u64 <= stale_ttl_ms
-    }
-
-    /// 业务作用：原子替换一个动态服务的完整实例集，并保留未变化实例的 slow-start 起点。
-    pub fn replace_service(&self, service: &str, mut instances: Vec<UpstreamInstance>) {
-        // 串行化所有写者,避免与其它服务的并发 watch 写互相丢更新(见结构体注释)。
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("dynamic upstream write lock poisoned");
-        let current = self.services.load();
-        if let Some(old) = current.get(service) {
-            for inst in &mut instances {
-                if let Some(prev) = old
-                    .instances
-                    .iter()
-                    .find(|prev| prev.health_key == inst.health_key)
-                {
-                    inst.created_at = prev.created_at;
-                    inst.feedback_generation = prev.feedback_generation;
-                }
-            }
-        }
-        // 发现更新是低频控制面操作；这里构造新的不可变切片，换取数据面无锁共享且不深拷贝。
-        let instances = instances
-            .into_iter()
-            .map(|mut instance| {
-                instance.bind_feedback_service(service);
-                Arc::new(instance)
-            })
-            .collect::<Vec<_>>()
-            .into();
-        let mut next = current.as_ref().clone();
-        next.insert(
-            service.to_string(),
-            DynamicServiceState {
-                instances,
-                updated_at: Instant::now(),
-            },
-        );
-        self.services.store(Arc::new(next));
-    }
-
-    /// 业务作用：把一个控制面 response 中的多个动态服务作为同一事务发布，并清除该
-    /// owner 本轮已省略的服务，避免请求看到半份 EDS SotW。
-    ///
-    /// 参数说明：
-    /// - `managed_services`：是该 owner 独占的全部逻辑服务
-    /// - `replacement`：是已完成 全量校验的新实例表，缺失 key 表示该服务当前没有 endpoint。
-    ///
-    /// 返回：无返回值；单次 `ArcSwap::store` 后所有读者同时观察新版本，未变化身份保留
-    /// slow-start 起点。调用前必须先验证整份 response，函数本身不执行外部 IO。
-    pub fn replace_managed_services(
-        &self,
-        managed_services: &[String],
-        mut replacement: HashMap<String, Vec<UpstreamInstance>>,
-    ) {
-        // 同一 ADS response 必须只发布一次：逐服务 replace 会让并发请求观察到新旧 cluster
-        // 混合状态，ACK 后也无法证明数据面实际对应完整 nonce。
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("dynamic upstream write lock poisoned");
-        let current = self.services.load();
-        let mut next = current.as_ref().clone();
-        for service in managed_services {
-            let instances = replacement.remove(service).unwrap_or_default();
-            let old = current.get(service);
-            let instances = instances
-                .into_iter()
-                .map(|mut instance| {
-                    if let Some(previous) = old.and_then(|state| {
-                        state
-                            .instances
-                            .iter()
-                            .find(|previous| previous.health_key == instance.health_key)
-                    }) {
-                        instance.created_at = previous.created_at;
-                        instance.feedback_generation = previous.feedback_generation;
-                    }
-                    instance.bind_feedback_service(service);
-                    Arc::new(instance)
-                })
-                .collect::<Vec<_>>()
-                .into();
-            next.insert(
-                service.clone(),
-                DynamicServiceState {
-                    instances,
-                    updated_at: Instant::now(),
-                },
-            );
-        }
-        self.services.store(Arc::new(next));
-    }
-
-    /// 业务作用：原子移除一个动态服务及其 freshness 状态。
-    pub fn remove_service(&self, service: &str) {
-        // 串行化写者(见结构体注释):否则 reconcile 的 remove 可能被并发 touch/replace 覆盖回退。
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("dynamic upstream write lock poisoned");
-        let current = self.services.load();
-        if !current.contains_key(service) {
-            return;
-        }
-        let mut next = current.as_ref().clone();
-        next.remove(service);
-        self.services.store(Arc::new(next));
-    }
-
-    /// 业务作用：「触活」一个服务的 last-known-good:仅刷新其 fresh 时间戳,不改实例列表。
-    ///
-    /// 由 Nacos watch 任务在**连接存活期间**周期性调用(discovery.rs)。维持租约有效期的原因：
-    /// `service_fresh` 的 staleness 是从 `updated_at` 算的,而 `updated_at` 只在【实例变更】push 时前移;
-    /// 一个稳定不变的服务(Nacos 不会重复推送相同数据)会在 `stale_ttl` 后被**误判 stale**,令 critical
-    /// `/readyz` 无谓地抖到 503、被前置 LB 摘流。 的 stale_ttl 语义本是「watch 断线后 last-known-good 老化」
-    /// ——即「距 watch 上次确认存活的时长」,而非「距上次数据变更的时长」。触活把二者对齐:watch 活着就保持 fresh,
-    /// watch 一旦断(任务退出、停止触活),stale_ttl 到点才降级。
-    ///
-    /// 参数说明：
-    /// - `service`: 逻辑服务名(`lb://<service>` 抽出的名)。仅当该服务已存在且非空时触活
-    ///   (空服务本就不该 fresh,触活它会掩盖「实例全没了」)。
-    pub fn touch_service(&self, service: &str) {
-        // 串行化写者(见结构体注释):触活也是 read-copy-update,并发写会丢别的服务的更新。
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("dynamic upstream write lock poisoned");
-        let current = self.services.load();
-        // 服务不存在或当前为空:不触活。空 = 真的没有可用实例,应让它按 service_fresh 判为 not-fresh。
-        let Some(state) = current.get(service) else {
-            return;
-        };
-        if state.instances.is_empty() {
-            return;
-        }
-        // 背景任务、低频(poll 间隔级),非请求热路径:整表 clone 换指针可接受(与 replace_service 同量级, 只约束热路径)。
-        let mut next = current.as_ref().clone();
-        if let Some(state) = next.get_mut(service) {
-            state.updated_at = Instant::now();
-        }
-        self.services.store(Arc::new(next));
-    }
-}
-
-/// 动态目录中一个服务的不可变发布版本。
-///
-/// 整个结构随外层 `ArcSwap<HashMap<...>>` 一次性替换，读请求不会观察到实例表与 freshness 撕裂。
-#[derive(Clone)]
-struct DynamicServiceState {
-    /// 一次发现版本的不可变实例切片；请求只 clone 外层 `Arc`。
-    instances: Arc<[Arc<UpstreamInstance>]>,
-    /// 最近一次发现连接确认该服务仍新鲜的时刻。
-    updated_at: Instant,
 }
 
 /// 一次配置快照内的上游目录。
@@ -386,8 +177,7 @@ impl UpstreamDirectory {
             // 防止 u64 极值把一次真实上游失败升级成进程 panic。
             const MAX_FAIL_TIMEOUT_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
             anyhow::ensure!(
-                svc.max_fails == 0
-                    || (1..=MAX_FAIL_TIMEOUT_MS).contains(&svc.fail_timeout_ms),
+                svc.max_fails == 0 || (1..=MAX_FAIL_TIMEOUT_MS).contains(&svc.fail_timeout_ms),
                 "service `{name}` fail_timeout_ms must be within 1..={MAX_FAIL_TIMEOUT_MS} when max_fails is positive"
             );
             let source = ServiceSource::parse(svc.source.as_deref().unwrap_or("static"))
@@ -572,6 +362,7 @@ impl UpstreamDirectory {
                         })
                         .transpose()?,
                     active_health,
+                    discovery_identity: None,
                     prewarm,
                     locality,
                     instances: instances.into(),
@@ -604,6 +395,10 @@ impl UpstreamDirectory {
                     },
                 },
             );
+        }
+        for (name, service) in &mut services {
+            service.discovery_identity =
+                dynamic::BindingIdentity::service(name, service, discovery);
         }
         Ok(Self {
             services,
@@ -1135,6 +930,16 @@ impl UpstreamDirectory {
             .collect()
     }
 
+    /// 业务作用：向当前注册订阅交付同一配置构建出的固定发布绑定，不重新复制或散列字段。
+    ///
+    /// 参数说明：
+    /// - `service`：当前计划内的逻辑服务。
+    ///
+    /// 返回：动态服务的固定绑定；静态或不存在的服务没有动态发布身份。
+    pub(crate) fn discovery_binding(&self, service: &str) -> Option<dynamic::BindingIdentity> {
+        self.services.get(service)?.discovery_identity
+    }
+
     /// 业务作用：返回当前配置快照声明的逻辑服务数量。
     pub fn service_count(&self) -> usize {
         self.services.len()
@@ -1427,7 +1232,7 @@ impl UpstreamDirectory {
     /// - `service`：是动态表 key
     /// - `svc`：是同一快照中的来源与 freshness 策略。
     ///
-    /// 返回：静态来源只借用快照切片；Nacos 来源只 clone 一次 `Arc`；过期/缺失时返回空视图。
+    /// 返回：静态来源借用快照切片；动态来源同次复验绑定与期限后只 clone 一次 `Arc`；失权或缺证据返回空视图。
     fn instances_for<'a>(
         &'a self,
         service: &str,
@@ -1435,28 +1240,18 @@ impl UpstreamDirectory {
     ) -> UpstreamInstances<'a> {
         match svc.source {
             ServiceSource::Static => UpstreamInstances::Static(&svc.instances),
-            // Nacos 实例也按 freshness 门控，让「选实例」与「readyz」读到一致的可用集。
-            //   stale_ttl 内(watch 活着,由 touch_service 保鲜)沿用 last-known-good;超时(watch 失联太久)
-            //   视为空 → select 返 None → 降级( watch 契约:超过 stale_ttl 进 degraded/empty,而非无限用旧实例)。
-            //   若不门控,watch 死后 readyz 已 503、select 却还在转发到可能已消失的实例,二者不一致。
+            // 当前来源绑定、确认状态和 freshness 必须来自同次读取，使选择、探测与就绪门采用同一权威。
+            // native 过期或换代时撤下实例；xDS 的本地 TTL 为零，由其已确认资源及控制面门决定可用性。
             ServiceSource::Nacos
             | ServiceSource::Consul
             | ServiceSource::Eureka
             | ServiceSource::Dns
             | ServiceSource::Kubernetes
-            | ServiceSource::Xds => {
-                if self
-                    .dynamic
-                    .service_fresh(service, svc.discovery_stale_ttl_ms)
-                {
-                    self.dynamic
-                        .service_instances(service)
-                        .map(UpstreamInstances::Dynamic)
-                        .unwrap_or(UpstreamInstances::Empty)
-                } else {
-                    UpstreamInstances::Empty
-                }
-            }
+            | ServiceSource::Xds => self
+                .dynamic
+                .current_instances(service, svc.discovery_identity, svc.discovery_stale_ttl_ms)
+                .map(UpstreamInstances::Dynamic)
+                .unwrap_or(UpstreamInstances::Empty),
         }
     }
 }
@@ -1510,6 +1305,8 @@ pub struct ServiceSnapshot {
     pub critical: bool,
     /// 实例来自静态 yml 还是 Nacos 动态目录。
     pub source: ServiceSource,
+    /// 当前配置允许采用的动态来源与实例转换身份；静态服务不使用动态目录。
+    discovery_identity: Option<dynamic::BindingIdentity>,
     /// primary/backup 候选内部使用的负载均衡算法。
     pub lb_policy: LbPolicy,
     /// 一致性哈希键来源与表参数;`ring_hash`/`maglev` 必需,其它策略为 None。
@@ -1611,7 +1408,7 @@ pub(crate) struct UpstreamPrewarmTarget {
 }
 
 /// 一个逻辑服务的实例事实来源。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ServiceSource {
     /// 主配置内声明的静态实例。
     Static,
@@ -1674,7 +1471,7 @@ pub struct NacosWatchSpec {
 }
 
 /// EDS ClusterLoadAssignment 到一个本地逻辑服务的不可变转换规格。
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq)]
 pub struct XdsWatchSpec {
     /// gateway 配置中的逻辑服务名。
     pub logical_service: String,
@@ -1690,6 +1487,30 @@ pub struct XdsWatchSpec {
     pub slow_start_ms: u64,
     /// 动态 HTTPS 实例共享的已验证 TLS profile。
     pub tls_profile: Option<UpstreamTlsProfile>,
+}
+
+impl PartialEq for XdsWatchSpec {
+    /// 业务作用：对账 EDS 转换任务时同时比较来源、传输材料和凭据授权策略，不能只复用材料池键。
+    ///
+    /// 参数说明：
+    /// - `other`：候选配置中的同名订阅规格。
+    ///
+    /// 返回：完整冻结绑定相同才可保留原任务，移动租约时钟不作为声明变更。
+    fn eq(&self, other: &Self) -> bool {
+        dynamic::BindingIdentity::xds(self) == dynamic::BindingIdentity::xds(other)
+    }
+}
+
+impl Hash for XdsWatchSpec {
+    /// 业务作用：订阅散列使用与相等判断相同的完整绑定，授权策略变化不会被材料池身份掩盖。
+    ///
+    /// 参数说明：
+    /// - `state`：调用方用于订阅索引的散列器。
+    ///
+    /// 返回：把固定绑定写入索引散列，不复制 TLS 材料或编码配置文档。
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        dynamic::BindingIdentity::xds(self).hash(state);
+    }
 }
 
 /// 非 Nacos 服务发现后端类型。
@@ -2278,7 +2099,9 @@ impl UpstreamProtocol {
                 }
             }
             other => {
-                anyhow::bail!("unsupported upstream protocol `{other}` (auto|h1|h2|h2c|h3|fastcgi|uwsgi|scgi)")
+                anyhow::bail!(
+                    "unsupported upstream protocol `{other}` (auto|h1|h2|h2c|h3|fastcgi|uwsgi|scgi)"
+                )
             }
         }
     }
@@ -2454,9 +2277,14 @@ impl UpstreamInstance {
             .with_context(|| format!("invalid upstream uri `{raw_uri}`"))?;
         let scheme = uri.scheme_str();
         if protocol.is_cgi() {
-            anyhow::ensure!(scheme == Some("http") && uri.port_u16().is_some()
-                && uri.path() == "/" && uri.query().is_none() && tls_profile.is_none(),
-                "CGI endpoints require an explicit TCP port, an http address carrier without path/query, and no TLS profile");
+            anyhow::ensure!(
+                scheme == Some("http")
+                    && uri.port_u16().is_some()
+                    && uri.path() == "/"
+                    && uri.query().is_none()
+                    && tls_profile.is_none(),
+                "CGI endpoints require an explicit TCP port, an http address carrier without path/query, and no TLS profile"
+            );
         }
         match scheme {
             Some("http") | Some("https") => {}
