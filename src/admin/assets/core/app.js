@@ -6,6 +6,7 @@ import { mount as catalog } from "../views/catalog.js";
 import { mount as operations } from "../views/operations.js";
 import { mount as routeTraffic } from "../views/routes.js";
 import { mount as services } from "../views/services.js";
+import { mount as consumers } from "../views/consumers.js";
 
 const root = document.getElementById("view");
 const loginForm = document.getElementById("login");
@@ -63,6 +64,14 @@ function navigate(name, service = "") {
     document.getElementById("subtitle").textContent =
       "集群与工作区 · 当前实例事实与完整节点覆盖";
     dispose = services(root, session, service);
+  } else if (
+    name === "consumers" &&
+    ((allowed("cluster") && allowed("consumers")) || session.workspaces?.length)
+  ) {
+    document.getElementById("title").textContent = "集群消费者";
+    document.getElementById("subtitle").textContent =
+      "原生 API-Key 绑定 · 逐节点启用状态与完整覆盖";
+    dispose = consumers(root, session);
   } else if (name === "nodes" && allowed("cluster")) {
     document.getElementById("title").textContent = "集群节点";
     document.getElementById("subtitle").textContent =
@@ -183,27 +192,34 @@ async function login(event) {
       (allowed("cluster") && allowed("upstreams")) ||
       session.workspaces?.length
     );
+    document.getElementById("consumers-nav").disabled = !(
+      (allowed("cluster") && allowed("consumers")) ||
+      session.workspaces?.length
+    );
     document.getElementById("catalog-nav").disabled =
       !allowed("cluster") ||
       !["routes", "config", "upstreams"].some((resource) => allowed(resource));
     notice.textContent = "";
     navigate(
-      location.pathname === "/services" &&
-        !document.getElementById("services-nav").disabled
-        ? "services"
-        : location.pathname === "/traffic" &&
-            !document.getElementById("traffic-nav").disabled
-          ? "traffic"
-          : location.pathname === "/operations"
-            ? "operations"
-            : allowed("cluster")
-              ? location.pathname === "/catalog" &&
-                !document.getElementById("catalog-nav").disabled
-                ? "catalog"
-                : location.pathname === "/cluster"
-                  ? "nodes"
-                  : "monitor"
-              : "system",
+      location.pathname === "/consumers" &&
+        !document.getElementById("consumers-nav").disabled
+        ? "consumers"
+        : location.pathname === "/services" &&
+            !document.getElementById("services-nav").disabled
+          ? "services"
+          : location.pathname === "/traffic" &&
+              !document.getElementById("traffic-nav").disabled
+            ? "traffic"
+            : location.pathname === "/operations"
+              ? "operations"
+              : allowed("cluster")
+                ? location.pathname === "/catalog" &&
+                  !document.getElementById("catalog-nav").disabled
+                  ? "catalog"
+                  : location.pathname === "/cluster"
+                    ? "nodes"
+                    : "monitor"
+                : "system",
     );
   } catch (error) {
     if (attempt === epoch && error.name !== "AbortError") {

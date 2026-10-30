@@ -12,6 +12,7 @@ mod candidate;
 use candidate::build as build_cluster_candidate_snapshot;
 mod catalog;
 mod cluster;
+mod consumers;
 #[cfg(feature = "telemetry-otlp")]
 mod diagnostics;
 mod diff;
@@ -168,6 +169,7 @@ pub struct AdminState {
     member_discovery: cluster::discovery::Runtime,
     /// 与上报共享当前配置对象目录；不进入普通请求执行链。
     catalog: catalog::Runtime,
+    consumers: consumers::Runtime,
     /// 启动期安装的持久提案权威；纯数据节点不创建数据库资源。
     #[cfg(feature = "admin-operations-pgsql")]
     operations: std::sync::OnceLock<Arc<operations::Store>>,
@@ -338,6 +340,7 @@ impl AdminState {
             cluster: cluster::Runtime::new(),
             member_discovery: Default::default(),
             catalog: catalog::Runtime::default(),
+            consumers: consumers::Runtime::default(),
             #[cfg(feature = "admin-operations-pgsql")]
             operations: std::sync::OnceLock::new(),
         })
@@ -729,6 +732,9 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
             monitor::services::read(&state, &request, &state.snap.load_full(), None)
         }
         (&Method::GET, "/api/cluster/catalog") => catalog::read(&state, &request).await,
+        (&Method::GET, "/api/cluster/consumers") => {
+            consumers::read::platform(&state, &request).await
+        }
         (&Method::GET, "/api/cluster/overview") | (&Method::GET, "/admin/cluster/facts") => {
             if request.uri.query().is_some() {
                 plain(
@@ -969,7 +975,9 @@ fn admin_permission(method: &Method, path: &str) -> Option<(AdminResource, Admin
         (&Method::GET, "/api/monitor/services") => {
             Some((AdminResource::Cluster, AdminAction::Read))
         }
-        (&Method::GET, "/api/cluster/catalog") => Some((AdminResource::Cluster, AdminAction::Read)),
+        (&Method::GET, "/api/cluster/catalog" | "/api/cluster/consumers") => {
+            Some((AdminResource::Cluster, AdminAction::Read))
+        }
         (&Method::GET, "/api/cluster/overview") | (&Method::GET, "/admin/cluster/facts") => {
             Some((AdminResource::Cluster, AdminAction::Read))
         }

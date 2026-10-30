@@ -1,6 +1,6 @@
 //! 每个已声明Admin只保留一条复用通道与两条有界在途流，故障不积压历史报告。
 
-use super::{catalog, protocol, telemetry, Plan, RPC_TIMEOUT};
+use super::{catalog, consumers, protocol, telemetry, Plan, RPC_TIMEOUT};
 use crate::admin::catalog::Catalog;
 use crate::admin::AdminState;
 use futures::{stream, StreamExt};
@@ -18,6 +18,8 @@ struct Target {
     catalog_generation: Option<(u64, [u8; 32])>,
     catalog_offset: usize,
     catalog_complete: bool,
+    consumers: consumers::Upload,
+    consumers_supported: bool,
     interest_until: Option<Instant>,
     service_metrics_supported: bool,
     issuer: Option<Arc<super::issuer::Verifier>>,
@@ -34,6 +36,7 @@ struct Round<'a> {
     facts: &'a protocol::NodeFacts,
     baseline: &'a crate::admin::cluster::baseline::Observation,
     catalog: &'a Catalog,
+    consumers: &'a crate::admin::consumers::Directory,
     sequence: u64,
     metrics_enabled: bool,
     sample: Option<&'a Arc<telemetry::Upload>>,
@@ -97,6 +100,8 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     catalog_generation: None,
                     catalog_offset: 0,
                     catalog_complete: false,
+                    consumers: consumers::Upload::default(),
+                    consumers_supported: false,
                     interest_until: None,
                     service_metrics_supported: false,
                     issuer: target.issuer.clone(),
@@ -122,6 +127,7 @@ pub(super) async fn run(owner: Weak<AdminState>) {
             continue;
         }
         let catalog = state.catalog.local(&snapshot);
+        let consumers = state.consumers.local(&snapshot);
         let metrics_enabled = plan.report_metrics && snapshot.admin_monitor.enabled;
         let sample = metrics_enabled
             .then(|| state.monitor.upload_sample(&state, &snapshot))
@@ -140,6 +146,7 @@ pub(super) async fn run(owner: Weak<AdminState>) {
             facts: &facts,
             baseline: &baseline,
             catalog: &catalog,
+            consumers: &consumers,
             sequence,
             metrics_enabled,
             sample: sample.as_ref(),
@@ -270,7 +277,25 @@ async fn send(target: &mut Target, round: &Round<'_>) {
             }
         };
         let _ = tokio::time::timeout_at(deadline, async {
-            tokio::join!(send_catalog(target, facts, catalog, deadline), metrics)
+            tokio::join!(
+                async {
+                    let _ = send_catalog(target, facts, catalog, deadline).await;
+                    if target.consumers_supported {
+                        // 凭据目录与原对象目录串行复用同一槽，不能增加一条常驻在途RPC。
+                        let _ = target
+                            .consumers
+                            .send(
+                                &mut target.client,
+                                facts,
+                                &target.session,
+                                round.consumers,
+                                deadline,
+                            )
+                            .await;
+                    }
+                },
+                metrics
+            )
         })
         .await;
     } else {
@@ -280,6 +305,7 @@ async fn send(target: &mut Target, round: &Round<'_>) {
         {
             target.session.clear();
             target.catalog_generation = None;
+            target.consumers = consumers::Upload::default();
             #[cfg(feature = "node-actions")]
             target.actions.clear();
             #[cfg(feature = "node-actions")]
@@ -452,6 +478,7 @@ async fn exchange(
             sequence,
             facts: Some(facts.clone()),
             metrics_supported: true,
+            consumers_supported: true,
             metrics_enabled,
             baseline_supported: baseline.availability != "unsupported",
             node_baseline: baseline
@@ -481,6 +508,11 @@ async fn exchange(
         .then(|| Instant::now() + Duration::from_millis(u64::from(response.metrics_interest_ms)));
     // 每次成功心跳重新取得能力；目标降级或切换后不能继续发送新字段及其摘要。
     target.service_metrics_supported = response.service_metrics_supported;
+    target.consumers_supported = response.consumers_supported;
+    if !target.consumers_supported {
+        // 接收端不再支持本领域时撤销原确认偏移，恢复能力后重新交付完整事实。
+        target.consumers = consumers::Upload::default();
+    }
     #[cfg(feature = "node-actions")]
     match (response.action, response.release, response.preview) {
         (Some(offer), None, None) if !target.previews.busy() => {

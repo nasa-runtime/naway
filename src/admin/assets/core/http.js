@@ -103,6 +103,8 @@ export async function request(path, options = {}) {
     let length = 0;
     const capacity =
       target.pathname === "/api/cluster/catalog" ||
+      target.pathname === "/api/cluster/consumers" ||
+      /^\/api\/workspaces\/[^/]+\/cluster\/consumers$/.test(target.pathname) ||
       target.pathname === "/api/operations/proposals" ||
       /^\/api\/operations\/proposals\/[0-9a-f]{32}\/preview$/.test(
         target.pathname,

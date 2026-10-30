@@ -1,6 +1,6 @@
 //! 节点上报使用证书绑定和接收端会话令牌，迟到报告不能覆盖新启动实例。
 
-use super::{catalog, protocol, security, telemetry, Manager, Plan, FRESHNESS};
+use super::{catalog, consumers, protocol, security, telemetry, Manager, Plan, FRESHNESS};
 use crate::admin::cluster::facts::Facts;
 use nasa::grpc::{PeerIdentity, Request, Response, Status};
 use std::collections::BTreeMap;
@@ -27,6 +27,8 @@ struct Entry {
     conflict: Option<Instant>,
     facts: Option<Arc<Facts>>,
     catalog: catalog::State,
+    consumers: consumers::State,
+    consumers_supported: bool,
     metrics_supported: bool,
     metrics_enabled: bool,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
@@ -48,6 +50,8 @@ pub(in crate::admin) struct Observation {
     pub facts: Option<Arc<Facts>>,
     pub at: Option<Instant>,
     pub catalog: Option<Arc<crate::admin::catalog::Catalog>>,
+    pub consumers: Option<Arc<crate::admin::consumers::Directory>>,
+    pub consumers_supported: bool,
     pub sample: Option<Arc<telemetry::Current>>,
     pub action_baseline: crate::admin::cluster::baseline::Observation,
     pub metrics_availability: &'static str,
@@ -108,6 +112,8 @@ impl Store {
                 conflict: None,
                 facts: None,
                 catalog: catalog::State::default(),
+                consumers: consumers::State::default(),
+                consumers_supported: false,
                 metrics_supported: false,
                 metrics_enabled: false,
                 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
@@ -171,6 +177,7 @@ impl Store {
         }) {
             // 心跳宣布新配置后，旧对象目录立即失去权威，不能等待下一份目录完成再撤下。
             entry.catalog = catalog::State::default();
+            entry.consumers = consumers::State::default();
             entry.sample = None;
         }
         entry.facts = Some(Arc::new(facts));
@@ -221,6 +228,53 @@ impl Store {
         entry
             .catalog
             .accept(request, catalog::STORE_BYTES.saturating_sub(others))
+    }
+
+    /// 业务作用：在目录分片进入内存前复验当前会话、配置身份与消费者独立预算。
+    ///
+    /// 参数说明：
+    /// - `request`：已通过TLS节点绑定的分片。
+    /// - `now`：接收端单调时刻。
+    ///
+    /// 返回：当前目录装配结果；陈旧、冲突、换代或预算不足均拒绝且不延长心跳。
+    fn consumers(
+        &mut self,
+        request: protocol::ConsumersRequest,
+        now: Instant,
+    ) -> Result<protocol::CatalogResponse, Status> {
+        let others = self
+            .entries
+            .iter()
+            .filter(|(id, _)| id.as_str() != request.node_id)
+            .map(|(_, entry)| entry.consumers.bytes())
+            .sum::<usize>();
+        let entry = self
+            .entries
+            .get_mut(&request.node_id)
+            .ok_or_else(|| Status::failed_precondition("open node session first"))?;
+        let expected = request
+            .config_fingerprint
+            .map(|value| format!("{value:016x}"));
+        if !entry.consumers_supported
+            || entry.boot != request.boot_id
+            || !crate::security::auth::constant_time_eq(&entry.session, &request.session)
+            || now.saturating_duration_since(entry.at) > FRESHNESS
+            || entry
+                .conflict
+                .is_some_and(|at| now.saturating_duration_since(at) <= FRESHNESS)
+            || !entry.facts.as_ref().is_some_and(|facts| {
+                facts.config_version == request.config_version
+                    && facts.config_fingerprint == expected
+            })
+        {
+            // 目录只证明同一活跃配置，旧会话与失去心跳的节点不能继续补全可读集合。
+            return Err(Status::failed_precondition(
+                "consumer node authority changed",
+            ));
+        }
+        entry
+            .consumers
+            .accept(request, consumers::STORE_BYTES.saturating_sub(others))
     }
 
     /// 业务作用：按配置成员生成有界当前视图，未报告和过期节点仍计入预期覆盖。
@@ -319,6 +373,10 @@ impl Store {
                     at: fresh
                         .filter(|entry| entry.facts.is_some())
                         .map(|entry| entry.at),
+                    consumers: fresh
+                        .filter(|entry| !conflict && entry.consumers_supported)
+                        .and_then(|entry| entry.consumers.complete()),
+                    consumers_supported: fresh.is_some_and(|entry| entry.consumers_supported),
                     catalog: fresh
                         .filter(|_| !conflict)
                         .and_then(|entry| entry.catalog.complete()),
@@ -610,6 +668,11 @@ impl protocol::node_management_server::NodeManagement for Service {
         entry.baseline_supported = value.baseline_supported;
         entry.baseline = baseline;
         entry.publication = publication;
+        entry.consumers_supported = value.consumers_supported;
+        if !entry.consumers_supported {
+            // 发送端撤销能力后旧目录也失效，不能把历史绑定当作当前凭据。
+            entry.consumers = consumers::State::default();
+        }
         entry.metrics_supported = value.metrics_supported;
         entry.metrics_enabled = value.metrics_supported && value.metrics_enabled;
         #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
@@ -684,6 +747,7 @@ impl protocol::node_management_server::NodeManagement for Service {
             release,
             metrics_interest_ms,
             service_metrics_supported: true,
+            consumers_supported: true,
             preview,
         }))
     }
@@ -820,6 +884,33 @@ impl protocol::node_management_server::NodeManagement for Service {
         store.reconcile(&plan);
         store
             .catalog(request.into_inner(), Instant::now())
+            .map(Response::new)
+    }
+
+    /// 业务作用：在同一mTLS和发布门内接收当前消费者低敏绑定分片，不提供任意配置上传或执行入口。
+    ///
+    /// 参数说明：
+    /// - `request`：当前节点会话及固定目录消息。
+    ///
+    /// 返回：已受理偏移；只有完整内容验证后complete才为true。
+    async fn consumers(
+        &self,
+        request: Request<protocol::ConsumersRequest>,
+    ) -> Result<Response<protocol::CatalogResponse>, Status> {
+        let manager = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| Status::unavailable("receiver stopped"))?;
+        let _gate = manager.publication.read();
+        let plan = self.authorize(
+            &manager,
+            &request.get_ref().node_id,
+            request.extensions().get::<PeerIdentity>(),
+        )?;
+        let mut store = manager.store.lock();
+        store.reconcile(&plan);
+        store
+            .consumers(request.into_inner(), Instant::now())
             .map(Response::new)
     }
 

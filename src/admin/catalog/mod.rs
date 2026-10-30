@@ -1,7 +1,7 @@
 //! 集群配置对象目录只公开固定摘要，不把配置声明解释为运行健康或完整配置一致。
 
 mod model;
-mod read;
+pub(super) mod read;
 mod scopes;
 pub(super) mod workspace;
 pub(super) use read::read;
@@ -16,7 +16,7 @@ use std::sync::{Arc, Weak};
 
 pub(in crate::admin) struct Runtime {
     local: parking_lot::Mutex<Option<(Weak<GatewaySnapshot>, Arc<Catalog>)>>,
-    requests: tokio::sync::Semaphore,
+    pub(in crate::admin) requests: tokio::sync::Semaphore,
 }
 
 impl Default for Runtime {

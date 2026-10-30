@@ -61,6 +61,10 @@ pub(in crate::admin) struct Node {
     at: Option<Instant>,
     #[serde(skip)]
     pub catalog: Option<Arc<crate::admin::catalog::Catalog>>,
+    #[serde(skip)]
+    pub consumers: Option<Arc<crate::admin::consumers::Directory>>,
+    #[serde(skip)]
+    pub consumers_supported: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -242,6 +246,8 @@ fn reported(state: &AdminState, snapshot: &GatewaySnapshot) -> Vec<Node> {
             facts: observation.facts,
             at: observation.at,
             catalog: observation.catalog,
+            consumers: observation.consumers,
+            consumers_supported: observation.consumers_supported,
             action_baseline: observation.action_baseline,
         })
         .collect()
@@ -352,6 +358,8 @@ async fn run(owner: Weak<AdminState>, wake: Arc<Notify>) {
             facts: Some(Arc::new(local)),
             at: Some(at),
             catalog: Some(state.catalog.local(&snapshot)),
+            consumers: Some(state.consumers.local(&snapshot)),
+            consumers_supported: true,
             action_baseline: super::baseline::collect(&state, &snapshot).await,
         }];
         for node in &reported {
@@ -462,6 +470,8 @@ fn node_result(
         facts,
         at,
         catalog: None,
+        consumers: None,
+        consumers_supported: false,
         action_baseline: super::baseline::Observation::unsupported(),
     })
 }

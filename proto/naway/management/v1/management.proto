@@ -7,6 +7,7 @@ service NodeManagement {
   rpc AuthenticateIssuer(IssuerChallenge) returns (IssuerProof);
   rpc Report(ReportRequest) returns (ReportResponse);
   rpc Catalog(CatalogRequest) returns (CatalogResponse);
+  rpc Consumers(ConsumersRequest) returns (CatalogResponse);
   rpc Sample(stream SampleRequest) returns (SampleResponse);
   rpc ActionData(ActionDataRequest) returns (ActionDataResponse);
   rpc ActionResult(ActionResultRequest) returns (ActionResultResponse);
@@ -75,6 +76,7 @@ message ReportRequest {
   bool actions_enabled = 10;
   bool previews_supported = 11;
   bool previews_enabled = 12;
+  bool consumers_supported = 13;
 }
 
 // 当前本地文件决定与业务就绪分开；没有历史、路径或恢复命令令牌。
@@ -121,6 +123,7 @@ message ReportResponse {
   ReleaseOffer release = 4;
   bool service_metrics_supported = 5;
   PreviewOffer preview = 6;
+  bool consumers_supported = 7;
 }
 
 // 独立只读证明不包含 Saga 步骤、文件方向或租约，原目标与候选不能由接收者替换。
@@ -489,4 +492,32 @@ message CatalogRequest {
 message CatalogResponse {
   uint32 next_offset = 1;
   bool complete = 2;
+}
+
+// 本代编译后凭据序号仅用于读取，不是原文 filters 下标或配置修改令牌。
+message ConsumerEntry {
+  string consumer = 1;
+  string proxy = 2;
+  string route = 3;
+  uint32 ordinal = 4;
+  string source = 5;
+  string name = 6;
+  bool enabled = 7;
+  string plan = 8;
+  string workspace = 9;
+  string tenant = 10;
+  string environment = 11;
+}
+
+message ConsumersRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  uint64 config_version = 4;
+  optional uint64 config_fingerprint = 5;
+  bytes digest = 6;
+  uint32 total = 7;
+  uint32 offset = 8;
+  bool capacity = 9;
+  repeated ConsumerEntry entries = 10;
 }

@@ -45,6 +45,20 @@ pub(super) enum ApiKeySource {
 }
 
 impl ApiKeyPolicy {
+    /// 业务作用：向控制面借用已编译的低敏绑定，不开放验证材料或内部凭据指纹。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：已声明 consumer、来源类型及名称、启用状态；缺少稳定 consumer 的策略不进入消费者目录。
+    pub(crate) fn consumer_binding(&self) -> Option<(&str, &'static str, &str, bool)> {
+        let consumer = self.consumer.as_deref()?;
+        let (source, name) = match &self.source {
+            ApiKeySource::Header(name) => ("header", name.as_str()),
+            ApiKeySource::Query(name) => ("query", name.as_str()),
+        };
+        Some((consumer, source, name, self.enabled))
+    }
+
     /// 业务作用：验证请求携带的 API-Key，并统一兼容 SecretSource 明文和 Console 不可逆摘要两种事实。
     ///
     /// 参数说明：

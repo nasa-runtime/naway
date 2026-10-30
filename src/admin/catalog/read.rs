@@ -322,7 +322,7 @@ fn pending(reason: &str) -> Response<BoxBody> {
     response
 }
 
-pub(super) struct Buffer(pub(super) Vec<u8>);
+pub(in crate::admin) struct Buffer(pub(in crate::admin) Vec<u8>);
 
 impl std::io::Write for Buffer {
     /// 业务作用：在输出分配前限制目录响应为4MiB，超限不能交付半个分布集合。
