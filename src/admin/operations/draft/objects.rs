@@ -32,6 +32,9 @@ pub(super) enum Object {
     ConsumerGroup {
         name: String,
     },
+    ConsumerBinding {
+        name: String,
+    },
     ScopePolicy {
         id: String,
     },
@@ -85,6 +88,9 @@ impl Object {
             }
             | Self::ConsumerGroup {
                 name,
+            }
+            | Self::ConsumerBinding {
+                name,
             } => (Domain::Gateway, name, None),
             Self::Flow {
                 id,
@@ -102,7 +108,7 @@ impl Object {
         Ok(())
     }
 
-    /// 业务作用：取得集合内的稳定键，服务、套餐与组使用 mapping key，具名材料使用 name，其它对象使用 id。
+    /// 业务作用：取得集合内的稳定键，具名映射使用父键，具名材料使用 name，其它对象使用 id。
     ///
     /// 参数说明: 无。
     ///
@@ -145,6 +151,9 @@ impl Object {
             }
             | Self::ConsumerGroup {
                 name,
+            }
+            | Self::ConsumerBinding {
+                name,
             } => name,
         }
     }
@@ -153,7 +162,7 @@ impl Object {
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：数组对象使用 id 或 name；服务、套餐与组身份由父 mapping 持有。
+    /// 返回：数组对象使用 id 或 name；服务、套餐、组和消费者绑定由父 mapping 持有身份。
     fn identity_field(&self) -> Option<&'static str> {
         match self {
             Self::Service {
@@ -163,6 +172,9 @@ impl Object {
                 ..
             }
             | Self::ConsumerGroup {
+                ..
+            }
+            | Self::ConsumerBinding {
                 ..
             } => None,
             Self::Credential {
@@ -179,7 +191,7 @@ impl Object {
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：服务、套餐与组的内部父键及集合键；数组对象返回空。
+    /// 返回：服务、套餐、组和消费者绑定的内部父键及集合键；数组对象返回空。
     fn mapping_path(&self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::Service {
@@ -191,8 +203,20 @@ impl Object {
             Self::ConsumerGroup {
                 ..
             } => Some(("usage_plans", "groups")),
+            Self::ConsumerBinding {
+                ..
+            } => Some(("usage_plans", "consumers")),
             _ => None,
         }
+    }
+
+    /// 业务作用：区分消费者字符串绑定与普通对象，控件字段投影不能改变原文结构。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：只有消费者显式套餐绑定使用标量编辑约束。
+    pub(super) fn is_binding(&self) -> bool {
+        matches!(self, Self::ConsumerBinding { .. })
     }
 
     /// 业务作用：在原文修改前拒绝对稳定身份的字段动作，不能通过嵌套或列表操作绕过选择器。
@@ -220,7 +244,7 @@ impl Object {
 /// - `name`：原始声明标识。
 ///
 /// 返回：非空且最多 256 字节的无控制字符标识为真。
-fn valid_name(name: &str) -> bool {
+pub(super) fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)
 }
 
@@ -331,6 +355,16 @@ pub(super) fn catalog(document: &Value, domain: Domain) -> Result<BTreeSet<Objec
                     insert(Object::ScopePolicy {
                         id: object_id(policy)?.into(),
                     })?;
+                }
+                if let Some(consumers) = usage.get("consumers") {
+                    for (name, plan) in consumers.as_object().ok_or(Error::Invalid)? {
+                        if !plan.as_str().is_some_and(valid_name) {
+                            return Err(Error::Invalid);
+                        }
+                        insert(Object::ConsumerBinding {
+                            name: name.clone(),
+                        })?;
+                    }
                 }
             }
         }
@@ -549,6 +583,9 @@ fn collection_mut<'a>(
         }
         | Object::ConsumerGroup {
             ..
+        }
+        | Object::ConsumerBinding {
+            ..
         } => return Err(Error::Invalid),
     };
     child(parent, key, create.then(|| Value::Array(Vec::new())))?
@@ -575,7 +612,12 @@ pub(super) fn create(
         if values.contains_key(object.id()) {
             return Err(Error::Conflict);
         }
-        values.insert(object.id().into(), Value::Object(fields));
+        let value = if object.is_binding() {
+            super::binding::create(fields)?
+        } else {
+            Value::Object(fields)
+        };
+        values.insert(object.id().into(), value);
     } else {
         fields.insert(
             object.identity_field().expect("array identity").into(),

@@ -31,6 +31,7 @@ export function draftFieldPanel(kind, values, capacity) {
       type,
       Object.hasOwn(values, name) ? values[name] : undefined,
       capacity,
+      kind !== "consumer_binding",
     );
     rows.set(name, row);
     node.append(row.node);
@@ -83,7 +84,17 @@ export function draftFieldPanel(kind, values, capacity) {
   const addLabel = element("label", "新增字段名");
   addLabel.append(addName);
   complex.append(addLabel, add, note);
-  node.append(complex);
+  if (kind === "consumer_binding") {
+    node.append(
+      element(
+        "p",
+        "解除显式套餐绑定请删除此对象；组成员及身份凭据不受影响。",
+        "subtle",
+      ),
+    );
+  } else {
+    node.append(complex);
+  }
 
   /**
    * 业务作用：收集明确编辑的键，不从展示值重建整个对象。

@@ -1,5 +1,6 @@
 //! 只编辑调用者提交的原始声明，结果继续交给共享提案和原目标的完整构建器。
 
+mod binding;
 mod nested;
 mod objects;
 mod sequence;
@@ -129,7 +130,12 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
                 if !catalog.contains(object) {
                     return Err(Error::Missing);
                 }
-                objects::find_mut(&mut document, object)?.take()
+                let value = objects::find_mut(&mut document, object)?.take();
+                if object.is_binding() {
+                    binding::fields(value)
+                } else {
+                    value
+                }
             }
             None => Value::Null,
         };
@@ -156,12 +162,21 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
                 return Err(Error::Missing);
             }
             object.protect_identity(fields.keys().chain(remove.iter()).map(String::as_str))?;
-            patch(objects::find_mut(&mut document, &object)?, fields, remove)?
+            let value = objects::find_mut(&mut document, &object)?;
+            if object.is_binding() {
+                binding::patch(value, fields, remove)?
+            } else {
+                patch(value, fields, remove)?
+            }
         }
         Action::PatchNested {
             object,
             edits,
         } => {
+            // 消费者绑定在配置中是字符串；字段投影不能被当作可修改的嵌套文档。
+            if object.is_binding() {
+                return Err(Error::Invalid);
+            }
             if !catalog.contains(&object) {
                 return Err(Error::Missing);
             }
@@ -177,6 +192,10 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
             path,
             edit,
         } => {
+            // 标量绑定没有列表语义，拒绝隐式改变原生配置形态。
+            if object.is_binding() {
+                return Err(Error::Invalid);
+            }
             if !catalog.contains(&object) {
                 return Err(Error::Missing);
             }

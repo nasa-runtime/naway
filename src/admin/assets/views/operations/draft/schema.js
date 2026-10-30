@@ -1,4 +1,6 @@
 const definitions = {
+  consumer_binding: [["plan", "消费者显式套餐", "string"]],
+
   usage_plan: [
     ["requests", "窗口内基础请求数", "number"],
     ["window_ms", "固定窗口（毫秒）", "number"],
@@ -149,6 +151,7 @@ export const objectKinds = {
     ["secret_provider", "远程秘密源"],
     ["usage_plan", "用量套餐"],
     ["consumer_group", "消费者组"],
+    ["consumer_binding", "消费者套餐绑定"],
     ["scope_policy", "身份作用域策略"],
     ["stream", "流协议监听"],
   ],
@@ -175,7 +178,7 @@ export function draftFields(kind) {
  * 业务作用：识别以独立 name 选择的具名对象，创建时不混用数组 id 与映射键。
  * 参数说明：
  * - `kind`：服务端支持的对象类别。
- * 返回：服务、套餐、组、上游凭据与远程秘密源为 true；其它对象使用 id。
+ * 返回：服务、套餐、组、消费者绑定、上游凭据与远程秘密源为 true；其它对象使用 id。
  */
 export function namedObject(kind) {
   return [
@@ -184,6 +187,7 @@ export function namedObject(kind) {
     "secret_provider",
     "usage_plan",
     "consumer_group",
+    "consumer_binding",
   ].includes(kind);
 }
 

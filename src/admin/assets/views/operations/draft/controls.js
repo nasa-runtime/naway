@@ -36,9 +36,10 @@ function exactValue(value) {
  * - `type`：常用控件类型或 JSON。
  * - `value`：原始声明值，缺失时为 undefined。
  * - `capacity`：候选字节上限，用于输入控件容量。
+ * - `removable`：该字段是否允许独立移除，必需的标量绑定须通过对象删除解除。
  * 返回：字段节点与显式修改读取器；保持状态不重新编码原始值。
  */
-export function fieldRow(name, title, type, value, capacity) {
+export function fieldRow(name, title, type, value, capacity, removable = true) {
   const row = element("div", "", "draft-field");
   const mode = element("select");
   mode.setAttribute("aria-label", `${name} 修改方式`);
@@ -47,6 +48,9 @@ export function fieldRow(name, title, type, value, capacity) {
     ["set", "设置值"],
     ["remove", "移除声明"],
   ]) {
+    if (key === "remove" && !removable) {
+      continue;
+    }
     const option = element("option", text);
     option.value = key;
     mode.append(option);
@@ -113,6 +117,9 @@ export function fieldRow(name, title, type, value, capacity) {
       return null;
     }
     if (mode.value === "remove") {
+      if (!removable) {
+        throw new Error("此字段不能单独移除，解除绑定请删除对象。");
+      }
       return {
         name,
 
