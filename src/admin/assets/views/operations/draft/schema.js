@@ -1,4 +1,28 @@
 const definitions = {
+  usage_plan: [
+    ["requests", "窗口内基础请求数", "number"],
+    ["window_ms", "固定窗口（毫秒）", "number"],
+    ["burst", "额外突发请求数", "number"],
+    ["max_active_keys", "本节点活跃消费者上限", "number"],
+    ["active_keys_fail_open", "维度满额时放行", "boolean"],
+  ],
+
+  consumer_group: [
+    ["consumers", "已认证消费者成员（每行一项）", "lines"],
+    ["plan", "组套餐", "string"],
+  ],
+
+  scope_policy: [
+    ["authentication", "静态作用域认证链（每行一项）", "lines"],
+    ["require_authentication", "必须有已验证身份", "boolean"],
+    ["deny", "拒绝该作用域", "boolean"],
+    ["quota_plan", "附加额度套餐", "string"],
+    ["quota_per_consumer", "按消费者独立计额", "boolean"],
+    ["products", "允许产品交集（每行一项）", "lines"],
+    ["request_headers", "网关上下文请求头映射", "json"],
+    ["inherit_headers", "继承上层上下文请求头", "boolean"],
+  ],
+
   credential: [
     ["kind", "凭据类型", "string"],
     ["value", "凭据值的 SecretSource 引用", "string"],
@@ -123,6 +147,9 @@ export const objectKinds = {
     ["service", "上游服务"],
     ["credential", "上游凭据"],
     ["secret_provider", "远程秘密源"],
+    ["usage_plan", "用量套餐"],
+    ["consumer_group", "消费者组"],
+    ["scope_policy", "身份作用域策略"],
     ["stream", "流协议监听"],
   ],
 
@@ -145,13 +172,19 @@ export function draftFields(kind) {
 }
 
 /**
- * 业务作用：识别以独立 name 选择的具名对象，创建和字段面板共同遵循稳定身份合同。
+ * 业务作用：识别以独立 name 选择的具名对象，创建时不混用数组 id 与映射键。
  * 参数说明：
  * - `kind`：服务端支持的对象类别。
- * 返回：服务、上游凭据与远程秘密源为 true；其它对象使用 id。
+ * 返回：服务、套餐、组、上游凭据与远程秘密源为 true；其它对象使用 id。
  */
 export function namedObject(kind) {
-  return ["service", "credential", "secret_provider"].includes(kind);
+  return [
+    "service",
+    "credential",
+    "secret_provider",
+    "usage_plan",
+    "consumer_group",
+  ].includes(kind);
 }
 
 /**

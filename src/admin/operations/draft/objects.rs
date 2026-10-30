@@ -26,6 +26,15 @@ pub(super) enum Object {
     SecretProvider {
         name: String,
     },
+    UsagePlan {
+        name: String,
+    },
+    ConsumerGroup {
+        name: String,
+    },
+    ScopePolicy {
+        id: String,
+    },
     Stream {
         id: String,
     },
@@ -58,6 +67,9 @@ impl Object {
             }
             | Self::Stream {
                 id,
+            }
+            | Self::ScopePolicy {
+                id,
             } => (Domain::Gateway, id, None),
             Self::Service {
                 name,
@@ -66,6 +78,12 @@ impl Object {
                 name,
             }
             | Self::SecretProvider {
+                name,
+            }
+            | Self::UsagePlan {
+                name,
+            }
+            | Self::ConsumerGroup {
                 name,
             } => (Domain::Gateway, name, None),
             Self::Flow {
@@ -84,7 +102,7 @@ impl Object {
         Ok(())
     }
 
-    /// 业务作用：取得集合内的稳定键，服务使用 mapping key，具名材料使用 name，其它对象使用 id。
+    /// 业务作用：取得集合内的稳定键，服务、套餐与组使用 mapping key，具名材料使用 name，其它对象使用 id。
     ///
     /// 参数说明: 无。
     ///
@@ -109,6 +127,9 @@ impl Object {
             }
             | Self::InterfaceRule {
                 id,
+            }
+            | Self::ScopePolicy {
+                id,
             } => id,
             Self::Service {
                 name,
@@ -118,18 +139,30 @@ impl Object {
             }
             | Self::SecretProvider {
                 name,
+            }
+            | Self::UsagePlan {
+                name,
+            }
+            | Self::ConsumerGroup {
+                name,
             } => name,
         }
     }
 
-    /// 业务作用：区分数组对象的稳定身份字段与服务 mapping key，编辑不能隐式改名。
+    /// 业务作用：区分数组对象的稳定身份字段与具名 mapping key，编辑不能隐式改名。
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：数组对象使用 id 或 name；服务身份由父 mapping 持有。
+    /// 返回：数组对象使用 id 或 name；服务、套餐与组身份由父 mapping 持有。
     fn identity_field(&self) -> Option<&'static str> {
         match self {
             Self::Service {
+                ..
+            }
+            | Self::UsagePlan {
+                ..
+            }
+            | Self::ConsumerGroup {
                 ..
             } => None,
             Self::Credential {
@@ -139,6 +172,26 @@ impl Object {
                 ..
             } => Some("name"),
             _ => Some("id"),
+        }
+    }
+
+    /// 业务作用：为具名映射对象提供固定集合位置，外部名称不能变成任意文档路径。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：服务、套餐与组的内部父键及集合键；数组对象返回空。
+    fn mapping_path(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Service {
+                ..
+            } => Some(("upstreams", "services")),
+            Self::UsagePlan {
+                ..
+            } => Some(("usage_plans", "plans")),
+            Self::ConsumerGroup {
+                ..
+            } => Some(("usage_plans", "groups")),
+            _ => None,
         }
     }
 
@@ -252,6 +305,34 @@ pub(super) fn catalog(document: &Value, domain: Domain) -> Result<BTreeSet<Objec
                     name: object_name(value)?.into(),
                 })?;
             }
+            if let Some(usage) = document.get("usage_plans") {
+                if !usage.is_object() {
+                    return Err(Error::Invalid);
+                }
+                for key in ["plans", "groups"] {
+                    if let Some(values) = usage.get(key) {
+                        for (name, value) in values.as_object().ok_or(Error::Invalid)? {
+                            if !value.is_object() {
+                                return Err(Error::Invalid);
+                            }
+                            insert(if key == "plans" {
+                                Object::UsagePlan {
+                                    name: name.clone(),
+                                }
+                            } else {
+                                Object::ConsumerGroup {
+                                    name: name.clone(),
+                                }
+                            })?;
+                        }
+                    }
+                }
+                for policy in array(usage.get("policies"))? {
+                    insert(Object::ScopePolicy {
+                        id: object_id(policy)?.into(),
+                    })?;
+                }
+            }
         }
         Domain::Sentinel => {
             for rule in array(document.get("flow"))? {
@@ -319,7 +400,7 @@ fn object_name(value: &Value) -> Result<&str, Error> {
         .ok_or(Error::Invalid)
 }
 
-/// 业务作用：取得已验证唯一身份的原对象，服务键和代理路由身份分别定位。
+/// 业务作用：取得已验证唯一身份的原对象，具名映射键和数组对象身份分别定位。
 ///
 /// 参数说明：
 /// - `document`：已经完成完整目录校验的原文树。
@@ -330,12 +411,9 @@ pub(super) fn find_mut<'a>(
     document: &'a mut Value,
     object: &Object,
 ) -> Result<&'a mut Value, Error> {
-    if let Object::Service {
-        name,
-    } = object
-    {
-        return services_mut(document, false)?
-            .get_mut(name)
+    if let Some(path) = object.mapping_path() {
+        return mapping_mut(document, path, false)?
+            .get_mut(object.id())
             .ok_or(Error::Missing);
     }
     collection_mut(document, object, false)?
@@ -370,26 +448,23 @@ fn child<'a>(
     }
 }
 
-/// 业务作用：定位具名服务的 mapping，只在显式创建动作中补齐缺失集合。
+/// 业务作用：定位具名对象的 mapping，只在显式创建动作中补齐缺失集合。
 ///
 /// 参数说明：
 /// - `document`：原文树。
-/// - `create`：允许补齐 upstreams/services 空 mapping 的显式创建标记。
+/// - `path`：由对象类型选出的固定父键与集合键。
+/// - `create`：允许补齐空 mapping 的显式创建标记。
 ///
-/// 返回：服务 mapping 的原地借用；已有非 mapping 值拒绝。
-fn services_mut(document: &mut Value, create: bool) -> Result<&mut Map<String, Value>, Error> {
-    let upstreams = child(
-        document,
-        "upstreams",
-        create.then(|| Value::Object(Map::new())),
-    )?;
-    child(
-        upstreams,
-        "services",
-        create.then(|| Value::Object(Map::new())),
-    )?
-    .as_object_mut()
-    .ok_or(Error::Invalid)
+/// 返回：集合 mapping 的原地借用；已有非 mapping 值拒绝。
+fn mapping_mut<'a>(
+    document: &'a mut Value,
+    path: (&'static str, &'static str),
+    create: bool,
+) -> Result<&'a mut Map<String, Value>, Error> {
+    let parent = child(document, path.0, create.then(|| Value::Object(Map::new())))?;
+    child(parent, path.1, create.then(|| Value::Object(Map::new())))?
+        .as_object_mut()
+        .ok_or(Error::Invalid)
 }
 
 /// 业务作用：按固定对象类型选择集合，路由追加必须归属于已存在的显式父入口。
@@ -437,6 +512,16 @@ fn collection_mut<'a>(
         Object::SecretProvider {
             ..
         } => (document, "secret_providers"),
+        Object::ScopePolicy {
+            ..
+        } => (
+            child(
+                document,
+                "usage_plans",
+                create.then(|| Value::Object(Map::new())),
+            )?,
+            "policies",
+        ),
         Object::Stream {
             ..
         } => (
@@ -457,6 +542,12 @@ fn collection_mut<'a>(
             ..
         } => (document, "rules"),
         Object::Service {
+            ..
+        }
+        | Object::UsagePlan {
+            ..
+        }
+        | Object::ConsumerGroup {
             ..
         } => return Err(Error::Invalid),
     };
@@ -479,15 +570,12 @@ pub(super) fn create(
     mut fields: Map<String, Value>,
 ) -> Result<(), Error> {
     object.protect_identity(fields.keys().map(String::as_str))?;
-    if let Object::Service {
-        name,
-    } = object
-    {
-        let services = services_mut(document, true)?;
-        if services.contains_key(name) {
+    if let Some(path) = object.mapping_path() {
+        let values = mapping_mut(document, path, true)?;
+        if values.contains_key(object.id()) {
             return Err(Error::Conflict);
         }
-        services.insert(name.clone(), Value::Object(fields));
+        values.insert(object.id().into(), Value::Object(fields));
     } else {
         fields.insert(
             object.identity_field().expect("array identity").into(),
@@ -506,12 +594,9 @@ pub(super) fn create(
 ///
 /// 返回：精确删除成功；引用是否允许删除由后续目标预检裁决，本函数不发布路由。
 pub(super) fn delete(document: &mut Value, object: &Object) -> Result<(), Error> {
-    if let Object::Service {
-        name,
-    } = object
-    {
-        services_mut(document, false)?
-            .remove(name)
+    if let Some(path) = object.mapping_path() {
+        mapping_mut(document, path, false)?
+            .remove(object.id())
             .ok_or(Error::Missing)?;
     } else {
         let collection = collection_mut(document, object, false)?;

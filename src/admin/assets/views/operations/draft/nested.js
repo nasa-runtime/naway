@@ -2,6 +2,39 @@ import { element } from "../../../core/dom.js";
 import { fieldRow } from "./controls.js";
 
 const groups = {
+  route: [
+    [
+      ["usage_plan"],
+      "用量套餐绑定",
+      [
+        ["default_plan", "未单独映射身份的套餐", "string"],
+        ["require_consumer", "要求可信消费者身份", "boolean"],
+      ],
+    ],
+  ],
+
+  scope_policy: [
+    [
+      ["scope"],
+      "策略作用域（只填写所选类型的字段）",
+      [
+        [
+          "type",
+          "类型：global / workspace / product / service / route / group / consumer",
+          "string",
+        ],
+        ["workspace", "工作区身份", "string"],
+        ["product", "产品身份", "string"],
+        ["version", "产品版本", "string"],
+        ["service", "上游服务身份", "string"],
+        ["proxy", "HTTP 入口身份", "string"],
+        ["route", "路由身份", "string"],
+        ["group", "消费者组身份", "string"],
+        ["consumer", "消费者身份", "string"],
+      ],
+    ],
+  ],
+
   interface_rule: [
     [
       ["match"],
@@ -121,6 +154,7 @@ export function nestedFields(kind, values, capacity) {
         );
         rows.push({
           path,
+
           row,
         });
         group.append(row.node);
@@ -141,12 +175,15 @@ export function nestedFields(kind, values, capacity) {
       if (action?.remove) {
         edits.push({
           op: "remove",
+
           path,
         });
       } else if (action) {
         edits.push({
           op: "set",
+
           path,
+
           value: action.value,
         });
       }
@@ -190,28 +227,36 @@ export function fieldAction(object, patch, creating) {
     }
     return {
       type: "create",
+
       object,
+
       fields,
     };
   }
   if (!edits.length) {
     return {
       type: "patch",
+
       object,
+
       fields: patch.fields,
+
       remove: patch.remove,
     };
   }
   for (const [key, value] of Object.entries(patch.fields)) {
     edits.push({
       op: "set",
+
       path: [key],
+
       value,
     });
   }
   for (const key of patch.remove) {
     edits.push({
       op: "remove",
+
       path: [key],
     });
   }
@@ -220,7 +265,9 @@ export function fieldAction(object, patch, creating) {
   }
   return {
     type: "patch_nested",
+
     object,
+
     edits,
   };
 }

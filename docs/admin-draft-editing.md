@@ -99,6 +99,9 @@
 | Gateway 具名服务 | `{"kind":"service","name":"服务名"}` |
 | Gateway 上游凭据 | `{"kind":"credential","name":"凭据名"}` |
 | Gateway 远程秘密源 | `{"kind":"secret_provider","name":"秘密源名"}` |
+| Gateway 用量套餐 | `{"kind":"usage_plan","name":"套餐名"}` |
+| Gateway 消费者组 | `{"kind":"consumer_group","name":"组名"}` |
+| Gateway 身份作用域策略 | `{"kind":"scope_policy","id":"策略 id"}` |
 | Gateway stream 入口 | `{"kind":"stream","id":"入口 id"}` |
 | Sentinel 流控 | `{"kind":"flow","id":"规则 id"}` |
 | Sentinel 熔断 | `{"kind":"degrade","id":"规则 id"}` |
@@ -143,6 +146,13 @@ JSON null 与移除互不等价。每行一项的列表保留行顺序及重复�
 认证和值/版本指针，以及刷新、陈旧期和请求预算控件。展示的是调用者提交的原始引用，草稿
 编辑不会解析秘密或访问远程源。适配器与 envelope 等扩展可通过复杂字段明确编辑；删除对象
 不会自动改写引用关系，是否允许发布仍由原目标预检决定。
+
+用量套餐和消费者组分别定位 `usage_plans.plans` 与 `usage_plans.groups` 的映射键，不向对象
+内容注入 `name` 或 `id`。身份作用域策略定位 `usage_plans.policies` 的稳定 `id`。表单提供
+固定窗口额度、消费者成员、组套餐、作用域选择、认证要求、拒绝策略、产品交集及上下文头；
+路由提供 `usage_plan` 绑定子字段。作用域切换时需显式移除旧类型专属字段，目标完整构建器
+拒绝不匹配的声明。删除对象不级联修改引用；关闭上下文头继承也不能解除上层认证、拒绝或额度。
+本地额度仍按节点独立计算，共享额度须使用相应运行配置；草稿表单不签发消费者密钥。
 
 “新增对象”要求显式身份；新增路由还须填写所属 HTTP 入口，根单入口使用 default。删除对象
 需要勾选确认，删除父对象同时删除其子声明。所有动作仅生成候选，不自动保存或执行。提案
