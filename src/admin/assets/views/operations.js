@@ -301,7 +301,10 @@ export function mount(root, session) {
       ) {
         throw new Error("草稿响应的范围或原文身份不一致，已丢弃结果。");
       }
-      if (action.type !== "inspect") {
+      if (
+        action.type !== "inspect" &&
+        !(action.type === "keys" && action.edit.op === "inspect")
+      ) {
         if (
           typeof data.candidate !== "string" ||
           typeof data.changed !== "boolean" ||

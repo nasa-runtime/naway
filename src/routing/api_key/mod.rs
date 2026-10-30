@@ -1,11 +1,10 @@
 //! API-Key 声明编译与请求认证，禁用凭据仍保留路由的认证保护。
 
-use super::{
-    filter_args, query_param_raw, unquote_token, validate_basic_auth_secret,
-    validate_basic_auth_user, validate_query_key_name,
-};
+pub(crate) mod declaration;
+
+use super::{query_param_raw, validate_basic_auth_secret};
 use crate::security::auth::constant_time_eq;
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use http::{header::HeaderName, request::Parts};
 use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc};
@@ -86,79 +85,21 @@ impl ApiKeyPolicy {
 ///
 /// 返回：合法声明返回不可变策略；禁用仍完整校验，重复、歧义或非法材料拒绝整个候选。
 pub(super) fn parse_api_key(spec: &str, config_dir: &Path) -> Result<ApiKeyPolicy> {
-    let rest = filter_args(spec, "api_key").trim();
-    if rest.is_empty() {
-        bail!("api_key requires `header=<name>|query=<name> value=<secret>|sha256=<digest>`");
-    }
-    let mut source = None;
-    let mut value = None;
-    let mut sha256 = None;
-    let mut consumer = None;
-    let mut enabled = None;
-    for token in rest.split_whitespace() {
-        let (key, raw_value) = token
-            .split_once('=')
-            .context("api_key options must be key=value")?;
-        let raw_value = unquote_token(raw_value.trim());
-        match key {
-            "header" => {
-                anyhow::ensure!(source.is_none(), "api_key requires one source declaration");
-                let name = raw_value
-                    .parse::<HeaderName>()
-                    .context("api_key invalid header name")?;
-                source = Some(ApiKeySource::Header(name));
-            }
-            "query" => {
-                anyhow::ensure!(source.is_none(), "api_key requires one source declaration");
-                validate_query_key_name(raw_value)?;
-                source = Some(ApiKeySource::Query(raw_value.to_string()));
-            }
-            "value" | "key" | "secret" => {
-                anyhow::ensure!(value.is_none(), "api_key requires one value declaration");
-                value = Some(raw_value.to_string());
-            }
-            "sha256" => {
-                anyhow::ensure!(sha256.is_none(), "api_key requires one digest declaration");
-                sha256 = Some(raw_value.to_string());
-            }
-            "consumer" => {
-                anyhow::ensure!(
-                    consumer.is_none(),
-                    "api_key requires one consumer declaration"
-                );
-                consumer = Some(raw_value.to_string());
-            }
-            "enabled" => {
-                anyhow::ensure!(
-                    enabled.is_none(),
-                    "api_key requires one enabled declaration"
-                );
-                enabled = Some(match raw_value {
-                    "true" => true,
-                    "false" => false,
-                    _ => bail!("api_key enabled must be true or false"),
-                });
-            }
-            _ => bail!("api_key unsupported option"),
-        }
-    }
-    let source = source.context("api_key requires header or query source")?;
-    anyhow::ensure!(
-        value.is_some() ^ sha256.is_some(),
-        "api_key requires exactly one of value or sha256"
-    );
-    let expected = if let Some(value) = value {
-        let value = crate::security::secret::resolve_text(&value, config_dir, "api_key value")?;
-        validate_basic_auth_secret("api_key value", &value)?;
-        ApiKeyExpected::Plain(value.into_bytes())
-    } else {
-        ApiKeyExpected::Sha256(parse_api_key_sha256(
-            sha256.as_deref().expect("exclusive option checked"),
-        )?)
+    // 纯声明先确认来源与身份，非法声明不能触发文件、环境或远程秘密求值。
+    let declaration = declaration::parse(spec)?;
+    let source = match declaration.source {
+        declaration::Source::Header(name) => ApiKeySource::Header(name),
+        declaration::Source::Query(name) => ApiKeySource::Query(name.to_owned()),
     };
-    if let Some(consumer) = &consumer {
-        validate_basic_auth_user(consumer)?;
-    }
+    let expected = match declaration.material {
+        declaration::Material::Secret(reference) => {
+            let value =
+                crate::security::secret::resolve_text(reference, config_dir, "api_key value")?;
+            validate_basic_auth_secret("api_key value", &value)?;
+            ApiKeyExpected::Plain(value.into_bytes())
+        }
+        declaration::Material::Sha256(digest) => ApiKeyExpected::Sha256(digest),
+    };
     let digest: [u8; 32] = match &expected {
         ApiKeyExpected::Plain(value) => Sha256::digest(value).into(),
         ApiKeyExpected::Sha256(digest) => *digest,
@@ -169,30 +110,10 @@ pub(super) fn parse_api_key(spec: &str, config_dir: &Path) -> Result<ApiKeyPolic
         write!(&mut fingerprint, "{byte:02x}").expect("SHA-256 hex formatting");
     }
     Ok(ApiKeyPolicy {
-        enabled: enabled.unwrap_or(true),
+        enabled: declaration.enabled,
         fingerprint: Arc::from(fingerprint),
         source,
         expected,
-        consumer: consumer.map(Arc::from),
+        consumer: declaration.consumer.map(Arc::from),
     })
-}
-
-/// 业务作用：解析管理面生成 API-Key 的固定长度 SHA-256，避免宽松 hex 语义产生不同配置解释。
-///
-/// 参数说明：
-/// - `value`：必须是 64 个 ASCII 十六进制字符。
-///
-/// 返回：严格解码为 32 字节；长度或任一字符非法时拒绝候选。
-fn parse_api_key_sha256(value: &str) -> Result<[u8; 32]> {
-    anyhow::ensure!(
-        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "api_key sha256 must contain 64 ASCII hex characters"
-    );
-    let mut digest = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let pair = std::str::from_utf8(pair).expect("hex pair is an ASCII slice");
-        digest[index] = u8::from_str_radix(pair, 16)
-            .with_context(|| format!("api_key sha256 contains invalid hex at byte {index}"))?;
-    }
-    Ok(digest)
 }

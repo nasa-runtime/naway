@@ -3,6 +3,7 @@ import { draftFieldPanel } from "./fields.js";
 import { objectKinds, objectLabel, namedObject } from "./schema.js";
 import { fieldAction } from "./nested.js";
 import { sequenceEditor } from "./sequence.js";
+import { keyEditor, keySecret } from "./keys.js";
 
 /**
  * 业务作用：围绕当前候选提供显式对象编辑，所有结果仍须进入共享提案和原目标执行。
@@ -60,6 +61,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
   }
   createPanel.append(create);
   const body = element("div");
+  const secretView = keySecret();
   const identity = element("p", "", "proposal-digest");
   const agreement = element("input");
   agreement.type = "checkbox";
@@ -79,6 +81,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
     notice,
     identity,
     body,
+    secretView.node,
     agreeLabel,
     actions,
   );
@@ -95,6 +98,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
    */
   function clearSelection() {
     generation += 1;
+    secretView.clear();
     selected = null;
     fields = null;
     creating = false;
@@ -135,7 +139,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
   function perform(action, receive) {
     const epoch = generation;
     const source = candidate.value;
-    requestDraft(source, action, (data) => {
+    return requestDraft(source, action, (data) => {
       if (generation !== epoch || candidate.value !== source) {
         throw new DOMException("草稿已变化", "AbortError");
       }
@@ -187,6 +191,25 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
           },
         ),
       );
+      if (object.kind === "route") {
+        body.append(
+          keyEditor(
+            object,
+            perform,
+            publish,
+            () => {
+              const epoch = generation;
+              const source = candidate.value;
+              return () =>
+                generation === epoch &&
+                selected === object &&
+                candidate.value === source &&
+                !document.hidden;
+            },
+            secretView,
+          ),
+        );
+      }
     }
     identity.textContent = `${isNew ? "准备新增" : "当前对象"}：${objectLabel(object)}`;
     apply.disabled = false;

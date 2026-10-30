@@ -1,6 +1,6 @@
 //! 路由表:predicates 全命中 → 命中 route → 指向上游 + nginx/Higress 风格 filter 计划。
 
-mod api_key;
+pub(crate) mod api_key;
 pub use api_key::ApiKeyPolicy;
 use api_key::{parse_api_key, ApiKeySource};
 

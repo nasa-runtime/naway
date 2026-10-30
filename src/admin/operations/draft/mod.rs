@@ -1,6 +1,7 @@
 //! 只编辑调用者提交的原始声明，结果继续交给共享提案和原目标的完整构建器。
 
 mod binding;
+mod keys;
 mod nested;
 mod objects;
 mod sequence;
@@ -28,6 +29,10 @@ struct Request {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
+    Keys {
+        object: Object,
+        edit: keys::Edit,
+    },
     Inspect {
         #[serde(default)]
         object: Option<Object>,
@@ -121,6 +126,25 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
     let mut document = crate::config::document::parse(candidate.as_bytes(), max_bytes)
         .map_err(|_| Error::Invalid)?;
     let catalog = objects::catalog(&document, domain)?;
+    if let Action::Keys {
+        object,
+        edit: keys::Edit::Inspect {},
+    } = &action
+    {
+        keys::validate_object(object, domain)?;
+        if !catalog.contains(object) {
+            return Err(Error::Missing);
+        }
+        let entries = keys::inspect(objects::find_mut(&mut document, object)?)?;
+        return Ok(serde_json::json!({
+            "schema_version": 1,
+            "validation": "declaration_only",
+            "published": false,
+            "base_sha256": base_sha256,
+            "selected": object,
+            "keys": entries
+        }));
+    }
     if let Action::Inspect {
         object,
     } = action
@@ -150,6 +174,16 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
         }));
     }
     let changed = match action {
+        Action::Keys {
+            object,
+            edit,
+        } => {
+            keys::validate_object(&object, domain)?;
+            if !catalog.contains(&object) {
+                return Err(Error::Missing);
+            }
+            keys::patch(objects::find_mut(&mut document, &object)?, edit)?
+        }
         Action::Inspect {
             ..
         } => unreachable!("inspection handled above"),
