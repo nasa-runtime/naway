@@ -824,9 +824,11 @@ where
         // 必须先占位再创建 inner future；`inner.call` 可能立即开始拨号，不能先产生 I/O 再等待额度。
         let slot = match self.budget.try_acquire() {
             Ok(slot) => slot,
-            Err(error) => return Box::pin(async move {
-                Err(Box::new(error) as BoxError)
-            }),
+            Err(error) => {
+                return Box::pin(async move {
+                    Err(Box::new(error) as BoxError)
+                })
+            }
         };
         let fut = Service::call(&mut self.inner, uri);
         Box::pin(async move {
@@ -6074,9 +6076,11 @@ impl super::GatewayProxy {
                 .map(|group| group.blocked())
                 .unwrap_or_default();
             // 被后台探测判为不健康的实例也要排除，与被动摘除叠加后才能避免继续选择已失效目标。
-            // 这里直接持有 Arc<HashSet> 迭代,不把整份主动不健康集合克隆进 Vec,保持请求热路径少分配。
+            // 只借用本服务当前策略的拒绝集合，不把整份事实克隆进 Vec，也不沿用旧策略或其它服务状态。
             let passive_excluded = self.ejected_upstreams(passive_policy);
-            let active_unhealthy = self.active_health.unhealthy_set();
+            let active_facts = self.active_health.unhealthy_set();
+            let active_unhealthy =
+                active_facts.service(service, snap.upstreams.active_health_identity(service));
             // 反馈基线与 panic 判定每请求算一次:选择内部的比较闭包必须看到一致口径,
             // 中途切换会让同一次 P2C 的两个候选用不同量纲比较。
             let load_policy = snap

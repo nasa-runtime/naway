@@ -1,7 +1,7 @@
 //! 主动健康探测。
 //!
 //! 后台任务按服务配置的间隔 TCP/HTTP 探测每个上游实例,连续成功/失败达阈值即翻转健康态。
-//! 数据面热路径只读一个 `ArcSwap<HashSet<String>>`(当前不健康 URI 集合),选实例时把它并入
+//! 数据面热路径借用同服务、同策略的当前拒绝集合，选实例时把它并入
 //! `excluded`,与被动摘除叠加成「主动探测 + 被动摘除」双保险。探测本身只发生在后台任务,
 //! 绝不进入请求热路径。
 
@@ -30,6 +30,12 @@ use crate::config::GatewaySnapshot;
 use crate::observability::metrics::Metrics;
 use crate::tls::UpstreamTlsProfile;
 use crate::upstream::UpstreamProtocol;
+
+mod identity;
+mod state;
+pub use identity::PolicyIdentity;
+pub use state::Rejections;
+use state::{CycleState, ProbeKey};
 
 type ProbeHttpClient = Client<HttpsConnector<HttpConnector>, Empty<Bytes>>;
 type ProbeTlsClientPool = HashMap<Arc<str>, ProbeHttpClient>;
@@ -67,6 +73,7 @@ pub struct ActiveHealthPolicy {
     grpc_service: Arc<str>,
     udp_payload: Bytes,
     udp_expected_response: Option<Bytes>,
+    fingerprint: [u8; 32],
 }
 
 impl ActiveHealthPolicy {
@@ -150,7 +157,7 @@ impl ActiveHealthPolicy {
         } else {
             format!("/{}", cfg.path)
         };
-        Ok(Self {
+        let mut policy = Self {
             kind,
             path,
             interval: Duration::from_millis(cfg.interval_ms),
@@ -165,7 +172,10 @@ impl ActiveHealthPolicy {
                 .udp_expected_response
                 .as_ref()
                 .map(|value| Bytes::copy_from_slice(value.as_bytes())),
-        })
+            fingerprint: [0; 32],
+        };
+        policy.fingerprint = policy.fingerprint();
+        Ok(policy)
     }
 
     /// 业务作用：向后台调度器暴露基础探测间隔，用于选择不会漏轮的全局 tick。
@@ -280,10 +290,10 @@ impl InstanceHealth {
 
 /// 主动健康检查器:常驻(生命周期=进程),不随配置快照换版丢失。
 pub struct ActiveHealthChecker {
-    /// 热路径读:当前不健康 URI 集合。
-    unhealthy: ArcSwap<HashSet<String>>,
+    /// 热路径读：按服务、策略和传输协议隔离的当前拒绝事实。
+    unhealthy: ArcSwap<Rejections>,
     /// 仅后台任务持有:每实例连续成功/失败计数 + 健康标记 + 上次探测时刻。
-    state: Mutex<HashMap<String, InstanceHealth>>,
+    state: Mutex<CycleState>,
     metrics: Arc<Metrics>,
     /// HTTP 探测专用 client(h1/h2);TCP 探测直接 connect,不走它。
     http_client: ProbeHttpClient,
@@ -311,8 +321,8 @@ impl ActiveHealthChecker {
         // 不能将端口可连接解释为 gRPC 应用已经 SERVING。
         let http_client = build_probe_http_client(None);
         Arc::new(Self {
-            unhealthy: ArcSwap::from_pointee(HashSet::new()),
-            state: Mutex::new(HashMap::new()),
+            unhealthy: ArcSwap::from_pointee(Rejections::default()),
+            state: Mutex::new(CycleState::default()),
             metrics,
             http_client,
             tls_clients: Mutex::new(HashMap::new()),
@@ -322,31 +332,16 @@ impl ActiveHealthChecker {
         })
     }
 
-    /// 业务作用：提供管理/调试侧兼容的不健康 URI 拷贝，不应在请求热路径使用。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：调用时刻 unhealthy 快照中的 URI 列表。
-    pub fn unhealthy_uris(&self) -> Vec<String> {
-        self.unhealthy.load().iter().cloned().collect()
-    }
-
-    /// 业务作用：查询单个健康 identity 是否已被主动探测摘除，供低频控制面观测。
-    ///
-    /// 参数说明：
-    /// - `uri`：是包含 TLS profile 时已扩展的健康状态 key。
-    ///
-    /// 返回：当前共享快照将该 identity 标为不健康时为 true。
-    pub fn is_unhealthy(&self, uri: &str) -> bool {
-        self.unhealthy.load().contains(uri)
-    }
-
     /// 业务作用：向 LB 与 readiness 提供同一份不可变不健康集合，确保摘除事实原子一致。
     ///
     /// 供 `/readyz` 判定与「选实例」保持一致——某 critical 服务的实例若被主动探测
     /// 全判为不健康,`select` 会返 503,则 `readyz` 也应转 503,而非「select 挂但 readyz 仍报 ready」的
     /// 不一致(那会让前置 LB 继续往一个转发必失败的节点分流)。
-    pub fn unhealthy_set(&self) -> Arc<HashSet<String>> {
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：共享拒绝事实；调用方必须用当前服务与策略身份取得对应端点集合。
+    pub fn unhealthy_set(&self) -> Arc<Rejections> {
         self.unhealthy.load_full()
     }
 
@@ -368,24 +363,25 @@ impl ActiveHealthChecker {
     /// 返回：无；到期探测完成后原子发布 unhealthy 与 summary 快照。
     pub async fn run_cycle(&self, targets: Vec<HealthTarget>) {
         let now = Instant::now();
-        let mut current: HashSet<String> = HashSet::new();
-        // 每个实例健康 key 的 (healthy_threshold, unhealthy_threshold),供探测后判翻转。
-        let mut thresholds: HashMap<String, (u32, u32)> = HashMap::new();
-        let mut due: Vec<(HealthInstanceTarget, ActiveHealthPolicy)> = Vec::new();
+        let owner = Arc::new(());
+        let mut current = HashSet::new();
+        let mut due = Vec::new();
         {
             let mut state = self.state.lock().expect("health state mutex poisoned");
+            // 当前轮次取得发布权；被新轮次替代的在途结果只能丢弃，不能重写新服务状态。
+            state.owner = owner.clone();
             for target in &targets {
+                let service = Arc::<str>::from(target.service.as_str());
                 for inst in &target.instances {
-                    current.insert(inst.key.clone());
-                    thresholds.insert(
-                        inst.key.clone(),
-                        (
-                            target.policy.healthy_threshold,
-                            target.policy.unhealthy_threshold,
-                        ),
-                    );
+                    let key = ProbeKey {
+                        service: service.clone(),
+                        policy: target.policy.identity(inst.protocol),
+                        endpoint: Arc::from(inst.key.as_str()),
+                    };
+                    current.insert(key.clone());
                     let entry = state
-                        .entry(inst.key.clone())
+                        .instances
+                        .entry(key.clone())
                         .or_insert_with(InstanceHealth::new);
                     let due_after = target
                         .policy
@@ -396,22 +392,26 @@ impl ActiveHealthChecker {
                     {
                         entry.last_probe = Some(now);
                         entry.probe_sequence = entry.probe_sequence.wrapping_add(1);
-                        due.push((inst.clone(), target.policy.clone()));
+                        due.push((key, inst.clone(), target.policy.clone()));
                     }
                 }
             }
-            // 清理已消失(配置删除 / nacos 摘除)的实例状态,避免内存滞留。
-            state.retain(|uri, _| current.contains(uri));
+            // 删除或改变策略后，旧阈值状态不再占有发布权；相同语义的配置保留合法迟滞计数。
+            state.instances.retain(|key, _| current.contains(key));
         }
 
-        // 并发探测到期实例(探测在后台任务,不阻塞热路径)。
         let mut set = JoinSet::new();
-        for (inst, policy) in due {
+        for (key, inst, policy) in due {
             let http_client = self.http_client_for(inst.tls_profile.as_ref());
             let grpc_client = self.grpc_client_for(inst.tls_profile.as_ref());
             set.spawn(async move {
                 let ok = probe_instance(&http_client, &grpc_client, &inst, &policy).await;
-                (inst.key, ok)
+                (
+                    key,
+                    ok,
+                    policy.healthy_threshold,
+                    policy.unhealthy_threshold,
+                )
             });
         }
         let mut results = Vec::new();
@@ -421,25 +421,28 @@ impl ActiveHealthChecker {
             }
         }
 
+        // 已完成探测属于真实观测开销，即使轮次失去发布权也必须计数；计数不授予阈值更新权。
+        for (_, ok, _, _) in &results {
+            self.metrics.inc_active_health_probe(*ok);
+        }
         {
             let mut state = self.state.lock().expect("health state mutex poisoned");
-            for (key, ok) in results {
-                // 每次探测结果计数(ok=可达 / fail=不可达或状态不符),供 gw_active_health_probe_total。
-                self.metrics.inc_active_health_probe(ok);
-                let Some((healthy_threshold, unhealthy_threshold)) = thresholds.get(&key).copied()
-                else {
-                    continue;
-                };
-                if let Some(entry) = state.get_mut(&key) {
-                    apply_probe_result(entry, ok, healthy_threshold, unhealthy_threshold, &key);
+            if !Arc::ptr_eq(&state.owner, &owner) {
+                // 新轮次已经重建当前目录，旧轮次即使网络成功也不能覆盖它的阈值和发布事实。
+                return;
+            }
+            for (key, ok, healthy_threshold, unhealthy_threshold) in results {
+                if let Some(entry) = state.instances.get_mut(&key) {
+                    apply_probe_result(
+                        entry,
+                        ok,
+                        healthy_threshold,
+                        unhealthy_threshold,
+                        &key.endpoint,
+                    );
                 }
             }
-            let unhealthy: HashSet<String> = state
-                .iter()
-                .filter(|(_, s)| !s.healthy)
-                .map(|(uri, _)| uri.clone())
-                .collect();
-            // 每服务健康汇总(healthy = 该服务实例中不在不健康集合的数量);在移交 unhealthy 前算,避免再借。
+            let unhealthy = Rejections::collect(&state.instances);
             let summary = targets
                 .iter()
                 .map(|target| ServiceHealthSummary {
@@ -447,14 +450,21 @@ impl ActiveHealthChecker {
                     healthy: target
                         .instances
                         .iter()
-                        .filter(|inst| !unhealthy.contains(&inst.key))
+                        .filter(|inst| {
+                            !unhealthy
+                                .service(
+                                    &target.service,
+                                    Some(target.policy.identity(inst.protocol)),
+                                )
+                                .contains(&inst.key)
+                        })
                         .count() as u32,
                     total: target.instances.len() as u32,
                 })
                 .collect::<Vec<_>>();
             self.summary.store(Arc::new(summary));
             self.metrics
-                .set_active_health_unhealthy(unhealthy.len() as u64);
+                .set_active_health_unhealthy(unhealthy.count() as u64);
             self.unhealthy.store(Arc::new(unhealthy));
         }
     }

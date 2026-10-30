@@ -119,7 +119,10 @@ impl Snapshot {
 /// - `active_unhealthy`：业务选择使用的当前主动探测拒绝集合，只借用，不触发探测。
 ///
 /// 返回：按服务身份排序的完整事实；过量或非法身份撤下整份目录，缺失与过期保持未知。
-pub(crate) fn capture(snapshot: &GatewaySnapshot, active_unhealthy: &HashSet<String>) -> Snapshot {
+pub(crate) fn capture(
+    snapshot: &GatewaySnapshot,
+    active_unhealthy: &super::health::Rejections,
+) -> Snapshot {
     let directory = &snapshot.upstreams;
     if directory.services.len() > MAX_SERVICES {
         return capacity();
@@ -149,7 +152,10 @@ pub(crate) fn capture(snapshot: &GatewaySnapshot, active_unhealthy: &HashSet<Str
             if scanned > MAX_INSTANCES {
                 return capacity();
             }
-            Some(count(instances, active_unhealthy))
+            Some(count(
+                instances,
+                active_unhealthy.service(name, directory.active_health_identity(name)),
+            ))
         } else {
             None
         };
@@ -205,7 +211,7 @@ fn count(instances: &[Arc<UpstreamInstance>], active_unhealthy: &HashSet<String>
         counts.configured_selectable += u32::from(instance.is_selectable());
         counts.manually_down += u32::from(instance.down);
         counts.backup += u32::from(instance.backup);
-        // 拒绝集合是实际选择依据；共享端点可能被另一服务探测，不能由本服务配置开关推断为零。
+        // 集合已经按当前服务和策略筛选，计数与数据面选择使用相同端点身份。
         counts.active_rejected += u32::from(
             active_unhealthy.contains(instance.uri.as_ref())
                 || active_unhealthy.contains(instance.health_key.as_ref()),

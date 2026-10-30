@@ -1103,10 +1103,10 @@ impl UpstreamDirectory {
     /// 不会出现「select 返 503 但 readyz 仍 200」这种让前置 LB 误分流的不一致。
     ///
     /// 参数说明：
-    /// - `active_unhealthy`: 主动健康探测当前判为不健康的 URI 集合;传引用免拷贝,为空表示未配探测或全健康。
+    /// - `active_unhealthy`：同一轮主动健康事实，按本服务当前策略与传输协议借用端点集合。
     ///
     /// 返回：所有没有可选实例的 critical service 名；空数组表示关键依赖已就绪。
-    pub fn critical_not_ready(&self, active_unhealthy: &HashSet<String>) -> Vec<String> {
+    pub fn critical_not_ready(&self, active_unhealthy: &health::Rejections) -> Vec<String> {
         self.services
             .iter()
             .filter_map(|(name, svc)| {
@@ -1115,6 +1115,8 @@ impl UpstreamDirectory {
                 }
                 // instances_for 已对 Nacos 做 stale_ttl 门控;这里再排除主动探测判死的实例,与选实例逻辑同源。
                 let instances = self.instances_for(name, svc);
+                let active_unhealthy =
+                    active_unhealthy.service(name, self.active_health_identity(name));
                 let has_usable = instances.as_slice().iter().any(|inst| {
                     inst.is_selectable()
                         && svc
@@ -1136,6 +1138,17 @@ impl UpstreamDirectory {
     /// 业务作用：返回当前配置快照声明的逻辑服务数量。
     pub fn service_count(&self) -> usize {
         self.services.len()
+    }
+
+    /// 业务作用：向数据面提供当前服务的探测权威，撤销策略后立即停止采用旧拒绝集合。
+    ///
+    /// 参数说明：
+    /// - `service`：本次选择冻结的逻辑服务身份。
+    ///
+    /// 返回：规范策略与实际传输协议身份；未配置探测或服务不存在返回 None，不构造字符串。
+    pub fn active_health_identity(&self, service: &str) -> Option<health::PolicyIdentity> {
+        let service = self.services.get(service)?;
+        Some(service.active_health.as_ref()?.identity(service.protocol))
     }
 
     /// 业务作用：向有界管理目录借用声明服务身份，避免为了遍历而复制全部服务名。

@@ -1672,7 +1672,10 @@ pub(super) fn resolve_stream_upstream(
             .map(|group| group.blocked())
             .unwrap_or_default();
         let passive_excluded = stream_lb.ejected_upstreams(passive_policy);
-        let active_unhealthy = active_health.unhealthy_set();
+        let active_facts = active_health.unhealthy_set();
+        // L4 与 HTTP 按同一当前服务策略读取，不能继承相同端点在其它服务中的探测拒绝。
+        let active_unhealthy =
+            active_facts.service(service, snap.upstreams.active_health_identity(service));
         let mut hints = gateway::upstream::LbSelectHints::default();
         if matches!(
             snap.upstreams.hash_source(service),
