@@ -1,4 +1,16 @@
 const definitions = {
+  instance: [
+    ["uri", "实例 URI", "string"],
+    ["weight", "调度权重", "number"],
+    ["healthy", "静态健康标记", "boolean"],
+    ["down", "手工下线", "boolean"],
+    ["backup", "备用实例", "boolean"],
+    ["slow_start_ms", "慢启动周期（毫秒）", "number"],
+    ["region", "地域", "string"],
+    ["zone", "可用区", "string"],
+    ["subzone", "子可用区", "string"],
+  ],
+
   route: [
     ["uri", "上游 URI", "string"],
     ["order", "匹配顺序", "number"],

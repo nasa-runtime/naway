@@ -2,6 +2,7 @@
 
 mod nested;
 mod objects;
+mod sequence;
 
 use super::model::{hex, Domain, Error};
 use crate::admin::{self, AdminState, BoxBody};
@@ -39,6 +40,11 @@ enum Action {
     PatchNested {
         object: Object,
         edits: Vec<nested::Edit>,
+    },
+    PatchSequence {
+        object: Object,
+        path: Vec<String>,
+        edit: sequence::Edit,
     },
     Create {
         object: Object,
@@ -159,6 +165,16 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
                 return Err(Error::Missing);
             }
             nested::patch(objects::find_mut(&mut document, &object)?, edits)?
+        }
+        Action::PatchSequence {
+            object,
+            path,
+            edit,
+        } => {
+            if !catalog.contains(&object) {
+                return Err(Error::Missing);
+            }
+            sequence::patch(objects::find_mut(&mut document, &object)?, &path, edit)?
         }
         Action::Create {
             object,

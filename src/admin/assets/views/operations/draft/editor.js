@@ -2,6 +2,7 @@ import { element } from "../../../core/dom.js";
 import { draftFieldPanel } from "./fields.js";
 import { objectKinds, objectLabel } from "./schema.js";
 import { fieldAction } from "./nested.js";
+import { sequenceEditor } from "./sequence.js";
 
 /**
  * 业务作用：围绕当前候选提供显式对象编辑，所有结果仍须进入共享提案和原目标执行。
@@ -170,6 +171,23 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
     selected = object;
     creating = isNew;
     body.append(fields.node);
+    if (!isNew) {
+      body.append(
+        sequenceEditor(
+          object,
+          values,
+          capacity,
+          (action) => {
+            if (selected === object && fields && !creating) {
+              perform(action, publish);
+            }
+          },
+          () => {
+            generation += 1;
+          },
+        ),
+      );
+    }
     identity.textContent = `${isNew ? "准备新增" : "当前对象"}：${objectLabel(object)}`;
     apply.disabled = false;
     agreeLabel.hidden = isNew;

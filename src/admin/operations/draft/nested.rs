@@ -20,7 +20,7 @@ impl Edit {
     /// 参数说明: 无。
     ///
     /// 返回：设置或移除动作共同的精确映射键序列。
-    fn path(&self) -> &[String] {
+    pub(super) fn path(&self) -> &[String] {
         match self {
             Self::Set {
                 path,
