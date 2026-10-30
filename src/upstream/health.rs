@@ -5,8 +5,8 @@
 //! `excluded`,与被动摘除叠加成「主动探测 + 被动摘除」双保险。探测本身只发生在后台任务,
 //! 绝不进入请求热路径。
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "http3")]
@@ -16,14 +16,7 @@ use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::header::{CONTENT_TYPE, TE};
 use hyper::{Method, Request, Version};
-use hyper_rustls::FixedServerNameResolver;
-use hyper_rustls::HttpsConnector;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::task::JoinSet;
-use tokio_rustls::rustls::pki_types::ServerName;
 
 use crate::config::model::HealthCheckCfg;
 use crate::config::GatewaySnapshot;
@@ -31,16 +24,15 @@ use crate::observability::metrics::Metrics;
 use crate::tls::UpstreamTlsProfile;
 use crate::upstream::UpstreamProtocol;
 
+mod clients;
 mod identity;
+mod scheduler;
+use clients::{ProbeClient, ProbeGrpcClient, ProbeHttpClient};
+use scheduler::ProbeJob;
 mod state;
 pub use identity::PolicyIdentity;
 pub use state::Rejections;
 use state::{CycleState, ProbeKey};
-
-type ProbeHttpClient = Client<HttpsConnector<HttpConnector>, Empty<Bytes>>;
-type ProbeTlsClientPool = HashMap<Arc<str>, ProbeHttpClient>;
-type ProbeGrpcClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
-type ProbeGrpcTlsClientPool = HashMap<Arc<str>, ProbeGrpcClient>;
 
 const GRPC_HEALTH_PATH: &str = "/grpc.health.v1.Health/Check";
 const GRPC_HEALTH_MAX_SERVICE_BYTES: usize = 1024;
@@ -295,14 +287,8 @@ pub struct ActiveHealthChecker {
     /// 仅后台任务持有:每实例连续成功/失败计数 + 健康标记 + 上次探测时刻。
     state: Mutex<CycleState>,
     metrics: Arc<Metrics>,
-    /// HTTP 探测专用 client(h1/h2);TCP 探测直接 connect,不走它。
-    http_client: ProbeHttpClient,
-    /// HTTP 探测专用 TLS profile 连接池:profile key -> client。
-    tls_clients: Mutex<ProbeTlsClientPool>,
-    /// gRPC Health 专用 HTTP/2-only client；与普通 HTTP 探测隔离，禁止协议降级。
-    grpc_client: OnceLock<ProbeGrpcClient>,
-    /// gRPC Health 专用 TLS profile 连接池:profile key -> HTTP/2-only client。
-    grpc_tls_clients: Mutex<ProbeGrpcTlsClientPool>,
+    /// 跨轮次共享真实网络探测名额，取消请求随 future 释放许可。
+    permits: tokio::sync::Semaphore,
     /// 每服务健康汇总的共享快照:供 `/metrics` 出 gw_upstream_healthy{service} 低基数指标。
     summary: ArcSwap<Vec<ServiceHealthSummary>>,
 }
@@ -316,18 +302,11 @@ impl ActiveHealthChecker {
     ///
     /// 返回：可在后台任务与数据面之间共享的检查器。
     pub fn new(metrics: Arc<Metrics>) -> Arc<Self> {
-        // http 探测 client 同时启用 h1/h2:TLS 上游按 ALPN 协商(h2 上游的 http 探测也能通)。
-        // 明文 gRPC 健康协议走独立的 HTTP/2 探测池；只需连接级存活时可显式选 TCP，
-        // 不能将端口可连接解释为 gRPC 应用已经 SERVING。
-        let http_client = build_probe_http_client(None);
         Arc::new(Self {
             unhealthy: ArcSwap::from_pointee(Rejections::default()),
             state: Mutex::new(CycleState::default()),
             metrics,
-            http_client,
-            tls_clients: Mutex::new(HashMap::new()),
-            grpc_client: OnceLock::new(),
-            grpc_tls_clients: Mutex::new(HashMap::new()),
+            permits: tokio::sync::Semaphore::new(scheduler::MAX_CONCURRENT_PROBES),
             summary: ArcSwap::from_pointee(Vec::new()),
         })
     }
@@ -370,6 +349,7 @@ impl ActiveHealthChecker {
             let mut state = self.state.lock().expect("health state mutex poisoned");
             // 当前轮次取得发布权；被新轮次替代的在途结果只能丢弃，不能重写新服务状态。
             state.owner = owner.clone();
+            state.clients.retain(&targets);
             for target in &targets {
                 let service = Arc::<str>::from(target.service.as_str());
                 for inst in &target.instances {
@@ -378,7 +358,10 @@ impl ActiveHealthChecker {
                         policy: target.policy.identity(inst.protocol),
                         endpoint: Arc::from(inst.key.as_str()),
                     };
-                    current.insert(key.clone());
+                    if !current.insert(key.clone()) {
+                        // 相同服务和策略的重复声明不能重复消耗网络名额或加速连续阈值。
+                        continue;
+                    }
                     let entry = state
                         .instances
                         .entry(key.clone())
@@ -390,9 +373,11 @@ impl ActiveHealthChecker {
                         .last_probe
                         .is_none_or(|last_probe| now.duration_since(last_probe) >= due_after)
                     {
-                        entry.last_probe = Some(now);
-                        entry.probe_sequence = entry.probe_sequence.wrapping_add(1);
-                        due.push((key, inst.clone(), target.policy.clone()));
+                        due.push(ProbeJob {
+                            key,
+                            instance: inst.clone(),
+                            policy: target.policy.clone(),
+                        });
                     }
                 }
             }
@@ -400,47 +385,12 @@ impl ActiveHealthChecker {
             state.instances.retain(|key, _| current.contains(key));
         }
 
-        let mut set = JoinSet::new();
-        for (key, inst, policy) in due {
-            let http_client = self.http_client_for(inst.tls_profile.as_ref());
-            let grpc_client = self.grpc_client_for(inst.tls_profile.as_ref());
-            set.spawn(async move {
-                let ok = probe_instance(&http_client, &grpc_client, &inst, &policy).await;
-                (
-                    key,
-                    ok,
-                    policy.healthy_threshold,
-                    policy.unhealthy_threshold,
-                )
-            });
-        }
-        let mut results = Vec::new();
-        while let Some(joined) = set.join_next().await {
-            if let Ok(result) = joined {
-                results.push(result);
-            }
-        }
-
-        // 已完成探测属于真实观测开销，即使轮次失去发布权也必须计数；计数不授予阈值更新权。
-        for (_, ok, _, _) in &results {
-            self.metrics.inc_active_health_probe(*ok);
-        }
+        self.execute_probes(due, &owner).await;
         {
-            let mut state = self.state.lock().expect("health state mutex poisoned");
+            let state = self.state.lock().expect("health state mutex poisoned");
             if !Arc::ptr_eq(&state.owner, &owner) {
                 // 新轮次已经重建当前目录，旧轮次即使网络成功也不能覆盖它的阈值和发布事实。
                 return;
-            }
-            for (key, ok, healthy_threshold, unhealthy_threshold) in results {
-                if let Some(entry) = state.instances.get_mut(&key) {
-                    apply_probe_result(
-                        entry,
-                        ok,
-                        healthy_threshold,
-                        unhealthy_threshold,
-                        &key.endpoint,
-                    );
-                }
             }
             let unhealthy = Rejections::collect(&state.instances);
             let summary = targets
@@ -468,56 +418,6 @@ impl ActiveHealthChecker {
             self.unhealthy.store(Arc::new(unhealthy));
         }
     }
-
-    /// 业务作用：按 TLS identity 复用普通 HTTP 探测池，避免周期探测重复解析证书并跨身份混池。
-    ///
-    /// 参数说明：
-    /// - `profile`：是上游已验证的 TLS 配置；None 使用公共根。
-    ///
-    /// 返回：支持 H1/H2 协商的普通 HTTP 探测 client。
-    fn http_client_for(&self, profile: Option<&UpstreamTlsProfile>) -> ProbeHttpClient {
-        let Some(profile) = profile else {
-            return self.http_client.clone();
-        };
-        let mut clients = self
-            .tls_clients
-            .lock()
-            .expect("health tls clients mutex poisoned");
-        if let Some(client) = clients.get(&profile.key) {
-            return client.clone();
-        }
-        let client = build_probe_http_client(Some(profile));
-        clients.insert(profile.key.clone(), client.clone());
-        client
-    }
-
-    /// 业务作用：按 TLS identity 复用 gRPC HTTP/2-only 探测池，防止与普通 HTTP client
-    /// 共享协议协商状态后出现 H1 降级或跨证书身份复用。
-    ///
-    /// 参数说明：
-    /// - `profile`：是上游已验证的 TLS 配置；None 使用公共根。
-    ///
-    /// 返回：强制 HTTP/2 的 gRPC Health 探测 client。
-    fn grpc_client_for(&self, profile: Option<&UpstreamTlsProfile>) -> ProbeGrpcClient {
-        let Some(profile) = profile else {
-            // 未配置 gRPC health 的默认进程不创建第二份 connector/TLS roots；首次真实
-            // gRPC 目标出现时再单飞构建，保持普通 HTTP/TCP 数据面的 idle 资源基线。
-            return self
-                .grpc_client
-                .get_or_init(|| build_probe_grpc_client(None))
-                .clone();
-        };
-        let mut clients = self
-            .grpc_tls_clients
-            .lock()
-            .expect("gRPC health TLS clients mutex poisoned");
-        if let Some(client) = clients.get(&profile.key) {
-            return client.clone();
-        }
-        let client = build_probe_grpc_client(Some(profile));
-        clients.insert(profile.key.clone(), client.clone());
-        client
-    }
 }
 
 /// 业务作用：让 `/readyz` 与 Nacos self-registration 共用数据面同源的 critical upstream
@@ -533,76 +433,6 @@ pub fn critical_upstreams_not_ready(
     checker: &ActiveHealthChecker,
 ) -> Vec<String> {
     snap.upstreams.critical_not_ready(&checker.unhealthy_set())
-}
-
-/// 业务作用：构建普通 HTTP 主动探测 client，并复用配置构建期已解析好的 TLS 材料，
-/// 使 H1/H2 HTTP 健康路径与业务证书身份一致。
-///
-/// 参数说明：
-/// - `profile`：是 HTTP 上游 TLS profile；None 使用内置公共根证书。
-///
-/// 返回：可按 scheme/ALPN 使用 H1 或 H2 的 Hyper client。
-fn build_probe_http_client(profile: Option<&UpstreamTlsProfile>) -> ProbeHttpClient {
-    let connector = match profile {
-        None => hyper_rustls::HttpsConnectorBuilder::new()
-            // CI/macOS 无 Keychain 时仍使用内置 Mozilla roots；避免健康检查因系统信任库不可读而 panic。
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build(),
-        Some(profile) => {
-            let mut config = profile.client_config.as_ref().clone();
-            config.alpn_protocols.clear();
-            let builder = hyper_rustls::HttpsConnectorBuilder::new()
-                .with_tls_config(config)
-                .https_or_http();
-            let builder = if let Some(server_name) = &profile.server_name {
-                let name = ServerName::try_from(server_name.as_ref().to_string())
-                    .expect("validated upstream tls server_name");
-                builder.with_server_name_resolver(FixedServerNameResolver::new(name))
-            } else {
-                builder
-            };
-            builder.enable_http1().enable_http2().build()
-        }
-    };
-    Client::builder(TokioExecutor::new()).build(connector)
-}
-
-/// 业务作用：构建标准 gRPC Health 专用 client，强制 h2/h2c prior knowledge，禁止健康
-/// 请求因连接池协商或明文 scheme 静默退化到 HTTP/1.1。
-///
-/// 参数说明：
-/// - `profile`：是 gRPC 上游 TLS profile；None 使用内置公共根证书或明文 h2c。
-///
-/// 返回：请求 body 为有界 protobuf frame、transport 强制 HTTP/2 的 Hyper client。
-fn build_probe_grpc_client(profile: Option<&UpstreamTlsProfile>) -> ProbeGrpcClient {
-    let connector = match profile {
-        None => hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http2()
-            .build(),
-        Some(profile) => {
-            let mut config = profile.client_config.as_ref().clone();
-            config.alpn_protocols.clear();
-            let builder = hyper_rustls::HttpsConnectorBuilder::new()
-                .with_tls_config(config)
-                .https_or_http();
-            let builder = if let Some(server_name) = &profile.server_name {
-                let name = ServerName::try_from(server_name.as_ref().to_string())
-                    .expect("validated upstream tls server_name");
-                builder.with_server_name_resolver(FixedServerNameResolver::new(name))
-            } else {
-                builder
-            };
-            builder.enable_http2().build()
-        }
-    };
-    let mut builder = Client::builder(TokioExecutor::new());
-    builder.http2_only(true);
-    builder.build(connector)
 }
 
 /// 业务作用：累计单实例探测结果并仅在连续阈值满足时翻转健康态，以迟滞阻止一次瞬时
@@ -686,15 +516,13 @@ fn health_jitter_delay(
 /// H1/H2 与真实 QUIC/H3，避免健康结论与业务传输脱节。
 ///
 /// 参数说明：
-/// - `http_client`：HTTP H1/H2 健康探测连接池。
-/// - `grpc_client`：gRPC 标准健康探测连接池。
+/// - `client`：只为实际探测类型准备的传输客户端。
 /// - `instance`：携带 URI、协议与 TLS 身份的目标实例。
 /// - `policy`：冻结的探测方式、路径、期限与状态码约束。
 ///
 /// 返回：探测在 deadline 内满足策略时为 true，否则为 false。
 async fn probe_instance(
-    http_client: &ProbeHttpClient,
-    grpc_client: &ProbeGrpcClient,
+    client: &ProbeClient,
     instance: &HealthInstanceTarget,
     policy: &ActiveHealthPolicy,
 ) -> bool {
@@ -707,9 +535,19 @@ async fn probe_instance(
                 // Hyper h1/h2 探测会产生「端口存活但 H3 不可用」的假阳性。
                 return probe_http3(&instance.uri, instance.tls_profile.as_ref(), policy).await;
             }
+            let ProbeClient::Http(http_client) = client else {
+                // 传输类型不匹配不能借用其它协议的成功作为当前健康证据。
+                return false;
+            };
             probe_http(http_client, &instance.uri, policy).await
         }
-        HealthKind::Grpc => probe_grpc(grpc_client, &instance.uri, policy).await,
+        HealthKind::Grpc => {
+            let ProbeClient::Grpc(grpc_client) = client else {
+                // 标准 gRPC 必须持有独立 HTTP/2 client，禁止回退到普通 HTTP 池。
+                return false;
+            };
+            probe_grpc(grpc_client, &instance.uri, policy).await
+        }
         HealthKind::Udp => probe_udp(&instance.uri, policy).await,
     }
 }
@@ -1133,11 +971,7 @@ async fn probe_tcp(uri: &str, timeout: Duration) -> bool {
 /// - `policy`：提供路径、状态和 deadline。
 ///
 /// 返回：deadline 内收到匹配的 response head 时为 true，不等待业务 body 聚合。
-async fn probe_http(
-    client: &Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
-    uri: &str,
-    policy: &ActiveHealthPolicy,
-) -> bool {
+async fn probe_http(client: &ProbeHttpClient, uri: &str, policy: &ActiveHealthPolicy) -> bool {
     let target = format!("{uri}{}", policy.path);
     let Ok(request) = Request::builder()
         .method(Method::GET)
@@ -1190,7 +1024,7 @@ fn bracket_ipv6_host(host: &str) -> String {
 }
 
 /// 业务作用：启动常驻主动健康调度任务，每轮从最新快照重建目标并以有界 tick 驱动探测，
-/// reload 删除策略时仍发布空 cycle 清除旧摘除状态。
+/// 换代时取消旧队列并按当前目录重建，删除策略时发布空 cycle 清除旧摘除状态。
 ///
 /// 参数说明：
 /// - `checker`：是进程级迟滞状态
@@ -1203,8 +1037,8 @@ pub fn spawn_active_health(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
+            let snapshot = snap.load_full();
             let (targets, tick) = {
-                let snapshot = snap.load_full();
                 let targets = snapshot.upstreams.active_health_targets();
                 let tick = targets
                     .iter()
@@ -1214,10 +1048,34 @@ pub fn spawn_active_health(
                     .max(Duration::from_millis(250));
                 (targets, tick)
             };
-            // 即使当前没有任何 health_check 目标,也要跑一轮空 cycle 清掉旧 state/unhealthy。
-            // 否则 reload 删除 health_check 后,旧的不健康 URI 会继续影响选实例与 /readyz。
-            checker.run_cycle(targets).await;
-            tokio::time::sleep(tick).await;
+            // 空目录也清理旧事实和客户端；执行及间隔等待都可被换代撤销，慢队列不能阻塞新策略。
+            tokio::select! {
+                _ = async {
+                    checker.run_cycle(targets).await;
+                    tokio::time::sleep(tick).await;
+                } => {}
+                _ = wait_for_snapshot_change(&snap, &snapshot) => {}
+            }
         }
     })
+}
+
+/// 业务作用：用固定低频身份复验打断已退休目录的探测与间隔等待，不让旧任务为新配置续权。
+///
+/// 参数说明：
+/// - `current`：当前已发布配置的共享入口。
+/// - `observed`：本轮持有的原配置，保持强引用以排除地址复用造成的同一性误判。
+///
+/// 返回：发现真实快照换代时结束；等待期间不解析配置、不分配目标或发起网络请求。
+async fn wait_for_snapshot_change(
+    current: &ArcSwap<GatewaySnapshot>,
+    observed: &Arc<GatewaySnapshot>,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if !Arc::ptr_eq(&current.load_full(), observed) {
+            // 原快照已不再是当前权威，调用方取消整个旧 future，队列和许可随之释放。
+            return;
+        }
+    }
 }

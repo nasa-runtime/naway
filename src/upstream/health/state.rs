@@ -15,6 +15,7 @@ pub(super) struct ProbeKey {
 pub(super) struct CycleState {
     pub owner: Arc<()>,
     pub instances: HashMap<ProbeKey, InstanceHealth>,
+    pub clients: super::clients::ClientSet,
 }
 
 #[derive(Default)]

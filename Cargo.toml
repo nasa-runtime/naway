@@ -190,7 +190,7 @@ regex = "1"                           # Gateway API HTTPRoute header/query Regul
 regex-syntax = "0.8"                  # AI 流式规则在构建期证明最大匹配长度，保证延迟发送窗口覆盖完整命中
 quick-xml = "0.41"                    # route 显式 WAF XML 慢路径；禁用 DTD/外部实体并执行节点预算
 regorus = { version = "0.10.1", optional = true, default-features = false, features = ["full-opa", "arc"] } # 显式 embedded OPA profile 的 Rego 解释器
-futures = "0.3"                       # 仅用于快照构建期驱动 Casbin 的字符串 adapter future
+futures = "0.3"                       # 控制面异步构建与有界后台探测
 x509-cert = { version = "0.2", features = ["pem"] } # OCSP 目标和 issuer 的严格 DER 解析
 x509-parser = "0.18"                  # 控制面解析证书 notAfter，避免无条件重复下单
 wasmtime = { version = "46.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] } # Proxy-Wasm 沙箱；无 WASI/文件/网络权限
