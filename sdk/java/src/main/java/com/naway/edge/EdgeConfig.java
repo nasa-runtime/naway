@@ -162,7 +162,7 @@ public final class EdgeConfig {
          *
          * 参数说明：
          * @param baseMillis 首次重连退避毫秒数，必须大于零。
-         * @param maxMillis 重连退避上限毫秒数，不得小于首次退避。
+         * @param maxMillis 重连退避上限毫秒数，不得小于首次退避或超过24小时。
          */
         public Builder reconnect(long baseMillis, long maxMillis) {
             this.reconnectBaseMillis = baseMillis;
@@ -196,8 +196,9 @@ public final class EdgeConfig {
             if (maxMessageBytes <= 0) {
                 throw new IllegalArgumentException("maxMessageBytes must be positive");
             }
-            if (reconnectBaseMillis <= 0 || reconnectMaxMillis < reconnectBaseMillis) {
-                throw new IllegalArgumentException("reconnect must satisfy 0 < base <= max");
+            if (reconnectBaseMillis <= 0 || reconnectMaxMillis < reconnectBaseMillis
+                    || reconnectMaxMillis > 86_400_000L) {
+                throw new IllegalArgumentException("reconnect must satisfy 0 < base <= max <= 24h");
             }
             return new EdgeConfig(this);
         }

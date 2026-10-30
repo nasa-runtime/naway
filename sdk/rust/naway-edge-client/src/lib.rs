@@ -14,8 +14,12 @@
 //!   **没有任何字段表示终端已收到**。这也是它不叫 `delivered` 的原因。
 //!
 //! 需要不丢的业务应当在 payload 里自带单调 `seq`/`event_id`,由订阅端发现空洞后
-//! 向后端补拉。[`Subscription`] 的重连会在日志层面告诉你发生过断流,但**断流期间
-//! 的消息就是没了**——这不是缺陷,是这条链路的设计取舍。
+//! 向后端补拉。订阅仅在调用 [`Subscription::next`] 时建立或读取连接，关闭和终止状态
+//! 不再重连；断流期间的消息不会保留。
+
+mod subscription;
+
+pub use subscription::Subscription;
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -39,7 +43,7 @@ const MAX_SUMMARY_MESSAGE_BYTES: usize = 4096;
 type RequestBody = UnsyncBoxBody<Bytes, std::io::Error>;
 
 /// SDK 错误。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum EdgeError {
     /// 传输层失败(连不上、连接中断)。
     Transport(String),
@@ -155,7 +159,7 @@ pub struct EdgeConfig {
     pub max_message_bytes: usize,
     /// 订阅断线后的首次重连退避;每次翻倍,上限 [`EdgeConfig::reconnect_max`]。
     pub reconnect_base: Duration,
-    /// 重连退避上限。
+    /// 重连退避上限；须满足 0 < reconnect_base <= reconnect_max <= 24小时。
     pub reconnect_max: Duration,
 }
 
@@ -591,18 +595,11 @@ impl EdgeClient {
     /// - `group`: 目标 group;能否订阅由 `grpc_edge.authz.subscribe_groups` 决定。
     ///
     /// 返回：
-    /// [`Subscription`]。**它不会在建立失败时返回错误**——首次连接同样走重连循环,
-    /// 因为边缘面的正常运维(节点 drain/重启)必然造成断流,把首连失败与后续断线
-    /// 区别对待只会让调用方写两套逻辑。授权被拒(7)属于**不可重试**错误,
-    /// 会直接从 [`Subscription::next`] 返回,不会无限重试。
+    /// 尚未连接的 [`Subscription`]；配置非法时首次及后续 `next` 返回相同错误。
+    /// 首连传输失败与后续断流均退避，明确状态 3/7/16 或协议错误终止句柄并释放资源。
+    /// 关闭和终止后不再建立连接，调用方须明确创建新句柄才能重新订阅。
     pub fn subscribe(&self, group: impl Into<String>) -> Subscription {
-        Subscription {
-            client: self.clone(),
-            group: group.into(),
-            stream: None,
-            buffer: BytesMut::new(),
-            backoff: self.cfg.reconnect_base,
-        }
+        Subscription::new(self.clone(), group.into())
     }
 
     /// 业务作用：组装并发出一次 unary edge 请求,返回响应 message 体(已去掉 gRPC 前缀)。
@@ -752,135 +749,11 @@ impl EdgeClient {
     }
 }
 
-/// 订阅句柄:内部维护一条服务端流,断线后按抖动退避自动重连。
-pub struct Subscription {
-    client: EdgeClient,
-    group: String,
-    stream: Option<hyper::body::Incoming>,
-    /// 跨 DATA 帧的重组缓冲。
-    ///
-    /// HTTP/2 DATA 边界不等于 gRPC 消息边界；半条消息必须等待更多数据，不能视为断线。
-    /// 断线时清空缓冲，避免旧流的半帧污染重连后的消息。
-    buffer: BytesMut,
-    backoff: Duration,
-}
-
-impl Subscription {
-    /// 业务作用：取下一条业务消息(已去掉 gRPC 前缀)。
-    ///
-    /// 返回：
-    /// - `Ok(bytes)`:一条完整业务消息。
-    /// - `Err(Status)` 且 status 为 `7`/`16`:授权或身份问题,**不可重试**,直接返回。
-    /// - 其它传输错误不返回给调用方,而是内部退避重连——因为节点 drain/重启造成的
-    ///   断流是这条链路的常态。**断流期间的消息不会补发**(at-most-once,无离线堆积),
-    ///   调用方若需补洞,应在业务 payload 里带 seq 并向后端补拉。
-    pub async fn next(&mut self) -> Result<Bytes> {
-        loop {
-            if self.stream.is_none() {
-                match self.open().await {
-                    Ok(stream) => {
-                        self.stream = Some(stream);
-                        self.backoff = self.client.cfg.reconnect_base;
-                    }
-                    // 授权/身份类错误重试多少次都一样,立即上报,避免无声打转。
-                    Err(
-                        err @ EdgeError::Status {
-                            ..
-                        },
-                    ) if is_terminal(&err) => return Err(err),
-                    Err(_) => {
-                        tokio::time::sleep(self.backoff).await;
-                        self.backoff = (self.backoff * 2).min(self.client.cfg.reconnect_max);
-                        continue;
-                    }
-                }
-            }
-            // 先看缓冲里是否已经攒够一条完整消息;攒够就直接给出,不必再等新帧。
-            if let Some(message) =
-                take_message(&mut self.buffer, self.client.cfg.max_message_bytes)?
-            {
-                return decode_frame_push(&message);
-            }
-            let stream = self.stream.as_mut().expect("stream present");
-            match next_chunk(stream).await {
-                Ok(Some(chunk)) => self.buffer.extend_from_slice(&chunk),
-                // 流正常结束或出错都当作断线:重连,并**丢弃半帧**——
-                // 截断的消息绝不能交给调用方,那会让业务拿到内容不全的 payload。
-                Ok(None) | Err(_) => {
-                    self.stream = None;
-                    self.buffer.clear();
-                }
-            }
-        }
-    }
-
-    /// 业务作用：建立一条新的订阅流。请求体是**恰好一条**空 SubReq 并立即 EOS( 契约)。
-    async fn open(&self) -> Result<hyper::body::Incoming> {
-        let request = self
-            .client
-            .base_request(
-                &self.client.cfg.subscribe_path,
-                "subscribe",
-                &self.client.cfg.group_header,
-                &self.group,
-            )?
-            // Full 体在写完后自动 EOS,正好满足"一条消息 + half-close"。
-            .body(full_request_body(frame(&[])))
-            .map_err(|e| EdgeError::Protocol(format!("build subscribe: {e}")))?;
-        let response = self
-            .client
-            .http
-            .request(request)
-            .await
-            .map_err(|e| EdgeError::Transport(e.to_string()))?;
-        if let Some(status) = header_str(response.headers(), "grpc-status") {
-            if status != "0" {
-                return Err(EdgeError::Status {
-                    status: status.to_string(),
-                    message: header_str(response.headers(), "grpc-message")
-                        .unwrap_or_default()
-                        .to_string(),
-                });
-            }
-        }
-        // 同 unary:route 配错时是 HTTP 错误页而不是 gRPC 流,必须明说,
-        // 否则会退化成"读到一条畸形帧"然后进入无意义的重连循环。
-        let content_type = header_str(response.headers(), "content-type").unwrap_or_default();
-        if !content_type.starts_with("application/grpc") {
-            return Err(EdgeError::Protocol(format!(
-                "gateway replied HTTP {} with content-type `{content_type}`, not a gRPC stream; \
-                 check subscribe_path against the route's grpc_edge.methods",
-                response.status()
-            )));
-        }
-        Ok(response.into_body())
-    }
-}
-
 /// 业务作用：授权/身份类错误重试无意义,应立刻上报给调用方。
 fn is_terminal(err: &EdgeError) -> bool {
     matches!(err, EdgeError::Status {
         status, ..
     } if status == "7" || status == "16" || status == "3")
-}
-
-/// 业务作用：从服务端流读下一块 DATA 负载(不做分帧解释)。返回 `Ok(None)` 表示流结束。
-async fn next_chunk(stream: &mut hyper::body::Incoming) -> Result<Option<Bytes>> {
-    use http_body_util::BodyExt as _;
-    while let Some(frame) = stream.frame().await {
-        let frame = frame.map_err(|e| EdgeError::Transport(e.to_string()))?;
-        match frame.into_data() {
-            Ok(chunk) => {
-                if chunk.is_empty() {
-                    continue;
-                }
-                return Ok(Some(chunk));
-            }
-            // trailer 帧:流结束。
-            Err(_) => return Ok(None),
-        }
-    }
-    Ok(None)
 }
 
 /// 业务作用：若缓冲里已有一条完整 gRPC message,取走并返回;不足则 `Ok(None)` 等更多数据。

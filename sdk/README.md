@@ -96,3 +96,25 @@ Rust 与 Java SDK 均采用 `Apache-2.0 OR MIT` 双许可证，使用者可自�
 
 - [Apache License 2.0](../LICENSE-APACHE)
 - [MIT License](../LICENSE-MIT)
+
+## 订阅关闭与重连
+
+两种 SDK 仅在实际交付完整消息后重置重连间隔；连接失败、空流和正常断流均先等待，连续无消息
+断流指数增长至上限。配置须满足 `0 < base <= max <= 24h`，不会以成功响应头证明业务已恢复。
+`INVALID_ARGUMENT`、`PERMISSION_DENIED`、`UNAUTHENTICATED` 终止订阅，不再自动连接；其它远端
+状态与传输中断仍按退避重试。Rust 的帧和状态解析错误、Java SDK 自身的 FramePush 解码异常也会
+终止；Java 底层 gRPC 库映射出的状态仍按上述状态规则裁决。重连不补发消息。
+
+Rust 的 `Subscription::close()` 幂等关闭当前流，后续 `next()` 返回 CANCELLED；已有终止原因
+保持不变，`is_closed()` 可观察。终止后的 `next()` 返回原原因，不新建 RPC。取消一次 `next()`
+等待后可以继续原句柄，已登记的退避截止保留；Drop 释放响应体和重组缓冲，没有后台订阅任务。
+重组只在跨帧或共享底层字节无法取得独占存储时复制，交付的 `Bytes` 继续共享业务 payload。
+响应头和流尾的认证拒绝使用相同裁决；缺失状态视为传输失败，非法状态或成功结束时残留半条
+消息视为协议错误，绝不把半条消息交给应用。无消息超时由调用方对 `next()` 设置期限。
+
+Java 的 `subscribeWithReconnect()` 返回可关闭句柄。关闭取消当前 gRPC 调用并唤醒退避；
+正常退出、不可重试状态及回调异常都释放当前轮次和订阅 Context，Channel 仍由调用方拥有。
+`onNext` 抛出运行期异常后停止重连，只通知一次 `onError`；显式关闭正常通知 `onCompleted`。
+终态回调由同一工作线程串行执行，回调本身再次抛出异常不会重新触发订阅。关闭不等待应用
+自定义回调执行完毕，SDK 无法强行终止阻塞的业务代码。普通 `subscribe()` 返回的直接迭代器
+没有自动重连句柄；调用方可以用自己的 gRPC Context 管理其取消。

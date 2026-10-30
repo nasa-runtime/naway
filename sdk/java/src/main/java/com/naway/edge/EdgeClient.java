@@ -1,9 +1,10 @@
 package com.naway.edge;
 
+import com.naway.edge.subscription.ReconnectingSubscription;
+
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientInterceptors;
-import io.grpc.Context;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.Status;
@@ -20,7 +21,6 @@ import java.io.InputStream;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -421,59 +421,20 @@ public final class EdgeClient {
      * 业务作用：订阅并在断线后按指数退避自动重连。
      *
      * <p><b>重连不补发</b>:断流期间的消息就是丢了(at-most-once + 无离线堆积)。
-     * 授权/身份类错误({@code PERMISSION_DENIED}/{@code UNAUTHENTICATED}/
+     * 只有交付完整消息后才重置退避。授权/身份类错误({@code PERMISSION_DENIED}/{@code UNAUTHENTICATED}/
      * {@code INVALID_ARGUMENT})<b>不重试</b>——重试多少次结果都一样,只会把真问题
-     * 掩埋成"一直连不上"。
+     * 掩埋成"一直连不上"。SDK 的 FramePush 解码或应用回调异常同样终止，退出时取消当前调用及订阅 Context。
      *
      *
      * 参数说明：
      * @param group    目标 group
-     * @param observer 回调;{@code onNext} 收消息,{@code onError} 只在不可重试错误时触发
+     * @param observer 串行回调；终止错误走 onError，显式关闭走 onCompleted，终态最多通知一次
      * @return 可关闭句柄;调用 {@link Subscription#close} 终止重连循环
      */
     public Subscription subscribeWithReconnect(String group, StreamObserver<byte[]> observer) {
-        AtomicBoolean closed = new AtomicBoolean(false);
-        Context.CancellableContext context = Context.current().withCancellation();
-        Thread worker = new Thread(() -> context.run(() -> {
-            long backoffMs = config.reconnectBaseMillis;
-            while (!closed.get()) {
-                try {
-                    Iterator<byte[]> stream = subscribe(group);
-                    backoffMs = config.reconnectBaseMillis;
-                    while (!closed.get() && stream.hasNext()) {
-                        observer.onNext(stream.next());
-                    }
-                } catch (StatusRuntimeException e) {
-                    if (isTerminal(e.getStatus())) {
-                        observer.onError(e);
-                        return;
-                    }
-                } catch (RuntimeException e) {
-                    // 其它运行期异常同样按可重试处理:边缘面断流是常态。
-                }
-                if (closed.get()) {
-                    break;
-                }
-                try {
-                    Thread.sleep(backoffMs);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-                backoffMs = Math.min(backoffMs * 2, config.reconnectMaxMillis);
-            }
-            observer.onCompleted();
-        }), "naway-edge-subscribe-" + group);
-        worker.setDaemon(true);
-        worker.start();
-        return () -> {
-            if (closed.compareAndSet(false, true)) {
-                // 只改 closed 无法唤醒阻塞在 Iterator.hasNext 的 gRPC call，线程会
-                // 一直泄漏到对端主动断流。取消 Context 才会向当前 call 传播 CANCELLED。
-                context.cancel(null);
-                worker.interrupt();
-            }
-        };
+        return ReconnectingSubscription.start(
+                () -> subscribe(group), observer,
+                config.reconnectBaseMillis, config.reconnectMaxMillis, EdgeClient::isTerminal);
     }
 
     /** 订阅句柄。 */
@@ -482,7 +443,7 @@ public final class EdgeClient {
          * 业务作用：停止订阅重连并取消当前阻塞的 gRPC 调用，释放后台线程。
          *
          *
-         * 返回：幂等关闭句柄；后台阻塞读取与重连等待被唤醒停止。
+         * 返回：幂等关闭句柄；后台阻塞读取与重连等待被唤醒停止，不等待应用自定义回调结束。
          *
          * 参数说明: 无。
          */
