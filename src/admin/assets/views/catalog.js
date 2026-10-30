@@ -75,9 +75,10 @@ function capabilities(entry) {
  * 参数说明：
  * - `root`：当前页面容器。
  * - `permissions`：后端返回的当前主体领域权限。
+ * - `openService`：进入同一授权会话中的集群服务实时状态。
  * 返回：取消读取并清空目录的退出函数，不保留历史或浏览器凭据。
  */
-export function mount(root, permissions) {
+export function mount(root, permissions, openService) {
   let current = null;
   let etag = null;
   let offset = 0;
@@ -267,6 +268,12 @@ export function mount(root, permissions) {
         element("p", `确认缺少：${object.missing.join("、") || "无"}`),
         element("p", `尚未确认：${object.unknown.join("、") || "无"}`),
       );
+      if (object.kind === "upstream" && openService) {
+        const inspect = element("button", "查看集群服务状态");
+        inspect.type = "button";
+        inspect.addEventListener("click", () => openService(object.id));
+        details.append(inspect);
+      }
       for (const variant of object.variants) {
         const entry = variant.description;
         const section = element("section", "", "panel");

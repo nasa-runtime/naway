@@ -19,6 +19,7 @@ struct Target {
     catalog_offset: usize,
     catalog_complete: bool,
     interest_until: Option<Instant>,
+    service_metrics_supported: bool,
     issuer: Option<Arc<super::issuer::Verifier>>,
     #[cfg(feature = "node-actions")]
     actions: super::actions::Channel,
@@ -95,6 +96,7 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     catalog_offset: 0,
                     catalog_complete: false,
                     interest_until: None,
+                    service_metrics_supported: false,
                     issuer: target.issuer.clone(),
                     #[cfg(feature = "node-actions")]
                     actions: super::actions::Channel::default(),
@@ -122,7 +124,8 @@ pub(super) async fn run(owner: Weak<AdminState>) {
             .flatten()
             .map(|(sample, at)| {
                 Arc::new(telemetry::Upload {
-                    digest: telemetry::digest(&sample),
+                    digest: telemetry::digest(&sample, true),
+                    legacy_digest: telemetry::digest(&sample, false),
                     sample,
                     at,
                 })
@@ -248,10 +251,18 @@ async fn send(target: &mut Target, round: &Round<'_>) {
             .cloned();
         let client = target.client.clone();
         let session = target.session.clone();
+        let service_supported = target.service_metrics_supported;
         let metrics = async {
             if let Some(sample) = upload {
-                let _ = telemetry::upload(client, sample, facts.node_id.clone(), session, deadline)
-                    .await;
+                let _ = telemetry::upload(
+                    client,
+                    sample,
+                    facts.node_id.clone(),
+                    session,
+                    deadline,
+                    service_supported,
+                )
+                .await;
             }
         };
         let _ = tokio::time::timeout_at(deadline, async {
@@ -453,6 +464,8 @@ async fn exchange(
     }
     target.interest_until = (metrics_enabled && response.metrics_interest_ms > 0)
         .then(|| Instant::now() + Duration::from_millis(u64::from(response.metrics_interest_ms)));
+    // 每次成功心跳重新取得能力；目标降级或切换后不能继续发送新字段及其摘要。
+    target.service_metrics_supported = response.service_metrics_supported;
     #[cfg(feature = "node-actions")]
     match (response.action, response.release) {
         (Some(offer), None) => {

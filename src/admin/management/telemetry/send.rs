@@ -13,6 +13,7 @@ use std::sync::Arc;
 /// - `node`：当前本机管理身份。
 /// - `session`：刚被心跳确认的目标会话。
 /// - `deadline`：心跳、目录与指标共用的绝对期限。
+/// - `service_supported`：刚被目标心跳确认的服务接收能力。
 ///
 /// 返回：只有完整样本ACK匹配才成功；失败由下一轮重新选择最新样本，不自动补发旧样本。
 pub(in crate::admin::management) async fn upload(
@@ -21,6 +22,7 @@ pub(in crate::admin::management) async fn upload(
     node: String,
     session: Vec<u8>,
     deadline: tokio::time::Instant,
+    service_supported: bool,
 ) -> Result<(), Status> {
     let sample_id = value.sample.sample_id;
     let series = value.sample.readings.len();
@@ -29,6 +31,12 @@ pub(in crate::admin::management) async fn upload(
         .route_traffic
         .as_ref()
         .map_or(0, |value| value.rows.len());
+    let services = value
+        .sample
+        .service_state
+        .as_ref()
+        .filter(|_| service_supported)
+        .map_or(0, |value| value.rows.len());
     let offsets = (0..series)
         .step_by(CHUNK)
         .chain(
@@ -36,15 +44,25 @@ pub(in crate::admin::management) async fn upload(
                 .step_by(super::routes::CHUNK)
                 .map(move |offset| series + offset),
         )
-        .chain((series == 0 && routes == 0).then_some(0));
+        .chain(
+            (0..services)
+                .step_by(super::services::CHUNK)
+                .map(move |offset| series + routes + offset),
+        )
+        .chain((series == 0 && routes == 0 && services == 0).then_some(0));
     let chunks = futures::stream::iter(offsets).map(move |offset| {
         frame(
             &value.sample,
             &node,
             &session,
-            &value.digest,
+            if service_supported {
+                &value.digest
+            } else {
+                &value.legacy_digest
+            },
             value.at,
             offset,
+            service_supported,
         )
     });
     let response = client

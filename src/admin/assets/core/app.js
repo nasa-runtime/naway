@@ -5,6 +5,7 @@ import { mount as nodes } from "../views/nodes.js";
 import { mount as catalog } from "../views/catalog.js";
 import { mount as operations } from "../views/operations.js";
 import { mount as routeTraffic } from "../views/routes.js";
+import { mount as services } from "../views/services.js";
 
 const root = document.getElementById("view");
 const loginForm = document.getElementById("login");
@@ -28,9 +29,10 @@ function allowed(resource, action = "read") {
  * 业务作用：撤销旧视图并按当前能力挂载选择的页面。
  * 参数说明：
  * - `name`：导航中的固定页面标识。
+ * - `service`：从当前集群目录选中的逻辑服务，其他页面忽略。
  * 返回：页面只在授权后读取业务数据。
  */
-function navigate(name) {
+function navigate(name, service = "") {
   dispose?.();
   dispose = null;
   root.replaceChildren();
@@ -53,6 +55,14 @@ function navigate(name) {
     document.getElementById("subtitle").textContent =
       "集群与工作区 · 当前区间、完整覆盖与流结束事实";
     dispose = routeTraffic(root, session);
+  } else if (
+    name === "services" &&
+    ((allowed("cluster") && allowed("upstreams")) || session.workspaces?.length)
+  ) {
+    document.getElementById("title").textContent = "服务实时状态";
+    document.getElementById("subtitle").textContent =
+      "集群与工作区 · 当前实例事实与完整节点覆盖";
+    dispose = services(root, session, service);
   } else if (name === "nodes" && allowed("cluster")) {
     document.getElementById("title").textContent = "集群节点";
     document.getElementById("subtitle").textContent =
@@ -66,7 +76,9 @@ function navigate(name) {
     document.getElementById("title").textContent = "路由与入口";
     document.getElementById("subtitle").textContent =
       "集群对象分布 · 每个节点的实际配置目录";
-    dispose = catalog(root, session.permissions);
+    dispose = catalog(root, session.permissions, (id) =>
+      navigate("services", id),
+    );
   } else if (name === "monitor" && allowed("cluster")) {
     document.getElementById("title").textContent = "实时监控";
     document.getElementById("subtitle").textContent =
@@ -167,24 +179,31 @@ async function login(event) {
       session.workspaces?.length
     );
     document.getElementById("nodes-nav").disabled = !allowed("cluster");
+    document.getElementById("services-nav").disabled = !(
+      (allowed("cluster") && allowed("upstreams")) ||
+      session.workspaces?.length
+    );
     document.getElementById("catalog-nav").disabled =
       !allowed("cluster") ||
       !["routes", "config", "upstreams"].some((resource) => allowed(resource));
     notice.textContent = "";
     navigate(
-      location.pathname === "/traffic" &&
-        !document.getElementById("traffic-nav").disabled
-        ? "traffic"
-        : location.pathname === "/operations"
-          ? "operations"
-          : allowed("cluster")
-            ? location.pathname === "/catalog" &&
-              !document.getElementById("catalog-nav").disabled
-              ? "catalog"
-              : location.pathname === "/cluster"
-                ? "nodes"
-                : "monitor"
-            : "system",
+      location.pathname === "/services" &&
+        !document.getElementById("services-nav").disabled
+        ? "services"
+        : location.pathname === "/traffic" &&
+            !document.getElementById("traffic-nav").disabled
+          ? "traffic"
+          : location.pathname === "/operations"
+            ? "operations"
+            : allowed("cluster")
+              ? location.pathname === "/catalog" &&
+                !document.getElementById("catalog-nav").disabled
+                ? "catalog"
+                : location.pathname === "/cluster"
+                  ? "nodes"
+                  : "monitor"
+              : "system",
     );
   } catch (error) {
     if (attempt === epoch && error.name !== "AbortError") {

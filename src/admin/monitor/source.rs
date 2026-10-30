@@ -67,6 +67,10 @@ pub(super) fn sample(state: &AdminState, runtime: &Runtime, sample_id: u64) -> m
         route_traffic: Some(crate::observability::http_stream::routes::capture(
             &snapshot,
         )),
+        service_state: Some(crate::upstream::observation::capture(
+            &snapshot,
+            &state.active_health.unhealthy_set(),
+        )),
         capabilities: [
             ("core", true),
             ("sentinel_queue", true),
@@ -95,6 +99,7 @@ pub(super) fn sample(state: &AdminState, runtime: &Runtime, sample_id: u64) -> m
             ),
             ("xds_server", cfg!(feature = "xds-server")),
             ("route_traffic", true),
+            ("service_state", true),
             ("sentinel_state", false),
             ("http_bytes", true),
             ("stream_completion_latency", true),

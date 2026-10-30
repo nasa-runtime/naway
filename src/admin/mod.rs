@@ -725,6 +725,9 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
         (&Method::GET, "/api/monitor/routes") => {
             monitor::routes::read(&state, &request, &state.snap.load_full(), None)
         }
+        (&Method::GET, "/api/monitor/services") => {
+            monitor::services::read(&state, &request, &state.snap.load_full(), None)
+        }
         (&Method::GET, "/api/cluster/catalog") => catalog::read(&state, &request).await,
         (&Method::GET, "/api/cluster/overview") | (&Method::GET, "/admin/cluster/facts") => {
             if request.uri.query().is_some() {
@@ -963,6 +966,9 @@ fn admin_permission(method: &Method, path: &str) -> Option<(AdminResource, Admin
         }
         (&Method::GET, "/api/dashboard") => Some((AdminResource::Cluster, AdminAction::Read)),
         (&Method::GET, "/api/monitor/routes") => Some((AdminResource::Cluster, AdminAction::Read)),
+        (&Method::GET, "/api/monitor/services") => {
+            Some((AdminResource::Cluster, AdminAction::Read))
+        }
         (&Method::GET, "/api/cluster/catalog") => Some((AdminResource::Cluster, AdminAction::Read)),
         (&Method::GET, "/api/cluster/overview") | (&Method::GET, "/admin/cluster/facts") => {
             Some((AdminResource::Cluster, AdminAction::Read))

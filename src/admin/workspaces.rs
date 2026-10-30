@@ -98,6 +98,9 @@ pub(super) async fn handle(req: AdminRequest, state: Arc<AdminState>) -> Respons
     if endpoint == "monitor/routes" {
         return monitor::routes::read(&state, &request, &snapshot, Some(&workspace));
     }
+    if endpoint == "monitor/services" {
+        return monitor::services::read(&state, &request, &snapshot, Some(&workspace));
+    }
     let Some((offset, limit)) = page(request.uri.query()) else {
         return plain(StatusCode::BAD_REQUEST, "invalid page parameters\n");
     };

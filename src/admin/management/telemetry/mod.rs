@@ -2,6 +2,7 @@
 
 mod routes;
 mod send;
+mod services;
 mod wire;
 pub(super) use send::upload;
 pub(super) use wire::{digest, frame, Candidate};
@@ -26,4 +27,5 @@ pub(super) struct Upload {
     pub sample: Arc<model::Sample>,
     pub at: Instant,
     pub digest: [u8; 32],
+    pub legacy_digest: [u8; 32],
 }

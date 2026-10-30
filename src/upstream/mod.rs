@@ -8,6 +8,7 @@ pub mod hash;
 pub mod health;
 pub mod load;
 mod locality;
+pub(crate) mod observation;
 pub mod passive;
 mod semantic;
 

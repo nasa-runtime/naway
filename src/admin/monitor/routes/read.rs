@@ -97,13 +97,13 @@ pub(in crate::admin) fn read(
     let Some(query) = query(request.uri.query()) else {
         return crate::admin::plain(StatusCode::BAD_REQUEST, "invalid route monitoring query\n");
     };
-    let Ok(_permit) = state.monitor.route_readers.try_acquire() else {
+    let Ok(_permit) = state.monitor.object_readers.try_acquire() else {
         return crate::admin::plain(
             StatusCode::TOO_MANY_REQUESTS,
             "route monitoring readers exhausted\n",
         );
     };
-    let publication = match super::super::cluster::route_sample(state, snapshot) {
+    let publication = match super::super::cluster::object_sample(state, snapshot) {
         Ok(value) => value,
         Err(reason) => return super::super::pending(reason, snapshot.admin_monitor.period),
     };

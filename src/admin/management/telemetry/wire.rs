@@ -1,6 +1,6 @@
 //! 固定字段摘要与类型化分片；网络边界之外共享同一累计样本。
 
-use super::routes;
+use super::{routes, services};
 use super::{CHUNK, SAMPLE_BYTES};
 use crate::admin::management::protocol;
 use crate::admin::monitor::model::{self, Histogram, NodeState, Reading, Sample, Value};
@@ -19,6 +19,7 @@ pub(in crate::admin::management) struct Candidate {
     pub(in crate::admin::management) sample: Sample,
     total: usize,
     route_total: usize,
+    service_total: usize,
     frames: usize,
 }
 
@@ -26,9 +27,10 @@ pub(in crate::admin::management) struct Candidate {
 ///
 /// 参数说明：
 /// - `sample`：已经验证并按指标身份排序的当前样本。
+/// - `service_supported`：目标已明确声明服务能力，否时保持原指标与路由摘要。
 ///
 /// 返回：包括全部业务字段的SHA-256，不包括传输年龄和会话令牌。
-pub(in crate::admin::management) fn digest(sample: &Sample) -> [u8; 32] {
+pub(in crate::admin::management) fn digest(sample: &Sample, service_supported: bool) -> [u8; 32] {
     let mut hash = Sha256::new();
     stamp(&mut hash, b"naway-current-sample");
     hash.update([sample.schema_version]);
@@ -101,6 +103,9 @@ pub(in crate::admin::management) fn digest(sample: &Sample) -> [u8; 32] {
         hash.update([u8::from(*enabled)]);
     }
     routes::digest(&mut hash, sample.route_traffic.as_ref());
+    if service_supported {
+        services::digest(&mut hash, sample.service_state.as_ref());
+    }
     hash.finalize().into()
 }
 
@@ -124,9 +129,10 @@ fn stamp(hash: &mut Sha256, bytes: &[u8]) {
 /// - `session`：该目标签发的boot会话。
 /// - `hash`：完整样本的共享摘要。
 /// - `at`：采集开始时刻，用于保守年龄。
-/// - `offset`：已经发送的固定系列与路由行总数。
+/// - `offset`：已经发送的固定系列、路由行与服务行总数。
+/// - `service_supported`：目标心跳声明的服务接收能力。
 ///
-/// 返回：最多64固定系列或32路由行；字段长度与接收端字节上限共同限制传输。
+/// 返回：最多64固定系列、32路由行或32服务行；不向旧目标发送无法验证摘要的新字段。
 pub(in crate::admin::management) fn frame(
     sample: &Sample,
     node: &str,
@@ -134,7 +140,14 @@ pub(in crate::admin::management) fn frame(
     hash: &[u8; 32],
     at: Instant,
     offset: usize,
+    service_supported: bool,
 ) -> protocol::SampleRequest {
+    let service_state = sample.service_state.as_ref().filter(|_| service_supported);
+    let service_offset = sample.readings.len()
+        + sample
+            .route_traffic
+            .as_ref()
+            .map_or(0, |value| value.rows.len());
     let header = (offset == 0).then(|| protocol::SampleHeader {
         facts: Some(protocol::NodeFacts {
             node_id: node.into(),
@@ -168,6 +181,8 @@ pub(in crate::admin::management) fn frame(
             .route_traffic
             .as_ref()
             .map_or(0, |value| value.rows.len() as u32),
+        service_capacity: service_state.map(|value| value.capacity),
+        service_total: service_state.map_or(0, |value| value.rows.len() as u32),
         bounds_ms: sample.latency.bounds_ms.clone(),
         buckets: sample.latency.buckets.clone(),
         sum_micros: sample.latency.sum_micros,
@@ -191,12 +206,21 @@ pub(in crate::admin::management) fn frame(
         routes: sample
             .route_traffic
             .as_ref()
-            .filter(|_| offset >= sample.readings.len())
+            .filter(|_| offset >= sample.readings.len() && offset < service_offset)
             .map_or_else(Vec::new, |value| {
                 let index = offset - sample.readings.len();
                 value.rows[index..(index + routes::CHUNK).min(value.rows.len())]
                     .iter()
                     .map(routes::encode)
+                    .collect()
+            }),
+        services: service_state
+            .filter(|_| offset >= service_offset)
+            .map_or_else(Vec::new, |value| {
+                let index = (offset - service_offset).min(value.rows.len());
+                value.rows[index..(index + services::CHUNK).min(value.rows.len())]
+                    .iter()
+                    .map(services::encode)
                     .collect()
             }),
         readings: sample.readings
@@ -259,6 +283,8 @@ impl Candidate {
             || header.total as usize > model::MAX_SERIES
             || header.route_total as usize > MAX_ROUTES
             || (header.route_capacity != Some(false) && header.route_total != 0)
+            || header.service_total as usize > crate::upstream::observation::MAX_SERVICES
+            || (header.service_capacity != Some(false) && header.service_total != 0)
             || header.bounds_ms.len() > 32
             || header.buckets.len() != header.bounds_ms.len() + 1
             || header.capabilities.len() > 64
@@ -286,6 +312,7 @@ impl Candidate {
                 .ok_or_else(|| Status::out_of_range("sample age overflow"))?,
             total: header.total as usize,
             route_total: header.route_total as usize,
+            service_total: header.service_total as usize,
             frames: 0,
             sample: Sample {
                 schema_version: 1,
@@ -316,6 +343,12 @@ impl Candidate {
                     capacity,
                     rows: Vec::with_capacity(header.route_total as usize),
                 }),
+                service_state: header.service_capacity.map(|capacity| {
+                    crate::upstream::observation::Snapshot {
+                        capacity,
+                        rows: Vec::with_capacity(header.service_total as usize),
+                    }
+                }),
             },
         };
         candidate.push(first)?;
@@ -338,12 +371,22 @@ impl Candidate {
             .as_ref()
             .map_or(0, |value| value.rows.len());
         let readings_remaining = self.total.saturating_sub(self.sample.readings.len());
+        let services_received = self
+            .sample
+            .service_state
+            .as_ref()
+            .map_or(0, |value| value.rows.len());
         let expected_routes = if readings_remaining == 0 {
             routes::CHUNK.min(self.route_total.saturating_sub(routes_received))
         } else {
             0
         };
-        if self.frames >= 49
+        let expected_services = if readings_remaining == 0 && routes_received == self.route_total {
+            services::CHUNK.min(self.service_total.saturating_sub(services_received))
+        } else {
+            0
+        };
+        if self.frames >= 65
             || part.encoded_len() > super::super::MAX_MESSAGE
             || part.header.is_some()
             || part.node_id != self.node
@@ -351,10 +394,15 @@ impl Candidate {
             || part.session != self.session
             || part.sample_id != self.sample.sample_id
             || part.digest != self.digest
-            || part.offset as usize != self.sample.readings.len() + routes_received
+            || part.offset as usize
+                != self.sample.readings.len() + routes_received + services_received
             || part.readings.len() != CHUNK.min(readings_remaining)
             || part.routes.len() != expected_routes
-            || (self.frames > 0 && readings_remaining == 0 && routes_received == self.route_total)
+            || part.services.len() != expected_services
+            || (self.frames > 0
+                && readings_remaining == 0
+                && routes_received == self.route_total
+                && services_received == self.service_total)
         {
             return Err(Status::invalid_argument("sample fragment mismatch"));
         }
@@ -419,6 +467,24 @@ impl Candidate {
             }
             current.rows.push(row);
         }
+        for row in part.services {
+            let row = services::decode(row)?;
+            let current = self
+                .sample
+                .service_state
+                .as_mut()
+                .ok_or_else(|| Status::invalid_argument("unexpected service facts"))?;
+            if current
+                .rows
+                .last()
+                .is_some_and(|old| old.service >= row.service)
+            {
+                return Err(Status::invalid_argument(
+                    "service facts must be unique and ordered",
+                ));
+            }
+            current.rows.push(row);
+        }
         Ok(())
     }
 
@@ -435,8 +501,14 @@ impl Candidate {
                 .as_ref()
                 .map_or(0, |value| value.rows.len())
                 != self.route_total
+            || self
+                .sample
+                .service_state
+                .as_ref()
+                .map_or(0, |value| value.rows.len())
+                != self.service_total
             || !model::validate(&mut self.sample)
-            || digest(&self.sample) != self.digest
+            || digest(&self.sample, true) != self.digest
         {
             return Err(Status::data_loss("incomplete or inconsistent sample"));
         }

@@ -572,14 +572,14 @@ pub(super) fn enabled(snapshot: &crate::config::GatewaySnapshot) -> bool {
                 && crate::admin::cluster_scrape_auth_header(&snapshot.admin_auth).is_some()))
 }
 
-/// 业务作用：为路由与工作区读取复用同一集群观察轮次，保留当前累计实体而不反解析HTTP文档。
+/// 业务作用：为路由、服务与工作区读取复用同一集群观察轮次，保留原生实体而不反解析HTTP文档。
 ///
 /// 参数说明：
 /// - `state`：当前已认证管理状态。
 /// - `snapshot`：调用方判权冻结的同代配置。
 ///
-/// 返回：同代且未过期的共享路由事实；未建立时唤醒原协调器并返回明确采样状态。
-pub(super) fn route_sample(
+/// 返回：同代且未过期的共享对象事实；未建立时唤醒原协调器并返回明确采样状态。
+pub(super) fn object_sample(
     state: &AdminState,
     snapshot: &Arc<crate::config::GatewaySnapshot>,
 ) -> Result<routes::Publication, &'static str> {

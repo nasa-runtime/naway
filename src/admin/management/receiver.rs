@@ -643,6 +643,7 @@ impl protocol::node_management_server::NodeManagement for Service {
             action,
             release,
             metrics_interest_ms,
+            service_metrics_supported: true,
         }))
     }
 

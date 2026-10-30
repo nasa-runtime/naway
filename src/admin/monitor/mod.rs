@@ -9,6 +9,7 @@ mod process;
 mod publication;
 mod response_codec;
 pub(in crate::admin) mod routes;
+pub(in crate::admin) mod services;
 
 use publication::Publication;
 mod source;
@@ -35,7 +36,7 @@ pub(super) struct Runtime {
     latest: ArcSwapOption<Publication>,
     task: OnceLock<AbortOnDropHandle<()>>,
     cluster: cluster::Runtime,
-    route_readers: tokio::sync::Semaphore,
+    object_readers: tokio::sync::Semaphore,
 }
 
 impl Runtime {
@@ -70,7 +71,7 @@ impl Runtime {
             latest: ArcSwapOption::empty(),
             task: OnceLock::new(),
             cluster: cluster::Runtime::new(),
-            route_readers: tokio::sync::Semaphore::new(4),
+            object_readers: tokio::sync::Semaphore::new(4),
         }
     }
 

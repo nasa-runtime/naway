@@ -16,7 +16,7 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
         return None;
     }
     let (mime, content): (&str, &[u8]) = match path {
-        "/monitor" | "/cluster" | "/catalog" | "/operations" | "/traffic" => (
+        "/monitor" | "/cluster" | "/catalog" | "/operations" | "/traffic" | "/services" => (
             "text/html; charset=utf-8",
             include_bytes!("assets/index.html"),
         ),
@@ -43,6 +43,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
         "/ui/views/routes.js" => (
             "application/javascript; charset=utf-8",
             include_bytes!("assets/views/routes.js"),
+        ),
+        "/ui/views/services.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/services.js"),
         ),
         "/ui/views/nodes.js" => (
             "application/javascript; charset=utf-8",

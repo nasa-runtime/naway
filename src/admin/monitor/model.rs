@@ -63,6 +63,9 @@ pub(in crate::admin) struct Sample {
     // HTTP原始指标读取权不包含对象目录权；路由身份仅通过明确授权的管理gRPC及独立读面交付。
     #[serde(skip)]
     pub route_traffic: Option<crate::observability::http_stream::routes::Snapshot>,
+    // 服务身份同样需要同代对象目录与工作区授权，不能从原始指标接口旁路读取。
+    #[serde(skip)]
+    pub service_state: Option<crate::upstream::observation::Snapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +152,10 @@ pub(in crate::admin) fn validate(sample: &mut Sample) -> bool {
             .route_traffic
             .as_ref()
             .is_some_and(|routes| !routes.valid())
+        || sample
+            .service_state
+            .as_ref()
+            .is_some_and(|services| !services.valid())
         || !sample
             .latency
             .bounds_ms
@@ -420,5 +427,9 @@ pub(in crate::admin) fn retained_bytes(sample: &Sample) -> usize {
         .route_traffic
         .as_ref()
         .map_or(0, |routes| routes.retained_bytes());
+    bytes += sample
+        .service_state
+        .as_ref()
+        .map_or(0, |services| services.retained_bytes());
     bytes
 }
