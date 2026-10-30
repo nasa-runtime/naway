@@ -183,7 +183,7 @@ pub(super) fn default_circuit_fallback_body() -> String {
 pub struct GuardRuleCfg {
     /// 规则唯一 id，用于诊断和管理面展示。
     pub id: String,
-    /// 是否编译该规则。
+    /// 是否参与接口匹配；禁用规则仍须通过完整校验并占用唯一身份。
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// path 与 method 匹配条件。

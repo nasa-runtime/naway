@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub(in crate::admin) enum DocumentKind {
     Gateway,
     Sentinel,
+    InterfaceGuard,
 }
 
 /// 业务作用：让归档、完整候选和比较共用一个真实工作许可，避免异步等待混合基线或取消后遗留正文。
@@ -42,6 +43,7 @@ pub(in crate::admin) async fn inspect_archived<T: Send + 'static>(
             match kind {
                 DocumentKind::Gateway => docs.gateway = text,
                 DocumentKind::Sentinel => docs.sentinel_rules = text,
+                DocumentKind::InterfaceGuard => docs.interface_guard = text,
             }
             Workspace::validate(&docs).map_err(|error| BuildError::Invalid(error.to_string()))?;
             let mut workspace =

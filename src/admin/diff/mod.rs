@@ -1,22 +1,24 @@
 //! 配置差异绑定单一活动基线，并在有界构建结束后复验当前身份。
 
 mod listener;
+mod model;
 mod route;
 mod sentinel;
 mod snapshot;
 
 use super::{
-    authenticate_admin_request, candidate, collect_bounded_admin_body, config_etag, json, plain,
-    reject_untrusted_admin_browser_origin, request_content_type, AdminAction, AdminRequest,
+    authenticate_admin_request, candidate, collect_bounded_admin_body, config_etag, full_body,
+    plain, reject_untrusted_admin_browser_origin, request_content_type, AdminAction, AdminRequest,
     AdminResource, AdminState, BoxBody,
 };
 use hyper::{header, Response, StatusCode};
+use model::{Domain, LocalResponse};
 use std::sync::Arc;
 
 /// 业务作用：在同一不可变基线与当前授权下比较完整候选，不把单节点构建声明为集群已发布事实。
 ///
 /// 参数说明：
-/// - `req`：选择 all、routes、sentinel、upstreams 或 listeners 的 YAML 候选，可携带精确整体 If-Match。
+/// - `req`：选择主配置或独立规则领域的 YAML 候选，可携带精确整体 If-Match。
 /// - `state`：提供当前快照、归档、统一候选预算和身份规则。
 ///
 /// 返回：合法且同基线时返回低敏差异和 ETag；失权、换代、过载或候选非法均无发布副作用。
@@ -24,19 +26,21 @@ pub(super) async fn semantic_config_diff(
     req: AdminRequest,
     state: Arc<AdminState>,
 ) -> Response<BoxBody> {
-    let kind = req
+    let kind = match req
         .uri()
         .path()
         .strip_prefix("/api/config/")
         .and_then(|path| path.strip_suffix("/diff"))
         .unwrap_or_default()
-        .to_owned();
-    if !matches!(
-        kind.as_str(),
-        "all" | "routes" | "sentinel" | "upstreams" | "listeners"
-    ) {
-        return plain(StatusCode::NOT_FOUND, "unsupported diff kind\n");
-    }
+    {
+        "all" => Domain::All,
+        "routes" => Domain::Routes,
+        "upstreams" => Domain::Upstreams,
+        "listeners" => Domain::Listeners,
+        "sentinel" => Domain::Sentinel,
+        "interface-guard" => Domain::InterfaceGuard,
+        _ => return plain(StatusCode::NOT_FOUND, "unsupported diff kind\n"),
+    };
     let (parts, body) = req.into_parts();
     let active = state.snap.load_full();
     let identity = match authenticate_admin_request(&parts, &state) {
@@ -90,10 +94,12 @@ pub(super) async fn semantic_config_diff(
     if !Arc::ptr_eq(&active, &state.snap.load_full()) {
         return plain(StatusCode::CONFLICT, "configuration baseline changed\n");
     }
-    let document = if kind == "sentinel" {
-        candidate::DocumentKind::Sentinel
-    } else {
-        candidate::DocumentKind::Gateway
+    let document = match kind {
+        Domain::Sentinel => candidate::DocumentKind::Sentinel,
+        Domain::InterfaceGuard => candidate::DocumentKind::InterfaceGuard,
+        Domain::All | Domain::Routes | Domain::Upstreams | Domain::Listeners => {
+            candidate::DocumentKind::Gateway
+        }
     };
     let diff =
         candidate::inspect_archived(&state, active.clone(), document, body, snapshot::compare)
@@ -111,27 +117,23 @@ pub(super) async fn semantic_config_diff(
     if !Arc::ptr_eq(&active, &state.snap.load_full()) {
         return plain(StatusCode::CONFLICT, "configuration baseline changed\n");
     }
-    let mut diff = match diff {
+    let diff = match diff {
         Ok(diff) => diff,
         Err(error) => {
             return error.policy_response("candidate is not valid for configuration comparison\n")
         }
     };
-    if kind != "all" {
-        diff.as_object_mut()
-            .expect("fixed comparison shape")
-            .retain(|key, _| {
-                matches!(key.as_str(), "current_version" | "candidate_version") || key == &kind
-            });
-    }
-    let mut response = json(
-        StatusCode::OK,
-        serde_json::json!({
-            "ok": true,
-            "scope": "local",
-            "diff": diff
-        }),
-    );
+    let body = serde_json::to_vec(&LocalResponse {
+        ok: true,
+        scope: "local",
+        diff: diff.view(kind),
+    })
+    .expect("fixed comparison response serializes");
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(body.into()))
+        .expect("build configuration comparison response");
     response.headers_mut().insert(
         header::ETAG,
         header::HeaderValue::from_str(&etag).expect("fixed fingerprint ETag"),

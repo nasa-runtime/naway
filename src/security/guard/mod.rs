@@ -3,6 +3,8 @@
 //! 独立 `interface-guard.yml` 配「某接口对外禁止服务」,网关在管线**最前**一步命中即**直接返回配置的 response**,
 //! 不进路由/鉴权/上游。规则 = match(path glob + methods)→ response(status + headers + body)。
 
+mod semantic;
+
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,7 +27,7 @@ use crate::runtime::state::{DynamicStore, SwappableDynamicStore};
 use crate::{full_body, BoxBody};
 
 /// 编译后的直接响应模板。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RespTemplate {
     status: StatusCode,
     headers: HeaderMap,
@@ -117,14 +119,25 @@ impl InterfaceGuard {
         }
     }
 
-    /// 业务作用：校验并预编译完整守卫文档；任一规则非法即拒绝整个候选快照。
+    /// 业务作用：校验并预编译完整守卫文档，唯一规则身份和实际匹配顺序同时用于执行与差异审阅。
+    ///
+    /// 参数说明：
+    /// - `gf`：经过 NAML 合并的完整守卫声明，禁用规则也必须具有唯一身份。
+    ///
+    /// 返回：全部规则合法的不可变守卫；空或重复身份、非法路径、方法或响应拒绝整个候选。
     pub fn build(gf: GuardFile) -> Result<Self> {
         let default_resp = match &gf.default_response {
             Some(c) => RespTemplate::compile(c)?,
             None => RespTemplate::service_unavailable(),
         };
         let mut rules = Vec::with_capacity(gf.rules.len());
+        let mut identities = std::collections::HashSet::with_capacity(gf.rules.len());
         for r in &gf.rules {
+            // 禁用状态不能释放身份，否则后续启用或差异审阅会把两个规则误认为同一个对象。
+            anyhow::ensure!(
+                !r.id.trim().is_empty() && identities.insert(r.id.as_str()),
+                "interface guard rule identity must be nonempty and unique"
+            );
             // 按声明的匹配类型编译;Glob 才做 glob 解析,Exact/Prefix 直接持有 pattern 串。
             let path = match r.matcher.match_type {
                 GuardMatchType::Exact => GuardPathMatcher::Exact(r.matcher.path.clone()),
@@ -137,13 +150,16 @@ impl InterfaceGuard {
                         .compile_matcher(),
                 ),
             };
-            let methods = r
+            let mut methods = r
                 .matcher
                 .methods
                 .iter()
                 .map(|m| Method::from_str(m.trim()))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .with_context(|| format!("rule `{}` invalid method", r.id))?;
+            // 方法采用 OR 匹配，顺序和重复项不影响准入；构建时归一，避免比较时复制集合。
+            methods.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+            methods.dedup();
             let response = match &r.response {
                 Some(c) => RespTemplate::compile(c)?,
                 None => default_resp.clone(),

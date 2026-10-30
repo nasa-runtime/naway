@@ -1,8 +1,8 @@
 # 配置候选差异
 
 `POST /api/config/{kind}/diff` 使用 `Content-Type: application/yaml`，要求平台配置的
-`dry-run` 权限。`kind` 可选 `all`、`routes`、`sentinel`、`upstreams`、`listeners`；
-`sentinel` 接收规则文档，其余类型接收完整主配置文档。候选通过与发布相同的完整构建器，
+`dry-run` 权限。`kind` 可选 `all`、`routes`、`sentinel`、`interface-guard`、`upstreams`、`listeners`；
+`sentinel` 与 `interface-guard` 分别接收对应规则文档，其余类型接收完整主配置文档。候选通过与发布相同的完整构建器，
 差异请求不改写活动文件，也不发布配置。
 
 每次比较冻结当前管理节点的一个活动快照，从该版本归档取回其它文档。可将配置读取响应的整体
@@ -13,6 +13,16 @@ ETag 放入 `If-Match`，只接受唯一且精确匹配的值；不匹配返回 
 响应中的 `scope: local` 表示本次比较来自该管理节点的活动基线，不能据此推断其它节点已经校验
 或发布。集群变更仍须使用[持久管理提案与执行](admin-operations.md)，由冻结的各原目标执行预检、
 应用、必要补偿和效果确认；独立 Admin 与 Data 的文件可以不同。
+
+差异计算保留原生对象身份列表，HTTP 响应直接借用所选领域并编码一次；不会先构造完整 JSON
+再复制、删除其它领域。单领域响应只包含 `current_version`、`candidate_version` 与对应领域，
+`all` 包含五个领域，每个领域均具有 `added`、`removed`、`changed` 三个有序数组。
+
+接口守卫差异位于 `interface_guard`，按原规则 id 返回增删改。比较实际编译后的匹配类型、路径、
+方法集合、启用状态、继承后的响应状态、头和正文，以及启用规则的首命中顺序。方法顺序、重复项
+和禁用规则的排列不影响执行；未被任何规则引用的默认响应不形成差异。空或重复 id 拒绝构建，
+禁用规则也必须具有唯一身份。响应只含 id，不输出匹配条件或短路响应内容；动态禁用缓存不属于
+静态候选差异。`all` 也比较主配置或 profile 选择最终产生的实际守卫。
 
 Sentinel 差异按 `flow/id` 和 `degrade/id` 返回 `added`、`removed`、`changed`，只包含业务标识。
 比较使用活动与候选快照各自实际加载的 NAML profile、环境覆盖结果，覆盖全部类型化字段和同一路由
