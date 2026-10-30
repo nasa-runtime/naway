@@ -155,6 +155,7 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
             if !catalog.contains(&object) {
                 return Err(Error::Missing);
             }
+            object.protect_identity(fields.keys().chain(remove.iter()).map(String::as_str))?;
             patch(objects::find_mut(&mut document, &object)?, fields, remove)?
         }
         Action::PatchNested {
@@ -164,6 +165,11 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
             if !catalog.contains(&object) {
                 return Err(Error::Missing);
             }
+            object.protect_identity(
+                edits
+                    .iter()
+                    .filter_map(|edit| edit.path().first().map(String::as_str)),
+            )?;
             nested::patch(objects::find_mut(&mut document, &object)?, edits)?
         }
         Action::PatchSequence {
@@ -174,6 +180,7 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
             if !catalog.contains(&object) {
                 return Err(Error::Missing);
             }
+            object.protect_identity(path.first().map(String::as_str).into_iter())?;
             sequence::patch(objects::find_mut(&mut document, &object)?, &path, edit)?
         }
         Action::Create {

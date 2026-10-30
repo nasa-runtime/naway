@@ -16,7 +16,10 @@ export function draftFieldPanel(kind, values, capacity) {
   const rows = new Map();
   const known = draftFields(kind);
   const remaining = Object.keys(values).filter(
-    (key) => key !== "id" && !known.some(([name]) => name === key),
+    (key) =>
+      key !== "id" &&
+      !(key === "name" && ["credential", "secret_provider"].includes(kind)) &&
+      !known.some(([name]) => name === key),
   );
   if (known.length + remaining.length > 128) {
     throw new Error("此对象字段过多，请在原始 YAML 中编辑。");
@@ -61,6 +64,7 @@ export function draftFieldPanel(kind, values, capacity) {
     if (
       !name ||
       name === "id" ||
+      (name === "name" && ["credential", "secret_provider"].includes(kind)) ||
       rows.has(name) ||
       /[\x00-\x1f\x7f]/.test(name) ||
       new TextEncoder().encode(name).length > 128 ||

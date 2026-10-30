@@ -20,6 +20,12 @@ pub(super) enum Object {
     Service {
         name: String,
     },
+    Credential {
+        name: String,
+    },
+    SecretProvider {
+        name: String,
+    },
     Stream {
         id: String,
     },
@@ -55,6 +61,12 @@ impl Object {
             } => (Domain::Gateway, id, None),
             Self::Service {
                 name,
+            }
+            | Self::Credential {
+                name,
+            }
+            | Self::SecretProvider {
+                name,
             } => (Domain::Gateway, name, None),
             Self::Flow {
                 id,
@@ -72,7 +84,7 @@ impl Object {
         Ok(())
     }
 
-    /// 业务作用：取得集合内的稳定键，服务使用 mapping key，其它对象使用显式 id。
+    /// 业务作用：取得集合内的稳定键，服务使用 mapping key，具名材料使用 name，其它对象使用 id。
     ///
     /// 参数说明: 无。
     ///
@@ -100,8 +112,52 @@ impl Object {
             } => id,
             Self::Service {
                 name,
+            }
+            | Self::Credential {
+                name,
+            }
+            | Self::SecretProvider {
+                name,
             } => name,
         }
+    }
+
+    /// 业务作用：区分数组对象的稳定身份字段与服务 mapping key，编辑不能隐式改名。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：数组对象使用 id 或 name；服务身份由父 mapping 持有。
+    fn identity_field(&self) -> Option<&'static str> {
+        match self {
+            Self::Service {
+                ..
+            } => None,
+            Self::Credential {
+                ..
+            }
+            | Self::SecretProvider {
+                ..
+            } => Some("name"),
+            _ => Some("id"),
+        }
+    }
+
+    /// 业务作用：在原文修改前拒绝对稳定身份的字段动作，不能通过嵌套或列表操作绕过选择器。
+    ///
+    /// 参数说明：
+    /// - `fields`：普通字段或精确路径的第一段，仅借用调用者声明。
+    ///
+    /// 返回：全部字段均不改变对象身份时成功；身份只能在显式新建对象时由选择器提供。
+    pub(super) fn protect_identity<'a>(
+        &self,
+        fields: impl Iterator<Item = &'a str>,
+    ) -> Result<(), Error> {
+        for field in fields {
+            if Some(field) == self.identity_field() {
+                return Err(Error::Invalid);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -186,6 +242,16 @@ pub(super) fn catalog(document: &Value, domain: Domain) -> Result<BTreeSet<Objec
                     })?;
                 }
             }
+            for value in array(document.get("upstream_credentials"))? {
+                insert(Object::Credential {
+                    name: object_name(value)?.into(),
+                })?;
+            }
+            for value in array(document.get("secret_providers"))? {
+                insert(Object::SecretProvider {
+                    name: object_name(value)?.into(),
+                })?;
+            }
         }
         Domain::Sentinel => {
             for rule in array(document.get("flow"))? {
@@ -238,6 +304,21 @@ fn object_id(value: &Value) -> Result<&str, Error> {
         .ok_or(Error::Invalid)
 }
 
+/// 业务作用：只接受显式具名凭据或秘密源，禁止从位置、端点或秘密内容推导管理身份。
+///
+/// 参数说明：
+/// - `value`：具名集合中的一个原始对象。
+///
+/// 返回：合法 name 的借用；字段缺失、类型错误或名称超限拒绝目录。
+fn object_name(value: &Value) -> Result<&str, Error> {
+    value
+        .as_object()
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| valid_name(name))
+        .ok_or(Error::Invalid)
+}
+
 /// 业务作用：取得已验证唯一身份的原对象，服务键和代理路由身份分别定位。
 ///
 /// 参数说明：
@@ -259,7 +340,12 @@ pub(super) fn find_mut<'a>(
     }
     collection_mut(document, object, false)?
         .iter_mut()
-        .find(|value| value.get("id").and_then(Value::as_str) == Some(object.id()))
+        .find(|value| {
+            value
+                .get(object.identity_field().expect("array identity"))
+                .and_then(Value::as_str)
+                == Some(object.id())
+        })
         .ok_or(Error::Missing)
 }
 
@@ -345,6 +431,12 @@ fn collection_mut<'a>(
         Object::Proxy {
             ..
         } => (document, "proxies"),
+        Object::Credential {
+            ..
+        } => (document, "upstream_credentials"),
+        Object::SecretProvider {
+            ..
+        } => (document, "secret_providers"),
         Object::Stream {
             ..
         } => (
@@ -378,7 +470,7 @@ fn collection_mut<'a>(
 /// 参数说明：
 /// - `document`：已证明目标不存在的原文树。
 /// - `object`：合法且属于当前领域的新身份。
-/// - `fields`：不含 id 的业务声明，所有值直接移入。
+/// - `fields`：不含稳定身份字段的业务声明，所有值直接移入。
 ///
 /// 返回：新增成功；已有目标、父对象缺失或集合形态错误拒绝。
 pub(super) fn create(
@@ -386,6 +478,7 @@ pub(super) fn create(
     object: &Object,
     mut fields: Map<String, Value>,
 ) -> Result<(), Error> {
+    object.protect_identity(fields.keys().map(String::as_str))?;
     if let Object::Service {
         name,
     } = object
@@ -396,7 +489,10 @@ pub(super) fn create(
         }
         services.insert(name.clone(), Value::Object(fields));
     } else {
-        fields.insert("id".into(), Value::String(object.id().into()));
+        fields.insert(
+            object.identity_field().expect("array identity").into(),
+            Value::String(object.id().into()),
+        );
         collection_mut(document, object, true)?.push(Value::Object(fields));
     }
     Ok(())
@@ -421,7 +517,12 @@ pub(super) fn delete(document: &mut Value, object: &Object) -> Result<(), Error>
         let collection = collection_mut(document, object, false)?;
         let index = collection
             .iter()
-            .position(|value| value.get("id").and_then(Value::as_str) == Some(object.id()))
+            .position(|value| {
+                value
+                    .get(object.identity_field().expect("array identity"))
+                    .and_then(Value::as_str)
+                    == Some(object.id())
+            })
             .ok_or(Error::Missing)?;
         collection.remove(index);
     }

@@ -1,4 +1,35 @@
 const definitions = {
+  credential: [
+    ["kind", "凭据类型", "string"],
+    ["value", "凭据值的 SecretSource 引用", "string"],
+    ["username", "Basic 用户名", "string"],
+    ["target", "注入的 header 或 query 名称", "string"],
+    ["overwrite", "允许覆盖路由生成的同名值", "boolean"],
+    ["allowed_backends", "允许接收凭据的后端（每行一项）", "lines"],
+    ["client_certificate", "客户端证书 SecretSource 引用", "string"],
+    ["client_private_key", "客户端私钥 SecretSource 引用", "string"],
+  ],
+
+  secret_provider: [
+    ["endpoint", "固定 HTTPS API 前缀", "string"],
+    ["authorization", "认证值 SecretSource 引用", "string"],
+    ["authorization_header", "认证 header 名称", "string"],
+    ["authorization_prefix", "认证值前缀", "string"],
+    ["ca_certificate", "信任根 SecretSource 引用", "string"],
+    ["client_certificate", "客户端证书 SecretSource 引用", "string"],
+    ["client_private_key", "客户端私钥 SecretSource 引用", "string"],
+    ["value_pointer", "秘密值 JSON Pointer", "string"],
+    ["version_pointer", "版本 JSON Pointer", "string"],
+    ["lease_seconds_pointer", "租约秒数 JSON Pointer", "string"],
+    ["refresh_interval_ms", "刷新周期（毫秒）", "number"],
+    ["max_stale_ms", "最大陈旧期（毫秒）", "number"],
+    ["connect_timeout_ms", "建连期限（毫秒）", "number"],
+    ["request_timeout_ms", "请求期限（毫秒）", "number"],
+    ["max_response_bytes", "响应字节上限", "number"],
+    ["retry_base_ms", "首次退避（毫秒）", "number"],
+    ["retry_max_ms", "退避上限（毫秒）", "number"],
+  ],
+
   instance: [
     ["uri", "实例 URI", "string"],
     ["weight", "调度权重", "number"],
@@ -90,6 +121,8 @@ export const objectKinds = {
     ["proxy", "HTTP 入口"],
     ["route", "HTTP 路由"],
     ["service", "上游服务"],
+    ["credential", "上游凭据"],
+    ["secret_provider", "远程秘密源"],
     ["stream", "流协议监听"],
   ],
 
@@ -109,6 +142,16 @@ export const objectKinds = {
  */
 export function draftFields(kind) {
   return definitions[kind] ?? [];
+}
+
+/**
+ * 业务作用：识别以独立 name 选择的具名对象，创建和字段面板共同遵循稳定身份合同。
+ * 参数说明：
+ * - `kind`：服务端支持的对象类别。
+ * 返回：服务、上游凭据与远程秘密源为 true；其它对象使用 id。
+ */
+export function namedObject(kind) {
+  return ["service", "credential", "secret_provider"].includes(kind);
 }
 
 /**

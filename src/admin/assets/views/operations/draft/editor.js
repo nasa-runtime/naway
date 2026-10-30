@@ -1,6 +1,6 @@
 import { element } from "../../../core/dom.js";
 import { draftFieldPanel } from "./fields.js";
-import { objectKinds, objectLabel } from "./schema.js";
+import { objectKinds, objectLabel, namedObject } from "./schema.js";
 import { fieldAction } from "./nested.js";
 import { sequenceEditor } from "./sequence.js";
 
@@ -246,26 +246,25 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
       ) {
         throw new Error("请填写对象身份；新增路由还需完整的所属入口身份。");
       }
-      const object =
-        kind.value === "service"
+      const object = namedObject(kind.value)
+        ? {
+            kind: kind.value,
+
+            name: name.value,
+          }
+        : kind.value === "route"
           ? {
               kind: kind.value,
 
-              name: name.value,
+              proxy: parent.value,
+
+              id: name.value,
             }
-          : kind.value === "route"
-            ? {
-                kind: kind.value,
+          : {
+              kind: kind.value,
 
-                proxy: parent.value,
-
-                id: name.value,
-              }
-            : {
-                kind: kind.value,
-
-                id: name.value,
-              };
+              id: name.value,
+            };
       show(object, {}, true);
     } catch (error) {
       notice.textContent = error.message;
