@@ -3,10 +3,13 @@
 //! 外部 protobuf 只存在于控制面；SotW/Delta 资源通过全量校验后转换成 native endpoint、
 //! cluster 与 route 计划，再走唯一发布链。数据面、路由和 LB 不直接依赖 Envoy API 类型。
 
+mod status;
+pub use status::{XdsConnectionState, XdsStatus, XdsStatusSnapshot};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -50,686 +53,6 @@ const ADS_DELTA_PATH: &str =
 const MAX_SECRET_BYTES: usize = 1024 * 1024;
 const INVALID_ARGUMENT_CODE: i32 = 3;
 const RESOURCE_EXHAUSTED_CODE: i32 = 8;
-
-/// xDS task 对 readiness/admin 暴露的低基数状态。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum XdsConnectionState {
-    /// 尚未连通或首次同步失败。
-    Disconnected = 0,
-    /// ADS stream 已建立，等待第一份可接受 EDS。
-    Syncing = 1,
-    /// 最近 response 已完整应用并 ACK。
-    Active = 2,
-    /// 已有 LKG，但 stream 断开或最新 response 被 NACK。
-    Degraded = 3,
-}
-
-impl XdsConnectionState {
-    /// 业务作用：把原子状态值恢复成封闭枚举，避免损坏值影响 readiness 判断。
-    ///
-    /// 参数说明：
-    /// - `raw`：是进程内 `AtomicU8` 当前值。
-    ///
-    /// 返回：已知值对应状态；未知值保守解释为 `Disconnected`。
-    fn from_u8(raw: u8) -> Self {
-        match raw {
-            1 => Self::Syncing,
-            2 => Self::Active,
-            3 => Self::Degraded,
-            _ => Self::Disconnected,
-        }
-    }
-}
-
-/// xDS 运行时可观测快照；字符串在 admin 低频读取时才 clone。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct XdsStatusSnapshot {
-    /// 当前连接/同步状态。
-    pub state: XdsConnectionState,
-    /// 是否至少成功应用过一份 EDS。
-    pub ready: bool,
-    /// 当前 ADS HTTP/2 stream 是否仍连接。
-    pub stream_up: bool,
-    /// 当前数据面 LKG 对应的 opaque version。
-    pub accepted_version: String,
-    /// 各受支持 type 已 ACK 的独立 opaque version，键固定为 eds/cds/rds。
-    pub accepted_versions: BTreeMap<String, String>,
-    /// 最近 response nonce。
-    pub last_nonce: String,
-    /// 各受支持 type 最近 ACK/NACK nonce，键固定为 eds/cds/rds。
-    pub last_nonces: BTreeMap<String, String>,
-    /// 最近失败摘要，不含证书或资源原文。
-    pub last_error: Option<String>,
-    /// 当前 accepted 候选尚未闭合的低敏资源名，active 时为空。
-    pub warming_dependencies: BTreeSet<String>,
-    /// 当前已发布 native xDS 内容 SHA-256；不含秘密，也不作为认证凭据。
-    pub applied_fingerprint: Option<String>,
-    /// 已发送 ACK 数。
-    pub ack_total: u64,
-    /// 已发送 NACK 数。
-    pub nack_total: u64,
-    /// ADS 重连次数。
-    pub reconnect_total: u64,
-    /// 内容未变化、仅 ACK 新 version/nonce 的 response 数。
-    pub duplicate_total: u64,
-    /// 最近收到任意 response 的 Unix 秒时间戳。
-    pub last_received_timestamp: u64,
-    /// 最近成功发布 EDS 的 Unix 秒时间戳。
-    pub last_applied_timestamp: u64,
-    /// 当前 active xDS resource 总数。
-    pub active_resources: u64,
-    /// 当前 active 资源按固定 eds/cds/rds type 的数量。
-    pub active_resources_by_type: BTreeMap<String, u64>,
-    /// 当前 translate/apply 队列深度；SotW 串行实现只能为 0 或 1。
-    pub apply_queue_depth: u64,
-    /// 因校验或预算拒绝的 response 编码字节累计值。
-    pub rejected_bytes_total: u64,
-    /// 依赖闭包在无新 response 时达到 warming deadline 的周期数。
-    pub warming_timeout_total: u64,
-    /// 因 Delta Resource.ttl 到期而撤销的资源数。
-    pub ttl_expired_total: u64,
-}
-
-#[derive(Default)]
-struct XdsStatusDetail {
-    accepted_version: String,
-    last_nonce: String,
-    last_error: Option<String>,
-    accepted_fingerprint: Option<[u8; 32]>,
-    accepted_versions: BTreeMap<String, String>,
-    last_nonces: BTreeMap<String, String>,
-    active_resources_by_type: BTreeMap<String, u64>,
-    warming_dependencies: BTreeSet<String>,
-    applied_fingerprint: Option<String>,
-}
-
-/// ADS task 与 readiness/admin 之间的常驻状态句柄。
-pub struct XdsStatus {
-    state: AtomicU8,
-    ready: AtomicBool,
-    stream_up: AtomicBool,
-    ack_total: AtomicU64,
-    nack_total: AtomicU64,
-    reconnect_total: AtomicU64,
-    duplicate_total: AtomicU64,
-    last_received_timestamp: AtomicU64,
-    last_applied_timestamp: AtomicU64,
-    active_resources: AtomicU64,
-    apply_queue_depth: AtomicU64,
-    rejected_bytes_total: AtomicU64,
-    warming_timeout_total: AtomicU64,
-    ttl_expired_total: AtomicU64,
-    detail: RwLock<XdsStatusDetail>,
-}
-
-impl Default for XdsStatus {
-    /// 业务作用：创建尚未取得任何 xDS 权威版本的 fail-closed 状态。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：`Disconnected` 且 `ready=false` 的状态句柄。
-    fn default() -> Self {
-        Self {
-            state: AtomicU8::new(XdsConnectionState::Disconnected as u8),
-            ready: AtomicBool::new(false),
-            stream_up: AtomicBool::new(false),
-            ack_total: AtomicU64::new(0),
-            nack_total: AtomicU64::new(0),
-            reconnect_total: AtomicU64::new(0),
-            duplicate_total: AtomicU64::new(0),
-            last_received_timestamp: AtomicU64::new(0),
-            last_applied_timestamp: AtomicU64::new(0),
-            active_resources: AtomicU64::new(0),
-            apply_queue_depth: AtomicU64::new(0),
-            rejected_bytes_total: AtomicU64::new(0),
-            warming_timeout_total: AtomicU64::new(0),
-            ttl_expired_total: AtomicU64::new(0),
-            detail: RwLock::new(XdsStatusDetail::default()),
-        }
-    }
-}
-
-impl XdsStatus {
-    /// 业务作用：撤销上一 ADS 代的 readiness 与详情权威，防止新身份复用旧 ACK。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：无返回值；累计计数保留，本代的 version/nonce/resource 从空状态重新取证。
-    fn begin_generation(&self) {
-        self.ready.store(false, Ordering::Release);
-        self.stream_up.store(false, Ordering::Release);
-        self.active_resources.store(0, Ordering::Release);
-        self.apply_queue_depth.store(0, Ordering::Release);
-        *self.detail.write().expect("xDS status lock poisoned") = XdsStatusDetail::default();
-        self.state
-            .store(XdsConnectionState::Disconnected as u8, Ordering::Release);
-    }
-
-    /// 业务作用：判断 require_xds 启动门是否已由一份完整 ACK 的 EDS 打开。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：至少成功应用过一次返回 true；断线后的 LKG 仍保持 true。
-    pub fn ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
-    }
-
-    /// 业务作用：提供一致的 admin/metrics 低频快照，不暴露 protobuf 或秘密材料。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：当前状态、LKG version/nonce、错误摘要和累计 ACK/NACK/reconnect 计数。
-    pub fn snapshot(&self) -> XdsStatusSnapshot {
-        let detail = self.detail.read().expect("xDS status lock poisoned");
-        XdsStatusSnapshot {
-            state: XdsConnectionState::from_u8(self.state.load(Ordering::Acquire)),
-            ready: self.ready(),
-            stream_up: self.stream_up.load(Ordering::Acquire),
-            accepted_version: detail.accepted_version.clone(),
-            accepted_versions: detail.accepted_versions.clone(),
-            last_nonce: detail.last_nonce.clone(),
-            last_nonces: detail.last_nonces.clone(),
-            last_error: detail.last_error.clone(),
-            warming_dependencies: detail.warming_dependencies.clone(),
-            applied_fingerprint: detail.applied_fingerprint.clone(),
-            ack_total: self.ack_total.load(Ordering::Relaxed),
-            nack_total: self.nack_total.load(Ordering::Relaxed),
-            reconnect_total: self.reconnect_total.load(Ordering::Relaxed),
-            duplicate_total: self.duplicate_total.load(Ordering::Relaxed),
-            last_received_timestamp: self.last_received_timestamp.load(Ordering::Relaxed),
-            last_applied_timestamp: self.last_applied_timestamp.load(Ordering::Relaxed),
-            active_resources: self.active_resources.load(Ordering::Relaxed),
-            active_resources_by_type: detail.active_resources_by_type.clone(),
-            apply_queue_depth: self.apply_queue_depth.load(Ordering::Relaxed),
-            rejected_bytes_total: self.rejected_bytes_total.load(Ordering::Relaxed),
-            warming_timeout_total: self.warming_timeout_total.load(Ordering::Relaxed),
-            ttl_expired_total: self.ttl_expired_total.load(Ordering::Relaxed),
-        }
-    }
-
-    /// 业务作用：记录 stream 已建立但尚未取得首份可用配置的同步态。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：无；已有 LKG 时保持 degraded 语义，不假装最新连接已经 active。
-    fn mark_syncing(&self) {
-        self.stream_up.store(true, Ordering::Release);
-        let next = if self.ready() {
-            XdsConnectionState::Degraded
-        } else {
-            XdsConnectionState::Syncing
-        };
-        self.state.store(next as u8, Ordering::Release);
-    }
-
-    /// 业务作用：在完整 EDS 已原子发布后登记 ACK 对应的 LKG 权威版本。
-    ///
-    /// 参数说明：
-    /// - `version`：来自已校验 response
-    /// - `nonce`：来自已校验 response
-    /// - `resource_count`：是 active EDS 资源数
-    /// - `fingerprint`：是已发布 native 内容摘要。
-    ///
-    /// 返回：无；先写详情再开放 readiness，读者不会看到 ready=true 的空版本。
-    fn mark_accepted(
-        &self,
-        version: &str,
-        nonce: &str,
-        resource_count: usize,
-        fingerprint: [u8; 32],
-    ) {
-        {
-            let mut detail = self.detail.write().expect("xDS status lock poisoned");
-            detail.accepted_version = version.to_owned();
-            detail.last_nonce = nonce.to_owned();
-            detail
-                .accepted_versions
-                .insert("eds".to_owned(), version.to_owned());
-            detail
-                .last_nonces
-                .insert("eds".to_owned(), nonce.to_owned());
-            detail.last_error = None;
-            detail.accepted_fingerprint = Some(fingerprint);
-            detail.warming_dependencies.clear();
-            detail.applied_fingerprint = Some(fingerprint_hex(&fingerprint));
-            detail
-                .active_resources_by_type
-                .insert("eds".to_owned(), resource_count as u64);
-        }
-        self.ack_total.fetch_add(1, Ordering::Relaxed);
-        self.active_resources
-            .store(resource_count as u64, Ordering::Relaxed);
-        self.last_applied_timestamp
-            .store(unix_timestamp_seconds(), Ordering::Relaxed);
-        self.ready.store(true, Ordering::Release);
-        self.state
-            .store(XdsConnectionState::Active as u8, Ordering::Release);
-    }
-
-    /// 业务作用：记录被拒 response，但保留先前已 ACK 的 LKG 与启动门状态。
-    ///
-    /// 参数说明：
-    /// - `nonce`：标识被拒 response
-    /// - `error`：是有界、去敏错误摘要
-    /// - `response_bytes`：用于累计受控拒绝流量。
-    ///
-    /// 返回：无；从未成功同步时保持 syncing，否则进入 degraded。
-    fn mark_rejected(&self, nonce: &str, error: &str, response_bytes: usize) {
-        {
-            let mut detail = self.detail.write().expect("xDS status lock poisoned");
-            detail.last_nonce = nonce.to_owned();
-            detail
-                .last_nonces
-                .insert("eds".to_owned(), nonce.to_owned());
-            detail.last_error = Some(truncate_error(error));
-        }
-        self.nack_total.fetch_add(1, Ordering::Relaxed);
-        self.rejected_bytes_total
-            .fetch_add(response_bytes as u64, Ordering::Relaxed);
-        let next = if self.ready() {
-            XdsConnectionState::Degraded
-        } else {
-            XdsConnectionState::Syncing
-        };
-        self.state.store(next as u8, Ordering::Release);
-    }
-
-    /// 业务作用：记录 ADS 断线并保留已接受 LKG，防止控制面瞬断清空业务端点。
-    ///
-    /// 参数说明：
-    /// - `error`：是连接或 stream 失败摘要。
-    ///
-    /// 返回：无；首份 EDS 前回到 disconnected，已有 LKG 后进入 degraded。
-    fn mark_disconnected(&self, error: &str) {
-        self.stream_up.store(false, Ordering::Release);
-        self.detail
-            .write()
-            .expect("xDS status lock poisoned")
-            .last_error = Some(truncate_error(error));
-        let next = if self.ready() {
-            XdsConnectionState::Degraded
-        } else {
-            XdsConnectionState::Disconnected
-        };
-        self.state.store(next as u8, Ordering::Release);
-    }
-
-    /// 业务作用：读取当前 LKG version，供新 stream 初始 DiscoveryRequest 恢复 SotW 会话。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：最近成功应用的 opaque version；尚无 LKG 时为空。
-    fn accepted_version(&self) -> String {
-        self.detail
-            .read()
-            .expect("xDS status lock poisoned")
-            .accepted_version
-            .clone()
-    }
-
-    /// 业务作用：判断 native EDS 内容是否与当前 active LKG 相同，避免版本心跳触发无意义 RCU 发布。
-    ///
-    /// 参数说明：
-    /// - `fingerprint`：是转换后按服务/实例规范排序的内容摘要。
-    ///
-    /// 返回：已有 active 内容且摘要一致时返回 true；首次同步返回 false。
-    fn content_unchanged(&self, fingerprint: &[u8; 32]) -> bool {
-        self.detail
-            .read()
-            .expect("xDS status lock poisoned")
-            .accepted_fingerprint
-            .as_ref()
-            == Some(fingerprint)
-    }
-
-    /// 业务作用：ACK 内容未变化的新 version/nonce，但不伪造一次新的数据面 apply 时间。
-    ///
-    /// 参数说明：
-    /// - `version`：是本轮 response
-    /// - `nonce`：是本轮 response
-    /// - `resource_count`：用于保持 active gauge。
-    ///
-    /// 返回：无；更新控制流 LKG version、ACK/duplicate 计数，保留原 applied timestamp。
-    fn mark_duplicate(&self, version: &str, nonce: &str, resource_count: usize) {
-        {
-            let mut detail = self.detail.write().expect("xDS status lock poisoned");
-            detail.accepted_version = version.to_owned();
-            detail.last_nonce = nonce.to_owned();
-            detail
-                .accepted_versions
-                .insert("eds".to_owned(), version.to_owned());
-            detail
-                .last_nonces
-                .insert("eds".to_owned(), nonce.to_owned());
-            detail.last_error = None;
-            detail.warming_dependencies.clear();
-            detail
-                .active_resources_by_type
-                .insert("eds".to_owned(), resource_count as u64);
-        }
-        self.ack_total.fetch_add(1, Ordering::Relaxed);
-        self.duplicate_total.fetch_add(1, Ordering::Relaxed);
-        self.active_resources
-            .store(resource_count as u64, Ordering::Relaxed);
-        self.ready.store(true, Ordering::Release);
-        self.state
-            .store(XdsConnectionState::Active as u8, Ordering::Release);
-    }
-
-    /// 业务作用：登记已从 gRPC stream 收到一份完整 response，供故障时判断控制面新鲜度。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：无；只更新低基数时间戳，不改变 accepted/applied 状态。
-    fn mark_received(&self) {
-        self.last_received_timestamp
-            .store(unix_timestamp_seconds(), Ordering::Relaxed);
-    }
-
-    /// 业务作用：读取指定 resource type 的 accepted version，供重连恢复独立 SotW 会话。
-    ///
-    /// 参数说明：
-    /// - `type_url`：是 EDS/CDS/RDS 规范 URL。
-    ///
-    /// 返回：该 type 最近 ACK version；尚未接受时为空。
-    fn accepted_version_for(&self, type_url: &str) -> String {
-        self.detail
-            .read()
-            .expect("xDS status lock poisoned")
-            .accepted_versions
-            .get(xds_type_label(type_url))
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// 业务作用：记录 CDS/RDS/EDS 候选已经 ACK，并按依赖闭包是否发布更新 readiness/LKG 状态。
-    ///
-    /// 参数说明：
-    /// - `type_url`：标识本轮
-    /// - `version`：标识本轮
-    /// - `nonce`：标识本轮
-    /// - `active_resources`：仅在完整闭包已发布时 携带固定 type 计数
-    /// - `applied_fingerprint`：是已发布 native 内容摘要
-    /// - `missing`：非空表示 合法候选仍在 warming，旧 active 必须继续服务。
-    ///
-    /// 返回：无；active 只在 Snapshot 已发布后开放，warming 不会伪造 applied 时间。
-    fn mark_policy_accepted(
-        &self,
-        type_url: &str,
-        version: &str,
-        nonce: &str,
-        active_resources: Option<&BTreeMap<String, u64>>,
-        applied_fingerprint: Option<&[u8; 32]>,
-        missing: Option<&BTreeSet<String>>,
-    ) {
-        {
-            let mut detail = self.detail.write().expect("xDS status lock poisoned");
-            let label = xds_type_label(type_url).to_owned();
-            detail
-                .accepted_versions
-                .insert(label.clone(), version.to_owned());
-            detail.last_nonces.insert(label, nonce.to_owned());
-            detail.accepted_version = version.to_owned();
-            detail.last_nonce = nonce.to_owned();
-            detail.warming_dependencies = missing.cloned().unwrap_or_default();
-            if let Some(fingerprint) = applied_fingerprint {
-                detail.accepted_fingerprint = Some(*fingerprint);
-                detail.applied_fingerprint = Some(fingerprint_hex(fingerprint));
-            }
-            detail.last_error = missing.map(|names| {
-                truncate_error(&format!(
-                    "xDS dependency warming: {}",
-                    names.iter().cloned().collect::<Vec<_>>().join(",")
-                ))
-            });
-        }
-        self.ack_total.fetch_add(1, Ordering::Relaxed);
-        if let Some(active_resources) = active_resources {
-            let total = active_resources.values().copied().sum::<u64>();
-            self.detail
-                .write()
-                .expect("xDS status lock poisoned")
-                .active_resources_by_type = active_resources.clone();
-            self.active_resources.store(total, Ordering::Relaxed);
-            self.last_applied_timestamp
-                .store(unix_timestamp_seconds(), Ordering::Relaxed);
-            self.ready.store(true, Ordering::Release);
-            self.state
-                .store(XdsConnectionState::Active as u8, Ordering::Release);
-        } else {
-            let state = if self.ready() {
-                XdsConnectionState::Degraded
-            } else {
-                XdsConnectionState::Syncing
-            };
-            self.state.store(state as u8, Ordering::Release);
-        }
-    }
-
-    /// 业务作用：按 resource type 记录 NACK nonce，同时保持该 type 旧 accepted version 与全局 LKG。
-    ///
-    /// 参数说明：
-    /// - `type_url`：被拒绝的 xDS 资源类型 URL。
-    /// - `nonce`：被拒绝响应的 nonce。
-    /// - `error`：候选校验或构建失败原因。
-    /// - `response_bytes`：被拒绝响应的 wire 字节数。
-    ///
-    /// 返回：无；只推进拒绝观测，不开放 readiness、不覆盖已发布 Snapshot。
-    fn mark_policy_rejected(
-        &self,
-        type_url: &str,
-        nonce: &str,
-        error: &str,
-        response_bytes: usize,
-    ) {
-        {
-            let mut detail = self.detail.write().expect("xDS status lock poisoned");
-            detail.last_nonce = nonce.to_owned();
-            detail
-                .last_nonces
-                .insert(xds_type_label(type_url).to_owned(), nonce.to_owned());
-            detail.last_error = Some(truncate_error(error));
-        }
-        self.nack_total.fetch_add(1, Ordering::Relaxed);
-        self.rejected_bytes_total
-            .fetch_add(response_bytes as u64, Ordering::Relaxed);
-        let next = if self.ready() {
-            XdsConnectionState::Degraded
-        } else {
-            XdsConnectionState::Syncing
-        };
-        self.state.store(next as u8, Ordering::Release);
-    }
-
-    /// 业务作用：记录一轮合法但依赖长期不闭合的 warming 超时，不把它伪造成资源 NACK 或清空 LKG。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：无；首次同步保持 syncing，已有 LKG 保持 ready 并进入 degraded。
-    fn mark_warming_timeout(&self) {
-        self.detail
-            .write()
-            .expect("xDS status lock poisoned")
-            .last_error =
-            Some("xDS dependency warming deadline exceeded; retaining prior LKG".to_owned());
-        self.warming_timeout_total.fetch_add(1, Ordering::Relaxed);
-        let next = if self.ready() {
-            XdsConnectionState::Degraded
-        } else {
-            XdsConnectionState::Syncing
-        };
-        self.state.store(next as u8, Ordering::Release);
-    }
-
-    /// 业务作用：记录 Delta TTL 已在无控制面 response 时真实撤销并发布，保持 accepted version/nonce 不变。
-    ///
-    /// 参数说明：
-    /// - `expired`：是本轮撤销资源数
-    /// - `resource_count`：是发布后的 EDS 数
-    /// - `fingerprint`：是发布后的 native 内容摘要。
-    ///
-    /// 返回：无；成功 publish 后保持/开放 ready；stream 在线为 active，断线期间保持 degraded。
-    fn mark_eds_ttl_applied(&self, expired: usize, resource_count: usize, fingerprint: [u8; 32]) {
-        let stream_up = self.stream_up.load(Ordering::Acquire);
-        {
-            let mut detail = self.detail.write().expect("xDS status lock poisoned");
-            if stream_up {
-                detail.last_error = None;
-            }
-            detail.accepted_fingerprint = Some(fingerprint);
-            detail.applied_fingerprint = Some(fingerprint_hex(&fingerprint));
-            detail.warming_dependencies.clear();
-            detail
-                .active_resources_by_type
-                .insert("eds".to_owned(), resource_count as u64);
-        }
-        self.ttl_expired_total
-            .fetch_add(expired as u64, Ordering::Relaxed);
-        self.active_resources
-            .store(resource_count as u64, Ordering::Relaxed);
-        self.last_applied_timestamp
-            .store(unix_timestamp_seconds(), Ordering::Relaxed);
-        self.ready.store(true, Ordering::Release);
-        let state = if stream_up {
-            XdsConnectionState::Active
-        } else {
-            XdsConnectionState::Degraded
-        };
-        self.state.store(state as u8, Ordering::Release);
-    }
-
-    /// 业务作用：记录 TTL 已撤销 accepted 候选但首次依赖仍不完整，不开放 readiness 或伪造 apply。
-    ///
-    /// 参数说明：
-    /// - `expired`：是撤销数
-    /// - `missing`：是撤销后仍未取得首次证据的资源名。
-    ///
-    /// 返回：无；保留旧 LKG（若有），状态为 syncing/degraded，并累计 TTL 撤销观测。
-    fn mark_ttl_warming(&self, expired: usize, missing: &BTreeSet<String>) {
-        {
-            let mut detail = self.detail.write().expect("xDS status lock poisoned");
-            detail.warming_dependencies = missing.clone();
-            detail.last_error = Some(truncate_error(&format!(
-                "xDS TTL expired while dependencies are warming: {}",
-                missing.iter().cloned().collect::<Vec<_>>().join(",")
-            )));
-        }
-        self.ttl_expired_total
-            .fetch_add(expired as u64, Ordering::Relaxed);
-        let next = if self.ready() {
-            XdsConnectionState::Degraded
-        } else {
-            XdsConnectionState::Syncing
-        };
-        self.state.store(next as u8, Ordering::Release);
-    }
-
-    /// 业务作用：ACK 只更新 per-resource version/TTL、native 内容未变化的 Delta response，避免无意义发布。
-    ///
-    /// 参数说明：
-    /// - `type_url`：标识本轮控制消息；system version 仅用于诊断。
-    /// - `system_version`：标识本轮控制消息；system version 仅用于诊断。
-    /// - `nonce`：标识本轮控制消息；system version 仅用于诊断。
-    ///
-    /// 返回：无；推进该 type 的 ACK/nonce 与 duplicate 计数，保留当前 active/warming 状态和错误。
-    fn mark_delta_duplicate(&self, type_url: &str, system_version: &str, nonce: &str) {
-        {
-            let mut detail = self.detail.write().expect("xDS status lock poisoned");
-            let label = xds_type_label(type_url).to_owned();
-            detail
-                .accepted_versions
-                .insert(label.clone(), system_version.to_owned());
-            detail.last_nonces.insert(label, nonce.to_owned());
-            detail.accepted_version = system_version.to_owned();
-            detail.last_nonce = nonce.to_owned();
-        }
-        self.ack_total.fetch_add(1, Ordering::Relaxed);
-        self.duplicate_total.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// 业务作用：ACK 已恢复完整依赖但 native fingerprint 等于当前 LKG 的 Delta response，解除 warming 而不重复 publish。
-    ///
-    /// 参数说明：
-    /// - `type_url`：是控制身份
-    /// - `system_version`：是控制身份
-    /// - `nonce`：是控制身份
-    /// - `resources`：是现有 active 计数
-    /// - `fingerprint`：必须等于当前已发布内容。
-    ///
-    /// 返回：无；更新 ACK/duplicate 与 cache 收敛状态，保留原 last_applied_timestamp。
-    fn mark_policy_duplicate(
-        &self,
-        type_url: &str,
-        system_version: &str,
-        nonce: &str,
-        resources: &BTreeMap<String, u64>,
-        fingerprint: [u8; 32],
-    ) {
-        {
-            let mut detail = self.detail.write().expect("xDS status lock poisoned");
-            let label = xds_type_label(type_url).to_owned();
-            detail
-                .accepted_versions
-                .insert(label.clone(), system_version.to_owned());
-            detail.last_nonces.insert(label, nonce.to_owned());
-            detail.accepted_version = system_version.to_owned();
-            detail.last_nonce = nonce.to_owned();
-            detail.last_error = None;
-            detail.warming_dependencies.clear();
-            detail.accepted_fingerprint = Some(fingerprint);
-            detail.applied_fingerprint = Some(fingerprint_hex(&fingerprint));
-            detail.active_resources_by_type = resources.clone();
-        }
-        self.ack_total.fetch_add(1, Ordering::Relaxed);
-        self.duplicate_total.fetch_add(1, Ordering::Relaxed);
-        self.active_resources
-            .store(resources.values().copied().sum(), Ordering::Relaxed);
-        self.ready.store(true, Ordering::Release);
-        self.state
-            .store(XdsConnectionState::Active as u8, Ordering::Release);
-    }
-
-    /// 业务作用：记录跨 type Delta TTL removal 已通过 single-writer 发布，不修改任何 response version/nonce。
-    ///
-    /// 参数说明：
-    /// - `expired`：是撤销资源数
-    /// - `resources`：是新 active 固定 type 计数
-    /// - `fingerprint`：是已发布 CDS/RDS/EDS 闭包摘要。
-    ///
-    /// 返回：无；更新 applied 事实、TTL 计数与 readiness；断线时保持 degraded，控制流身份不变。
-    fn mark_policy_ttl_applied(
-        &self,
-        expired: usize,
-        resources: &BTreeMap<String, u64>,
-        fingerprint: [u8; 32],
-    ) {
-        let stream_up = self.stream_up.load(Ordering::Acquire);
-        {
-            let mut detail = self.detail.write().expect("xDS status lock poisoned");
-            if stream_up {
-                detail.last_error = None;
-            }
-            detail.warming_dependencies.clear();
-            detail.accepted_fingerprint = Some(fingerprint);
-            detail.applied_fingerprint = Some(fingerprint_hex(&fingerprint));
-            detail.active_resources_by_type = resources.clone();
-        }
-        self.ttl_expired_total
-            .fetch_add(expired as u64, Ordering::Relaxed);
-        self.active_resources
-            .store(resources.values().copied().sum(), Ordering::Relaxed);
-        self.last_applied_timestamp
-            .store(unix_timestamp_seconds(), Ordering::Relaxed);
-        self.ready.store(true, Ordering::Release);
-        let state = if stream_up {
-            XdsConnectionState::Active
-        } else {
-            XdsConnectionState::Degraded
-        };
-        self.state.store(state as u8, Ordering::Release);
-    }
-}
 
 /// xDS CDS/RDS apply 所需的唯一 Snapshot writer 依赖。
 #[derive(Clone)]
@@ -793,7 +116,6 @@ impl XdsGenerationManager {
     ///
     /// 返回：无返回值；网络故障由后台退避并反映为未就绪。
     pub fn start_initial(&self, cfg: XdsCfg, specs: Vec<XdsWatchSpec>) {
-        self.status.begin_generation();
         let task = spawn_inner_with_status(
             cfg,
             specs,
@@ -838,23 +160,23 @@ impl PreparedXdsGeneration {
     ///
     /// 返回：无返回值；旧 task 先失去后续写权，新 task 才使用同一发布锁。
     pub fn commit(self) {
-        if self.cfg.is_none() {
-            // 关闭来源先撤销目录发布权，单独 abort 无法约束另一线程已进入的同步发布分支。
-            self.manager.dynamic.revoke_xds();
-        }
-        if let Some(old) = self.manager.active.lock().take() {
-            old.abort();
-        }
-        self.manager.status.begin_generation();
-        if let Some(cfg) = self.cfg {
-            let task = spawn_inner_with_status(
+        let next = if let Some(cfg) = self.cfg {
+            // 启动器先同步撤销状态和目录令牌，再调度新任务；取消旧任务只负责释放资源。
+            Some(spawn_inner_with_status(
                 cfg,
                 self.specs,
                 self.manager.dynamic.clone(),
                 Some(self.manager.snapshot_runtime.clone()),
                 self.manager.status.clone(),
-            );
-            *self.manager.active.lock() = Some(task);
+            ))
+        } else {
+            // 关闭来源先撤销状态发布权，再撤销目录；旧事件不能重新开放 readiness。
+            self.manager.status.begin_generation();
+            self.manager.dynamic.revoke_xds();
+            None
+        };
+        if let Some(old) = std::mem::replace(&mut *self.manager.active.lock(), next) {
+            old.abort();
         }
     }
 }
@@ -974,7 +296,8 @@ fn spawn_inner_with_status(
     snapshot_runtime: Option<XdsSnapshotRuntime>,
     status: Arc<XdsStatus>,
 ) -> JoinHandle<()> {
-    // 先同步领取整批写权，再启动网络任务；旧 stream 的迟到响应不能通过目录发布门。
+    // 状态先撤销旧任务权威，再领取目录批次；网络任务启动前两个发布入口都已完成换代。
+    let status = status.begin_generation();
     let publisher = dynamic.claim_xds(
         specs
             .iter()
@@ -995,7 +318,7 @@ fn spawn_inner_with_status(
 /// - `snapshot_runtime`：routes 或 clusters 由 xDS 持有时使用的快照发布权威。
 /// - `status`：管理面可观察的控制器状态。
 ///
-/// 返回：正常运行不返回；仅进程 runtime 取消 task 时结束。
+/// 返回：当前代持续重连；失去任务或目录发布权时停止，runtime 取消也会结束任务。
 async fn run_forever(
     cfg: XdsCfg,
     specs: Vec<XdsWatchSpec>,
@@ -1018,8 +341,8 @@ async fn run_forever(
         None
     };
     let mut delta_eds = DeltaResourceCache::default();
-    while publisher.is_current() {
-        let acknowledgements_before = status.ack_total.load(Ordering::Relaxed);
+    while publisher.is_current() && status.is_current() {
+        let acknowledgements_before = status.ack_total();
         let stream_result =
             if let (Some(policy), Some(runtime)) = (policy.as_mut(), snapshot_runtime.as_ref()) {
                 if cfg.transport == XdsTransportCfg::AdsDeltaV3 {
@@ -1039,7 +362,7 @@ async fn run_forever(
             } else {
                 run_stream(&cfg, &specs, publisher.clone(), status.clone()).await
             };
-        if !publisher.is_current() {
+        if !publisher.is_current() || !status.is_current() {
             // 新代已接管目录，旧连接结束不能重置当前共享连接状态或继续重连。
             return;
         }
@@ -1050,9 +373,8 @@ async fn run_forever(
                 status.mark_disconnected(&format!("{error:#}"));
             }
         }
-        status.reconnect_total.fetch_add(1, Ordering::Relaxed);
-        let accepted_this_stream =
-            status.ack_total.load(Ordering::Relaxed) > acknowledgements_before;
+        status.mark_reconnect();
+        let accepted_this_stream = status.ack_total() > acknowledgements_before;
         let sleep_backoff = if accepted_this_stream {
             initial_backoff
         } else {
@@ -1111,6 +433,10 @@ async fn wait_reconnect_delay(
     let warming_timeout =
         parse_duration(&cfg.limits.warming_timeout).unwrap_or_else(|| Duration::from_secs(60));
     loop {
+        if !status.is_current() {
+            // 失权代只结束本地退避，不再执行 timer 或向新代记录重连状态。
+            return;
+        }
         let timer_deadline = if let Some(policy) = policy.as_deref() {
             delta_policy_deadline(policy, warming_timeout)
         } else {
@@ -1713,90 +1039,113 @@ async fn run_delta_policy_stream(
     status: Arc<XdsStatus>,
 ) -> Result<()> {
     let channel = connect_channel(cfg).await?;
+    // 异步建连可能跨越配置换代，旧连接不能继续发起已退休订阅或更新当前连接事实。
+    anyhow::ensure!(
+        status.is_current(),
+        "xDS generation authority changed during connect"
+    );
     status.mark_syncing();
     let request_capacity = cfg.limits.max_apply_queue.max(1).saturating_add(6);
     let (request_tx, request_rx) = mpsc::channel(request_capacity);
     if policy.listener_owned {
-        request_tx
-            .send(delta_request(
-                LDS_TYPE_URL,
-                vec!["*".to_owned()],
-                Vec::new(),
-                policy.delta_lds.initial_versions(),
-                Some(build_node(cfg)),
-                String::new(),
-                None,
-            ))
+        status
+            .send_current(
+                &request_tx,
+                delta_request(
+                    LDS_TYPE_URL,
+                    vec!["*".to_owned()],
+                    Vec::new(),
+                    policy.delta_lds.initial_versions(),
+                    Some(build_node(cfg)),
+                    String::new(),
+                    None,
+                ),
+            )
             .await
             .context("queue initial Delta LDS request")?;
     }
-    request_tx
-        .send(delta_request(
-            CDS_TYPE_URL,
-            vec!["*".to_owned()],
-            Vec::new(),
-            policy.delta_cds.initial_versions(),
-            (!policy.listener_owned).then(|| build_node(cfg)),
-            String::new(),
-            None,
-        ))
+    status
+        .send_current(
+            &request_tx,
+            delta_request(
+                CDS_TYPE_URL,
+                vec!["*".to_owned()],
+                Vec::new(),
+                policy.delta_cds.initial_versions(),
+                (!policy.listener_owned).then(|| build_node(cfg)),
+                String::new(),
+                None,
+            ),
+        )
         .await
         .context("queue initial Delta CDS request")?;
     if !policy.route_names.is_empty() {
-        request_tx
-            .send(delta_request(
-                RDS_TYPE_URL,
-                policy.resource_names(RDS_TYPE_URL)?,
-                Vec::new(),
-                policy.delta_rds.initial_versions(),
-                None,
-                String::new(),
-                None,
-            ))
+        status
+            .send_current(
+                &request_tx,
+                delta_request(
+                    RDS_TYPE_URL,
+                    policy.resource_names(RDS_TYPE_URL)?,
+                    Vec::new(),
+                    policy.delta_rds.initial_versions(),
+                    None,
+                    String::new(),
+                    None,
+                ),
+            )
             .await
             .context("queue initial Delta RDS request")?;
     }
     if !policy.specs.is_empty() {
-        request_tx
-            .send(delta_request(
-                EDS_TYPE_URL,
-                policy.resource_names(EDS_TYPE_URL)?,
-                Vec::new(),
-                policy.delta_eds.initial_versions(),
-                None,
-                String::new(),
-                None,
-            ))
+        status
+            .send_current(
+                &request_tx,
+                delta_request(
+                    EDS_TYPE_URL,
+                    policy.resource_names(EDS_TYPE_URL)?,
+                    Vec::new(),
+                    policy.delta_eds.initial_versions(),
+                    None,
+                    String::new(),
+                    None,
+                ),
+            )
             .await
             .context("queue restored Delta EDS request")?;
     }
     if policy.secret_owned && !policy.secret_names.is_empty() {
-        request_tx
-            .send(delta_request(
-                SDS_TYPE_URL,
-                policy.resource_names(SDS_TYPE_URL)?,
-                Vec::new(),
-                policy.delta_sds.initial_versions(),
-                None,
-                String::new(),
-                None,
-            ))
+        status
+            .send_current(
+                &request_tx,
+                delta_request(
+                    SDS_TYPE_URL,
+                    policy.resource_names(SDS_TYPE_URL)?,
+                    Vec::new(),
+                    policy.delta_sds.initial_versions(),
+                    None,
+                    String::new(),
+                    None,
+                ),
+            )
             .await
             .context("queue restored Delta SDS request")?;
     }
 
     #[cfg(feature = "xds-client-extensions")]
     if !policy.extension_names.is_empty() {
-        request_tx
-            .send(delta_request(
-                ECDS_TYPE_URL,
-                policy.resource_names(ECDS_TYPE_URL)?,
-                Vec::new(),
-                policy.delta_ecds.initial_versions(),
-                None,
-                String::new(),
-                None,
-            ))
+        status
+            .send_current(
+                &request_tx,
+                delta_request(
+                    ECDS_TYPE_URL,
+                    policy.resource_names(ECDS_TYPE_URL)?,
+                    Vec::new(),
+                    policy.delta_ecds.initial_versions(),
+                    None,
+                    String::new(),
+                    None,
+                ),
+            )
             .await
             .context("queue restored Delta ECDS request")?;
     }
@@ -1819,6 +1168,8 @@ async fn run_delta_policy_stream(
         parse_duration(&cfg.limits.warming_timeout).unwrap_or_else(|| Duration::from_secs(60));
 
     loop {
+        // timer 与接收循环均只属于当前任务，退休代不继续请求或维护旧依赖闭包。
+        anyhow::ensure!(status.is_current(), "xDS generation authority changed");
         let response = if let Some(deadline) = delta_policy_deadline(policy, warming_timeout) {
             tokio::select! {
                 response = responses.message() => response.context("read Delta ADS response")?,
@@ -1831,7 +1182,7 @@ async fn run_delta_policy_stream(
                         warming_timeout,
                     ).await?;
                     for (type_url, subscribe, unsubscribe) in subscriptions {
-                        request_tx.send(delta_request(
+                        status.send_current(&request_tx, delta_request(
                             type_url,
                             subscribe,
                             unsubscribe,
@@ -1873,7 +1224,7 @@ async fn run_delta_policy_stream(
         let current_sds = policy.delta_sds.clone();
         let validation_base = runtime.snap.load_full();
         let validation_path = runtime.cfg_path.clone();
-        status.apply_queue_depth.store(1, Ordering::Release);
+        status.set_apply_queue_depth(1);
         let translated_task = tokio::task::spawn_blocking(move || {
             let now = Instant::now();
             match response.type_url.as_str() {
@@ -2003,8 +1354,13 @@ async fn run_delta_policy_stream(
             }
         })
         .await;
-        status.apply_queue_depth.store(0, Ordering::Release);
+        status.set_apply_queue_depth(0);
         let translated = translated_task.context("join Delta xDS policy translation task")?;
+        // 转换结果属于原任务；相同配置回切也不能把旧结果确认成当前代。
+        anyhow::ensure!(
+            status.is_current(),
+            "xDS generation authority changed during translation"
+        );
 
         match translated {
             Ok(translated) => {
@@ -2172,9 +1528,13 @@ async fn run_delta_policy_stream(
                                     fingerprint,
                                 );
                             } else {
-                                if let Err(error) =
-                                    apply_policy_generation(&active, &candidate.endpoints, runtime)
-                                        .await
+                                if let Err(error) = apply_policy_generation(
+                                    &active,
+                                    &candidate.endpoints,
+                                    runtime,
+                                    status.as_ref(),
+                                )
+                                .await
                                 {
                                     let message = truncate_error(&format!("{error:#}"));
                                     tracing::warn!(type_url = %response_type, nonce = %nonce, error = %message, "xDS Delta policy apply NACK");
@@ -2184,20 +1544,23 @@ async fn run_delta_policy_stream(
                                         &message,
                                         response_bytes,
                                     );
-                                    request_tx
-                                        .send(delta_request(
-                                            &response_type,
-                                            Vec::new(),
-                                            Vec::new(),
-                                            HashMap::new(),
-                                            None,
-                                            nonce.clone(),
-                                            Some(RpcStatus {
-                                                code: INVALID_ARGUMENT_CODE,
-                                                message,
-                                                details: Vec::new(),
-                                            }),
-                                        ))
+                                    status
+                                        .send_current(
+                                            &request_tx,
+                                            delta_request(
+                                                &response_type,
+                                                Vec::new(),
+                                                Vec::new(),
+                                                HashMap::new(),
+                                                None,
+                                                nonce.clone(),
+                                                Some(RpcStatus {
+                                                    code: INVALID_ARGUMENT_CODE,
+                                                    message,
+                                                    details: Vec::new(),
+                                                }),
+                                            ),
+                                        )
                                         .await
                                         .context("queue Delta xDS policy apply NACK")?;
                                     continue;
@@ -2224,6 +1587,7 @@ async fn run_delta_policy_stream(
                                     &protected,
                                     &candidate.active_endpoints,
                                     runtime,
+                                    status.as_ref(),
                                 )
                                 .await?;
                                 status.mark_policy_ttl_applied(
@@ -2252,78 +1616,93 @@ async fn run_delta_policy_stream(
                 let extension_subscription =
                     delta_subscription_diff(&old_extensions, &candidate.extension_names);
                 *policy = candidate;
-                request_tx
-                    .send(delta_request(
-                        &response_type,
-                        Vec::new(),
-                        Vec::new(),
-                        HashMap::new(),
-                        None,
-                        nonce,
-                        None,
-                    ))
+                status
+                    .send_current(
+                        &request_tx,
+                        delta_request(
+                            &response_type,
+                            Vec::new(),
+                            Vec::new(),
+                            HashMap::new(),
+                            None,
+                            nonce,
+                            None,
+                        ),
+                    )
                     .await
                     .context("queue Delta xDS policy ACK")?;
                 if let Some((subscribe, unsubscribe)) = eds_subscription {
                     if !subscribe.is_empty() || !unsubscribe.is_empty() {
-                        request_tx
-                            .send(delta_request(
-                                EDS_TYPE_URL,
-                                subscribe,
-                                unsubscribe,
-                                HashMap::new(),
-                                None,
-                                String::new(),
-                                None,
-                            ))
+                        status
+                            .send_current(
+                                &request_tx,
+                                delta_request(
+                                    EDS_TYPE_URL,
+                                    subscribe,
+                                    unsubscribe,
+                                    HashMap::new(),
+                                    None,
+                                    String::new(),
+                                    None,
+                                ),
+                            )
                             .await
                             .context("queue CDS-derived Delta EDS subscription")?;
                     }
                 }
                 if let Some((subscribe, unsubscribe)) = rds_subscription {
                     if !subscribe.is_empty() || !unsubscribe.is_empty() {
-                        request_tx
-                            .send(delta_request(
-                                RDS_TYPE_URL,
-                                subscribe,
-                                unsubscribe,
-                                HashMap::new(),
-                                None,
-                                String::new(),
-                                None,
-                            ))
+                        status
+                            .send_current(
+                                &request_tx,
+                                delta_request(
+                                    RDS_TYPE_URL,
+                                    subscribe,
+                                    unsubscribe,
+                                    HashMap::new(),
+                                    None,
+                                    String::new(),
+                                    None,
+                                ),
+                            )
                             .await
                             .context("queue LDS-derived Delta RDS subscription")?;
                     }
                 }
                 if let Some((subscribe, unsubscribe)) = sds_subscription {
                     if !subscribe.is_empty() || !unsubscribe.is_empty() {
-                        request_tx
-                            .send(delta_request(
-                                SDS_TYPE_URL,
-                                subscribe,
-                                unsubscribe,
-                                HashMap::new(),
-                                None,
-                                String::new(),
-                                None,
-                            ))
+                        status
+                            .send_current(
+                                &request_tx,
+                                delta_request(
+                                    SDS_TYPE_URL,
+                                    subscribe,
+                                    unsubscribe,
+                                    HashMap::new(),
+                                    None,
+                                    String::new(),
+                                    None,
+                                ),
+                            )
                             .await
                             .context("queue LDS-derived Delta SDS subscription")?;
                     }
                 }
                 #[cfg(feature = "xds-client-extensions")]
                 if !extension_subscription.0.is_empty() || !extension_subscription.1.is_empty() {
-                    request_tx
-                        .send(delta_request(
-                            ECDS_TYPE_URL,
-                            extension_subscription.0,
-                            extension_subscription.1,
-                            HashMap::new(),
-                            None,
-                            String::new(),
-                            None,
-                        ))
+                    status
+                        .send_current(
+                            &request_tx,
+                            delta_request(
+                                ECDS_TYPE_URL,
+                                extension_subscription.0,
+                                extension_subscription.1,
+                                HashMap::new(),
+                                None,
+                                String::new(),
+                                None,
+                            ),
+                        )
                         .await
                         .context("queue LDS-derived Delta ECDS subscription")?;
                 }
@@ -2337,24 +1716,27 @@ async fn run_delta_policy_stream(
                 let message = truncate_error(&format!("{error:#}"));
                 tracing::warn!(type_url = %response_type, nonce = %nonce, error = %message, "xDS Delta policy response NACK");
                 status.mark_policy_rejected(&response_type, &nonce, &message, response_bytes);
-                request_tx
-                    .send(delta_request(
-                        if response_type.is_empty() {
-                            EDS_TYPE_URL
-                        } else {
-                            &response_type
-                        },
-                        Vec::new(),
-                        Vec::new(),
-                        HashMap::new(),
-                        None,
-                        nonce,
-                        Some(RpcStatus {
-                            code,
-                            message,
-                            details: Vec::new(),
-                        }),
-                    ))
+                status
+                    .send_current(
+                        &request_tx,
+                        delta_request(
+                            if response_type.is_empty() {
+                                EDS_TYPE_URL
+                            } else {
+                                &response_type
+                            },
+                            Vec::new(),
+                            Vec::new(),
+                            HashMap::new(),
+                            None,
+                            nonce,
+                            Some(RpcStatus {
+                                code,
+                                message,
+                                details: Vec::new(),
+                            }),
+                        ),
+                    )
                     .await
                     .context("queue Delta xDS policy NACK")?;
             }
@@ -2489,6 +1871,11 @@ async fn apply_delta_policy_timers(
     limits: &crate::config::model::XdsLimitsCfg,
     warming_timeout: Duration,
 ) -> Result<Vec<(&'static str, Vec<String>, Vec<String>)>> {
+    // 无网络消息的 timer 也不能延长旧任务权限。
+    anyhow::ensure!(
+        status.is_current(),
+        "xDS generation authority changed before timer"
+    );
     let now = Instant::now();
     if policy
         .cache
@@ -2608,7 +1995,7 @@ async fn apply_delta_policy_timers(
     let outcome = candidate.cache.accept_endpoints(observed, now);
     match outcome {
         XdsPolicyOutcome::Active(active) => {
-            apply_policy_generation(&active, &candidate.endpoints, runtime).await?;
+            apply_policy_generation(&active, &candidate.endpoints, runtime, status).await?;
             let fingerprint = policy_fingerprint(&active, &candidate.endpoints);
             let resources = policy_resource_counts(&active, &candidate.endpoints);
             status.mark_policy_ttl_applied(expired, &resources, fingerprint);
@@ -2621,7 +2008,8 @@ async fn apply_delta_policy_timers(
         } => {
             if let Some(protected) = protection {
                 // TTL 是执行权威的绝对截止点；先撤路，再发布等待状态，不能用 LKG 续期。
-                apply_policy_generation(&protected, &candidate.active_endpoints, runtime).await?;
+                apply_policy_generation(&protected, &candidate.active_endpoints, runtime, status)
+                    .await?;
                 status.mark_policy_ttl_applied(
                     0,
                     &policy_resource_counts(&protected, &candidate.active_endpoints),
@@ -2666,83 +2054,106 @@ async fn run_policy_stream(
     status: Arc<XdsStatus>,
 ) -> Result<()> {
     let channel = connect_channel(cfg).await?;
+    // 异步建连可能跨越配置换代，旧连接不能继续发起已退休订阅或更新当前连接事实。
+    anyhow::ensure!(
+        status.is_current(),
+        "xDS generation authority changed during connect"
+    );
     status.mark_syncing();
     let request_capacity = cfg.limits.max_apply_queue.max(1).saturating_add(6);
     let (request_tx, request_rx) = mpsc::channel(request_capacity);
     if policy.listener_owned {
-        request_tx
-            .send(DiscoveryRequest {
-                version_info: status.accepted_version_for(LDS_TYPE_URL),
-                node: Some(build_node(cfg)),
-                resource_names: Vec::new(),
-                type_url: LDS_TYPE_URL.to_owned(),
-                response_nonce: String::new(),
-                error_detail: None,
-            })
+        status
+            .send_current(
+                &request_tx,
+                DiscoveryRequest {
+                    version_info: status.accepted_version_for(LDS_TYPE_URL),
+                    node: Some(build_node(cfg)),
+                    resource_names: Vec::new(),
+                    type_url: LDS_TYPE_URL.to_owned(),
+                    response_nonce: String::new(),
+                    error_detail: None,
+                },
+            )
             .await
             .context("queue initial LDS DiscoveryRequest")?;
     }
-    request_tx
-        .send(DiscoveryRequest {
-            version_info: status.accepted_version_for(CDS_TYPE_URL),
-            node: (!policy.listener_owned).then(|| build_node(cfg)),
-            resource_names: Vec::new(),
-            type_url: CDS_TYPE_URL.to_owned(),
-            response_nonce: String::new(),
-            error_detail: None,
-        })
+    status
+        .send_current(
+            &request_tx,
+            DiscoveryRequest {
+                version_info: status.accepted_version_for(CDS_TYPE_URL),
+                node: (!policy.listener_owned).then(|| build_node(cfg)),
+                resource_names: Vec::new(),
+                type_url: CDS_TYPE_URL.to_owned(),
+                response_nonce: String::new(),
+                error_detail: None,
+            },
+        )
         .await
         .context("queue initial CDS DiscoveryRequest")?;
     if !policy.route_names.is_empty() {
-        request_tx
-            .send(DiscoveryRequest {
-                version_info: status.accepted_version_for(RDS_TYPE_URL),
-                node: None,
-                resource_names: policy.resource_names(RDS_TYPE_URL)?,
-                type_url: RDS_TYPE_URL.to_owned(),
-                response_nonce: String::new(),
-                error_detail: None,
-            })
+        status
+            .send_current(
+                &request_tx,
+                DiscoveryRequest {
+                    version_info: status.accepted_version_for(RDS_TYPE_URL),
+                    node: None,
+                    resource_names: policy.resource_names(RDS_TYPE_URL)?,
+                    type_url: RDS_TYPE_URL.to_owned(),
+                    response_nonce: String::new(),
+                    error_detail: None,
+                },
+            )
             .await
             .context("queue initial RDS DiscoveryRequest")?;
     }
     if !policy.specs.is_empty() {
-        request_tx
-            .send(DiscoveryRequest {
-                version_info: status.accepted_version_for(EDS_TYPE_URL),
-                node: None,
-                resource_names: policy.resource_names(EDS_TYPE_URL)?,
-                type_url: EDS_TYPE_URL.to_owned(),
-                response_nonce: String::new(),
-                error_detail: None,
-            })
+        status
+            .send_current(
+                &request_tx,
+                DiscoveryRequest {
+                    version_info: status.accepted_version_for(EDS_TYPE_URL),
+                    node: None,
+                    resource_names: policy.resource_names(EDS_TYPE_URL)?,
+                    type_url: EDS_TYPE_URL.to_owned(),
+                    response_nonce: String::new(),
+                    error_detail: None,
+                },
+            )
             .await
             .context("queue restored EDS DiscoveryRequest")?;
     }
     if policy.secret_owned && !policy.secret_names.is_empty() {
-        request_tx
-            .send(DiscoveryRequest {
-                version_info: status.accepted_version_for(SDS_TYPE_URL),
-                node: None,
-                resource_names: policy.resource_names(SDS_TYPE_URL)?,
-                type_url: SDS_TYPE_URL.to_owned(),
-                response_nonce: String::new(),
-                error_detail: None,
-            })
+        status
+            .send_current(
+                &request_tx,
+                DiscoveryRequest {
+                    version_info: status.accepted_version_for(SDS_TYPE_URL),
+                    node: None,
+                    resource_names: policy.resource_names(SDS_TYPE_URL)?,
+                    type_url: SDS_TYPE_URL.to_owned(),
+                    response_nonce: String::new(),
+                    error_detail: None,
+                },
+            )
             .await
             .context("queue restored SDS DiscoveryRequest")?;
     }
     #[cfg(feature = "xds-client-extensions")]
     if !policy.extension_names.is_empty() {
-        request_tx
-            .send(DiscoveryRequest {
-                version_info: status.accepted_version_for(ECDS_TYPE_URL),
-                node: None,
-                resource_names: policy.resource_names(ECDS_TYPE_URL)?,
-                type_url: ECDS_TYPE_URL.to_owned(),
-                response_nonce: String::new(),
-                error_detail: None,
-            })
+        status
+            .send_current(
+                &request_tx,
+                DiscoveryRequest {
+                    version_info: status.accepted_version_for(ECDS_TYPE_URL),
+                    node: None,
+                    resource_names: policy.resource_names(ECDS_TYPE_URL)?,
+                    type_url: ECDS_TYPE_URL.to_owned(),
+                    response_nonce: String::new(),
+                    error_detail: None,
+                },
+            )
             .await
             .context("queue restored ECDS DiscoveryRequest")?;
     }
@@ -2763,6 +2174,8 @@ async fn run_policy_stream(
     let warming_timeout =
         parse_duration(&cfg.limits.warming_timeout).unwrap_or_else(|| Duration::from_secs(60));
     loop {
+        // timer 与接收循环均只属于当前任务，退休代不继续请求或维护旧依赖闭包。
+        anyhow::ensure!(status.is_current(), "xDS generation authority changed");
         let response = if let Some(deadline) = policy.cache.warming_deadline(warming_timeout) {
             tokio::select! {
                 response = responses.message() => response.context("read ADS response")?,
@@ -2795,7 +2208,7 @@ async fn run_policy_stream(
         let allowed_extensions = policy.extension_names.clone();
         let validation_base = runtime.snap.load_full();
         let validation_path = runtime.cfg_path.clone();
-        status.apply_queue_depth.store(1, Ordering::Release);
+        status.set_apply_queue_depth(1);
         let translated_task = tokio::task::spawn_blocking(move || {
             validate_discovery_response_envelope(&response, &limits)?;
             match response.type_url.as_str() {
@@ -2845,8 +2258,13 @@ async fn run_policy_stream(
             }
         })
         .await;
-        status.apply_queue_depth.store(0, Ordering::Release);
+        status.set_apply_queue_depth(0);
         let translated = translated_task.context("join xDS policy translation task")?;
+        // 转换结果属于原任务；相同配置回切也不能把旧结果确认成当前代。
+        anyhow::ensure!(
+            status.is_current(),
+            "xDS generation authority changed during translation"
+        );
 
         match translated {
             Ok(translated) => {
@@ -2889,8 +2307,13 @@ async fn run_policy_stream(
                 };
                 match outcome {
                     XdsPolicyOutcome::Active(active) => {
-                        if let Err(error) =
-                            apply_policy_generation(&active, &candidate.endpoints, runtime).await
+                        if let Err(error) = apply_policy_generation(
+                            &active,
+                            &candidate.endpoints,
+                            runtime,
+                            status.as_ref(),
+                        )
+                        .await
                         {
                             // listener prepare/native materialization 失败属于本 response 的应用失败；
                             // 必须 NACK 并保留 accepted cache/LKG，不能断 stream 让控制面误判超时。
@@ -2902,21 +2325,24 @@ async fn run_policy_stream(
                                 &message,
                                 response_bytes,
                             );
-                            request_tx
-                                .send(DiscoveryRequest {
-                                    version_info: status.accepted_version_for(&response_type),
-                                    node: None,
-                                    resource_names: policy
-                                        .resource_names(&response_type)
-                                        .unwrap_or_default(),
-                                    type_url: response_type.clone(),
-                                    response_nonce: nonce.clone(),
-                                    error_detail: Some(RpcStatus {
-                                        code: INVALID_ARGUMENT_CODE,
-                                        message,
-                                        details: Vec::new(),
-                                    }),
-                                })
+                            status
+                                .send_current(
+                                    &request_tx,
+                                    DiscoveryRequest {
+                                        version_info: status.accepted_version_for(&response_type),
+                                        node: None,
+                                        resource_names: policy
+                                            .resource_names(&response_type)
+                                            .unwrap_or_default(),
+                                        type_url: response_type.clone(),
+                                        response_nonce: nonce.clone(),
+                                        error_detail: Some(RpcStatus {
+                                            code: INVALID_ARGUMENT_CODE,
+                                            message,
+                                            details: Vec::new(),
+                                        }),
+                                    },
+                                )
                                 .await
                                 .context("queue xDS policy apply NACK")?;
                             continue;
@@ -2945,6 +2371,7 @@ async fn run_policy_stream(
                                 &protected,
                                 &candidate.active_endpoints,
                                 runtime,
+                                status.as_ref(),
                             )
                             .await?;
                             status.mark_policy_ttl_applied(
@@ -2965,53 +2392,65 @@ async fn run_policy_stream(
                     }
                 }
                 let ack_names = policy.resource_names(&response_type)?;
-                request_tx
-                    .send(DiscoveryRequest {
-                        version_info: version.clone(),
-                        node: None,
-                        resource_names: ack_names,
-                        type_url: response_type.clone(),
-                        response_nonce: nonce.clone(),
-                        error_detail: None,
-                    })
+                status
+                    .send_current(
+                        &request_tx,
+                        DiscoveryRequest {
+                            version_info: version.clone(),
+                            node: None,
+                            resource_names: ack_names,
+                            type_url: response_type.clone(),
+                            response_nonce: nonce.clone(),
+                            error_detail: None,
+                        },
+                    )
                     .await
                     .context("queue xDS policy ACK")?;
                 if eds_subscription_changed && !policy.specs.is_empty() {
-                    request_tx
-                        .send(DiscoveryRequest {
-                            version_info: status.accepted_version_for(EDS_TYPE_URL),
-                            node: None,
-                            resource_names: policy.resource_names(EDS_TYPE_URL)?,
-                            type_url: EDS_TYPE_URL.to_owned(),
-                            response_nonce: String::new(),
-                            error_detail: None,
-                        })
+                    status
+                        .send_current(
+                            &request_tx,
+                            DiscoveryRequest {
+                                version_info: status.accepted_version_for(EDS_TYPE_URL),
+                                node: None,
+                                resource_names: policy.resource_names(EDS_TYPE_URL)?,
+                                type_url: EDS_TYPE_URL.to_owned(),
+                                response_nonce: String::new(),
+                                error_detail: None,
+                            },
+                        )
                         .await
                         .context("queue CDS-derived EDS subscription")?;
                 }
                 if rds_subscription_changed && !policy.route_names.is_empty() {
-                    request_tx
-                        .send(DiscoveryRequest {
-                            version_info: status.accepted_version_for(RDS_TYPE_URL),
-                            node: None,
-                            resource_names: policy.resource_names(RDS_TYPE_URL)?,
-                            type_url: RDS_TYPE_URL.to_owned(),
-                            response_nonce: String::new(),
-                            error_detail: None,
-                        })
+                    status
+                        .send_current(
+                            &request_tx,
+                            DiscoveryRequest {
+                                version_info: status.accepted_version_for(RDS_TYPE_URL),
+                                node: None,
+                                resource_names: policy.resource_names(RDS_TYPE_URL)?,
+                                type_url: RDS_TYPE_URL.to_owned(),
+                                response_nonce: String::new(),
+                                error_detail: None,
+                            },
+                        )
                         .await
                         .context("queue LDS-derived RDS subscription")?;
                 }
                 if sds_subscription_changed && !policy.secret_names.is_empty() {
-                    request_tx
-                        .send(DiscoveryRequest {
-                            version_info: status.accepted_version_for(SDS_TYPE_URL),
-                            node: None,
-                            resource_names: policy.resource_names(SDS_TYPE_URL)?,
-                            type_url: SDS_TYPE_URL.to_owned(),
-                            response_nonce: String::new(),
-                            error_detail: None,
-                        })
+                    status
+                        .send_current(
+                            &request_tx,
+                            DiscoveryRequest {
+                                version_info: status.accepted_version_for(SDS_TYPE_URL),
+                                node: None,
+                                resource_names: policy.resource_names(SDS_TYPE_URL)?,
+                                type_url: SDS_TYPE_URL.to_owned(),
+                                response_nonce: String::new(),
+                                error_detail: None,
+                            },
+                        )
                         .await
                         .context("queue LDS-derived SDS subscription")?;
                 }
@@ -3024,15 +2463,18 @@ async fn run_policy_stream(
                         } else {
                             policy.resource_names(ECDS_TYPE_URL)?
                         };
-                        request_tx
-                            .send(DiscoveryRequest {
-                                version_info: status.accepted_version_for(ECDS_TYPE_URL),
-                                node: None,
-                                resource_names: names,
-                                type_url: ECDS_TYPE_URL.to_owned(),
-                                response_nonce: String::new(),
-                                error_detail: None,
-                            })
+                        status
+                            .send_current(
+                                &request_tx,
+                                DiscoveryRequest {
+                                    version_info: status.accepted_version_for(ECDS_TYPE_URL),
+                                    node: None,
+                                    resource_names: names,
+                                    type_url: ECDS_TYPE_URL.to_owned(),
+                                    response_nonce: String::new(),
+                                    error_detail: None,
+                                },
+                            )
                             .await
                             .context("queue LDS-derived ECDS subscription")?;
                     }
@@ -3048,19 +2490,22 @@ async fn run_policy_stream(
                 tracing::warn!(type_url = %response_type, nonce = %nonce, error = %message, "xDS policy response NACK");
                 status.mark_policy_rejected(&response_type, &nonce, &message, response_bytes);
                 let resource_names = policy.resource_names(&response_type).unwrap_or_default();
-                request_tx
-                    .send(DiscoveryRequest {
-                        version_info: status.accepted_version_for(&response_type),
-                        node: None,
-                        resource_names,
-                        type_url: response_type.clone(),
-                        response_nonce: nonce.clone(),
-                        error_detail: Some(RpcStatus {
-                            code,
-                            message,
-                            details: Vec::new(),
-                        }),
-                    })
+                status
+                    .send_current(
+                        &request_tx,
+                        DiscoveryRequest {
+                            version_info: status.accepted_version_for(&response_type),
+                            node: None,
+                            resource_names,
+                            type_url: response_type.clone(),
+                            response_nonce: nonce.clone(),
+                            error_detail: Some(RpcStatus {
+                                code,
+                                message,
+                                details: Vec::new(),
+                            }),
+                        },
+                    )
                     .await
                     .context("queue xDS policy NACK")?;
             }
@@ -3075,14 +2520,21 @@ async fn run_policy_stream(
 /// - `policy`：是同一 accepted 候选
 /// - `endpoints`：是同一 accepted 候选
 /// - `runtime`：提供当前 base 与版本权威。
+/// - `status`：原任务代际的同步发布权。
 ///
-/// 返回：native 二次编译和 ArcSwap 发布成功返回 Ok；失败保持当前 Snapshot/版本不变。
+/// 返回：native 二次编译并在同代发布成功返回 Ok；失权或准备失败保持活动快照与版本。
 async fn apply_policy_generation(
     policy: &crate::control::xds_resources::XdsPolicySnapshot,
     endpoints: &HashMap<String, Vec<UpstreamInstance>>,
     runtime: &XdsSnapshotRuntime,
+    status: &XdsStatus,
 ) -> Result<()> {
     let _apply_guard = runtime.apply_coordinator.lock().await;
+    // 相同 ownership 布尔值不能恢复旧任务权威，异步准备前先拒绝已经退休的候选。
+    anyhow::ensure!(
+        status.is_current(),
+        "xDS generation authority changed before apply"
+    );
     let current = runtime.snap.load_full();
     anyhow::ensure!(
         current.control_plane.xds.enabled
@@ -3121,25 +2573,31 @@ async fn apply_policy_generation(
     };
     // 所有 protobuf/native 校验已完成后才执行唯一 publish；版本随后推进。ADS ACK 在本函数
     // 返回之后发送，management server 不会看到“已 ACK 但数据面仍是旧 generation”的半完成态。
-    runtime
-        .config_history
-        .with_stable_local_files(|| -> Result<()> {
-            anyhow::ensure!(
-                runtime.snap.load().version == current.version,
-                "xDS base snapshot changed before publication"
-            );
+    // 最终快照、版本和 listener 提交共用代际门；准备期间发生换代时不发布任何候选副作用。
+    status
+        .with_current(|| -> Result<()> {
             runtime
                 .config_history
-                .prepare_external_publication(&candidate)?;
-            runtime.snap.store(Arc::new(candidate));
+                .with_stable_local_files(|| -> Result<()> {
+                    anyhow::ensure!(
+                        runtime.snap.load().version == current.version,
+                        "xDS base snapshot changed before publication"
+                    );
+                    runtime
+                        .config_history
+                        .prepare_external_publication(&candidate)?;
+                    runtime.snap.store(Arc::new(candidate));
+                    Ok(())
+                })?;
+            runtime.version.store(next_version, Ordering::Release);
+            if let Some(prepared) = prepared_listener {
+                // publish 后的 commit 只启动已准备 acceptor 并停旧 generation，不含可失败 I/O；数据面
+                // 请求一旦进入新 listener，读取到的必然已经是同一 LDS generation 的 Snapshot。
+                prepared.commit();
+            }
             Ok(())
-        })?;
-    runtime.version.store(next_version, Ordering::Release);
-    if let Some(prepared) = prepared_listener {
-        // publish 后的 commit 只启动已准备 acceptor 并停旧 generation，不含可失败 I/O；数据面
-        // 请求一旦进入新 listener，读取到的必然已经是同一 LDS generation 的 Snapshot。
-        prepared.commit();
-    }
+        })
+        .context("xDS generation authority changed before publication")??;
     Ok(())
 }
 
@@ -3209,19 +2667,27 @@ async fn run_delta_stream(
     status: Arc<XdsStatus>,
 ) -> Result<()> {
     let channel = connect_channel(cfg).await?;
+    // 异步建连可能跨越配置换代，旧连接不能继续发起已退休订阅或更新当前连接事实。
+    anyhow::ensure!(
+        status.is_current(),
+        "xDS generation authority changed during connect"
+    );
     status.mark_syncing();
     let (request_tx, request_rx) = mpsc::channel(cfg.limits.max_apply_queue.max(1));
     let resource_names = subscribed_clusters(specs)?;
-    request_tx
-        .send(delta_request(
-            EDS_TYPE_URL,
-            resource_names.clone(),
-            Vec::new(),
-            cache.initial_versions(),
-            Some(build_node(cfg)),
-            String::new(),
-            None,
-        ))
+    status
+        .send_current(
+            &request_tx,
+            delta_request(
+                EDS_TYPE_URL,
+                resource_names.clone(),
+                Vec::new(),
+                cache.initial_versions(),
+                Some(build_node(cfg)),
+                String::new(),
+                None,
+            ),
+        )
         .await
         .context("queue initial Delta EDS request")?;
 
@@ -3241,6 +2707,8 @@ async fn run_delta_stream(
         .into_inner();
 
     loop {
+        // timer 与接收循环均只属于当前任务，退休代不继续请求或维护旧依赖闭包。
+        anyhow::ensure!(status.is_current(), "xDS generation authority changed");
         let response = if let Some(deadline) = cache.next_expiry() {
             tokio::select! {
                 response = responses.message() => response.context("read Delta ADS response")?,
@@ -3265,7 +2733,7 @@ async fn run_delta_stream(
         let current = cache.clone();
         let translate_specs = specs.to_vec();
         let limits = cfg.limits.clone();
-        status.apply_queue_depth.store(1, Ordering::Release);
+        status.set_apply_queue_depth(1);
         let translated_task = tokio::task::spawn_blocking(move || {
             validate_delta_response_envelope(&response, EDS_TYPE_URL, &limits)?;
             let subscribed = translate_specs
@@ -3285,10 +2753,13 @@ async fn run_delta_stream(
             Ok::<_, anyhow::Error>((next, replacement))
         })
         .await;
-        status.apply_queue_depth.store(0, Ordering::Release);
+        status.set_apply_queue_depth(0);
         let translated = translated_task.context("join Delta EDS translation task")?;
         // 重复内容与 warming ACK 同样需要当前批次权威；它们不能绕过没有实际写入的发布分支。
-        anyhow::ensure!(publisher.is_current(), "EDS publication authority changed");
+        anyhow::ensure!(
+            publisher.is_current() && status.is_current(),
+            "EDS publication authority changed"
+        );
         match translated {
             Ok((next, replacement)) => {
                 let missing = delta_eds_missing(&next, specs);
@@ -3300,7 +2771,9 @@ async fn run_delta_stream(
                         // Delta cache/translation 已全部成功后才执行唯一 RCU publish；cache 与 ACK
                         // 随后推进，坏 response 不可能留下“版本已记住但数据面未应用”的半状态。
                         anyhow::ensure!(
-                            publisher.publish(replacement),
+                            status
+                                .with_current(|| publisher.publish(replacement))
+                                .unwrap_or(false),
                             "EDS publication authority changed"
                         );
                         status.mark_accepted(
@@ -3321,16 +2794,19 @@ async fn run_delta_stream(
                     );
                 }
                 *cache = next;
-                request_tx
-                    .send(delta_request(
-                        EDS_TYPE_URL,
-                        Vec::new(),
-                        Vec::new(),
-                        HashMap::new(),
-                        None,
-                        nonce,
-                        None,
-                    ))
+                status
+                    .send_current(
+                        &request_tx,
+                        delta_request(
+                            EDS_TYPE_URL,
+                            Vec::new(),
+                            Vec::new(),
+                            HashMap::new(),
+                            None,
+                            nonce,
+                            None,
+                        ),
+                    )
                     .await
                     .context("queue Delta EDS ACK")?;
             }
@@ -3343,20 +2819,23 @@ async fn run_delta_stream(
                 let message = truncate_error(&format!("{error:#}"));
                 tracing::warn!(nonce = %nonce, error = %message, "xDS Delta EDS response NACK");
                 status.mark_rejected(&nonce, &message, response_bytes);
-                request_tx
-                    .send(delta_request(
-                        EDS_TYPE_URL,
-                        Vec::new(),
-                        Vec::new(),
-                        HashMap::new(),
-                        None,
-                        nonce,
-                        Some(RpcStatus {
-                            code,
-                            message,
-                            details: Vec::new(),
-                        }),
-                    ))
+                status
+                    .send_current(
+                        &request_tx,
+                        delta_request(
+                            EDS_TYPE_URL,
+                            Vec::new(),
+                            Vec::new(),
+                            HashMap::new(),
+                            None,
+                            nonce,
+                            Some(RpcStatus {
+                                code,
+                                message,
+                                details: Vec::new(),
+                            }),
+                        ),
+                    )
                     .await
                     .context("queue Delta EDS NACK")?;
             }
@@ -3543,14 +3022,19 @@ async fn apply_delta_eds_expiry(
     .await
     .context("join Delta EDS TTL translation task")??;
     // timer 的异步转换也可能跨越配置换代，失权后不再推进旧 cache 或 warming 状态。
-    anyhow::ensure!(publisher.is_current(), "EDS publication authority changed");
+    anyhow::ensure!(
+        publisher.is_current() && status.is_current(),
+        "EDS publication authority changed"
+    );
     let missing = delta_eds_missing(&next, specs);
     if missing.is_empty() {
         let fingerprint = replacement_fingerprint(&replacement);
         // TTL 是协议授权的 removal；完整 native 候选构建后才发布并提交 cache，不能先删版本再
         // 因转换失败留下控制面/数据面分叉。
         anyhow::ensure!(
-            publisher.publish(replacement),
+            status
+                .with_current(|| publisher.publish(replacement))
+                .unwrap_or(false),
             "EDS publication authority changed"
         );
         status.mark_eds_ttl_applied(expired.len(), next.resources.len(), fingerprint);
@@ -3577,19 +3061,27 @@ async fn run_stream(
     status: Arc<XdsStatus>,
 ) -> Result<()> {
     let channel = connect_channel(cfg).await?;
+    // 异步建连可能跨越配置换代，旧连接不能继续发起已退休订阅或更新当前连接事实。
+    anyhow::ensure!(
+        status.is_current(),
+        "xDS generation authority changed during connect"
+    );
     status.mark_syncing();
     let queue = cfg.limits.max_apply_queue.max(1);
     let (request_tx, request_rx) = mpsc::channel(queue);
     let resource_names = subscribed_clusters(specs)?;
-    request_tx
-        .send(DiscoveryRequest {
-            version_info: status.accepted_version(),
-            node: Some(build_node(cfg)),
-            resource_names: resource_names.clone(),
-            type_url: EDS_TYPE_URL.to_owned(),
-            response_nonce: String::new(),
-            error_detail: None,
-        })
+    status
+        .send_current(
+            &request_tx,
+            DiscoveryRequest {
+                version_info: status.accepted_version(),
+                node: Some(build_node(cfg)),
+                resource_names: resource_names.clone(),
+                type_url: EDS_TYPE_URL.to_owned(),
+                response_nonce: String::new(),
+                error_detail: None,
+            },
+        )
         .await
         .context("queue initial EDS DiscoveryRequest")?;
 
@@ -3607,6 +3099,8 @@ async fn run_stream(
         .into_inner();
 
     while let Some(response) = responses.message().await.context("read ADS response")? {
+        // 等待消息后复验任务代际，避免退休连接继续转换旧资源。
+        anyhow::ensure!(status.is_current(), "xDS generation authority changed");
         let nonce = response.nonce.clone();
         let response_type = response.type_url.clone();
         let version = response.version_info.clone();
@@ -3618,15 +3112,18 @@ async fn run_stream(
         // 100k endpoint 的 wire allowlist/translate 是控制面 CPU 工作；每条 stream 仍严格串行，
         // 但放到 blocking pool，避免占住处理下游请求的 Tokio worker。等待本轮完成后才继续读
         // 下一 response，自然形成有界背压，不会为更新风暴无界 spawn task。
-        status.apply_queue_depth.store(1, Ordering::Release);
+        status.set_apply_queue_depth(1);
         let translated_task = tokio::task::spawn_blocking(move || {
             translate_eds_response(&response, &translate_specs, &limits)
         })
         .await;
-        status.apply_queue_depth.store(0, Ordering::Release);
+        status.set_apply_queue_depth(0);
         let translated = translated_task.context("join EDS translation task")?;
         // 无变化 response 也须有当前发布权，旧 stream 不能借去重路径继续确认已退休订阅。
-        anyhow::ensure!(publisher.is_current(), "EDS publication authority changed");
+        anyhow::ensure!(
+            publisher.is_current() && status.is_current(),
+            "EDS publication authority changed"
+        );
         match translated {
             Ok(replacement) => {
                 let fingerprint = replacement_fingerprint(&replacement);
@@ -3638,20 +3135,25 @@ async fn run_stream(
                     // response 已全部解码和验证后才做唯一一次 RCU 发布；ACK 必须在发布之后，
                     // 否则 management server 会误以为 nonce 已经真实进入数据面。
                     anyhow::ensure!(
-                        publisher.publish(replacement),
+                        status
+                            .with_current(|| publisher.publish(replacement))
+                            .unwrap_or(false),
                         "EDS publication authority changed"
                     );
                     status.mark_accepted(&version, &nonce, response_resources, fingerprint);
                 }
-                request_tx
-                    .send(DiscoveryRequest {
-                        version_info: version,
-                        node: None,
-                        resource_names: resource_names.clone(),
-                        type_url: response_type,
-                        response_nonce: nonce,
-                        error_detail: None,
-                    })
+                status
+                    .send_current(
+                        &request_tx,
+                        DiscoveryRequest {
+                            version_info: version,
+                            node: None,
+                            resource_names: resource_names.clone(),
+                            type_url: response_type,
+                            response_nonce: nonce,
+                            error_detail: None,
+                        },
+                    )
                     .await
                     .context("queue EDS ACK")?;
             }
@@ -3666,23 +3168,26 @@ async fn run_stream(
                 status.mark_rejected(&nonce, &message, response_bytes);
                 // NACK 必须携带旧 LKG version 与本次 nonce；不能先清空动态目录，也不能把
                 // 被拒 version 写进后续请求，否则会越过 last-known-good fencing。
-                request_tx
-                    .send(DiscoveryRequest {
-                        version_info: status.accepted_version(),
-                        node: None,
-                        resource_names: resource_names.clone(),
-                        type_url: if response_type.is_empty() {
-                            EDS_TYPE_URL.to_owned()
-                        } else {
-                            response_type
+                status
+                    .send_current(
+                        &request_tx,
+                        DiscoveryRequest {
+                            version_info: status.accepted_version(),
+                            node: None,
+                            resource_names: resource_names.clone(),
+                            type_url: if response_type.is_empty() {
+                                EDS_TYPE_URL.to_owned()
+                            } else {
+                                response_type
+                            },
+                            response_nonce: nonce,
+                            error_detail: Some(RpcStatus {
+                                code,
+                                message,
+                                details: Vec::new(),
+                            }),
                         },
-                        response_nonce: nonce,
-                        error_detail: Some(RpcStatus {
-                            code,
-                            message,
-                            details: Vec::new(),
-                        }),
-                    })
+                    )
                     .await
                     .context("queue EDS NACK")?;
             }

@@ -3721,6 +3721,15 @@ Delta 版本，之后重新引用必须重新取得正文。ECDS 与其它资源
 不支持的 [VHDS 合并](https://www.envoyproxy.io/docs/envoy/v1.36.0/api-v3/config/route/v3/route.proto) 和
 [SRDS scope key](https://www.envoyproxy.io/docs/envoy/v1.36.0/api-v3/config/route/v3/scoped_route.proto) 不会被静默忽略。
 
+ADS 配置热更会撤销旧任务的状态和发布权；即使节点身份随后切回原值，旧响应、TTL 事件和
+断线事件也不能修改当前状态。完整策略在异步资源准备完成后复验同代权限，成功后才发布快照、
+推进配置版本和提交监听器。订阅及 ACK/NACK 等待发送队列时，取得空位后还要复验权限。
+这些检查只发生在控制面，请求继续读取不可变快照。
+
+同一任务内的网络重连保留有效 LKG；bootstrap 或资源归属换代会清空本代 readiness、接受版本、
+应用指纹与时间戳，等待新一代完整资源。累计接受、拒绝和重连指标继续保留，管理面读到的是当前代
+一致的状态。资源在撤权前已经进入网络传输时，不能承诺撤回对端已收到的字节。
+
 ## xDS 管理端
 
 `xds-server` 是独立、默认关闭的 feature。它把已经发布的 Naway 配置快照投影为 Envoy v3
