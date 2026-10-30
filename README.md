@@ -1298,6 +1298,9 @@ latency、weighted 与 joint；joint 联合冻结能力、声明/观测 SLO 和�
 依赖故障则按 route 的 `closed|open` 策略处理。token quota 在 cache miss 后预留，依据 provider 最终
 usage 幂等多退少补；非 2xx/transport 失败退款，成功但 usage 缺失或流中断保留保守预留。
 
+API-Key 支持显式禁用与重叠轮换：`enabled=false` 撤销该凭据的匹配资格，保留认证保护；
+全部凭据禁用时不会自动开放匿名路由。配置及集群生效边界见[API-Key 验证与撤销](docs/api-key.md)。
+
 token quota 与缓存的 `api_key`、`consumer` 维度只读取本地认证后冻结的身份；外部授权或后续插件
 改写请求头不会转移额度或缓存归属。子路由可继承父层 API-Key 认证，但完整父链必须具有真实
 认证来源；仅外部授权成功不能创建 API-Key 计费身份，缺少该事实返回 401。

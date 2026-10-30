@@ -7021,7 +7021,7 @@ async fn publish_sentinel_config(req: AdminRequest, state: Arc<AdminState>) -> R
 /// - `path`：可为集合、单个 consumer 或其 `/keys`
 /// - `state`：提供活动快照与同代配置读取门。
 ///
-/// 返回：返回 consumer 到 plan 的绑定和 key 所在 route/source；绝不返回 `value`/`secret`/SecretSource 或它们的可验证摘要。
+/// 返回：消费者套餐绑定及密钥的路由、来源与启用状态；不返回明文、SecretSource 或可验证摘要。
 fn read_consumers(path: &str, state: &AdminState) -> Response<BoxBody> {
     let config = match read_active_gateway_config(state) {
         Ok(config) => config,
@@ -7056,6 +7056,7 @@ fn read_consumers(path: &str, state: &AdminState) -> Response<BoxBody> {
                     "proxy": proxy,
                     "route": route.id,
                     "source": source,
+                    "enabled": filter_option(trimmed, "enabled") != Some("false"),
                 }));
         }
     }
