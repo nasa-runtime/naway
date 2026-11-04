@@ -1,10 +1,12 @@
 //! 证书材料安装与条件写入共用唯一事务门；签发来源不决定文件发布语义。
 
+pub(crate) mod conditions;
 mod generation;
 mod io;
 mod legacy;
 mod manifest;
 mod preflight;
+mod source;
 mod validation;
 
 use crate::config::TlsRuntimeCfg;

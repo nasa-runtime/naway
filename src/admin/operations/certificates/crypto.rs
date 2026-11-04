@@ -63,7 +63,8 @@ pub(super) struct Sealed {
 ///
 /// 返回：密文及有限公开摘要；任何密码学失败只返回固定错误。
 pub(super) fn seal(material: Material, key: &str, context: &Context) -> Result<Sealed, Error> {
-    let summary = serde_json::to_vec(&material.inspect()?).map_err(|_| Error::Invalid)?;
+    let summary = serde_json::to_vec(&material.inspect().map_err(|_| Error::Invalid)?)
+        .map_err(|_| Error::Invalid)?;
     let ciphertext = nasa::crypto::encrypt_modern_bytes_with_aad(&material.0, key, &context.aad())
         .map_err(|_| Error::Unavailable)?;
     if !ciphertext.starts_with("NC2.65536.3.4.")

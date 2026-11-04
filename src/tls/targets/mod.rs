@@ -20,6 +20,20 @@ pub(crate) struct Target {
 }
 
 impl Target {
+    /// 业务作用：统一 HTTP 与 TCP 证书对象的归属键，SNI 条目继承所属监听的证书对象边界。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：归属目录中对应命名空间的唯一键，不包含文件路径。
+    #[cfg(feature = "admin-operations-pgsql")]
+    pub(crate) fn object_key(&self) -> String {
+        let kind = match self.kind {
+            Kind::Proxy => "certificate",
+            Kind::Stream => "stream_certificate",
+        };
+        format!("{kind}:{}", self.listener)
+    }
+
     /// 业务作用：把材料目标限定为当前逻辑入口中的默认身份或规范 SNI 声明序号。
     ///
     /// 参数说明: 无。

@@ -25,6 +25,7 @@ struct Cached {
 pub(in crate::admin) struct Runtime {
     local: parking_lot::Mutex<Option<Cached>>,
     installs: Arc<tokio::sync::Semaphore>,
+    conditions: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for Runtime {
@@ -37,6 +38,7 @@ impl Default for Runtime {
         Self {
             local: parking_lot::Mutex::new(None),
             installs: Arc::new(tokio::sync::Semaphore::new(2)),
+            conditions: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
 }

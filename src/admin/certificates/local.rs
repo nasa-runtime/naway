@@ -9,6 +9,7 @@ use crate::admin::{
 use http::{Response, StatusCode};
 use std::sync::Arc;
 
+pub(in crate::admin) mod conditions;
 mod read;
 use crate::tls::targets::{writable as manual_target, Kind, Target};
 pub(in crate::admin) use read::read_certificates;

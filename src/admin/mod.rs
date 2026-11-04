@@ -633,6 +633,9 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
     if req.method() == Method::POST && req.uri().path() == "/api/certs" {
         return upload_certificate(req, state).await;
     }
+    if req.method() == Method::POST && req.uri().path() == "/api/certs/conditions" {
+        return Box::pin(certificates::local::conditions::read(req, state)).await;
+    }
     if req.method() == Method::POST && parse_change_action(req.uri().path()).is_some() {
         return review_pending_change(req, state).await;
     }
@@ -1070,6 +1073,7 @@ fn admin_permission(method: &Method, path: &str) -> Option<(AdminResource, Admin
         }
         (&Method::GET, "/api/certs") => Some((AdminResource::Certs, AdminAction::Read)),
         (&Method::POST, "/api/certs") => Some((AdminResource::Certs, AdminAction::Write)),
+        (&Method::POST, "/api/certs/conditions") => Some((AdminResource::Certs, AdminAction::Read)),
         (&Method::PUT, "/admin/blacklist")
         | (&Method::POST, "/admin/blacklist")
         | (&Method::DELETE, "/admin/blacklist") => {
