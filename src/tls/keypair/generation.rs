@@ -1,0 +1,277 @@
+//! 材料代只属于受管文件事务；摘要相同不能使已经退休的写入重新获得所有权。
+
+use super::atomic_write;
+use crate::config::TlsRuntimeCfg;
+use anyhow::{ensure, Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+
+const MAX_RECORD_BYTES: usize = 4096;
+pub(super) const MANIFEST_RECORD: &str = "ownership.json";
+
+/// 私有元数据绑定完整 pair 和来源计划；对外只能提供不可重用的随机代。
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Record {
+    schema: u32,
+    pub(super) generation: String,
+    target: [u8; 32],
+    certificate: [u8; 32],
+    private_key: [u8; 32],
+}
+
+impl Record {
+    /// 业务作用：为一次新的受管写入生成不可重用的材料代，相同字节也不能复用旧动作所有权。
+    ///
+    /// 参数说明：
+    /// - `target`：固定文件计划的域分隔摘要。
+    /// - `certificate`：已验证的完整证书链 PEM。
+    /// - `private_key`：与证书匹配的完整私钥 PEM。
+    ///
+    /// 返回：尚未持久化的新代；随机源失败时拒绝开始材料事务。
+    pub(super) fn new(target: [u8; 32], certificate: &[u8], private_key: &[u8]) -> Result<Self> {
+        let mut random = [0u8; 32];
+        getrandom::getrandom(&mut random).context("TLS material generation entropy unavailable")?;
+        Ok(Self {
+            schema: 1,
+            generation: hex(&random),
+            target,
+            certificate: Sha256::digest(certificate).into(),
+            private_key: Sha256::digest(private_key).into(),
+        })
+    }
+
+    /// 业务作用：复验元数据格式及原目标绑定，另一材料位置的记录不能授权当前文件。
+    ///
+    /// 参数说明：
+    /// - `target`：当前配置明确选择的材料来源摘要。
+    ///
+    /// 返回：格式、随机代和目标均匹配才成功；不将损坏记录降格成未受管材料。
+    pub(super) fn validate(&self, target: &[u8; 32]) -> Result<()> {
+        ensure!(
+            self.schema == 1 && valid_token(&self.generation) && &self.target == target,
+            "TLS material generation evidence is invalid"
+        );
+        Ok(())
+    }
+
+    /// 业务作用：证明当前材料仍属于记录中的完整 pair，私钥单独变化也会撤销原写入资格。
+    ///
+    /// 参数说明：
+    /// - `certificate`：同一安装锁内读取的当前证书 PEM。
+    /// - `private_key`：写入裁决时的当前私钥；只读目录不提供时仅核对公开证书。
+    ///
+    /// 返回：提供的全部材料与原记录一致时为真；目录的证书核对不能替代写入时完整 pair 核对。
+    pub(super) fn matches(&self, certificate: &[u8], private_key: Option<&[u8]>) -> bool {
+        self.certificate == <[u8; 32]>::from(Sha256::digest(certificate))
+            && private_key
+                .is_none_or(|key| self.private_key == <[u8; 32]>::from(Sha256::digest(key)))
+    }
+
+    /// 业务作用：在材料事务决定内持久化唯一归属，权限从临时文件创建时即限制为当前用户。
+    ///
+    /// 参数说明：
+    /// - `path`：由受管文件计划或当前不可变目录确定的元数据位置。
+    ///
+    /// 返回：元数据与目录项同步完成时成功；I/O 失败不能解释为没有完成替换。
+    pub(super) fn publish(&self, path: &Path) -> Result<()> {
+        let bytes = serde_json::to_vec(self).context("encode TLS material generation")?;
+        atomic_write(path, &bytes, true)
+    }
+}
+
+/// 业务作用：约束材料条件令牌为固定长度小写随机身份，不接受路径、通配或弱比较形式。
+///
+/// 参数说明：
+/// - `value`：请求或持久记录中的材料代。
+///
+/// 返回：仅 64 个小写十六进制字符为真。
+pub(crate) fn valid_token(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// 业务作用：固定材料来源的业务身份，manifest 与双文件计划不能共享条件写入证据。
+///
+/// 参数说明：
+/// - `tls`：声明证书文件或 manifest 位置的运行计划。
+///
+/// 返回：解析实际父目录后得到域分隔和长度分帧的 SHA-256；不读取材料内容，目录证据错误时失败。
+pub(super) fn target(tls: &TlsRuntimeCfg) -> Result<[u8; 32]> {
+    match &tls.keypair_manifest_file {
+        Some(path) => manifest_target(path),
+        None => Ok(digest_paths(
+            b"legacy",
+            &[
+                &identity_path(&tls.cert_file)?,
+                &identity_path(&tls.key_file)?,
+            ],
+        )),
+    }
+}
+
+/// 业务作用：让不可变目录和当前 manifest 使用同一来源身份，切换目录不改变目标归属。
+///
+/// 参数说明：
+/// - `path`：配置固定的 manifest 路径。
+///
+/// 返回：仅绑定 manifest 位置的材料目标摘要，不包含其可变内容。
+pub(super) fn manifest_target(path: &Path) -> Result<[u8; 32]> {
+    Ok(digest_paths(b"manifest", &[&identity_path(path)?]))
+}
+
+/// 业务作用：为双文件目标定位唯一材料代记录，多个逻辑监听共享同一 pair 时共享归属。
+///
+/// 参数说明：
+/// - `tls`：无 manifest 的规范化双文件计划。
+///
+/// 返回：证书同目录下的私有元数据路径；非法来源拒绝定位。
+pub(super) fn legacy_path(tls: &TlsRuntimeCfg) -> Result<PathBuf> {
+    ensure!(
+        tls.keypair_manifest_file.is_none(),
+        "TLS source is not a legacy pair"
+    );
+    let parent = tls
+        .cert_file
+        .parent()
+        .context("TLS certificate has no parent")?;
+    Ok(parent.join(format!(
+        ".naway-keypair-generation-{}.json",
+        hex(&target(tls)?)
+    )))
+}
+
+/// 业务作用：从确定位置读取完整有界归属证据，损坏或跨目标记录不能变成无条件写入资格。
+///
+/// 参数说明：
+/// - `path`：受管计划确定的元数据位置。
+/// - `target`：本次访问允许的唯一材料来源。
+///
+/// 返回：缺失为未受管，存在且完整合法时返回原字节及记录；错误阻断材料写入。
+pub(super) fn read(path: &Path, target: &[u8; 32]) -> Result<Option<(Vec<u8>, Record)>> {
+    let Some(bytes) = crate::io::bounded_io::read_optional_file(
+        path,
+        MAX_RECORD_BYTES,
+        "TLS material generation",
+    )?
+    else {
+        return Ok(None);
+    };
+    let record: Record = serde_json::from_slice(&bytes).context("parse TLS material generation")?;
+    record.validate(target)?;
+    Ok(Some((bytes, record)))
+}
+
+/// 业务作用：只从当前活动来源读取材料代，旧目录和 seed 文件不能冒充已激活的 manifest 材料。
+///
+/// 参数说明：
+/// - `tls`：已完成旧事务恢复的当前文件计划。
+/// - `certificate`：安装锁内选定的公开证书原文。
+/// - `private_key`：条件写入时必须提供的当前私钥；只读投影可省略。
+///
+/// 返回：与所给材料一致的随机代或未受管；损坏证据返回错误，调用方不得据此安装。
+pub(super) fn current(
+    tls: &TlsRuntimeCfg,
+    certificate: &[u8],
+    private_key: Option<&[u8]>,
+) -> Result<Option<String>> {
+    let path = if let Some(manifest) = &tls.keypair_manifest_file {
+        let Some(directory) = super::manifest::current_material_directory(manifest)? else {
+            return Ok(None);
+        };
+        directory.join(MANIFEST_RECORD)
+    } else {
+        legacy_path(tls)?
+    };
+    Ok(read(&path, &target(tls)?)?
+        .filter(|(_, record)| record.matches(certificate, private_key))
+        .map(|(_, record)| record.generation))
+}
+
+/// 业务作用：固定实际父目录及文件槽位，目录别名和点路径不能形成两套受管材料所有权。
+///
+/// 参数说明：
+/// - `path`：当前文件计划的目标路径，最终文件可尚不存在。
+///
+/// 返回：解析已有父目录别名并保留未创建后缀后的绝对路径；权限或目录证据错误拒绝写入。
+pub(super) fn identity_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let filename = absolute
+        .file_name()
+        .context("TLS material file name missing")?;
+    let mut parent = absolute.parent().context("TLS material parent missing")?;
+    let mut missing = Vec::new();
+    let mut canonical = loop {
+        match std::fs::canonicalize(parent) {
+            Ok(path) => break path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    parent
+                        .file_name()
+                        .context("TLS material ancestor missing")?,
+                );
+                parent = parent.parent().context("TLS material ancestor missing")?;
+            }
+            Err(error) => return Err(error).context("resolve TLS material parent"),
+        }
+    };
+    for suffix in missing.into_iter().rev() {
+        canonical.push(suffix);
+    }
+    canonical.push(filename);
+    Ok(canonical)
+}
+
+/// 业务作用：为审批冻结声明本身，路径后来发生别名或文件系统变化不能悄然改写已批准的意图。
+///
+/// 参数说明：
+/// - `tls`：原提交时的文件来源计划。
+///
+/// 返回：不读取文件系统的声明摘要；实际安装另行证明物理目标身份。
+pub(super) fn declared_target(tls: &TlsRuntimeCfg) -> [u8; 32] {
+    match &tls.keypair_manifest_file {
+        Some(path) => digest_paths(b"manifest", &[path]),
+        None => digest_paths(b"legacy", &[&tls.cert_file, &tls.key_file]),
+    }
+}
+
+/// 业务作用：为来源摘要保持字段边界，不让不同路径分段或材料模式产生相同输入。
+///
+/// 参数说明：
+/// - `kind`：固定来源类别。
+/// - `paths`：按业务角色排列的规范化路径。
+///
+/// 返回：单次增量 SHA-256，不复制路径字节。
+fn digest_paths(kind: &[u8], paths: &[&Path]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"naway-tls-material-target\0");
+    digest.update(kind);
+    for path in paths {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    digest.finalize().into()
+}
+
+/// 业务作用：编码固定随机身份或摘要，输出不携带秘密材料。
+///
+/// 参数说明：
+/// - `bytes`：随机身份或材料来源摘要。
+///
+/// 返回：规范小写十六进制文本。
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut text, "{byte:02x}").expect("write hexadecimal identity");
+    }
+    text
+}

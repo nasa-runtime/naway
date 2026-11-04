@@ -1,5 +1,6 @@
 //! 证书材料安装与条件写入共用唯一事务门；签发来源不决定文件发布语义。
 
+mod generation;
 mod io;
 mod legacy;
 mod manifest;
@@ -7,9 +8,11 @@ mod validation;
 
 use crate::config::TlsRuntimeCfg;
 use anyhow::Result;
+pub(crate) use generation::valid_token as valid_material_generation;
 pub(crate) use io::atomic_write;
 use io::sync_directory;
 use legacy::{install_legacy_keypair_transaction, recover_legacy_keypair_transaction_locked};
+pub(crate) use manifest::current_material_directory;
 use manifest::{gc_keypair_versions, prepare_keypair_version};
 use validation::validate_keypair;
 
@@ -33,15 +36,18 @@ pub(crate) fn install_keypair_atomically(
         .map_err(|_| anyhow::anyhow!("TLS keypair install lock is poisoned"))?;
     recover_legacy_keypair_transaction_locked(tls)?;
     validate_installation(tls, certificate_pem, private_key_pem)?;
-    publish_keypair_locked(tls, certificate_pem, private_key_pem)
+    generation::current(tls, certificate_pem, None)?;
+    publish_keypair_locked(tls, certificate_pem, private_key_pem).map(|_| ())
 }
 
 /// 手工证书 CAS 安装结果。
 pub(crate) enum KeypairCasInstallOutcome {
     /// 比较基线仍一致，完整 pair 已发布。
-    Installed,
+    Installed(String),
     /// 安装前证书已变化，未开始该候选的文件决定。
     Changed(String),
+    /// 完整材料已不属于所给代；不因证书摘要重新相同而恢复旧写入资格。
+    GenerationChanged,
     /// 材料或当前 OCSP 策略不允许安装，未开始该候选的文件决定。
     Invalid,
     /// 不能取得安装权或读取当前基线，未开始该候选的文件决定。
@@ -56,6 +62,7 @@ pub(crate) enum KeypairCasInstallOutcome {
 /// 参数说明：
 /// - `tls`：固定当前证书事实源的 TLS 策略。
 /// - `expected_etag`：从证书读取接口取得的 CAS 基线 ETag。
+/// - `expected_generation`：可选受管材料代，指定后还须证明完整 pair 仍属于该代。
 /// - `certificate_pem`：有界上传的完整证书 PEM。
 /// - `private_key_pem`：有界上传的完整私钥 PEM。
 ///
@@ -64,6 +71,7 @@ pub(crate) enum KeypairCasInstallOutcome {
 pub(crate) fn install_keypair_atomically_if_match(
     tls: &TlsRuntimeCfg,
     expected_etag: &str,
+    expected_generation: Option<&str>,
     certificate_pem: &[u8],
     private_key_pem: &[u8],
 ) -> KeypairCasInstallOutcome {
@@ -84,15 +92,64 @@ pub(crate) fn install_keypair_atomically_if_match(
     if expected_etag.trim() != current_etag {
         return KeypairCasInstallOutcome::Changed(current_etag);
     }
+    let current_generation = if expected_generation.is_some() {
+        // 材料代与完整 pair 在同一锁内复验；A→B→A 或私钥单独改变不能复活旧动作的所有权。
+        crate::tls::active_keypair_paths_unrecovered(tls).and_then(|(_, key)| {
+            let private_key = crate::io::bounded_io::read_file(
+                &key,
+                MAX_KEYPAIR_BYTES,
+                "TLS material ownership private key",
+            )?;
+            generation::current(tls, &current, Some(&private_key))
+        })
+    } else {
+        generation::current(tls, &current, None)
+    };
+    let Ok(current_generation) = current_generation else {
+        return KeypairCasInstallOutcome::Unavailable;
+    };
+    if let Some(expected) = expected_generation {
+        if !valid_material_generation(expected) || current_generation.as_deref() != Some(expected) {
+            return KeypairCasInstallOutcome::GenerationChanged;
+        }
+    }
     // 候选身份与当前 staple 必须在任何准备写入之前自洽，不能先破坏磁盘材料再依赖 listener 的 LKG。
     if validate_installation(tls, certificate_pem, private_key_pem).is_err() {
         return KeypairCasInstallOutcome::Invalid;
     }
     match publish_keypair_locked(tls, certificate_pem, private_key_pem) {
-        Ok(()) => KeypairCasInstallOutcome::Installed,
+        Ok(generation) => KeypairCasInstallOutcome::Installed(generation),
         // rename 或 fsync 的失败不证明提交未发生；调用者只能回读原目标，不能无条件重放。
         Err(_) => KeypairCasInstallOutcome::OutcomeUnknown,
     }
+}
+
+/// 业务作用：为本机材料读面提供已记录的随机代，读取不创建或收养外部材料所有权。
+///
+/// 参数说明：
+/// - `tls`：当前默认文件身份来源。
+/// - `certificate`：本次已读取的公开证书原文，仍须与归属记录一致。
+///
+/// 返回：受管代、未受管空值或不可证明错误；普通投影不读取私钥，旧 journal 的必要恢复仍核对完整 pair。
+pub(crate) fn material_generation(
+    tls: &TlsRuntimeCfg,
+    certificate: &[u8],
+) -> Result<Option<String>> {
+    let _guard = keypair_install_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("TLS keypair install lock is poisoned"))?;
+    recover_legacy_keypair_transaction_locked(tls)?;
+    generation::current(tls, certificate, None)
+}
+
+/// 业务作用：把材料目标绑定到审批摘要，不能把同一 pair 的批准令牌用于另一来源计划。
+///
+/// 参数说明：
+/// - `tls`：审批记录冻结的材料来源。
+///
+/// 返回：不含可逆文件路径的目标摘要，不触发磁盘读取或秘密解析。
+pub(crate) fn material_target_fingerprint(tls: &TlsRuntimeCfg) -> [u8; 32] {
+    generation::declared_target(tls)
 }
 
 /// 业务作用：返回 ACME 与手工轮换共享的证书安装互斥锁，保证比较和 manifest/pair 发布不交错。
@@ -172,12 +229,12 @@ fn validate_installation(
 /// - `certificate_pem`：已通过当前身份策略校验的完整证书 PEM。
 /// - `private_key_pem`：与已验证证书匹配的完整私钥 PEM。
 ///
-/// 返回：事实源完整切换时成功；任一步 I/O 失败时返回错误，调用者不能据此推断未提交。
+/// 返回：事实源完整切换时返回新材料代；任一步 I/O 失败时返回错误，调用者不能据此推断未提交。
 fn publish_keypair_locked(
     tls: &TlsRuntimeCfg,
     certificate_pem: &[u8],
     private_key_pem: &[u8],
-) -> Result<()> {
+) -> Result<String> {
     if let Some(manifest_file) = &tls.keypair_manifest_file {
         let prepared = prepare_keypair_version(manifest_file, certificate_pem, private_key_pem)?;
         atomic_write(manifest_file, &prepared.manifest, false)?;
@@ -195,8 +252,8 @@ fn publish_keypair_locked(
             // 当前 manifest 已持久化；回收失败只留下额外历史，不能谎称激活失败并诱发重复签发。
             tracing::warn!(error = %format!("{error:#}"), "TLS keypair history cleanup failed");
         }
+        Ok(prepared.generation)
     } else {
-        install_legacy_keypair_transaction(tls, certificate_pem, private_key_pem)?;
+        install_legacy_keypair_transaction(tls, certificate_pem, private_key_pem)
     }
-    Ok(())
 }

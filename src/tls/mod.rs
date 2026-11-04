@@ -18,7 +18,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -26,7 +26,6 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Deserialize;
 use sha2::Digest as _;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -51,20 +50,12 @@ use crate::config::{
     ClientOcspCacheRecord, OcspStaplingRuntime, SessionTicketRuntime, TlsRuntimeCfg,
 };
 
-const KEYPAIR_MANIFEST_MAX_BYTES: usize = 64 * 1024;
 /// 单个证书链、私钥或 CA PEM 的控制面硬上限。PEM 只在启动/reload 读取，但仍必须防止
 /// 错挂载的大文件在配置构建期造成 OOM；4 MiB 足以容纳远超常规规模的证书链。
 const TLS_PEM_MAX_BYTES: usize = 4 * 1024 * 1024;
 const OCSP_RESPONSE_MAX_BYTES: usize = 256 * 1024;
 const MAX_SESSION_TICKET_PLAINTEXT_BYTES: usize = 64 * 1024;
 const SESSION_TICKET_PREFIX: &[u8; 5] = b"NWTK1";
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KeypairManifest {
-    schema_version: u32,
-    directory: String,
-}
 
 struct SessionTicketKey {
     id: [u8; 8],
@@ -1269,35 +1260,10 @@ pub(crate) fn active_keypair_paths_unrecovered(tls: &TlsRuntimeCfg) -> Result<(P
     let Some(manifest_file) = &tls.keypair_manifest_file else {
         return Ok((tls.cert_file.clone(), tls.key_file.clone()));
     };
-    let bytes = match crate::io::bounded_io::read_optional_file(
-        manifest_file,
-        KEYPAIR_MANIFEST_MAX_BYTES,
-        "TLS keypair manifest",
-    )? {
-        Some(bytes) => bytes,
-        None => return Ok((tls.cert_file.clone(), tls.key_file.clone())),
-    };
-    let manifest: KeypairManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse TLS keypair manifest {}", manifest_file.display()))?;
-    anyhow::ensure!(
-        manifest.schema_version == 1,
-        "TLS keypair manifest {} uses unsupported schema_version {}",
-        manifest_file.display(),
-        manifest.schema_version
-    );
-    let relative = Path::new(&manifest.directory);
-    anyhow::ensure!(
-        !relative.as_os_str().is_empty()
-            && !relative.is_absolute()
-            && relative
-                .components()
-                .all(|component| matches!(component, Component::Normal(_))),
-        "TLS keypair manifest {} directory must be a non-empty relative path without traversal",
-        manifest_file.display()
-    );
-    let parent = manifest_file.parent().unwrap_or_else(|| Path::new("."));
-    let directory = parent.join(relative);
-    Ok((directory.join("cert.pem"), directory.join("key.pem")))
+    match keypair::current_material_directory(manifest_file)? {
+        Some(directory) => Ok((directory.join("cert.pem"), directory.join("key.pem"))),
+        None => Ok((tls.cert_file.clone(), tls.key_file.clone())),
+    }
 }
 
 /// 业务作用：起证书热换 watcher:监听 cert/key 文件所在目录,内容变更即重建 `ServerConfig` 并原子换入 `shared`。

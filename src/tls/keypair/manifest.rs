@@ -1,6 +1,6 @@
 //! 不可变材料目录以单一 manifest 激活，回收始终保留当前及恢复指针。
 
-use super::{atomic_write, sync_directory};
+use super::{atomic_write, generation, sync_directory};
 use anyhow::{Context, Result};
 use std::{
     fs,
@@ -11,17 +11,28 @@ use std::{
 pub(super) struct PreparedKeypairVersion {
     pub(super) directory: PathBuf,
     pub(super) manifest: Vec<u8>,
+    pub(super) generation: String,
 }
 
 /// 业务作用：把完整 pair 写入不可变版本目录，但不切换当前 manifest。
 ///
-/// 返回的 manifest 只有在调用者以单次原子 rename 安装后才生效；因此进程在本函数后
-/// 崩溃只会留下无引用版本，旧 pair 仍是唯一事实。
+/// 参数说明：
+/// - `manifest_file`：固定当前指针及材料归属的文件位置。
+/// - `certificate_pem`：已验证的完整证书链。
+/// - `private_key_pem`：已验证且与证书匹配的私钥。
+///
+/// 返回：完整材料目录、待激活的指针及唯一材料代；失败不改变当前指针。
+/// 指针只有经调用者原子安装后才生效，此前崩溃仅留下未激活目录。
 pub(super) fn prepare_keypair_version(
     manifest_file: &Path,
     certificate_pem: &[u8],
     private_key_pem: &[u8],
 ) -> Result<PreparedKeypairVersion> {
+    let owner = generation::Record::new(
+        generation::manifest_target(manifest_file)?,
+        certificate_pem,
+        private_key_pem,
+    )?;
     let parent = manifest_file.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .with_context(|| format!("create keypair manifest dir {}", parent.display()))?;
@@ -47,6 +58,8 @@ pub(super) fn prepare_keypair_version(
     let result = (|| -> Result<Vec<u8>> {
         atomic_write(&directory.join("key.pem"), private_key_pem, true)?;
         atomic_write(&directory.join("cert.pem"), certificate_pem, false)?;
+        // 当前指针只能指向已经持久化完整 pair 与材料代的目录，不能在激活后补记归属。
+        owner.publish(&directory.join(generation::MANIFEST_RECORD))?;
         sync_directory(&directory)?;
         let relative = directory.strip_prefix(parent).with_context(|| {
             format!(
@@ -68,6 +81,7 @@ pub(super) fn prepare_keypair_version(
         Ok(manifest) => Ok(PreparedKeypairVersion {
             directory,
             manifest,
+            generation: owner.generation,
         }),
         Err(error) => {
             let _ = fs::remove_dir_all(&directory);
@@ -140,6 +154,7 @@ pub(super) fn gc_keypair_versions(manifest_file: &Path, retention: usize) -> Res
     }
 
     let mut versions = Vec::new();
+    let target = generation::manifest_target(manifest_file)?;
     for entry in fs::read_dir(&root).context("scan TLS keypair versions")? {
         let entry = entry.context("read TLS keypair version entry")?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -150,6 +165,13 @@ pub(super) fn gc_keypair_versions(manifest_file: &Path, retention: usize) -> Res
         }
         let metadata = fs::symlink_metadata(entry.path())?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        // 多个 manifest 可共享同一父目录；没有本目标的完整归属证据时不能回收，尤其不能删除另一监听的当前材料。
+        if !matches!(
+            generation::read(&entry.path().join(generation::MANIFEST_RECORD), &target),
+            Ok(Some(_))
+        ) {
             continue;
         }
         let cert = fs::symlink_metadata(entry.path().join("cert.pem"));
@@ -233,4 +255,49 @@ fn valid_keypair_version_name(name: &str) -> bool {
         && timestamp.bytes().all(|byte| byte.is_ascii_digit())
         && suffix.len() == 16
         && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeypairManifest {
+    schema_version: u32,
+    directory: String,
+}
+
+/// 业务作用：一次读取并验证活动 manifest，路径解析与材料代读取共享相同来源规则。
+///
+/// 参数说明：
+/// - `manifest_file`：当前唯一激活指针的位置。
+///
+/// 返回：合法相对目录或尚未建立的空值；格式、遍历、容量或 I/O 不可信时拒绝候选。
+pub(crate) fn current_material_directory(manifest_file: &Path) -> Result<Option<PathBuf>> {
+    let bytes = match crate::io::bounded_io::read_optional_file(
+        manifest_file,
+        64 * 1024,
+        "TLS keypair manifest",
+    )? {
+        Some(bytes) => bytes,
+        None => return Ok(None),
+    };
+    let manifest: KeypairManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse TLS keypair manifest {}", manifest_file.display()))?;
+    anyhow::ensure!(
+        manifest.schema_version == 1,
+        "TLS keypair manifest {} uses unsupported schema_version {}",
+        manifest_file.display(),
+        manifest.schema_version
+    );
+    let relative = Path::new(&manifest.directory);
+    anyhow::ensure!(
+        !relative.as_os_str().is_empty()
+            && !relative.is_absolute()
+            && relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "TLS keypair manifest {} directory must be a non-empty relative path without traversal",
+        manifest_file.display()
+    );
+    let parent = manifest_file.parent().unwrap_or_else(|| Path::new("."));
+    let directory = parent.join(relative);
+    Ok(Some(directory))
 }

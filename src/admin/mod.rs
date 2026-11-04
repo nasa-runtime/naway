@@ -4027,6 +4027,7 @@ enum ApprovalPayload {
     Certificate {
         tls: Box<crate::config::TlsRuntimeCfg>,
         expected_etag: String,
+        expected_generation: Option<String>,
         certificate_pem: Vec<u8>,
         private_key_pem: Vec<u8>,
     },
@@ -6650,10 +6651,21 @@ fn approval_payload_digest(payload: &ApprovalPayload) -> String {
             update(target.sentinel_rules.as_bytes());
         }
         ApprovalPayload::Certificate {
+            tls,
+            expected_etag,
+            expected_generation,
             certificate_pem,
             private_key_pem,
-            ..
         } => {
+            update(b"naway-certificate-material-intent");
+            update(&crate::tls::keypair::material_target_fingerprint(tls));
+            update(expected_etag.as_bytes());
+            update(
+                expected_generation
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
             update(certificate_pem);
             update(private_key_pem);
         }
@@ -6908,6 +6920,7 @@ async fn review_pending_change(req: AdminRequest, state: Arc<AdminState>) -> Res
                         ApprovalPayload::Certificate {
                             tls,
                             expected_etag,
+                            expected_generation,
                             certificate_pem,
                             private_key_pem,
                         } => {
@@ -6917,6 +6930,7 @@ async fn review_pending_change(req: AdminRequest, state: Arc<AdminState>) -> Res
                                 certificates::local::Installation {
                                     tls: *tls,
                                     expected: expected_etag,
+                                    expected_generation,
                                     certificate: certificate_pem,
                                     private_key: private_key_pem,
                                     version: change.base_version,

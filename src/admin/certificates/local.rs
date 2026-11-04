@@ -18,7 +18,7 @@ use std::{
 /// 参数说明：
 /// - `state`：提供当前不可变 TLS 计划与有界证书读取路径。
 ///
-/// 返回：返回 200 和逐证书状态；单个证书缺失/损坏仅将该项标记 `ok=false`，不读取或返回私钥。
+/// 返回：返回 200 和逐证书状态；单项缺失或损坏标记 `ok=false`，不返回私钥；旧 pair journal 仍先恢复。
 pub(in crate::admin) fn read_certificates(state: &AdminState) -> Response<BoxBody> {
     let snapshot = state.snap.load();
     let mut certificates = Vec::new();
@@ -42,7 +42,16 @@ pub(in crate::admin) fn read_certificates(state: &AdminState) -> Response<BoxBod
                 .and_then(|(cert, _)| {
                     crate::io::bounded_io::read_file(&cert, 1024 * 1024, "admin TLS certificate")
                 })
-                .and_then(|bytes| certificate_status(&bytes))
+                .and_then(|bytes| {
+                    let mut status = certificate_status(&bytes)?;
+                    status["material_generation"] = (if manual_target(tls) {
+                        crate::tls::keypair::material_generation(tls, &bytes)?
+                    } else {
+                        None
+                    })
+                    .map_or(serde_json::Value::Null, serde_json::Value::String);
+                    Ok(status)
+                })
         };
         certificates.push(certificate_json(
             &proxy.id,
@@ -90,6 +99,7 @@ struct CertificateUploadInput {
 pub(in crate::admin) struct Installation {
     pub tls: crate::config::TlsRuntimeCfg,
     pub expected: String,
+    pub expected_generation: Option<String>,
     pub certificate: Vec<u8>,
     pub private_key: Vec<u8>,
     pub version: u64,
@@ -124,7 +134,17 @@ pub(in crate::admin) async fn upload_certificate(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let response = if !request_content_type(&parts, "application/json") {
+    let mut generations = parts.headers.get_all("x-naway-material-if-match").iter();
+    let generation_header = generations.next();
+    let expected_generation = generation_header
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| crate::tls::keypair::valid_material_generation(value))
+        .map(str::to_owned);
+    let response = if generations.next().is_some()
+        || (generation_header.is_some() && expected_generation.is_none())
+    {
+        installation_failure(StatusCode::BAD_REQUEST, "invalid_material_generation")
+    } else if !request_content_type(&parts, "application/json") {
         json(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             serde_json::json!({
@@ -222,6 +242,7 @@ pub(in crate::admin) async fn upload_certificate(
                                     ApprovalPayload::Certificate {
                                         tls: Box::new(tls),
                                         expected_etag: expected,
+                                        expected_generation,
                                         certificate_pem: certificate,
                                         private_key_pem: private_key,
                                     },
@@ -233,6 +254,7 @@ pub(in crate::admin) async fn upload_certificate(
                                     Installation {
                                         tls,
                                         expected,
+                                        expected_generation,
                                         certificate,
                                         private_key,
                                         version: prepared.base_version,
@@ -323,6 +345,7 @@ pub(in crate::admin) async fn install_uploaded_certificate(
             Some(crate::tls::keypair::install_keypair_atomically_if_match(
                 &input.tls,
                 &input.expected,
+                input.expected_generation.as_deref(),
                 &input.certificate,
                 &input.private_key,
             ))
@@ -330,11 +353,12 @@ pub(in crate::admin) async fn install_uploaded_certificate(
     })
     .await;
     match installed {
-        Ok(Some(crate::tls::keypair::KeypairCasInstallOutcome::Installed)) => json(
+        Ok(Some(crate::tls::keypair::KeypairCasInstallOutcome::Installed(generation))) => json(
             StatusCode::OK,
             serde_json::json!({
                 "ok": true,
-                "status": "installed"
+                "status": "installed",
+                "material_generation": generation
             }),
         ),
         Ok(Some(crate::tls::keypair::KeypairCasInstallOutcome::Changed(etag))) => {
@@ -350,6 +374,12 @@ pub(in crate::admin) async fn install_uploaded_certificate(
                 response.headers_mut().insert(hyper::header::ETAG, value);
             }
             response
+        }
+        Ok(Some(crate::tls::keypair::KeypairCasInstallOutcome::GenerationChanged)) => {
+            installation_failure(
+                StatusCode::PRECONDITION_FAILED,
+                "certificate_material_generation_changed",
+            )
         }
         Ok(None) => plain(
             StatusCode::PRECONDITION_FAILED,
