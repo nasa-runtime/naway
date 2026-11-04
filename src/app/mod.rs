@@ -317,6 +317,7 @@ pub(super) async fn run() -> Result<()> {
             traffic_meter: traffic_meter.clone(),
             mode: run_mode.admin_plane_mode(),
             config_history: config_history.clone(),
+            apply_coordinator: apply_coordinator.clone(),
             dynamic_store: dynamic_store.clone(),
             blacklist: blacklist.clone(),
             interface_disable: interface_disable.clone(),

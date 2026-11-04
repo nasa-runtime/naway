@@ -6,6 +6,7 @@
 
 pub mod acme;
 pub mod installed;
+pub(crate) mod keypair;
 pub mod material;
 pub mod spire;
 pub(crate) mod trust;

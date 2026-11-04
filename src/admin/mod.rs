@@ -12,6 +12,7 @@ mod candidate;
 use candidate::build as build_cluster_candidate_snapshot;
 mod catalog;
 mod certificates;
+use certificates::local::{install_uploaded_certificate, read_certificates, upload_certificate};
 mod cluster;
 mod consumers;
 #[cfg(feature = "telemetry-otlp")]
@@ -110,6 +111,8 @@ pub struct AdminState {
     cfg_path: PathBuf,
     /// 配置 reload 历史与本地 rollback 归档。
     config_history: ConfigHistory,
+    /// 材料条件写入与 file/Nacos/xDS 共享发布权，不能跨越配置权限换代。
+    apply_coordinator: Arc<crate::control::reload::SnapshotApplyCoordinator>,
     /// 候选许可覆盖实际阻塞工作与清理，所有管理入口共用同一有界容量。
     candidate_builds: candidate::Admission,
     /// 数据面是否已就绪(监听已绑定、可接流量);停机时置 false → /readyz 转 503,供 LB 摘流。
@@ -195,6 +198,8 @@ pub struct AdminRuntimeState {
     pub mode: AdminPlaneMode,
     /// 配置版本历史与本地归档。
     pub config_history: ConfigHistory,
+    /// 必须与所有快照发布者共用，证书写入等待期间不允许静默改用另一把锁。
+    pub apply_coordinator: Arc<crate::control::reload::SnapshotApplyCoordinator>,
     /// 运行态事实源,用于 admin 写入黑名单和动态接口禁用。
     pub dynamic_store: Arc<SwappableDynamicStore>,
     /// 本节点黑名单缓存。
@@ -330,6 +335,7 @@ impl AdminState {
             workspace_operations: Default::default(),
             workspace_watches: Default::default(),
             config_history: runtime_state.config_history,
+            apply_coordinator: runtime_state.apply_coordinator,
             candidate_builds: candidate::Admission::new(),
             ready,
             #[cfg(feature = "xds-client")]
@@ -6906,10 +6912,17 @@ async fn review_pending_change(req: AdminRequest, state: Arc<AdminState>) -> Res
                             private_key_pem,
                         } => {
                             install_uploaded_certificate(
-                                *tls,
-                                expected_etag,
-                                certificate_pem,
-                                private_key_pem,
+                                &state,
+                                &parts,
+                                certificates::local::Installation {
+                                    tls: *tls,
+                                    expected: expected_etag,
+                                    certificate: certificate_pem,
+                                    private_key: private_key_pem,
+                                    version: change.base_version,
+                                    fingerprint: change.base_fingerprint,
+                                    initiator: Arc::from(change.initiator.as_str()),
+                                },
                             )
                             .await
                         }
@@ -7898,363 +7911,6 @@ async fn inject_created_api_key(
         hyper::header::HeaderValue::from_static("private, no-store"),
     );
     Response::from_parts(parts, full_body(Bytes::from(bytes)))
-}
-
-/// 业务作用：枚举所有 TLS listener 的域名、证书到期时间、原子 manifest 与 ACME 策略状态。
-///
-/// 参数说明：
-/// - `state`：提供当前不可变 TLS 计划与有界证书读取路径。
-///
-/// 返回：返回 200 和逐证书状态；单个证书缺失/损坏仅将该项标记 `ok=false`，不读取或返回私钥。
-fn read_certificates(state: &AdminState) -> Response<BoxBody> {
-    let snapshot = state.snap.load();
-    let mut certificates = Vec::new();
-    for proxy in snapshot.proxies.iter() {
-        let Some(tls) = &proxy.tls else {
-            continue;
-        };
-        let source = if tls.in_memory.is_some() {
-            "sds"
-        } else if tls.keypair_manifest_file.is_some() {
-            "manifest"
-        } else if tls.acme.is_some() {
-            "acme"
-        } else {
-            "static"
-        };
-        let default_status = if let Some(material) = &tls.in_memory {
-            certificate_status(material.certificate_chain.as_ref())
-        } else {
-            crate::tls::active_keypair_paths(tls)
-                .and_then(|(cert, _)| {
-                    crate::io::bounded_io::read_file(&cert, 1024 * 1024, "admin TLS certificate")
-                })
-                .and_then(|bytes| certificate_status(&bytes))
-        };
-        certificates.push(certificate_json(
-            &proxy.id,
-            "default",
-            proxy.server_names.as_ref(),
-            source,
-            tls,
-            default_status,
-        ));
-        for (index, sni) in tls.certs.iter().enumerate() {
-            let status = crate::io::bounded_io::read_file(
-                &sni.cert_file,
-                1024 * 1024,
-                "admin SNI TLS certificate",
-            )
-            .and_then(|bytes| certificate_status(&bytes));
-            certificates.push(certificate_json(
-                &proxy.id,
-                &format!("sni-{index}"),
-                sni.server_names.as_ref(),
-                "static",
-                tls,
-                status,
-            ));
-        }
-    }
-    json(
-        StatusCode::OK,
-        serde_json::json!({
-            "ok": true,
-            "certificates": certificates
-        }),
-    )
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CertificateUploadInput {
-    proxy: String,
-    certificate_pem: String,
-    private_key_pem: String,
-}
-
-/// 业务作用：以配置集 CAS 和证书事实 CAS 双重保护手工证书轮换，并与 ACME 安装共享互斥与 pair
-/// 校验，防止覆盖并发续期或发布不匹配私钥。
-///
-/// 参数说明：
-/// - `req`：必须带配置 `If-Match`、`X-Naway-Certificate-If-Match` 和有界 JSON PEM
-/// - `state`：提供当前 TLS 计划、RBAC 与审计。
-///
-/// 返回：两个基线均未变化且 pair 安装成功时返回 200；并发轮换返回 412；无 listener、SDS、非法
-/// PEM、超限或权限错误返回 4xx，I/O 故障返回 5xx。
-async fn upload_certificate(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody> {
-    const MAX_CERT_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
-
-    let (parts, body) = req.into_parts();
-    let prepared = match prepare_config_write(&parts, &state, AdminResource::Certs).await {
-        Ok(prepared) => prepared,
-        Err(response) => return *response,
-    };
-    let expected_certificate = parts
-        .headers
-        .get("x-naway-certificate-if-match")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let response = if !request_content_type(&parts, "application/json") {
-        json(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            serde_json::json!({
-                "ok": false,
-                "error": "Content-Type must be application/json"
-            }),
-        )
-    } else if expected_certificate.is_none() {
-        json(
-            StatusCode::PRECONDITION_REQUIRED,
-            serde_json::json!({
-                "ok": false,
-                "error": "X-Naway-Certificate-If-Match is required; read GET /api/certs",
-            }),
-        )
-    } else {
-        match collect_bounded_admin_body(&parts, body, MAX_CERT_UPLOAD_BYTES).await {
-            Err(response) => *response,
-            Ok(body) => match serde_json::from_slice::<CertificateUploadInput>(&body) {
-                Err(error) => json(
-                    StatusCode::BAD_REQUEST,
-                    serde_json::json!({
-                        "ok": false,
-                        "error": format!("invalid certificate JSON: {error}")
-                    }),
-                ),
-                Ok(input)
-                    if input
-                        .certificate_pem
-                        .len()
-                        .saturating_add(input.private_key_pem.len())
-                        > MAX_CERT_UPLOAD_BYTES =>
-                {
-                    json(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        serde_json::json!({
-                            "ok": false,
-                            "error": "certificate pair exceeds 2 MiB"
-                        }),
-                    )
-                }
-                Ok(input) => {
-                    let tls = {
-                        let snapshot = state.snap.load();
-                        snapshot
-                            .proxies
-                            .iter()
-                            .find(|proxy| proxy.id == input.proxy)
-                            .and_then(|proxy| proxy.tls.clone())
-                    };
-                    match tls {
-                        None => json(
-                            StatusCode::NOT_FOUND,
-                            serde_json::json!({
-                                "ok": false,
-                                "error": "TLS proxy not found"
-                            }),
-                        ),
-                        Some(tls) if tls.in_memory.is_some() => json(
-                            StatusCode::CONFLICT,
-                            serde_json::json!({
-                                "ok": false,
-                                "error": "SDS-owned certificate cannot be overwritten by file upload"
-                            }),
-                        ),
-                        Some(tls) => {
-                            let expected = expected_certificate
-                                .as_deref()
-                                .expect("presence checked")
-                                .to_string();
-                            let certificate = input.certificate_pem.into_bytes();
-                            let private_key = input.private_key_pem.into_bytes();
-                            if approval_required(&state, AdminResource::Certs) {
-                                submit_approval_change(
-                                    &state,
-                                    &prepared,
-                                    AdminResource::Certs,
-                                    ApprovalPayload::Certificate {
-                                        tls: Box::new(tls),
-                                        expected_etag: expected,
-                                        certificate_pem: certificate,
-                                        private_key_pem: private_key,
-                                    },
-                                )
-                            } else {
-                                install_uploaded_certificate(
-                                    tls,
-                                    expected,
-                                    certificate,
-                                    private_key,
-                                )
-                                .await
-                            }
-                        }
-                    }
-                }
-            },
-        }
-    };
-    finish_config_write(
-        &state,
-        &prepared.identity,
-        &parts,
-        AdminResource::Certs,
-        response,
-    )
-    .await
-}
-
-/// 业务作用：执行已经通过管理门禁的证书 CAS 安装，并把并发变化与执行故障映射为稳定 HTTP 语义。
-///
-/// 参数说明：
-/// - `tls`：已冻结的 TLS 安装目标。
-/// - `expected`：安装前必须仍匹配的证书基线。
-/// - `certificate`：有界且已读完的证书 PEM。
-/// - `private_key`：有界且已读完的私钥 PEM。
-///
-/// 返回：安装成功返回 200；证书已变化返回 412 和新 ETag；pair 非法返回 400；worker 故障返回 500。
-async fn install_uploaded_certificate(
-    tls: crate::config::TlsRuntimeCfg,
-    expected: String,
-    certificate: Vec<u8>,
-    private_key: Vec<u8>,
-) -> Response<BoxBody> {
-    let installed = tokio::task::spawn_blocking(move || {
-        crate::tls::acme::install_keypair_atomically_if_match(
-            &tls,
-            &expected,
-            &certificate,
-            &private_key,
-        )
-    })
-    .await;
-    match installed {
-        Ok(Ok(crate::tls::acme::KeypairCasInstallOutcome::Installed)) => json(
-            StatusCode::OK,
-            serde_json::json!({
-                "ok": true,
-                "status": "installed"
-            }),
-        ),
-        Ok(Ok(crate::tls::acme::KeypairCasInstallOutcome::Changed(etag))) => {
-            let mut response = json(
-                StatusCode::PRECONDITION_FAILED,
-                serde_json::json!({
-                    "ok": false,
-                    "error": "certificate changed since it was read",
-                    "certificate_etag": etag,
-                }),
-            );
-            if let Ok(value) = hyper::header::HeaderValue::from_str(&etag) {
-                response.headers_mut().insert(hyper::header::ETAG, value);
-            }
-            response
-        }
-        Ok(Err(error)) => json(
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "ok": false,
-                "error": error.to_string()
-            }),
-        ),
-        Err(error) => json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({
-                "ok": false,
-                "error": format!("certificate worker failed: {error}")
-            }),
-        ),
-    }
-}
-
-/// 业务作用：将一张可见证书的有效期解析成 Console 可用状态，不接触私钥。
-///
-/// 参数说明：
-/// - `pem`：是经 1 MiB 上限保护的 PEM 证书链。
-///
-/// 返回：有 leaf 且 X.509 可解析时返回 notBefore/notAfter Unix 时间与剩余天数；空链或非法证书失败。
-fn certificate_status(pem: &[u8]) -> anyhow::Result<serde_json::Value> {
-    let mut reader = std::io::Cursor::new(pem);
-    let leaf = rustls_pemfile::certs(&mut reader)
-        .next()
-        .transpose()
-        .context("parse TLS certificate PEM")?
-        .ok_or_else(|| anyhow::anyhow!("certificate PEM contains no certificate"))?;
-    let (_, certificate) = x509_parser::parse_x509_certificate(leaf.as_ref())
-        .map_err(|error| anyhow::anyhow!("parse X.509 certificate: {error}"))?;
-    let not_before = certificate.validity().not_before.timestamp();
-    let not_after = certificate.validity().not_after.timestamp();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .min(i64::MAX as u64) as i64;
-    Ok(serde_json::json!({
-        "etag": crate::tls::acme::certificate_etag(pem),
-        "not_before_unix": not_before,
-        "not_after_unix": not_after,
-        "days_remaining": not_after.saturating_sub(now) / 86_400,
-        "expired": not_after <= now,
-        "subject": certificate.subject().to_string(),
-    }))
-}
-
-/// 业务作用：组装一条不含路径和私钥的 TLS/ACME 管理读模型。
-///
-/// 参数说明：
-/// - `proxy`：证书所属 proxy 标识。
-/// - `entry`：该 proxy 内证书条目标识。
-/// - `domains`：证书覆盖的域名集合。
-/// - `source`：证书来源类型。
-/// - `tls`：TLS 交付策略。
-/// - `status`：有界 X.509 解析结果。
-///
-/// 返回：解析成功时合并有效期；失败时返回 `ok=false` 和低敏原因。
-fn certificate_json(
-    proxy: &str,
-    entry: &str,
-    domains: &[String],
-    source: &str,
-    tls: &crate::config::TlsRuntimeCfg,
-    status: anyhow::Result<serde_json::Value>,
-) -> serde_json::Value {
-    let acme = tls.acme.as_ref().map(|acme| {
-        serde_json::json!({
-            "domains": acme.domains.as_ref(),
-            "challenge": match acme.challenge {
-                crate::config::AcmeChallenge::Http01 => "http-01",
-                crate::config::AcmeChallenge::Dns01 => "dns-01",
-            },
-            "renew_before_days": acme.renew_before_days,
-            "storage_mode": acme.storage_mode,
-            "lock_backend": acme.lock_backend,
-        })
-    });
-    match status {
-        Ok(status) => serde_json::json!({
-            "proxy": proxy,
-            "entry": entry,
-            "domains": domains,
-            "source": source,
-            "manifest": tls.keypair_manifest_file.is_some(),
-            "acme": acme,
-            "ok": true,
-            "status": status,
-        }),
-        Err(error) => serde_json::json!({
-            "proxy": proxy,
-            "entry": entry,
-            "domains": domains,
-            "source": source,
-            "manifest": tls.keypair_manifest_file.is_some(),
-            "acme": acme,
-            "ok": false,
-            "reason": error.to_string(),
-        }),
-    }
 }
 
 /// 业务作用：枚举手写单入口与多 proxy 配置中的原始 route，供低频消费者管理对账。

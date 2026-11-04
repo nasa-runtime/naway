@@ -204,7 +204,7 @@ impl ReloadEvent {
 /// file/Nacos 与 xDS 共用的进程级 Snapshot 发布串行器。
 #[derive(Default)]
 pub struct SnapshotApplyCoordinator {
-    gate: Mutex<()>,
+    gate: Arc<Mutex<()>>,
 }
 
 impl SnapshotApplyCoordinator {
@@ -215,6 +215,15 @@ impl SnapshotApplyCoordinator {
     /// 返回：持有期间调用方是唯一 Snapshot writer；guard 释放后下一候选才能开始提交。
     pub async fn lock(&self) -> MutexGuard<'_, ()> {
         self.gate.lock().await
+    }
+
+    /// 业务作用：把唯一配置发布权交给实际阻塞任务，HTTP 取消不能提前释放仍在写材料的保护门。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：可移动至阻塞线程的发布许可；实际任务释放后其它配置写者才能继续。
+    pub(crate) async fn lock_owned(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gate.clone().lock_owned().await
     }
 }
 

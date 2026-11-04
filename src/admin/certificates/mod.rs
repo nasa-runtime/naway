@@ -1,5 +1,6 @@
 //! 集群证书目录来源于实际安装事实，不以磁盘材料或配置声明代替在线身份。
 
+pub(super) mod local;
 mod model;
 pub(super) mod read;
 
@@ -21,9 +22,23 @@ struct Cached {
     directory: Arc<Directory>,
 }
 
-#[derive(Default)]
 pub(in crate::admin) struct Runtime {
     local: parking_lot::Mutex<Option<Cached>>,
+    installs: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for Runtime {
+    /// 业务作用：为证书观察与材料写入分别建立独立容量，少量写入等待不能占满阻塞线程池。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：空观察缓存与两个实际安装任务许可，不读取材料或创建背景任务。
+    fn default() -> Self {
+        Self {
+            local: parking_lot::Mutex::new(None),
+            installs: Arc::new(tokio::sync::Semaphore::new(2)),
+        }
+    }
 }
 
 impl Runtime {
