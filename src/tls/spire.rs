@@ -66,6 +66,8 @@ struct SpireSourceConfig {
 pub(crate) struct SpireMaterial {
     /// 当前 SVID 的 rustls 签名身份；私钥只驻留于该不可调试对象。
     pub(crate) identity: Arc<CertifiedKey>,
+    /// 同次 SVID 校验生成的公开事实；读取时仍须经过来源的当前授权门。
+    pub(crate) observation: Arc<crate::tls::material::CertificateSnapshot>,
     /// 按规范化 trust domain 隔离的验证根，禁止跨域混用 CA。
     pub(crate) trust_bundles: HashMap<String, Arc<[CertificateDer<'static>]>>,
     /// Agent 随同完整响应提供的 CRL 集合。
@@ -838,6 +840,10 @@ fn validate_response(
         crls.push(CertificateRevocationListDer::from(bytes));
     }
     Ok(ResponseValidation::Active(Arc::new(SpireMaterial {
+        observation: crate::tls::material::single_certificate(
+            certified.cert[0].as_ref(),
+            crate::tls::material::CertificateSource::Spire,
+        ),
         identity: Arc::new(certified),
         trust_bundles,
         crls: Arc::from(crls),

@@ -1,6 +1,6 @@
 //! 每个已声明Admin只保留一条复用通道与两条有界在途流，故障不积压历史报告。
 
-use super::{catalog, consumers, protocol, telemetry, Plan, RPC_TIMEOUT};
+use super::{catalog, certificates, consumers, protocol, telemetry, Plan, RPC_TIMEOUT};
 use crate::admin::catalog::Catalog;
 use crate::admin::AdminState;
 use futures::{stream, StreamExt};
@@ -20,6 +20,8 @@ struct Target {
     catalog_complete: bool,
     consumers: consumers::Upload,
     consumers_supported: bool,
+    certificates: certificates::Upload,
+    certificates_supported: bool,
     interest_until: Option<Instant>,
     service_metrics_supported: bool,
     issuer: Option<Arc<super::issuer::Verifier>>,
@@ -37,6 +39,7 @@ struct Round<'a> {
     baseline: &'a crate::admin::cluster::baseline::Observation,
     catalog: &'a Catalog,
     consumers: &'a crate::admin::consumers::Directory,
+    certificates: &'a crate::admin::certificates::Directory,
     sequence: u64,
     metrics_enabled: bool,
     sample: Option<&'a Arc<telemetry::Upload>>,
@@ -102,6 +105,8 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     catalog_complete: false,
                     consumers: consumers::Upload::default(),
                     consumers_supported: false,
+                    certificates: certificates::Upload::default(),
+                    certificates_supported: false,
                     interest_until: None,
                     service_metrics_supported: false,
                     issuer: target.issuer.clone(),
@@ -128,6 +133,11 @@ pub(super) async fn run(owner: Weak<AdminState>) {
         }
         let catalog = state.catalog.local(&snapshot);
         let consumers = state.consumers.local(&snapshot);
+        let certificates = state.certificates.local(
+            &snapshot,
+            &state.installed_certificates,
+            state.mode.runs_data(),
+        );
         let metrics_enabled = plan.report_metrics && snapshot.admin_monitor.enabled;
         let sample = metrics_enabled
             .then(|| state.monitor.upload_sample(&state, &snapshot))
@@ -147,6 +157,7 @@ pub(super) async fn run(owner: Weak<AdminState>) {
             baseline: &baseline,
             catalog: &catalog,
             consumers: &consumers,
+            certificates: &certificates,
             sequence,
             metrics_enabled,
             sample: sample.as_ref(),
@@ -293,6 +304,19 @@ async fn send(target: &mut Target, round: &Round<'_>) {
                             )
                             .await;
                     }
+                    if target.certificates_supported {
+                        // 材料目录仍复用同一个串行目录槽，不扩大并发 RPC 和连接预算。
+                        let _ = target
+                            .certificates
+                            .send(
+                                &mut target.client,
+                                facts,
+                                &target.session,
+                                round.certificates,
+                                deadline,
+                            )
+                            .await;
+                    }
                 },
                 metrics
             )
@@ -306,6 +330,7 @@ async fn send(target: &mut Target, round: &Round<'_>) {
             target.session.clear();
             target.catalog_generation = None;
             target.consumers = consumers::Upload::default();
+            target.certificates = certificates::Upload::default();
             #[cfg(feature = "node-actions")]
             target.actions.clear();
             #[cfg(feature = "node-actions")]
@@ -479,6 +504,7 @@ async fn exchange(
             facts: Some(facts.clone()),
             metrics_supported: true,
             consumers_supported: true,
+            certificates_digest: Some(round.certificates.digest.to_vec()),
             metrics_enabled,
             baseline_supported: baseline.availability != "unsupported",
             node_baseline: baseline
@@ -509,6 +535,11 @@ async fn exchange(
     // 每次成功心跳重新取得能力；目标降级或切换后不能继续发送新字段及其摘要。
     target.service_metrics_supported = response.service_metrics_supported;
     target.consumers_supported = response.consumers_supported;
+    target.certificates_supported = response.certificates_supported;
+    if !target.certificates_supported {
+        // 目标降级时撤销本领域确认进度，恢复能力后必须重新交付完整材料事实。
+        target.certificates = certificates::Upload::default();
+    }
     if !target.consumers_supported {
         // 接收端不再支持本领域时撤销原确认偏移，恢复能力后重新交付完整事实。
         target.consumers = consumers::Upload::default();

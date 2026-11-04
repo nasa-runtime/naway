@@ -3,6 +3,9 @@
 //! 本模块只负责 QUIC/H3 frame 与网关统一 `BoxBody` 之间的流式桥接；路由、鉴权、限流、
 //! gRPC 与上游选择仍全部进入 [`GatewayProxy`]，避免产生第二套治理实现。
 
+mod certificates;
+pub use certificates::{spawn_cert_watcher, spawn_observed_cert_watcher, QuicServerMaterial};
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +29,6 @@ use crate::config::{Http3RuntimeCfg, TlsRuntimeCfg};
 use crate::observability::metrics::Metrics;
 use crate::protocols::proxy_protocol::ConnInfo;
 use crate::proxy::GatewayProxy;
-use crate::tls::build_server_config;
 use crate::{full_body, BoxBody, BoxError};
 
 /// HTTP/3 禁止转发到 wire 的 hop-by-hop header；后两个没有 `http::header` 常量。
@@ -138,8 +140,8 @@ pub fn build_server_endpoint(
     http3: &Http3RuntimeCfg,
     socket: UdpSocket,
 ) -> Result<PreparedServerEndpoint> {
-    let tls_config = build_server_config(tls)?;
-    let server_config = build_quic_server_config(tls_config, http3)?;
+    let material = crate::tls::material::build_server_material(tls)?;
+    let server_config = build_quic_server_config(material.config.clone(), http3)?;
 
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
@@ -153,6 +155,7 @@ pub fn build_server_endpoint(
     Ok(PreparedServerEndpoint {
         endpoint,
         server_config,
+        material,
     })
 }
 
@@ -163,9 +166,19 @@ pub fn build_server_endpoint(
 pub struct PreparedServerEndpoint {
     endpoint: quinn::Endpoint,
     server_config: quinn::ServerConfig,
+    material: crate::tls::material::ServerMaterial,
 }
 
 impl PreparedServerEndpoint {
+    /// 业务作用：共享候选 endpoint 实际使用的同源 TLS 材料，避免启动 watcher 时再次打开文件。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：低成本共享构建产物；调用方仅在 activate 完成后登记安装事实。
+    pub fn material(&self) -> crate::tls::material::ServerMaterial {
+        self.material.clone()
+    }
+
     /// 在 topology commit 点开放新 QUIC handshake。
     ///
     /// 业务作用：把 server identity 发布与 listener generation 切换对齐；调用前候选只占端口但
@@ -265,102 +278,6 @@ fn build_quic_server_config(
         .retry_token_lifetime(Duration::from_secs(http3.retry_token_lifetime_seconds))
         .migration(true);
     Ok(server_config)
-}
-
-/// 启动 HTTP/3 证书材料 watcher，新配置只作用于后续 QUIC handshake。
-///
-/// 业务作用：证书/私钥/SNI/mTLS CA 或 manifest 原子切换后更新 endpoint server config，并按
-/// 固定周期生成新的 Retry token 主密钥；构建或 QUIC 转换失败时保留旧身份，已建立 connection
-/// 永不因轮换被中断。
-///
-/// 参数说明：
-/// - `tls`：是材料来源
-/// - `http3`：固化 transport 预算
-/// - `shutdown`：绑定 watcher 与当前 listener generation 生命周期。
-///
-/// 返回：配置更新 receiver；accept loop 必须串行应用它，sender 随 generation 停止而释放。
-pub fn spawn_cert_watcher(
-    tls: TlsRuntimeCfg,
-    http3: Http3RuntimeCfg,
-    shutdown: watch::Receiver<bool>,
-) -> watch::Receiver<Option<quinn::ServerConfig>> {
-    let (updates, receiver) = watch::channel(None);
-    let material = Arc::new(Mutex::new(build_server_config(&tls).ok()));
-    let cert_material = material.clone();
-    let cert_updates = updates.clone();
-    let cert_http3 = http3.clone();
-    let session_tls = tls.clone();
-    crate::tls::spawn_cert_material_watcher_until(
-        tls,
-        move |tls_config| {
-            let mut current = cert_material.lock();
-            let server_config = build_quic_server_config(tls_config.clone(), &cert_http3)?;
-            *current = Some(tls_config);
-            // callback 不持有 Endpoint；accept loop 串行应用更新，停机后 sender 释放，不可能把
-            // 已经 set_server_config(None) 的旧 generation 重新打开。
-            cert_updates.send_replace(Some(server_config));
-            Ok(())
-        },
-        shutdown.clone(),
-    );
-    tokio::spawn(async move {
-        let period = Duration::from_secs(http3.retry_token_rotation_seconds);
-        let mut rotation = tokio::time::interval(period);
-        rotation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let session_period = Duration::from_secs(http3.early_data_session_rotation_seconds);
-        let mut session_rotation = tokio::time::interval(session_period);
-        session_rotation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // `interval` 首次 tick 立即就绪；初始 endpoint 已有随机密钥，不需要 commit 后立刻再换一次。
-        rotation.tick().await;
-        session_rotation.tick().await;
-        let mut shutdown = shutdown;
-        loop {
-            tokio::select! {
-                _ = rotation.tick() => {
-                    let current = material.lock();
-                    let Some(tls_config) = current.as_ref() else {
-                        continue;
-                    };
-                    match build_quic_server_config(tls_config.clone(), &http3) {
-                        Ok(server_config) => {
-                            // 新 key 只服务后续 Initial；轮换瞬间携带旧 token 的客户端会被当作
-                            // 未验证来源重新 Retry，不会降级成无认证放行。
-                            updates.send_replace(Some(server_config));
-                            tracing::info!("HTTP/3 Retry token key rotated");
-                        }
-                        Err(error) => tracing::warn!(
-                            error = %format!("{error:#}"),
-                            "HTTP/3 Retry token key rotation failed; keeping previous config"
-                        ),
-                    }
-                }
-                _ = session_rotation.tick(), if http3.zero_rtt => {
-                    // 有状态 session id 是一次性凭据，但未使用项仍可能在客户端保存；周期性发布
-                    // 新 storage 代会统一撤销旧项，并保持已建立 connection 完全不受影响。
-                    match build_server_config(&session_tls).and_then(|tls_config| {
-                        let server_config = build_quic_server_config(tls_config.clone(), &http3)?;
-                        Ok((tls_config, server_config))
-                    }) {
-                        Ok((tls_config, server_config)) => {
-                            *material.lock() = Some(tls_config);
-                            updates.send_replace(Some(server_config));
-                            tracing::info!("HTTP/3 early-data session generation rotated");
-                        }
-                        Err(error) => tracing::warn!(
-                            error = %format!("{error:#}"),
-                            "HTTP/3 early-data session rotation failed; keeping previous config"
-                        ),
-                    }
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                }
-            }
-        }
-    });
-    receiver
 }
 
 /// 驱动一条已完成 QUIC 握手的 HTTP/3 连接。

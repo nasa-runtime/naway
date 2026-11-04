@@ -65,6 +65,10 @@ pub(in crate::admin) struct Node {
     pub consumers: Option<Arc<crate::admin::consumers::Directory>>,
     #[serde(skip)]
     pub consumers_supported: bool,
+    #[serde(skip)]
+    pub certificates: Option<Arc<crate::admin::certificates::Directory>>,
+    #[serde(skip)]
+    pub certificates_supported: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -248,6 +252,8 @@ fn reported(state: &AdminState, snapshot: &GatewaySnapshot) -> Vec<Node> {
             catalog: observation.catalog,
             consumers: observation.consumers,
             consumers_supported: observation.consumers_supported,
+            certificates: observation.certificates,
+            certificates_supported: observation.certificates_supported,
             action_baseline: observation.action_baseline,
         })
         .collect()
@@ -360,6 +366,12 @@ async fn run(owner: Weak<AdminState>, wake: Arc<Notify>) {
             catalog: Some(state.catalog.local(&snapshot)),
             consumers: Some(state.consumers.local(&snapshot)),
             consumers_supported: true,
+            certificates: Some(state.certificates.local(
+                &snapshot,
+                &state.installed_certificates,
+                state.mode.runs_data(),
+            )),
+            certificates_supported: true,
             action_baseline: super::baseline::collect(&state, &snapshot).await,
         }];
         for node in &reported {
@@ -472,6 +484,8 @@ fn node_result(
         catalog: None,
         consumers: None,
         consumers_supported: false,
+        certificates: None,
+        certificates_supported: false,
         action_baseline: super::baseline::Observation::unsupported(),
     })
 }

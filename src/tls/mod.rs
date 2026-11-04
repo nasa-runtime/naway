@@ -5,6 +5,8 @@
 //! 证书文件内容变更由 notify watcher 捕获并重建(热换证不断连,)。
 
 pub mod acme;
+pub mod installed;
+pub mod material;
 pub mod spire;
 pub(crate) mod trust;
 
@@ -42,8 +44,7 @@ use x509_cert::der::{Decode, Encode};
 
 use crate::config::{
     ClientAuthRuntime, ClientCertificateOcspMode, ClientCertificateOcspRuntime,
-    ClientOcspCacheRecord, InMemoryTlsMaterial, OcspStaplingRuntime, SessionTicketRuntime,
-    TlsRuntimeCfg,
+    ClientOcspCacheRecord, OcspStaplingRuntime, SessionTicketRuntime, TlsRuntimeCfg,
 };
 
 const KEYPAIR_MANIFEST_MAX_BYTES: usize = 64 * 1024;
@@ -1346,7 +1347,7 @@ pub fn spawn_cert_material_watcher<F>(tls: TlsRuntimeCfg, publish: F)
 where
     F: Fn(Arc<ServerConfig>) -> Result<()> + Send + 'static,
 {
-    spawn_cert_material_watcher_inner(tls, publish, None);
+    spawn_cert_material_watcher_inner(tls, move |material| publish(material.config), None);
 }
 
 /// 启动随 listener generation 停止的 TLS 材料 watcher。
@@ -1367,7 +1368,11 @@ pub fn spawn_cert_material_watcher_until<F>(
 ) where
     F: Fn(Arc<ServerConfig>) -> Result<()> + Send + 'static,
 {
-    spawn_cert_material_watcher_inner(tls, publish, Some(shutdown));
+    spawn_cert_material_watcher_inner(
+        tls,
+        move |material| publish(material.config),
+        Some(shutdown),
+    );
 }
 
 /// 装配可选 generation 生命周期的证书 watcher 共用实现。
@@ -1385,7 +1390,7 @@ fn spawn_cert_material_watcher_inner<F>(
     publish: F,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) where
-    F: Fn(Arc<ServerConfig>) -> Result<()> + Send + 'static,
+    F: Fn(material::ServerMaterial) -> Result<()> + Send + 'static,
 {
     if let Some(source) = tls.spire.clone() {
         let reload_tls = tls.clone();
@@ -1400,7 +1405,7 @@ fn spawn_cert_material_watcher_inner<F>(
             {
                 return;
             }
-            match build_server_config(&reload_tls) {
+            match material::build_server_material(&reload_tls) {
                 Ok(config) => match publish(config) {
                     Ok(()) => tracing::info!("SPIRE TLS identity and trust bundles updated"),
                     Err(error) => {
@@ -1485,7 +1490,7 @@ fn spawn_cert_material_watcher_inner<F>(
                 {
                     return;
                 }
-                match build_server_config(&reload_tls) {
+                match material::build_server_material(&reload_tls) {
                     Ok(cfg) => match publish(cfg) {
                         Ok(()) => tracing::info!("tls certificate reloaded (hot swap)"),
                         Err(error) => tracing::warn!(
@@ -1531,50 +1536,14 @@ fn spawn_cert_material_watcher_inner<F>(
     });
 }
 
-/// 业务作用：从 `TlsRuntimeCfg` 构建一份 `ServerConfig`(ALPN 广告 h2 + http/1.1)。启动期与证书热换时各调用一次。
+/// 业务作用：构建包含 SNI、OCSP 或 SPIRE 授权门的服务端配置，保留现有调用方的加载接口。
 ///
-/// - 无 SNI 证书(`certs` 空):走 `with_single_cert`,保留 rustls 的 key↔cert 匹配校验(常见单域名)。
-/// - 有 SNI 证书:装一个 `SniCertResolver`,按 ClientHello 的 server_name 选证,默认证书兜底。
+/// 参数说明：
+/// - `tls`：已经完成配置校验的 TLS 材料计划。
+///
+/// 返回：证书、签名身份及认证策略合法时返回 ALPN 为 h2/http1.1 的配置；错误不替换在线配置。
 pub fn build_server_config(tls: &TlsRuntimeCfg) -> Result<Arc<ServerConfig>> {
-    if let Some(material) = &tls.in_memory {
-        anyhow::ensure!(
-            tls.keypair_manifest_file.is_none()
-                && tls.certs.is_empty()
-                && tls.client_auth.is_none()
-                && tls.acme.is_none(),
-            "in-memory TLS material cannot be combined with file, SNI, client_auth, or ACME sources"
-        );
-        return build_in_memory_server_config(material);
-    }
-    let builder = ServerConfig::builder();
-    let builder = match &tls.client_auth {
-        Some(ca) => match &tls.spire {
-            Some(source) => {
-                builder.with_client_cert_verifier(build_spire_client_verifier(source, ca)?)
-            }
-            None => builder.with_client_cert_verifier(build_client_verifier(ca)?),
-        },
-        None => builder.with_no_client_auth(),
-    };
-    let resolver: Arc<dyn ResolvesServerCert> = match &tls.spire {
-        Some(source) => {
-            anyhow::ensure!(
-                source.current().is_some(),
-                "SPIRE identity is not currently authorized or has expired"
-            );
-            Arc::new(crate::tls::spire::SpireServerCertResolver::new(
-                source.clone(),
-            ))
-        }
-        None => Arc::new(build_sni_resolver(tls)?),
-    };
-    // 选证 resolver 在每次握手执行 OCSP 或 SPIRE 到期门禁；任何身份失权都不能沿用已构建配置绕过。
-    let mut cfg = builder.with_cert_resolver(resolver);
-    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    if let Some(tickets) = &tls.session_tickets {
-        cfg.ticketer = build_session_ticket_producer(tickets)?;
-    }
-    Ok(Arc::new(cfg))
+    material::build_server_material(tls).map(|material| material.config)
 }
 
 struct SpireClientCertVerifier {
@@ -1865,47 +1834,17 @@ fn build_session_ticket_producer(
     }))
 }
 
-/// 业务作用：把快照持有的内存 PEM 构造成独立 rustls 配置，整个过程不创建临时文件或日志字段。
+/// 业务作用：为 SDS 控制通道构建已验证的服务端配置，材料不写入磁盘。
 ///
 /// 参数说明：
-/// - `material`：持有证书链、私钥与可选客户端 CA；其生命周期绑定当前 Snapshot。
+/// - `material`：当前内存证书、私钥及客户端认证材料。
 ///
-/// 返回：证书/私钥/CA 完整且彼此匹配时返回服务端配置；任何解析或身份错误拒绝候选 generation。
+/// 返回：全部材料合法时返回握手配置；任何身份错误均拒绝候选。
+#[cfg(feature = "xds-server")]
 pub(crate) fn build_in_memory_server_config(
-    material: &InMemoryTlsMaterial,
+    material: &crate::config::InMemoryTlsMaterial,
 ) -> Result<Arc<ServerConfig>> {
-    let builder = ServerConfig::builder();
-    let builder = match material.client_ca.as_deref() {
-        Some(ca) => {
-            let certs = load_certs_from_bytes(ca, "SDS trusted CA")?;
-            let mut roots = RootCertStore::empty();
-            for cert in certs {
-                roots.add(cert).context("add SDS client CA certificate")?;
-            }
-            let verifier = WebPkiClientVerifier::builder(Arc::new(roots));
-            let verifier = if material.require_client_certificate {
-                verifier.build()
-            } else {
-                verifier.allow_unauthenticated().build()
-            }
-            .context("build SDS client certificate verifier")?;
-            builder.with_client_cert_verifier(verifier)
-        }
-        None => {
-            anyhow::ensure!(
-                !material.require_client_certificate,
-                "SDS require_client_certificate needs a validation-context secret"
-            );
-            builder.with_no_client_auth()
-        }
-    };
-    let certs = load_certs_from_bytes(&material.certificate_chain, "SDS certificate chain")?;
-    let key = load_private_key_from_bytes(&material.private_key, "SDS private key")?;
-    let mut config = builder
-        .with_single_cert(certs, key)
-        .context("build SDS TLS certificate identity")?;
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(Arc::new(config))
+    material::build_in_memory_material(material).map(|material| material.config)
 }
 
 /// 业务作用：从 CA PEM 构建客户端证书 verifier，并准确落实严格、可选或不安全兼容模式。

@@ -38,7 +38,11 @@ use gateway::config::{
 use gateway::observability::metrics::Metrics;
 use gateway::protocols::proxy_protocol::{strip_proxy_protocol, ConnInfo};
 use gateway::proxy::{ConnectionClientIpHeader, DownstreamConnectionLease, GatewayProxy};
-use gateway::tls::{build_server_config, spawn_cert_watcher_until, SharedServerConfig};
+use gateway::tls::installed::{CertificateOwner, CertificateProtocol, CertificatePublisher};
+use gateway::tls::material::{
+    build_server_material, spawn_material_watcher_until, CertificateObservation, ServerMaterial,
+};
+use gateway::tls::SharedServerConfig;
 
 use super::stream::*;
 
@@ -885,7 +889,8 @@ pub(super) fn spawn_tls_accept_loop(
 /// 参数说明：
 /// - `endpoint`：是 prepare 阶段已绑定的 UDP endpoint
 /// - `runtime`：是同版 H3 硬预算
-/// - `certificate_updates`：串行接收新握手配置
+/// - `certificate_updates`：串行接收新握手配置与同源事实
+/// - `certificates`：当前 generation 的可撤销发布权
 /// - `proxy_id`：标识逻辑 listener
 /// - `state`：提供统一 代理、预算和指标
 /// - `shutdown`：是 generation 停收广播。
@@ -895,7 +900,8 @@ pub(super) fn spawn_tls_accept_loop(
 pub(super) fn spawn_http3_accept_loop(
     endpoint: quinn::Endpoint,
     runtime: gateway::config::Http3RuntimeCfg,
-    mut certificate_updates: watch::Receiver<Option<quinn::ServerConfig>>,
+    mut certificate_updates: watch::Receiver<Option<gateway::protocols::http3::QuicServerMaterial>>,
+    certificates: CertificatePublisher,
     proxy_id: Arc<str>,
     state: DataPlaneState,
     mut shutdown: watch::Receiver<bool>,
@@ -927,7 +933,9 @@ pub(super) fn spawn_http3_accept_loop(
                     } else if let Some(config) = certificate_updates.borrow_and_update().clone() {
                         // 与停机分支在同一个 accept task 串行执行；一旦 shutdown 把 server config
                         // 置空并 break，证书 watcher 再也没有机会重新开放旧 generation。
-                        endpoint.set_server_config(Some(config));
+                        certificates.publish(config.observation, || {
+                            endpoint.set_server_config(Some(config.config));
+                        });
                         info!(proxy = %proxy_id, "HTTP/3 certificate reloaded for new handshakes");
                     }
                     continue;
@@ -1166,6 +1174,7 @@ pub(super) fn configure_downstream_tcp(stream: &TcpStream, peer: SocketAddr) {
 /// - `state`：是数据面状态
 /// - `shutdown`：撤销本代
 /// - `readiness`：统一约束 pending、就绪与停机事实。
+/// - `certificates`：本代实际安装事实的发布能力。
 ///
 /// 返回：无同步返回值；后台仅在证书完整可用后启动 accept，取消或坏材料均保持端口不服务。
 pub(super) fn spawn_deferred_tls_accept_loop(
@@ -1175,6 +1184,7 @@ pub(super) fn spawn_deferred_tls_accept_loop(
     state: DataPlaneState,
     mut shutdown: watch::Receiver<bool>,
     readiness: DeferredTlsReadiness,
+    certificates: CertificatePublisher,
 ) {
     tokio::spawn(async move {
         let _pending = PendingTlsActivation::new(readiness);
@@ -1189,18 +1199,30 @@ pub(super) fn spawn_deferred_tls_accept_loop(
             if *shutdown.borrow() {
                 return;
             }
-            match build_server_config(&tls_cfg) {
-                Ok(server_config) => {
-                    let shared_tls: SharedServerConfig = Arc::new(ArcSwap::new(server_config));
-                    spawn_cert_watcher_until(tls_cfg.clone(), shared_tls.clone(), shutdown.clone());
+            match build_server_material(&tls_cfg) {
+                Ok(material) => {
+                    let shared_tls: SharedServerConfig = Arc::new(ArcSwap::new(material.config));
+                    let watcher_tls = shared_tls.clone();
+                    let watcher_shutdown = shutdown.clone();
                     let listen = listener.local_addr().ok();
-                    spawn_tls_accept_loop(
-                        listener,
-                        proxy_id.clone(),
-                        shared_tls,
-                        tls_cfg.client_auth.clone(),
-                        state,
-                        shutdown,
+                    // 首签期间可能已经删除或替换入口；失权不能再启动旧 accept loop。
+                    if !certificates.publish(material.observation, || {
+                        spawn_tls_accept_loop(
+                            listener,
+                            proxy_id.clone(),
+                            shared_tls,
+                            tls_cfg.client_auth.clone(),
+                            state,
+                            shutdown,
+                        );
+                    }) {
+                        return;
+                    }
+                    spawn_installed_cert_watcher(
+                        tls_cfg.clone(),
+                        watcher_tls,
+                        certificates.clone(),
+                        watcher_shutdown,
                     );
                     info!(proxy = %proxy_id, ?listen, "ACME bootstrap keypair installed; TLS listener activated without restart");
                     return;
@@ -1300,7 +1322,7 @@ pub(super) struct BoundTlsProxy {
 /// TLS listener 启动形态：已有 keypair 立即 accept，或 ACME 首签后在同进程激活。
 pub(super) enum BoundTlsMode {
     /// 启动期已构建可用 rustls 配置。
-    Ready(SharedServerConfig),
+    Ready(ServerMaterial),
     /// socket 已绑定，但 cert/key 尚不存在；后台检测到完整 keypair 后才开始 accept。
     Deferred,
 }
@@ -1315,7 +1337,7 @@ pub(super) struct BoundStream {
 
 pub(super) struct BoundStreamTls {
     pub(super) runtime: gateway::config::TlsRuntimeCfg,
-    pub(super) config: SharedServerConfig,
+    pub(super) material: ServerMaterial,
 }
 
 pub(super) enum BoundStreamSocket {
@@ -1326,6 +1348,8 @@ pub(super) enum BoundStreamSocket {
 pub(super) struct ActiveListenerGeneration {
     pub(super) topology: ProxyListenTopology,
     pub(super) stop: watch::Sender<bool>,
+    /// 唯一安装所有权随 generation 退出而撤销，watcher 克隆不能延长它。
+    pub(super) _certificate_owners: Vec<CertificateOwner>,
 }
 
 pub(super) struct ActiveAdminGeneration {
@@ -1525,10 +1549,21 @@ impl ListenerSupervisor {
         let (stop, stop_rx) = watch::channel(false);
         let proxy_id: Arc<str> = Arc::from(bound.id.clone());
         let mut log = Vec::new();
+        let mut certificate_owners = Vec::new();
         #[cfg(feature = "http3")]
         let http3 = bound.http3.map(|http3| {
-            let endpoint = http3.endpoint.activate();
-            (http3.listen, http3.runtime, endpoint)
+            let material = http3.endpoint.material();
+            let tls = &bound.tls.as_ref().expect("HTTP/3 requires TLS").runtime;
+            let (endpoint, owner) = self.admin_state.installed_certificates().activate(
+                proxy_id.clone(),
+                CertificateProtocol::Http3,
+                Arc::new(tls.clone()),
+                material.observation.clone(),
+                || http3.endpoint.activate(),
+            );
+            let publisher = owner.publisher();
+            certificate_owners.push(owner);
+            (http3.listen, http3.runtime, endpoint, material, publisher)
         });
         #[cfg(feature = "http3")]
         let mut http3_certificate_updates = None;
@@ -1543,34 +1578,46 @@ impl ListenerSupervisor {
         }
         if let Some(tls) = bound.tls {
             match tls.mode {
-                BoundTlsMode::Ready(config) => {
+                BoundTlsMode::Ready(material) => {
                     log.push(format!("{}@{}(tls)", bound.id, tls.listen));
+                    let config: SharedServerConfig = Arc::new(ArcSwap::new(material.config));
+                    let accept_config = config.clone();
+                    let (_, owner) = self.admin_state.installed_certificates().activate(
+                        proxy_id.clone(),
+                        CertificateProtocol::Https,
+                        Arc::new(tls.runtime.clone()),
+                        material.observation,
+                        || {
+                            spawn_tls_accept_loop(
+                                tls.listener,
+                                proxy_id.clone(),
+                                accept_config,
+                                tls.runtime.client_auth.clone(),
+                                self.data_plane.clone(),
+                                stop_rx.clone(),
+                            );
+                        },
+                    );
                     if tls.runtime.in_memory.is_none() {
-                        // 文件 watcher 只能在 commit 后启动；prepare 中启动会让失败候选泄漏后台
-                        // task。SDS 材料随 Snapshot generation 原子切换，不创建文件 watcher。
-                        spawn_cert_watcher_until(
+                        // 候选已 commit 并持有 owner 才启动 watcher，避免失败候选泄漏任务或发布事实。
+                        spawn_installed_cert_watcher(
                             tls.runtime.clone(),
-                            config.clone(),
+                            config,
+                            owner.publisher(),
                             stop_rx.clone(),
                         );
                         #[cfg(feature = "http3")]
-                        if let Some((_, runtime, _)) = &http3 {
+                        if let Some((_, runtime, _, material, _)) = &http3 {
                             http3_certificate_updates =
-                                Some(gateway::protocols::http3::spawn_cert_watcher(
+                                Some(gateway::protocols::http3::spawn_observed_cert_watcher(
                                     tls.runtime.clone(),
                                     runtime.clone(),
+                                    material.clone(),
                                     stop_rx.clone(),
                                 ));
                         }
                     }
-                    spawn_tls_accept_loop(
-                        tls.listener,
-                        proxy_id.clone(),
-                        config,
-                        tls.runtime.client_auth.clone(),
-                        self.data_plane.clone(),
-                        stop_rx.clone(),
-                    );
+                    certificate_owners.push(owner);
                 }
                 BoundTlsMode::Deferred => {
                     log.push(format!("{}@{}(tls-pending)", bound.id, tls.listen));
@@ -1578,6 +1625,15 @@ impl ListenerSupervisor {
                     // 防止新 generation 只开放 challenge/明文半边时被前置 LB 当成完整节点。
                     self.deferred_tls.ready.store(false, Ordering::Release);
                     self.deferred_tls.pending.fetch_add(1, Ordering::AcqRel);
+                    let (_, owner) = self.admin_state.installed_certificates().activate(
+                        proxy_id.clone(),
+                        CertificateProtocol::Https,
+                        Arc::new(tls.runtime.clone()),
+                        CertificateObservation::waiting(),
+                        || {},
+                    );
+                    let publisher = owner.publisher();
+                    certificate_owners.push(owner);
                     spawn_deferred_tls_accept_loop(
                         tls.listener,
                         proxy_id.clone(),
@@ -1585,18 +1641,20 @@ impl ListenerSupervisor {
                         self.data_plane.clone(),
                         stop_rx.clone(),
                         self.deferred_tls.clone(),
+                        publisher,
                     );
                 }
             }
         }
         #[cfg(feature = "http3")]
-        if let Some((listen, runtime, endpoint)) = http3 {
+        if let Some((listen, runtime, endpoint, _, publisher)) = http3 {
             log.push(format!("{}@{}(h3/udp)", bound.id, listen));
             spawn_http3_accept_loop(
                 endpoint,
                 runtime,
                 http3_certificate_updates
                     .expect("HTTP/3 listener always has a ready TLS certificate watcher"),
+                publisher,
                 proxy_id,
                 self.data_plane.clone(),
                 stop_rx,
@@ -1611,6 +1669,7 @@ impl ListenerSupervisor {
                 ActiveListenerGeneration {
                     topology,
                     stop,
+                    _certificate_owners: certificate_owners,
                 },
             );
         if let Some(old) = old {
@@ -1644,20 +1703,41 @@ impl ListenerSupervisor {
             }
         );
         let (stop, stop_rx) = watch::channel(false);
-        let tls = bound.tls.map(|tls| {
-            spawn_cert_watcher_until(tls.runtime, tls.config.clone(), stop_rx.clone());
-            tls.config
-        });
+        let mut certificate_owners = Vec::new();
         match bound.socket {
-            BoundStreamSocket::Tcp(listener) => spawn_stream_accept_loop(
-                listener,
-                bound.runtime,
-                tls,
-                self.stream_plane.clone(),
-                stop_rx,
-            ),
+            BoundStreamSocket::Tcp(listener) => {
+                if let Some(tls) = bound.tls {
+                    let config: SharedServerConfig = Arc::new(ArcSwap::new(tls.material.config));
+                    let accept_config = config.clone();
+                    let (_, owner) = self.admin_state.installed_certificates().activate(
+                        Arc::from(bound.runtime.id.as_str()),
+                        CertificateProtocol::StreamTls,
+                        Arc::new(tls.runtime.clone()),
+                        tls.material.observation,
+                        || {
+                            spawn_stream_accept_loop(
+                                listener,
+                                bound.runtime,
+                                Some(accept_config),
+                                self.stream_plane.clone(),
+                                stop_rx.clone(),
+                            );
+                        },
+                    );
+                    spawn_installed_cert_watcher(tls.runtime, config, owner.publisher(), stop_rx);
+                    certificate_owners.push(owner);
+                } else {
+                    spawn_stream_accept_loop(
+                        listener,
+                        bound.runtime,
+                        None,
+                        self.stream_plane.clone(),
+                        stop_rx,
+                    );
+                }
+            }
             BoundStreamSocket::Udp(socket) => {
-                spawn_stream_udp_loop(socket, bound.runtime, self.stream_plane.clone(), stop_rx)
+                spawn_stream_udp_loop(socket, bound.runtime, self.stream_plane.clone(), stop_rx);
             }
         }
         let old = self
@@ -1669,6 +1749,7 @@ impl ListenerSupervisor {
                 ActiveListenerGeneration {
                     topology,
                     stop,
+                    _certificate_owners: certificate_owners,
                 },
             );
         if let Some(old) = old {
@@ -1963,11 +2044,10 @@ pub(super) async fn bind_proxy(proxy: &ProxyRuntime) -> Result<BoundProxy> {
                 warn!(proxy = %proxy.id, %tls_listen, "ACME bootstrap: seed certificate missing; TLS socket bound and awaiting first issuance");
                 BoundTlsMode::Deferred
             } else {
-                let server_config = build_server_config(tls_cfg).with_context(|| {
+                let material = build_server_material(tls_cfg).with_context(|| {
                     format!("build initial tls server config for proxy `{}`", proxy.id)
                 })?;
-                let shared_tls: SharedServerConfig = Arc::new(ArcSwap::new(server_config));
-                BoundTlsMode::Ready(shared_tls)
+                BoundTlsMode::Ready(material)
             };
             Some(BoundTlsProxy {
                 listen: tls_listen,
@@ -2042,12 +2122,11 @@ pub(super) async fn bind_stream(stream: &StreamRuntime) -> Result<BoundStream> {
         .tls
         .as_ref()
         .map(|tls| {
-            let config = build_server_config(tls)
+            let material = build_server_material(tls)
                 .with_context(|| format!("build stream `{}` TLS config", stream.id))?;
-            let shared: SharedServerConfig = Arc::new(ArcSwap::new(config));
             Ok::<_, anyhow::Error>(BoundStreamTls {
                 runtime: tls.clone(),
-                config: shared,
+                material,
             })
         })
         .transpose()?;
@@ -2082,4 +2161,31 @@ pub(super) fn bind_reuseport_udp(addr: SocketAddr) -> std::io::Result<UdpSocket>
     socket.bind(&addr.into())?;
     socket.set_nonblocking(true)?;
     UdpSocket::from_std(socket.into())
+}
+
+/// 业务作用：把 TCP/L4 热换与证书观察值放进同一个 owner 发布门，迟到材料不得重新激活旧代。
+///
+/// 参数说明：
+/// - `tls`：本代完整材料来源计划。
+/// - `config`：accept 循环读取的原子配置指针。
+/// - `certificates`：与 listener 生命周期绑定的发布能力。
+/// - `shutdown`：取消本代文件与动态身份 watcher。
+///
+/// 返回：无同步结果；坏材料保留 LKG，已失权的候选不执行配置替换。
+fn spawn_installed_cert_watcher(
+    tls: gateway::config::TlsRuntimeCfg,
+    config: SharedServerConfig,
+    certificates: CertificatePublisher,
+    shutdown: watch::Receiver<bool>,
+) {
+    spawn_material_watcher_until(
+        tls,
+        move |material| {
+            certificates.publish(material.observation, || {
+                config.store(material.config);
+            });
+            Ok(())
+        },
+        shutdown,
+    );
 }

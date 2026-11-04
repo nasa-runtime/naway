@@ -8,6 +8,7 @@ service NodeManagement {
   rpc Report(ReportRequest) returns (ReportResponse);
   rpc Catalog(CatalogRequest) returns (CatalogResponse);
   rpc Consumers(ConsumersRequest) returns (CatalogResponse);
+  rpc Certificates(CertificatesRequest) returns (CatalogResponse);
   rpc Sample(stream SampleRequest) returns (SampleResponse);
   rpc ActionData(ActionDataRequest) returns (ActionDataResponse);
   rpc ActionResult(ActionResultRequest) returns (ActionResultResponse);
@@ -77,6 +78,8 @@ message ReportRequest {
   bool previews_supported = 11;
   bool previews_enabled = 12;
   bool consumers_supported = 13;
+  // 当前实际安装目录的身份；配置版本不变的热换也必须撤销旧完整目录。
+  optional bytes certificates_digest = 14;
 }
 
 // 当前本地文件决定与业务就绪分开；没有历史、路径或恢复命令令牌。
@@ -124,6 +127,7 @@ message ReportResponse {
   bool service_metrics_supported = 5;
   PreviewOffer preview = 6;
   bool consumers_supported = 7;
+  bool certificates_supported = 8;
 }
 
 // 独立只读证明不包含 Saga 步骤、文件方向或租约，原目标与候选不能由接收者替换。
@@ -520,4 +524,40 @@ message ConsumersRequest {
   uint32 offset = 8;
   bool capacity = 9;
   repeated ConsumerEntry entries = 10;
+}
+
+// 公开叶证书事实，不传送 DER、PEM、私钥或文件路径。
+message CertificateLeaf {
+  bytes sha256 = 1;
+  int64 not_before = 2;
+  int64 not_after = 3;
+  repeated string names = 4;
+}
+
+message CertificateEntry {
+  string listener = 1;
+  string protocol = 2;
+  string binding = 3;
+  uint32 selection_order = 4;
+  string state = 5;
+  string source = 6;
+  CertificateLeaf leaf = 7;
+  optional int64 ocsp_valid_until = 8;
+  bool ocsp_required = 9;
+  string workspace = 10;
+  string tenant = 11;
+  string environment = 12;
+}
+
+message CertificatesRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  uint64 config_version = 4;
+  optional uint64 config_fingerprint = 5;
+  bytes digest = 6;
+  uint32 total = 7;
+  uint32 offset = 8;
+  bool capacity = 9;
+  repeated CertificateEntry entries = 10;
 }

@@ -95,6 +95,9 @@ pub(super) async fn handle(req: AdminRequest, state: Arc<AdminState>) -> Respons
     if endpoint == "cluster/consumers" {
         return consumers::read::workspace(&state, &request, &identity, &snapshot, &workspace);
     }
+    if endpoint == "cluster/certificates" {
+        return certificates::read::workspace(&state, &request, &identity, &snapshot, &workspace);
+    }
     if endpoint == "cluster/catalog" {
         return catalog::workspace::read(&state, &request, &identity, &snapshot, &workspace);
     }

@@ -4,6 +4,7 @@
 pub(in crate::admin) mod actions;
 mod baseline;
 mod catalog;
+mod certificates;
 mod consumers;
 mod issuer;
 pub(in crate::admin) mod metrics;

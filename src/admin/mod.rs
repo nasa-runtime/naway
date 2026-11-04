@@ -11,6 +11,7 @@ pub mod audit;
 mod candidate;
 use candidate::build as build_cluster_candidate_snapshot;
 mod catalog;
+mod certificates;
 mod cluster;
 mod consumers;
 #[cfg(feature = "telemetry-otlp")]
@@ -170,6 +171,9 @@ pub struct AdminState {
     /// 与上报共享当前配置对象目录；不进入普通请求执行链。
     catalog: catalog::Runtime,
     consumers: consumers::Runtime,
+    certificates: certificates::Runtime,
+    /// 仅由实际 listener commit 登记的证书事实，不以配置或磁盘文件冒充安装状态。
+    installed_certificates: crate::tls::installed::InstalledCertificates,
     /// 启动期安装的持久提案权威；纯数据节点不创建数据库资源。
     #[cfg(feature = "admin-operations-pgsql")]
     operations: std::sync::OnceLock<Arc<operations::Store>>,
@@ -207,6 +211,15 @@ pub struct AdminRuntimeState {
 }
 
 impl AdminState {
+    /// 业务作用：让 listener supervisor 与集群上报共用实际 TLS 安装事实的唯一注册表。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：共享控制面注册表；不会读取证书文件或改变监听器状态。
+    pub fn installed_certificates(&self) -> &crate::tls::installed::InstalledCertificates {
+        &self.installed_certificates
+    }
+
     /// 业务作用：挂接唯一数据面被动健康状态，管理读取不另行采样或建立实例目录。
     ///
     /// 参数说明：
@@ -341,6 +354,8 @@ impl AdminState {
             member_discovery: Default::default(),
             catalog: catalog::Runtime::default(),
             consumers: consumers::Runtime::default(),
+            certificates: certificates::Runtime::default(),
+            installed_certificates: crate::tls::installed::InstalledCertificates::default(),
             #[cfg(feature = "admin-operations-pgsql")]
             operations: std::sync::OnceLock::new(),
         })
@@ -735,6 +750,9 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
         (&Method::GET, "/api/cluster/consumers") => {
             consumers::read::platform(&state, &request).await
         }
+        (&Method::GET, "/api/cluster/certificates") => {
+            certificates::read::platform(&state, &request).await
+        }
         (&Method::GET, "/api/cluster/overview") | (&Method::GET, "/admin/cluster/facts") => {
             if request.uri.query().is_some() {
                 plain(
@@ -975,9 +993,10 @@ fn admin_permission(method: &Method, path: &str) -> Option<(AdminResource, Admin
         (&Method::GET, "/api/monitor/services") => {
             Some((AdminResource::Cluster, AdminAction::Read))
         }
-        (&Method::GET, "/api/cluster/catalog" | "/api/cluster/consumers") => {
-            Some((AdminResource::Cluster, AdminAction::Read))
-        }
+        (
+            &Method::GET,
+            "/api/cluster/catalog" | "/api/cluster/consumers" | "/api/cluster/certificates",
+        ) => Some((AdminResource::Cluster, AdminAction::Read)),
         (&Method::GET, "/api/cluster/overview") | (&Method::GET, "/admin/cluster/facts") => {
             Some((AdminResource::Cluster, AdminAction::Read))
         }
