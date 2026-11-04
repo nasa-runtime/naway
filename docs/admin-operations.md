@@ -229,7 +229,9 @@ naway --config /data/naway/naway.yml --admin-operations-workflow-status admin
 工作流初始化只接受没有既存 Saga/Inbox/Outbox 对象的命名空间，在一个数据库事务中创建完整结构、
 初始化配额账本并保存结构证据。中途失败整体回滚。未确认完成时，保留原数据库、schema 和集群身份，
 先查看状态再原样重试；不能把通信失败当成已经回滚。重复初始化核对已有合同，不覆盖未知结构。
-普通 `--admin-operations-migrate` 不主动开启工作流初始化；已有工作流结构时仍验证其完整合同。
+普通 `--admin-operations-migrate` 不主动开启工作流运行态；已有工作流结构时仍验证其完整合同。
+显式启用[加密证书提案](admin-certificate-proposals.md)时，该命令同时初始化材料合同所需的前置
+结构；材料受理不会因此启动配置工作流或节点执行器。
 
 显式工作流迁移还安装独立的交付结构，保存冻结执行、目标占位和永久递增 fence；
 `delivery_schema_installed` 单独表示这组结构已经通过实际校验。两个迁移各自原子提交，后段失败时

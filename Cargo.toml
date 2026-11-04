@@ -105,6 +105,7 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] } # gzip/br 流式编解码；保持请求与响应正文背压
 base64 = "0.22"                       # gRPC-Web text 与 Connect status details 的标准 Base64 envelope
 bytes = "1"
+zeroize = "1.9"                     # 控制面材料和解析后的钥环在最后一个持有者释放时清零
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] } # OCSP freshness 使用带时区的验证时刻
 casbin = { version = "2.20.0", default-features = false, features = ["glob", "ip", "runtime-tokio"] } # 内嵌 RBAC/ABAC；模型/策略构建后只读
 crossbeam-utils = "0.8"                # 热指标 CachePadded 条带计数，避免 Tokio worker 争用同一 cache line

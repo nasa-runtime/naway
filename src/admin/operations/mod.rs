@@ -3,6 +3,7 @@
 mod api;
 mod authorization;
 mod capacity;
+mod certificates;
 mod connection;
 mod draft;
 mod execution;
@@ -16,6 +17,7 @@ mod workflow;
 
 use super::AdminState;
 pub(super) use api::handle;
+pub(super) use certificates::handle as handle_certificates;
 use std::sync::Arc;
 pub use store::Store;
 

@@ -15,7 +15,7 @@ use io::sync_directory;
 use legacy::{install_legacy_keypair_transaction, recover_legacy_keypair_transaction_locked};
 pub(crate) use manifest::current_material_directory;
 use manifest::{gc_keypair_versions, prepare_keypair_version};
-use validation::validate_keypair;
+pub(crate) use validation::validate_keypair;
 
 const MAX_KEYPAIR_BYTES: usize = 4 * 1024 * 1024;
 

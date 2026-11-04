@@ -322,11 +322,13 @@ pub enum AdminResource {
     Audit,
     /// 限时流量诊断的申请、复核和有界下载。
     Diagnostics,
+    /// 跨节点保存和审阅加密证书材料提案。
+    CertificateProposals,
 }
 
 impl AdminResource {
     /// 固定资源域全集；用于内置角色构建，不依赖用户输入产生动态 label。
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Config,
         Self::Routes,
         Self::InterfaceGuard,
@@ -341,6 +343,7 @@ impl AdminResource {
         Self::Upstreams,
         Self::Audit,
         Self::Diagnostics,
+        Self::CertificateProposals,
     ];
 
     /// 业务作用：转换为权限位图中的稳定资源序号。

@@ -597,6 +597,7 @@ pub(super) const fn resource_name(resource: AdminResource) -> &'static str {
         AdminResource::Upstreams => "upstreams",
         AdminResource::Audit => "audit",
         AdminResource::Diagnostics => "diagnostics",
+        AdminResource::CertificateProposals => "certificate-proposals",
     }
 }
 

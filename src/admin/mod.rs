@@ -549,6 +549,12 @@ pub async fn admin_config_current_publish_mvc(
 /// 业务作用：管理面统一安全分发：认证 → Origin → 平面边界 → RBAC → 审计 → handler；未知路径 404。
 async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody> {
     #[cfg(feature = "admin-operations-pgsql")]
+    if req.uri().path() == "/api/certificate-proposals"
+        || req.uri().path().starts_with("/api/certificate-proposals/")
+    {
+        return Box::pin(operations::handle_certificates(req, state)).await;
+    }
+    #[cfg(feature = "admin-operations-pgsql")]
     if req.uri().path() == "/api/operations/proposals"
         || req.uri().path().starts_with("/api/operations/proposals/")
     {
@@ -4414,6 +4420,7 @@ fn admin_resource_name(resource: AdminResource) -> &'static str {
         AdminResource::Upstreams => "upstreams",
         AdminResource::Audit => "audit",
         AdminResource::Diagnostics => "diagnostics",
+        AdminResource::CertificateProposals => "certificate-proposals",
     }
 }
 

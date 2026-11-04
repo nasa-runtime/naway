@@ -28,6 +28,7 @@ pub(super) fn read(state: &AdminState, identity: &AdminIdentity) -> Response<Box
         ("upstreams", AdminResource::Upstreams),
         ("audit", AdminResource::Audit),
         ("diagnostics", AdminResource::Diagnostics),
+        ("certificate-proposals", AdminResource::CertificateProposals),
     ];
     let actions = [
         ("read", AdminAction::Read),

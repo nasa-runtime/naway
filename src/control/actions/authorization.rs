@@ -1,6 +1,8 @@
 //! 提案和目标执行共用当前主体与工作区授权，不以命令中的身份声明授予权限。
 
 use super::domain::Domain;
+#[cfg(any(feature = "admin-operations-pgsql", feature = "node-actions"))]
+use crate::config::model::AdminResource;
 use crate::{
     config::{model::AdminAction, GatewaySnapshot},
     control::ownership::config::Action,
@@ -84,9 +86,27 @@ impl<'a> Scope<'a> {
     /// 参数说明：
     /// - `snapshot`：创建或审阅时的已发布主体与工作区目录。
     ///
-    /// 返回：保持排序、长度分帧和原始凭据贡献的摘要；缺失工作区返回空，秘密不进入输出字段。
+    /// 返回：保持配置动作固定资源范围、排序、长度分帧和原始凭据贡献的摘要；缺失工作区返回空。
     #[cfg(any(feature = "admin-operations-pgsql", feature = "node-actions"))]
     pub(crate) fn authority(&self, snapshot: &GatewaySnapshot) -> Option<[u8; 32]> {
+        // 配置动作的已持久授权只覆盖既定资源；新增独立材料权限不能使原任务因升级而失去原授权证明。
+        self.authority_through(snapshot, AdminResource::Diagnostics)
+    }
+
+    /// 业务作用：按控制域固定的资源边界冻结权限，独立领域扩展不改变其它持久任务的摘要合同。
+    ///
+    /// 参数说明：
+    /// - `snapshot`：创建或复核时的当前主体与工作区目录。
+    /// - `last_resource`：调用方代码固定的最后资源，不接受请求中的自选范围。
+    ///
+    /// 返回：包含该范围全部权限及凭据、工作区绑定的摘要；位数越界或工作区缺失时为空。
+    #[cfg(any(feature = "admin-operations-pgsql", feature = "node-actions"))]
+    pub(crate) fn authority_through(
+        &self,
+        snapshot: &GatewaySnapshot,
+        last_resource: AdminResource,
+    ) -> Option<[u8; 32]> {
+        let permissions = 1_u128.checked_shl((last_resource.index() + 1) * AdminAction::COUNT)? - 1;
         let mut digest = Sha256::new();
         digest.update(b"naway-operation-proposal-authority\0");
         field(&mut digest, self.key.as_bytes());
@@ -94,7 +114,10 @@ impl<'a> Scope<'a> {
         principals.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         for principal in principals {
             field(&mut digest, principal.id.as_bytes());
-            field(&mut digest, &principal.permission_bits().to_be_bytes());
+            field(
+                &mut digest,
+                &(principal.permission_bits() & permissions).to_be_bytes(),
+            );
             field(
                 &mut digest,
                 principal.bearer_token.as_deref().unwrap_or_default(),

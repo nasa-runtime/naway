@@ -2453,27 +2453,33 @@ fn build_admin_principals(
     Ok(principals.into())
 }
 
-/// 业务作用：编译内置管理职责，流量诊断不随普通只读角色隐式授权。
+/// 业务作用：编译内置管理职责，流量诊断与加密材料提案不随普通角色隐式授权。
 ///
 /// 参数说明：
 /// - `permissions`：是权限位图
 /// - `role`：是固定角色模板。
 ///
-/// 返回：追加该职责允许的权限；非 admin 的诊断权限必须显式声明 grant。
+/// 返回：追加该平台职责允许的权限；非 admin 平台角色须显式声明诊断及材料提案 grant，工作区角色不获得平台权限。
 fn add_role_permissions(permissions: &mut u128, role: AdminRole) {
     let mut allow = |resource, action| *permissions |= permission_bit(resource, action);
     match role {
         AdminRole::Workspace => {}
         AdminRole::Viewer => {
             for resource in AdminResource::ALL {
-                if resource != AdminResource::Diagnostics {
+                if !matches!(
+                    resource,
+                    AdminResource::Diagnostics | AdminResource::CertificateProposals
+                ) {
                     allow(resource, AdminAction::Read);
                 }
             }
         }
         AdminRole::Operator => {
             for resource in AdminResource::ALL {
-                if resource != AdminResource::Diagnostics {
+                if !matches!(
+                    resource,
+                    AdminResource::Diagnostics | AdminResource::CertificateProposals
+                ) {
                     allow(resource, AdminAction::Read);
                 }
             }
@@ -2488,7 +2494,10 @@ fn add_role_permissions(permissions: &mut u128, role: AdminRole) {
         }
         AdminRole::SecuritySre => {
             for resource in AdminResource::ALL {
-                if resource != AdminResource::Diagnostics {
+                if !matches!(
+                    resource,
+                    AdminResource::Diagnostics | AdminResource::CertificateProposals
+                ) {
                     allow(resource, AdminAction::Read);
                 }
             }
@@ -2519,7 +2528,7 @@ fn add_role_permissions(permissions: &mut u128, role: AdminRole) {
 /// - `resource`：是已解析枚举。
 /// - `action`：是已解析枚举。
 ///
-/// 返回：u128 中唯一授权位，当前十四个资源各占五位。
+/// 返回：u128 中唯一授权位，当前十五个资源各占五位。
 const fn permission_bit(resource: AdminResource, action: AdminAction) -> u128 {
     1_u128 << (resource.index() * AdminAction::COUNT + action.index())
 }
@@ -5465,6 +5474,11 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
             &cfg.admin.operations.database_url,
             config_dir,
         ));
+        if cfg.admin.operations.certificates.enabled {
+            for source in cfg.admin.operations.certificates.keys.values() {
+                paths.extend(crate::security::secret::dependency_path(source, config_dir));
+            }
+        }
     }
     #[cfg(feature = "xds-server")]
     paths.extend(crate::control::xds_server::security::dependencies(

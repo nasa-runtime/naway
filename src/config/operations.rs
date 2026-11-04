@@ -4,6 +4,8 @@ use anyhow::{ensure, Result};
 use serde::Deserialize;
 use std::{fmt, path::Path, sync::Arc};
 
+pub(crate) mod certificates;
+
 pub(crate) const MAX_TARGETS: usize = 128;
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
@@ -21,6 +23,7 @@ pub struct Config {
     pub retention: Retention,
     pub workflow: Workflow,
     pub execution: Execution,
+    pub certificates: certificates::Config,
 }
 
 #[derive(Clone, Default, Deserialize, PartialEq, Eq)]
@@ -82,6 +85,7 @@ impl Default for Config {
             retention: Retention::default(),
             workflow: Workflow::default(),
             execution: Execution::default(),
+            certificates: certificates::Config::default(),
         }
     }
 }
@@ -109,6 +113,7 @@ impl fmt::Debug for Config {
 pub struct Plan {
     pub(crate) config: Config,
     pub(crate) database_url: Arc<str>,
+    pub(crate) certificate_keys: Option<Arc<certificates::Keyring>>,
 }
 
 impl Plan {
@@ -191,17 +196,22 @@ impl Plan {
             "admin.operations requires a PostgreSQL URL"
         );
         Ok(Some(Arc::new(Self {
+            certificate_keys: certificates::Keyring::build(
+                &config.certificates,
+                retention.enabled,
+                root,
+            )?,
             config: config.clone(),
             database_url: database_url.into(),
         })))
     }
 
-    /// 业务作用：区分可热关闭的受理及执行入口与必须重启才能迁移的持久权威。
+    /// 业务作用：区分可热更的受理、执行开关及材料钥环，与必须重启才能迁移的持久资源。
     ///
     /// 参数说明：
     /// - `other`：尚未发布的候选计划。
     ///
-    /// 返回：除受理与执行开关外所有资源和解析后的秘密相同时为真。
+    /// 返回：数据库、功能启用和容量相同才为真；受理、执行开关与材料钥环允许热更。
     pub(crate) fn same_bootstrap(&self, other: &Self) -> bool {
         let mut left = self.config.clone();
         let mut right = other.config.clone();
@@ -209,7 +219,22 @@ impl Plan {
         right.accept_proposals = false;
         left.execution.enabled = false;
         right.execution.enabled = false;
+        left.certificates.clear_dynamic();
+        right.certificates.clear_dynamic();
         left == right && self.database_url == other.database_url
+    }
+
+    /// 业务作用：为长期数据库 owner 保留资源身份，不让启动时的材料钥环阻止退休秘密释放。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：没有解析材料密钥和动态钥环声明的计划；每次材料操作必须使用当前授权快照。
+    #[cfg(feature = "admin-operations-pgsql")]
+    pub(crate) fn resources_only(&self) -> Self {
+        let mut plan = self.clone();
+        plan.certificate_keys = None;
+        plan.config.certificates.clear_dynamic();
+        plan
     }
 }
 

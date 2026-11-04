@@ -188,7 +188,9 @@ impl Store {
                     return Err(Error::Conflict);
                 }
             }
-            Ok(rows.len())
+            let materials = super::certificates::collect(self, connection.as_mut(), authority.epoch, cutoff,
+                (policy.batch_size as usize).saturating_sub(rows.len())).await?;
+            Ok(rows.len() + materials)
         })).await
     }
 

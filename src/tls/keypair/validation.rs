@@ -11,7 +11,7 @@ use tokio_rustls::rustls::sign::CertifiedKey;
 /// - `private_key_pem`: 待安装私钥。
 ///
 /// 返回：已解析且匹配的签名身份；格式、算法或密钥不匹配时失败，不访问活动文件。
-pub(super) fn validate_keypair(
+pub(crate) fn validate_keypair(
     certificate_pem: &[u8],
     private_key_pem: &[u8],
 ) -> Result<CertifiedKey> {

@@ -19,12 +19,14 @@ pub struct Store {
     pub(super) pool: sqlx::PgPool,
     pub(super) workflow_installed: bool,
     pub(super) delivery_installed: bool,
+    pub(super) certificates_installed: bool,
+    pub(super) certificate_workers: Option<Arc<tokio::sync::Semaphore>>,
     #[cfg(feature = "admin-operations-workflow-pgsql")]
     pub(super) workflow: std::sync::OnceLock<super::workflow::Workflow>,
     #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
     pub(super) executor:
         std::sync::OnceLock<tokio::sync::Mutex<Option<super::execution::runtime::Runtime>>>,
-    idempotency: PgIdempotencyStore,
+    pub(super) idempotency: PgIdempotencyStore,
     pub(super) admission: tokio::sync::Semaphore,
     pub(super) stopping: tokio_util::sync::CancellationToken,
     pub(super) cleaner:
@@ -69,6 +71,11 @@ impl Store {
             store.close().await;
             anyhow::bail!("operations retention authority unavailable or differs");
         }
+        // 材料身份依赖已绑定命名空间和单调受理代，二者确认后才允许登记共享材料写入权威。
+        if super::certificates::register(&store).await.is_err() {
+            store.close().await;
+            anyhow::bail!("certificate material authority unavailable or differs");
+        }
         Ok(store)
     }
 
@@ -93,10 +100,16 @@ impl Store {
         }
         let idempotency = PgIdempotencyStore::with_datasource(DATASOURCE)?;
         Ok(Arc::new(Self {
-            plan,
+            certificate_workers: plan
+                .config
+                .certificates
+                .enabled
+                .then(|| Arc::new(tokio::sync::Semaphore::new(2))),
+            plan: Arc::new(plan.resources_only()),
             pool,
             workflow_installed: installed.workflow,
             delivery_installed: installed.delivery,
+            certificates_installed: installed.certificates,
             #[cfg(feature = "admin-operations-workflow-pgsql")]
             workflow: std::sync::OnceLock::new(),
             #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]

@@ -4455,6 +4455,7 @@ dependencies = [
  "x509-parser",
  "xattr",
  "xmltree",
+ "zeroize",
 ]
 
 [[package]]
