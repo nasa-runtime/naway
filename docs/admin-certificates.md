@@ -85,8 +85,12 @@ gRPC 汇聚同一集群的当前事实；纯 Admin 节点显示不承载业务 T
 持久交付收据。证书文件写入、审批、条件替换及失败补偿需要独立的材料交付流程，不能把目录
 已更新当作所有目标已经接受某次写入。
 
-本机 `POST /api/certs` 只安装指定 HTTP proxy 的默认文件身份。请求使用 `application/json`，
-正文包含 `proxy`、`certificate_pem` 和 `private_key_pem`，总请求及材料受2 MiB上限保护。
+本机 `POST /api/certs` 接受 HTTP proxy 与 TCP stream 的默认或 SNI 文件身份。请求使用
+`application/json`，正文包含 `target`、`certificate_pem` 和 `private_key_pem`，总请求及材料
+受2 MiB上限保护。`target` 包含 `kind`（`proxy` 或 `stream`）、`listener`（配置入口标识）和
+`entry`（`default` 或 `sni-0` 等零起始声明序号）。目标可直接取自本机 `/api/certs` 对应条目，
+不接受文件路径。SNI 序号只在原配置代内有效，重排后须重新读取。兼容正文中的单独 `proxy`
+字段表示该 proxy 默认身份；`proxy` 和 `target` 只能选择一个。
 `If-Match` 取自 `/api/config/current`，`X-Naway-Certificate-If-Match` 取自本机 `/api/certs`
 对应条目的 PEM ETag；两者均须仍匹配。SDS、SPIRE 与外部 signer 身份拒绝文件上传。
 
@@ -102,14 +106,20 @@ gRPC 汇聚同一集群的当前事实；纯 Admin 节点显示不承载业务 T
 
 本机与 ACME 文件安装在写入前复用实际身份加载的 must-staple 和 OCSP 校验。仅证书与私钥匹配
 并不足以安装：新证书要求 staple 却没有响应策略，或当前响应不属于新证书、已过期、签名无效，
-均拒绝候选并保留原文件。此门检查默认身份，不能替代完整监听器配置预检或安装确认。
+均拒绝候选并保留原文件。SNI 上传使用自己的 OCSP 策略，不继承默认身份的 ACME、manifest 或响应。
+
+本机手工安装还在材料锁内预检所有共享该来源的监听器，包括其它 SNI、客户端 CA 与会话策略。
+候选私钥只解析一次，完整配置构建不发布到活动监听器；任一相关策略不成立即拒绝本次材料决定。
+只共享一个文件、外部 signer 共享证书或不同来源复用不可变目录时拒绝覆盖。首次创建 manifest
+只激活新目录，不改原 seed，继续使用 seed 的独立监听器保持原材料。预检最多检查4096个声明身份，
+超过上限拒绝安装。ACME 的来源级策略门不等同此完整手工预检，两者均不替代文件决定后的实际安装确认。
 
 本机上传以400和 `invalid_certificate_material` 表示候选不满足当前身份策略；旧材料基线无法
 读取时以503和 `certificate_storage_unavailable` 拒绝。恢复或文件决定阶段无法证明完成时，
 以503和 `certificate_installation_outcome_unknown` 表示结果未知，应重新读取原目标的材料与
 实际监听事实。错误响应不返回私钥、上传字段名、底层解析文本或内部文件路径。
 
-受管安装为每次文件决定生成独立材料代，相同 PEM 的再次安装也会推进该代。本机默认身份的
+受管安装为每次文件决定生成独立材料代，相同 PEM 的再次安装也会推进该代。本机文件身份的
 `status.material_generation` 返回已记录且与公开证书一致的令牌；未受管材料为null，读取不创建
 归属记录。普通材料代投影不读取私钥；存在未完成的双文件journal时，仍须先核对完整pair并恢复。
 令牌是条件写入证据，不能替代配置权限或实际安装事实。上传可额外携带

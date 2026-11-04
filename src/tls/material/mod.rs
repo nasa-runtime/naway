@@ -4,6 +4,7 @@ mod build;
 mod certificate;
 
 pub use build::build_server_material;
+pub(super) use build::build_with_resolver;
 pub use certificate::{
     CertificateBinding, CertificateLeaf, CertificateObservation, CertificateSnapshot,
     CertificateSource, ObservationState,

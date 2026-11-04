@@ -4025,6 +4025,7 @@ enum ApprovalPayload {
         baseline: crate::control::history::ArchivedDocs,
     },
     Certificate {
+        target: crate::tls::targets::Target,
         tls: Box<crate::config::TlsRuntimeCfg>,
         expected_etag: String,
         expected_generation: Option<String>,
@@ -6651,6 +6652,7 @@ fn approval_payload_digest(payload: &ApprovalPayload) -> String {
             update(target.sentinel_rules.as_bytes());
         }
         ApprovalPayload::Certificate {
+            target,
             tls,
             expected_etag,
             expected_generation,
@@ -6658,6 +6660,12 @@ fn approval_payload_digest(payload: &ApprovalPayload) -> String {
             private_key_pem,
         } => {
             update(b"naway-certificate-material-intent");
+            update(match target.kind {
+                crate::tls::targets::Kind::Proxy => b"proxy",
+                crate::tls::targets::Kind::Stream => b"stream",
+            });
+            update(target.listener.as_bytes());
+            update(target.entry.as_bytes());
             update(&crate::tls::keypair::material_target_fingerprint(tls));
             update(expected_etag.as_bytes());
             update(
@@ -6918,6 +6926,7 @@ async fn review_pending_change(req: AdminRequest, state: Arc<AdminState>) -> Res
                             publish_document_set(&state, target, baseline, &change.initiator).await
                         }
                         ApprovalPayload::Certificate {
+                            target,
                             tls,
                             expected_etag,
                             expected_generation,
@@ -6928,6 +6937,7 @@ async fn review_pending_change(req: AdminRequest, state: Arc<AdminState>) -> Res
                                 &state,
                                 &parts,
                                 certificates::local::Installation {
+                                    target,
                                     tls: *tls,
                                     expected: expected_etag,
                                     expected_generation,

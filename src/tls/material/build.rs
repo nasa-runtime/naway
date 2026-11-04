@@ -9,6 +9,35 @@ use crate::tls::*;
 ///
 /// 返回：身份校验成功后返回同源构建产物；材料错误拒绝候选，观察容量不足只影响事实可见性。
 pub fn build_server_material(tls: &TlsRuntimeCfg) -> Result<ServerMaterial> {
+    build(tls, None)
+}
+
+/// 业务作用：用候选选证器执行完整监听策略构建，验证客户 CA、会话及身份策略而不发布材料。
+///
+/// 参数说明：
+/// - `tls`：已发布的完整监听策略。
+/// - `resolver`：覆盖待安装材料后的完整选证器。
+///
+/// 返回：可构建的候选配置及公开事实；错误不改变磁盘或活动监听器。
+pub(in crate::tls) fn build_with_resolver(
+    tls: &TlsRuntimeCfg,
+    resolver: SniCertResolver,
+) -> Result<ServerMaterial> {
+    build(tls, Some(resolver))
+}
+
+/// 业务作用：集中构建完整 TLS 策略，候选材料和普通加载保持相同安全门及协议设置。
+///
+/// 参数说明：
+/// - `tls`：当前完整监听声明。
+/// - `prepared`：文件来源预检时提供的候选选证器；普通加载为空。
+///
+/// 返回：未发布的完整材料；动态来源不得接收文件候选覆盖。
+fn build(tls: &TlsRuntimeCfg, prepared: Option<SniCertResolver>) -> Result<ServerMaterial> {
+    anyhow::ensure!(
+        prepared.is_none() || (tls.in_memory.is_none() && tls.spire.is_none()),
+        "dynamic TLS identity cannot accept file material override"
+    );
     if let Some(material) = &tls.in_memory {
         anyhow::ensure!(
             tls.keypair_manifest_file.is_none()
@@ -43,7 +72,10 @@ pub fn build_server_material(tls: &TlsRuntimeCfg) -> Result<ServerMaterial> {
             )
         }
         None => {
-            let resolver = build_sni_resolver(tls)?;
+            let resolver = match prepared {
+                Some(resolver) => resolver,
+                None => build_sni_resolver(tls)?,
+            };
             let observation = super::certificate::observe_resolver(&resolver, tls);
             (Arc::new(resolver), observation)
         }

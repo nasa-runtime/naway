@@ -6,97 +6,27 @@ use crate::admin::{
     submit_approval_change, AdminAction, AdminRequest, AdminRequestParts, AdminResource,
     AdminState, ApprovalPayload, BoxBody,
 };
-use anyhow::Context;
 use http::{Response, StatusCode};
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Arc;
 
-/// 业务作用：枚举所有 TLS listener 的域名、证书到期时间、原子 manifest 与 ACME 策略状态。
-///
-/// 参数说明：
-/// - `state`：提供当前不可变 TLS 计划与有界证书读取路径。
-///
-/// 返回：返回 200 和逐证书状态；单项缺失或损坏标记 `ok=false`，不返回私钥；旧 pair journal 仍先恢复。
-pub(in crate::admin) fn read_certificates(state: &AdminState) -> Response<BoxBody> {
-    let snapshot = state.snap.load();
-    let mut certificates = Vec::new();
-    for proxy in snapshot.proxies.iter() {
-        let Some(tls) = &proxy.tls else {
-            continue;
-        };
-        let source = if tls.in_memory.is_some() {
-            "sds"
-        } else if tls.keypair_manifest_file.is_some() {
-            "manifest"
-        } else if tls.acme.is_some() {
-            "acme"
-        } else {
-            "static"
-        };
-        let default_status = if let Some(material) = &tls.in_memory {
-            certificate_status(material.certificate_chain.as_ref())
-        } else {
-            crate::tls::active_keypair_paths(tls)
-                .and_then(|(cert, _)| {
-                    crate::io::bounded_io::read_file(&cert, 1024 * 1024, "admin TLS certificate")
-                })
-                .and_then(|bytes| {
-                    let mut status = certificate_status(&bytes)?;
-                    status["material_generation"] = (if manual_target(tls) {
-                        crate::tls::keypair::material_generation(tls, &bytes)?
-                    } else {
-                        None
-                    })
-                    .map_or(serde_json::Value::Null, serde_json::Value::String);
-                    Ok(status)
-                })
-        };
-        certificates.push(certificate_json(
-            &proxy.id,
-            "default",
-            proxy.server_names.as_ref(),
-            source,
-            tls,
-            default_status,
-        ));
-        for (index, sni) in tls.certs.iter().enumerate() {
-            let status = crate::io::bounded_io::read_file(
-                &sni.cert_file,
-                1024 * 1024,
-                "admin SNI TLS certificate",
-            )
-            .and_then(|bytes| certificate_status(&bytes));
-            certificates.push(certificate_json(
-                &proxy.id,
-                &format!("sni-{index}"),
-                sni.server_names.as_ref(),
-                "static",
-                tls,
-                status,
-            ));
-        }
-    }
-    json(
-        StatusCode::OK,
-        serde_json::json!({
-            "ok": true,
-            "certificates": certificates
-        }),
-    )
-}
+mod read;
+use crate::tls::targets::{writable as manual_target, Kind, Target};
+pub(in crate::admin) use read::read_certificates;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CertificateUploadInput {
-    proxy: String,
+    #[serde(default)]
+    proxy: Option<String>,
+    #[serde(default)]
+    target: Option<Target>,
     certificate_pem: String,
     private_key_pem: String,
 }
 
 /// 与原配置和提交主体绑定的完整材料；不能被序列化进入列表或审计。
 pub(in crate::admin) struct Installation {
+    pub target: Target,
     pub tls: crate::config::TlsRuntimeCfg,
     pub expected: String,
     pub expected_generation: Option<String>,
@@ -107,15 +37,13 @@ pub(in crate::admin) struct Installation {
     pub initiator: Arc<str>,
 }
 
-/// 业务作用：以配置集 CAS 和证书事实 CAS 双重保护手工证书轮换，并与 ACME 安装共享互斥与 pair
-/// 校验，防止覆盖并发续期或发布不匹配私钥。
+/// 业务作用：按逻辑入口与身份执行有条件材料轮换，与 ACME 共用安装锁，拒绝过期授权和基线。
 ///
 /// 参数说明：
-/// - `req`：必须带配置 `If-Match`、`X-Naway-Certificate-If-Match` 和有界 JSON PEM
+/// - `req`：带配置、PEM 及可选材料代条件的有界请求，目标不接受文件路径。
 /// - `state`：提供当前 TLS 计划、RBAC 与审计。
 ///
-/// 返回：两个基线均未变化且 pair 安装成功时返回 200；并发轮换返回 412；无 listener、SDS、非法
-/// PEM、超限或权限错误返回 4xx，I/O 故障返回 5xx。
+/// 返回：基线、完整共享监听策略与文件决定通过返回200；过期412、非法或失权4xx、存储不可用或未知5xx。
 pub(in crate::admin) async fn upload_certificate(
     req: AdminRequest,
     state: Arc<AdminState>,
@@ -204,20 +132,37 @@ pub(in crate::admin) async fn upload_certificate(
                         )
                         .await;
                     }
+                    let target = match (input.proxy, input.target) {
+                        (Some(listener), None) => Target {
+                            kind: Kind::Proxy,
+                            listener,
+                            entry: "default".into(),
+                        },
+                        (None, Some(target)) if target.valid() => target,
+                        _ => {
+                            return finish_config_write(
+                                &state,
+                                &prepared.identity,
+                                &parts,
+                                AdminResource::Certs,
+                                installation_failure(
+                                    StatusCode::BAD_REQUEST,
+                                    "invalid_certificate_target",
+                                ),
+                            )
+                            .await;
+                        }
+                    };
                     let tls = {
                         let snapshot = state.snap.load();
-                        snapshot
-                            .proxies
-                            .iter()
-                            .find(|proxy| proxy.id == input.proxy)
-                            .and_then(|proxy| proxy.tls.clone())
+                        target.resolve(&snapshot)
                     };
                     match tls {
                         None => json(
                             StatusCode::NOT_FOUND,
                             serde_json::json!({
                                 "ok": false,
-                                "error": "TLS proxy not found"
+                                "error": "TLS certificate target not found"
                             }),
                         ),
                         Some(tls) if !manual_target(&tls) => json(
@@ -240,6 +185,7 @@ pub(in crate::admin) async fn upload_certificate(
                                     &prepared,
                                     AdminResource::Certs,
                                     ApprovalPayload::Certificate {
+                                        target,
                                         tls: Box::new(tls),
                                         expected_etag: expected,
                                         expected_generation,
@@ -252,6 +198,7 @@ pub(in crate::admin) async fn upload_certificate(
                                     &state,
                                     &parts,
                                     Installation {
+                                        target,
                                         tls,
                                         expected,
                                         expected_generation,
@@ -287,7 +234,7 @@ pub(in crate::admin) async fn upload_certificate(
 /// - `request`：当前请求凭据和浏览器来源，等待之后重新认证。
 /// - `input`：原配置、提交主体、目标材料和 PEM 基线。
 ///
-/// 返回：文件安装成功返回200；权限失败401/403、基线变化412、繁忙429，非法材料400或worker错误500。
+/// 返回：文件安装成功200；权限失败401/403、基线变化412、繁忙429，非法材料或策略400、结果未知503。
 /// HTTP 取消不释放实际任务仍持有的发布权；文件成功不代表所有监听协议已经完成热换。
 pub(in crate::admin) async fn install_uploaded_certificate(
     state: &Arc<AdminState>,
@@ -319,12 +266,7 @@ pub(in crate::admin) async fn install_uploaded_certificate(
         Ok(snapshot) => snapshot,
         Err(response) => return *response,
     };
-    if !manual_target(&input.tls)
-        || !snapshot
-            .proxies
-            .iter()
-            .any(|proxy| proxy.tls.as_ref() == Some(&input.tls))
-    {
+    if !manual_target(&input.tls) || input.target.resolve(&snapshot).as_ref() != Some(&input.tls) {
         return plain(
             StatusCode::CONFLICT,
             "certificate target authority changed\n",
@@ -348,6 +290,7 @@ pub(in crate::admin) async fn install_uploaded_certificate(
                 input.expected_generation.as_deref(),
                 &input.certificate,
                 &input.private_key,
+                Some(&snapshot),
             ))
         })
     })
@@ -420,16 +363,6 @@ fn installation_failure(status: StatusCode, code: &'static str) -> Response<BoxB
     )
 }
 
-/// 业务作用：拒绝向外部身份所有者的占位文件写材料，避免将无效上传描述为成功换证。
-///
-/// 参数说明：
-/// - `tls`：当前材料来源计划。
-///
-/// 返回：仅文件或 manifest 持有私钥时为真；SDS、SPIRE 和外部 signer 为假。
-fn manual_target(tls: &crate::config::TlsRuntimeCfg) -> bool {
-    tls.in_memory.is_none() && tls.spire.is_none() && tls.private_key_provider.is_none()
-}
-
 /// 业务作用：让当前请求和原提交者在同一配置代内仍有证书写权，正文接收及排队不能固化旧权限。
 ///
 /// 参数说明：
@@ -475,91 +408,4 @@ fn authorize(
         )));
     }
     Ok(snapshot)
-}
-
-/// 业务作用：将一张可见证书的有效期解析成 Console 可用状态，不接触私钥。
-///
-/// 参数说明：
-/// - `pem`：是经 1 MiB 上限保护的 PEM 证书链。
-///
-/// 返回：有 leaf 且 X.509 可解析时返回 notBefore/notAfter Unix 时间与剩余天数；空链或非法证书失败。
-fn certificate_status(pem: &[u8]) -> anyhow::Result<serde_json::Value> {
-    let mut reader = std::io::Cursor::new(pem);
-    let leaf = rustls_pemfile::certs(&mut reader)
-        .next()
-        .transpose()
-        .context("parse TLS certificate PEM")?
-        .ok_or_else(|| anyhow::anyhow!("certificate PEM contains no certificate"))?;
-    let (_, certificate) = x509_parser::parse_x509_certificate(leaf.as_ref())
-        .map_err(|error| anyhow::anyhow!("parse X.509 certificate: {error}"))?;
-    let not_before = certificate.validity().not_before.timestamp();
-    let not_after = certificate.validity().not_after.timestamp();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .min(i64::MAX as u64) as i64;
-    Ok(serde_json::json!({
-        "etag": crate::tls::acme::certificate_etag(pem),
-        "not_before_unix": not_before,
-        "not_after_unix": not_after,
-        "days_remaining": not_after.saturating_sub(now) / 86_400,
-        "expired": not_after <= now,
-        "subject": certificate.subject().to_string(),
-    }))
-}
-
-/// 业务作用：组装一条不含路径和私钥的 TLS/ACME 管理读模型。
-///
-/// 参数说明：
-/// - `proxy`：证书所属 proxy 标识。
-/// - `entry`：该 proxy 内证书条目标识。
-/// - `domains`：证书覆盖的域名集合。
-/// - `source`：证书来源类型。
-/// - `tls`：TLS 交付策略。
-/// - `status`：有界 X.509 解析结果。
-///
-/// 返回：解析成功时合并有效期；失败时返回 `ok=false` 和低敏原因。
-fn certificate_json(
-    proxy: &str,
-    entry: &str,
-    domains: &[String],
-    source: &str,
-    tls: &crate::config::TlsRuntimeCfg,
-    status: anyhow::Result<serde_json::Value>,
-) -> serde_json::Value {
-    let acme = tls.acme.as_ref().map(|acme| {
-        serde_json::json!({
-            "domains": acme.domains.as_ref(),
-            "challenge": match acme.challenge {
-                crate::config::AcmeChallenge::Http01 => "http-01",
-                crate::config::AcmeChallenge::Dns01 => "dns-01",
-            },
-            "renew_before_days": acme.renew_before_days,
-            "storage_mode": acme.storage_mode,
-            "lock_backend": acme.lock_backend,
-        })
-    });
-    match status {
-        Ok(status) => serde_json::json!({
-            "proxy": proxy,
-            "entry": entry,
-            "domains": domains,
-            "source": source,
-            "manifest": tls.keypair_manifest_file.is_some(),
-            "acme": acme,
-            "ok": true,
-            "status": status,
-        }),
-        Err(error) => serde_json::json!({
-            "proxy": proxy,
-            "entry": entry,
-            "domains": domains,
-            "source": source,
-            "manifest": tls.keypair_manifest_file.is_some(),
-            "acme": acme,
-            "ok": false,
-            "reason": error.to_string(),
-        }),
-    }
 }

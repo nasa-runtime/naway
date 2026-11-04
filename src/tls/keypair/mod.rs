@@ -4,6 +4,7 @@ mod generation;
 mod io;
 mod legacy;
 mod manifest;
+mod preflight;
 mod validation;
 
 use crate::config::TlsRuntimeCfg;
@@ -35,7 +36,7 @@ pub(crate) fn install_keypair_atomically(
         .lock()
         .map_err(|_| anyhow::anyhow!("TLS keypair install lock is poisoned"))?;
     recover_legacy_keypair_transaction_locked(tls)?;
-    validate_installation(tls, certificate_pem, private_key_pem)?;
+    validate_installation(tls, certificate_pem, private_key_pem, None)?;
     generation::current(tls, certificate_pem, None)?;
     publish_keypair_locked(tls, certificate_pem, private_key_pem).map(|_| ())
 }
@@ -65,6 +66,7 @@ pub(crate) enum KeypairCasInstallOutcome {
 /// - `expected_generation`：可选受管材料代，指定后还须证明完整 pair 仍属于该代。
 /// - `certificate_pem`：有界上传的完整证书 PEM。
 /// - `private_key_pem`：有界上传的完整私钥 PEM。
+/// - `snapshot`：持有配置发布权时的完整监听计划；提供后同时预检所有共享来源。
 ///
 /// 返回：基线及身份有效且文件提交完成时为 Installed；摘要变化携带当前 ETag；其它结果区分
 /// 候选无效、存储不可用与提交未知，不附带材料或底层文件路径。
@@ -74,6 +76,7 @@ pub(crate) fn install_keypair_atomically_if_match(
     expected_generation: Option<&str>,
     certificate_pem: &[u8],
     private_key_pem: &[u8],
+    snapshot: Option<&crate::config::GatewaySnapshot>,
 ) -> KeypairCasInstallOutcome {
     let Ok(_guard) = keypair_install_lock().lock() else {
         return KeypairCasInstallOutcome::Unavailable;
@@ -114,7 +117,7 @@ pub(crate) fn install_keypair_atomically_if_match(
         }
     }
     // 候选身份与当前 staple 必须在任何准备写入之前自洽，不能先破坏磁盘材料再依赖 listener 的 LKG。
-    if validate_installation(tls, certificate_pem, private_key_pem).is_err() {
+    if validate_installation(tls, certificate_pem, private_key_pem, snapshot).is_err() {
         return KeypairCasInstallOutcome::Invalid;
     }
     match publish_keypair_locked(tls, certificate_pem, private_key_pem) {
@@ -127,7 +130,7 @@ pub(crate) fn install_keypair_atomically_if_match(
 /// 业务作用：为本机材料读面提供已记录的随机代，读取不创建或收养外部材料所有权。
 ///
 /// 参数说明：
-/// - `tls`：当前默认文件身份来源。
+/// - `tls`：当前默认或 SNI 文件身份来源。
 /// - `certificate`：本次已读取的公开证书原文，仍须与归属记录一致。
 ///
 /// 返回：受管代、未受管空值或不可证明错误；普通投影不读取私钥，旧 journal 的必要恢复仍核对完整 pair。
@@ -196,18 +199,20 @@ pub(crate) fn certificate_etag(certificate_pem: &[u8]) -> String {
     format!("\"sha256-{encoded}\"")
 }
 
-/// 业务作用：在任何材料写入前证明受管文件身份与当前默认 OCSP 策略一致，复用实际握手加载的校验门。
+/// 业务作用：在材料写入前复验所选身份及可选共享监听策略，复用实际握手加载的校验门。
 ///
 /// 参数说明：
-/// - `tls`：当前默认身份的来源和 OCSP 策略。
+/// - `tls`：当前所选身份的来源和专属 OCSP 策略。
 /// - `certificate_pem`：待安装的有界完整证书链。
 /// - `private_key_pem`：待安装的有界私钥。
+/// - `snapshot`：可选的完整已发布监听计划，由外层配置发布权冻结。
 ///
 /// 返回：本地文件身份满足密钥匹配和 OCSP 约束时成功；失败不创建材料目录或切换文件。
 fn validate_installation(
     tls: &TlsRuntimeCfg,
     certificate_pem: &[u8],
     private_key_pem: &[u8],
+    snapshot: Option<&crate::config::GatewaySnapshot>,
 ) -> Result<()> {
     anyhow::ensure!(
         tls.in_memory.is_none() && tls.spire.is_none() && tls.private_key_provider.is_none(),
@@ -218,7 +223,11 @@ fn validate_installation(
         "TLS keypair material exceeds installation budget"
     );
     let certified = validate_keypair(certificate_pem, private_key_pem)?;
-    crate::tls::identity::apply_ocsp_policy(certified, tls.ocsp_stapling.as_ref())?;
+    if let Some(snapshot) = snapshot {
+        preflight::validate(snapshot, tls, &certified)?;
+    } else {
+        crate::tls::identity::apply_ocsp_policy(certified, tls.ocsp_stapling.as_ref())?;
+    }
     Ok(())
 }
 

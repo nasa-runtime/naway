@@ -9,26 +9,35 @@ use super::*;
 ///
 /// 返回：全部身份可加载时返回选证目录；任一身份不满足策略时拒绝整个候选。
 pub(super) fn build_sni_resolver(tls: &TlsRuntimeCfg) -> Result<SniCertResolver> {
-    let (default_cert_file, default_key_file) = active_keypair_paths(tls)?;
-    let default = certified_identity(
-        &default_cert_file,
-        &default_key_file,
-        tls.private_key_provider.as_ref(),
-        tls.ocsp_stapling.as_ref(),
-    )
-    .context("build default tls certificate")?;
+    build_sni_resolver_with(tls, |source| {
+        // 默认与 SNI 文件均先结算原 pair journal，不能把崩溃遗留的半份身份交给选证器。
+        let (certificate, private_key) = active_keypair_paths(source)?;
+        certified_identity(
+            &certificate,
+            &private_key,
+            source.private_key_provider.as_ref(),
+            source.ocsp_stapling.as_ref(),
+        )
+    })
+}
+
+/// 业务作用：让磁盘加载与候选覆盖共用同一选证顺序，预检不能采用另一套 SNI 匹配规则。
+///
+/// 参数说明：
+/// - `tls`：完整默认及 SNI 声明。
+/// - `load`：按单个身份来源取得已经验证的签名材料。
+///
+/// 返回：完整解析器；任一来源拒绝时不返回半份选证目录。
+pub(super) fn build_sni_resolver_with(
+    tls: &TlsRuntimeCfg,
+    mut load: impl FnMut(&TlsRuntimeCfg) -> Result<CertifiedIdentity>,
+) -> Result<SniCertResolver> {
+    let default = load(tls).context("build default tls certificate")?;
     let mut exact: HashMap<String, Arc<CertifiedIdentity>> = HashMap::new();
     let mut wildcards: Vec<(String, Arc<CertifiedIdentity>)> = Vec::new();
     for cert in &tls.certs {
-        let key = Arc::new(
-            certified_identity(
-                &cert.cert_file,
-                &cert.key_file,
-                cert.private_key_provider.as_ref(),
-                cert.ocsp_stapling.as_ref(),
-            )
-            .with_context(|| format!("build sni tls certificate for {:?}", cert.server_names))?,
-        );
+        let source = targets::sni_source(tls, cert);
+        let key = Arc::new(load(&source).context("build sni tls certificate")?);
         for name in &cert.server_names {
             if let Some(suffix) = name.strip_prefix("*.") {
                 // 通配 `*.foo.com` → 匹配 SNI 以 `.foo.com` 结尾。

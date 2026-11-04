@@ -10,6 +10,7 @@ pub mod installed;
 pub(crate) mod keypair;
 pub mod material;
 pub mod spire;
+pub(crate) mod targets;
 pub(crate) mod trust;
 
 use identity::build_sni_resolver;
