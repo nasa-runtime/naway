@@ -8,23 +8,6 @@ use nasa::{grpc::Status, saga::WorkflowDefinition};
 
 #[cfg(feature = "admin-operations-workflow-pgsql")]
 impl Signer {
-    /// 业务作用：只用构建时已证明与本机私钥配对的公钥建立内部验证器，命令不能自行选择信任材料。
-    ///
-    /// 参数说明：
-    /// - node：当前管理计划的本机永久节点身份。
-    ///
-    /// 返回：仅供同进程受控会话的验证器，不修改任何远程成员或可信目标声明。
-    pub(in crate::admin::management) fn local_verifier(
-        &self,
-        node: &str,
-    ) -> std::sync::Arc<Verifier> {
-        std::sync::Arc::new(Verifier {
-            cluster: self.cluster.clone(),
-            node: node.to_owned(),
-            public_key: self.public_key.clone(),
-        })
-    }
-
     /// 业务作用：只为本发行者和固定集群的完整命令签名，避免同一私钥被用来声明其它管理身份。
     ///
     /// 参数说明：

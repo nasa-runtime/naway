@@ -439,6 +439,10 @@ Admin 节点以及本次随机挑战、node/boot/session 的绑定；不支持�
 页面只展示当前事实，不提供历史或材料上传；叶证书摘要不是本机 PEM 文件的条件写入身份。
 来源、覆盖、预算和失败语义见[集群活动证书](docs/admin-certificates.md)。
 
+独立 `material_previews` 开关还提供原目标批量材料条件查询：任一 Admin 保留全部原节点分母，
+由目标观察公开 PEM 条件、受管材料代和完整共享影响，并检查工作区归属。此查询不授予安装权；
+部署条件、接口与容量见[集群原目标材料条件](docs/admin-certificates.md#集群原目标材料条件)。
+
 ## 持久管理提案
 
 配置编辑前可使用[配置候选差异](docs/admin-configuration-diff.md)核对固定活动基线；

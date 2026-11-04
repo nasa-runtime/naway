@@ -1,10 +1,13 @@
 //! 物理来源与完整共享影响在同一材料锁内解析，不向管理调用者暴露路径。
 
 use super::generation;
-use crate::config::{GatewaySnapshot, TlsRuntimeCfg};
-use crate::tls::targets::{self, Kind};
+use crate::config::TlsRuntimeCfg;
+use crate::tls::targets::Kind;
 use anyhow::{ensure, Result};
 use std::path::PathBuf;
+
+mod index;
+pub(super) use index::Index;
 
 pub(super) struct Position {
     certificate: PathBuf,
@@ -14,6 +17,24 @@ pub(super) struct Position {
 }
 
 impl Position {
+    /// 业务作用：复用已解析的物理槽位计算写入来源身份，不为共享影响再次访问目录。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：与持久材料代相同域的来源摘要；外部私钥来源没有手工写入身份。
+    pub(super) fn identity(&self) -> Result<[u8; 32]> {
+        if let Some(manifest) = &self.manifest {
+            return Ok(generation::digest_paths(b"manifest", &[manifest]));
+        }
+        let private_key = self
+            .private_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TLS source has no local private key authority"))?;
+        Ok(generation::digest_paths(
+            b"legacy",
+            &[&self.certificate, private_key],
+        ))
+    }
     /// 业务作用：定位实际文件槽位与指针，使共享来源判定不会被目录别名或默认 seed 混淆。
     ///
     /// 参数说明：
@@ -114,7 +135,6 @@ impl Position {
 
 /// 共享来源的全部逻辑身份；实际来源证明留在控制面，不由路径文本推测共同所有权。
 pub(super) struct Impact<'a> {
-    pub(super) position: Position,
     pub(super) listeners: Vec<Listener<'a>>,
 }
 
@@ -123,77 +143,4 @@ pub(super) struct Listener<'a> {
     pub(super) kind: Kind,
     pub(super) id: &'a str,
     pub(super) entries: Vec<Option<usize>>,
-}
-
-impl<'a> Impact<'a> {
-    /// 业务作用：取得材料动作影响的全部逻辑身份，任何不确定来源均不能被遗漏后当作独立写入。
-    ///
-    /// 参数说明：
-    /// - `snapshot`：调用方已冻结的完整监听计划。
-    /// - `selected`：当前目标声明解析出的本地材料来源。
-    ///
-    /// 返回：有界且完整的共享监听集合；来源冲突、超量或目标已不存在时拒绝。
-    pub(super) fn read(snapshot: &'a GatewaySnapshot, selected: &TlsRuntimeCfg) -> Result<Self> {
-        let plans = || {
-            snapshot
-                .proxies
-                .iter()
-                .filter_map(|proxy| {
-                    proxy
-                        .tls
-                        .as_ref()
-                        .map(|tls| (Kind::Proxy, proxy.id.as_str(), tls))
-                })
-                .chain(snapshot.stream_listeners.iter().filter_map(|listener| {
-                    listener
-                        .tls
-                        .as_ref()
-                        .map(|tls| (Kind::Stream, listener.id.as_str(), tls))
-                }))
-        };
-        let identities = plans().try_fold(0usize, |count, (_, _, plan)| {
-            count.checked_add(plan.certs.len().saturating_add(1))
-        });
-        ensure!(
-            identities.is_some_and(|count| count <= 4096),
-            "TLS material impact exceeds identity budget"
-        );
-        let position = Position::read(selected)?;
-        ensure!(
-            position.private_key.is_some()
-                && position.private_key.as_ref() != Some(&position.certificate),
-            "TLS material requires distinct local pair slots"
-        );
-        let mut listeners = Vec::new();
-        for (kind, id, plan) in plans() {
-            if plan.in_memory.is_some() || plan.spire.is_some() {
-                continue;
-            }
-            let mut entries = Vec::new();
-            if position.shares(&Position::read(plan)?)? {
-                entries.push(None);
-            }
-            for (index, sni) in plan.certs.iter().enumerate() {
-                if position.shares(&Position::read(&targets::sni_source(plan, sni))?)? {
-                    entries.push(Some(index));
-                }
-            }
-            if !entries.is_empty() {
-                listeners.push(Listener {
-                    plan,
-                    kind,
-                    id,
-                    entries,
-                });
-            }
-        }
-        ensure!(
-            !listeners.is_empty(),
-            "TLS material target is no longer declared"
-        );
-        Ok(Self {
-            position,
-            listeners,
-        })
-    }
 }

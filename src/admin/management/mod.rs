@@ -7,6 +7,8 @@ mod catalog;
 mod certificates;
 mod consumers;
 mod issuer;
+#[cfg(feature = "node-actions")]
+pub(in crate::admin) mod material;
 pub(in crate::admin) mod metrics;
 mod plan;
 #[cfg(feature = "node-actions")]

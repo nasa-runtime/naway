@@ -29,6 +29,8 @@ struct Target {
     actions: super::actions::Channel,
     #[cfg(feature = "node-actions")]
     previews: super::preview::Channel,
+    #[cfg(feature = "node-actions")]
+    material: super::material::Channel,
 }
 
 /// 同次报告借用唯一事实和样本，各目标只保留自己的会话与传输进度。
@@ -114,6 +116,8 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     actions: super::actions::Channel::default(),
                     #[cfg(feature = "node-actions")]
                     previews: super::preview::Channel::default(),
+                    #[cfg(feature = "node-actions")]
+                    material: super::material::Channel::default(),
                 })
                 .collect();
             generation = Arc::downgrade(&plan);
@@ -258,7 +262,7 @@ async fn send(target: &mut Target, round: &Round<'_>) {
         target.failures = 0;
         target.next = Instant::now();
         #[cfg(feature = "node-actions")]
-        if target.actions.busy() || target.previews.busy() {
+        if target.actions.busy() || target.previews.busy() || target.material.busy() {
             // 动作或预览已经占用第二条 RPC，心跳独立继续，目录和样本不能挤占工作或突破连接预算。
             return;
         }
@@ -335,6 +339,8 @@ async fn send(target: &mut Target, round: &Round<'_>) {
             target.actions.clear();
             #[cfg(feature = "node-actions")]
             target.previews.clear();
+            #[cfg(feature = "node-actions")]
+            target.material.clear();
         }
     }
 }
@@ -495,6 +501,11 @@ async fn exchange(
             .previews
             .open(plan.clone(), target.issuer.clone(), &session)
             .map_err(|_| Status::permission_denied("node preview session denied"))?;
+        #[cfg(feature = "node-actions")]
+        target
+            .material
+            .open(plan.clone(), target.issuer.clone(), &session)
+            .map_err(|_| Status::permission_denied("material conditions session denied"))?;
         target.session = session;
     }
     let request = timed_request(
@@ -517,6 +528,10 @@ async fn exchange(
                 && plan.actions_enabled
                 && state.mode.runs_data(),
             previews_supported: cfg!(feature = "node-actions"),
+            material_previews_supported: cfg!(feature = "node-actions"),
+            material_previews_enabled: cfg!(feature = "node-actions")
+                && plan.material_previews_enabled
+                && state.mode.runs_data(),
             previews_enabled: cfg!(feature = "node-actions")
                 && plan.previews_enabled
                 && state.mode.runs_data(),
@@ -545,21 +560,31 @@ async fn exchange(
         target.consumers = consumers::Upload::default();
     }
     #[cfg(feature = "node-actions")]
-    match (response.action, response.release, response.preview) {
-        (Some(offer), None, None) if !target.previews.busy() => {
+    match (
+        response.action,
+        response.release,
+        response.preview,
+        response.material_conditions,
+    ) {
+        (Some(offer), None, None, None) if !target.previews.busy() && !target.material.busy() => {
             // 无效或忙碌命令不撤销已经成功的心跳；发行端仍须依靠持久结果判断是否重投。
             let _ = target
                 .actions
                 .start(state.clone(), target.client.clone(), offer);
         }
-        (None, Some(offer), None) if !target.previews.busy() => {
+        (None, Some(offer), None, None) if !target.previews.busy() && !target.material.busy() => {
             let _ = target
                 .actions
                 .start_release(state.clone(), target.client.clone(), offer);
         }
-        (None, None, Some(offer)) if !target.actions.busy() => {
+        (None, None, Some(offer), None) if !target.actions.busy() && !target.material.busy() => {
             let _ = target
                 .previews
+                .start(state.clone(), target.client.clone(), offer);
+        }
+        (None, None, None, Some(offer)) if !target.actions.busy() && !target.previews.busy() => {
+            let _ = target
+                .material
                 .start(state.clone(), target.client.clone(), offer);
         }
         // 单槽不可能合法地同时产生多类声明，矛盾响应不选择其中任意一个执行。

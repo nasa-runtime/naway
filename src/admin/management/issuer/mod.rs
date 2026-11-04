@@ -3,6 +3,8 @@
 #[cfg(feature = "node-actions")]
 mod command;
 #[cfg(feature = "node-actions")]
+mod material;
+#[cfg(feature = "node-actions")]
 mod preview;
 mod proof;
 #[cfg(feature = "node-actions")]
@@ -20,7 +22,7 @@ use std::{path::Path, sync::Arc};
 pub(super) struct Signer {
     cluster: String,
     private_key: String,
-    #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+    #[cfg(feature = "node-actions")]
     public_key: String,
 }
 
@@ -31,12 +33,11 @@ pub(super) struct Verifier {
 }
 
 impl Signer {
-    /// 业务作用：把本机发行身份与永久节点目录所属集群进行比较，不暴露签名材料。
+    /// 业务作用：向管理报告和永久节点目录提供本机发行集群，限制基线归属而不暴露签名材料。
     ///
     /// 参数说明: 无。
     ///
     /// 返回：构建时冻结的发行集群标识。
-    #[cfg(feature = "node-journal")]
     pub(super) fn cluster(&self) -> &str {
         &self.cluster
     }
@@ -72,7 +73,7 @@ impl Signer {
         Ok(Some(Self {
             cluster: cfg.cluster_id.clone(),
             private_key,
-            #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+            #[cfg(feature = "node-actions")]
             public_key,
         }))
     }

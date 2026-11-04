@@ -1,5 +1,7 @@
 //! 集群证书目录来源于实际安装事实，不以磁盘材料或配置声明代替在线身份。
 
+#[cfg(feature = "node-actions")]
+pub(in crate::admin) mod conditions;
 pub(super) mod local;
 mod model;
 pub(super) mod read;

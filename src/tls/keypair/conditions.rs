@@ -7,13 +7,19 @@ use serde::Serialize;
 #[derive(Serialize)]
 pub(crate) struct Conditions {
     pub source: Source,
+    #[serde(flatten)]
+    pub group: Group,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Group {
     pub certificate_etag: String,
     pub material_generation: Option<String>,
     pub source_id: String,
     pub affected: Vec<Affected>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Source {
     File,
@@ -37,7 +43,19 @@ pub(crate) enum Unavailable {
     ImpactUnproven,
 }
 
-/// 业务作用：在同一材料锁内读取公开条件及完整共享影响，GET 不创建材料代或取得安装权。
+#[derive(Serialize)]
+pub(crate) struct Batch {
+    pub entries: Vec<Reference>,
+    pub groups: Vec<Group>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Reference {
+    pub source: Source,
+    pub group: usize,
+}
+
+/// 业务作用：在同一材料锁内读取公开条件及完整共享影响，查询不创建材料代或取得安装权。
 ///
 /// 参数说明：
 /// - `snapshot`：调用方冻结且在交付前需要复验的完整配置。
@@ -46,9 +64,28 @@ pub(crate) enum Unavailable {
 /// 返回：公开证书条件及完整来源影响；缺失、外部所有权、超量或证据不足返回固定原因。
 /// 普通读取不打开私钥，已有未完成 pair 事务仍须先按既定恢复规则结算。
 pub(crate) fn read(snapshot: &GatewaySnapshot, target: &Target) -> Result<Conditions, Unavailable> {
-    let selected = target.resolve(snapshot).ok_or(Unavailable::TargetAbsent)?;
-    if !crate::tls::targets::writable(&selected) {
-        return Err(Unavailable::ExternalSource);
+    let mut batch = read_many(snapshot, std::slice::from_ref(target))?;
+    let entry = batch.entries.pop().ok_or(Unavailable::Storage)?;
+    debug_assert_eq!(entry.group, 0);
+    Ok(Conditions {
+        source: entry.source,
+        group: batch.groups.pop().ok_or(Unavailable::Storage)?,
+    })
+}
+
+/// 业务作用：在一次材料锁内观察整批原目标，共享来源只读一次公开证书并保留完整影响。
+///
+/// 参数说明：
+/// - `snapshot`：调用方持有配置发布权的完整计划。
+/// - `targets`：一至一百二十八个已授权逻辑身份，顺序就是原请求分母。
+///
+/// 返回：原顺序引用与唯一写入来源组；任一目标无法证明时整批拒绝，不返回截断或混合材料代。
+pub(crate) fn read_many(
+    snapshot: &GatewaySnapshot,
+    targets: &[Target],
+) -> Result<Batch, Unavailable> {
+    if !(1..=128).contains(&targets.len()) {
+        return Err(Unavailable::Capacity);
     }
     let identities = snapshot
         .proxies
@@ -66,13 +103,73 @@ pub(crate) fn read(snapshot: &GatewaySnapshot, target: &Target) -> Result<Condit
     if identities.is_none_or(|count| count > 4096) {
         return Err(Unavailable::Capacity);
     }
+    let selected = targets
+        .iter()
+        .map(|target| {
+            let source = target.source(snapshot).ok_or(Unavailable::TargetAbsent)?;
+            if !crate::tls::targets::writable(&source) {
+                return Err(Unavailable::ExternalSource);
+            }
+            Ok(source)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let _guard = keypair_install_lock()
         .lock()
         .map_err(|_| Unavailable::Storage)?;
     // 旧 journal 代表尚未结算的文件决定；不能绕开恢复把半份 pair 声称为可提交的基线。
-    recover_legacy_keypair_transaction_locked(&selected).map_err(|_| Unavailable::Storage)?;
-    let impact =
-        source::Impact::read(snapshot, &selected).map_err(|_| Unavailable::ImpactUnproven)?;
+    for selected in &selected {
+        recover_legacy_keypair_transaction_locked(selected).map_err(|_| Unavailable::Storage)?;
+    }
+    let index = source::Index::read(snapshot).map_err(|_| Unavailable::ImpactUnproven)?;
+    let mut groups = Vec::new();
+    let mut entries = Vec::with_capacity(targets.len());
+    let mut positions = std::collections::BTreeMap::new();
+    for (target, selected) in targets.iter().zip(&selected) {
+        let position = index.position(target).ok_or(Unavailable::ImpactUnproven)?;
+        let identity = position.identity().map_err(|_| Unavailable::Storage)?;
+        let group = if let Some(group) = positions.get(&identity) {
+            *group
+        } else {
+            let group = groups.len();
+            groups.push(read_group(&index, position, selected, &identity)?);
+            positions.insert(identity, group);
+            group
+        };
+        entries.push(Reference {
+            source: if selected.acme.is_some() {
+                Source::Acme
+            } else if selected.keypair_manifest_file.is_some() {
+                Source::Manifest
+            } else {
+                Source::File
+            },
+            group,
+        });
+    }
+    Ok(Batch {
+        entries,
+        groups,
+    })
+}
+
+/// 业务作用：为一个唯一写入来源生成公开条件，来源索引与材料读取必须处在同一锁内。
+///
+/// 参数说明：
+/// - `index`：本批全部身份的物理来源索引。
+/// - `position`：该来源在索引中的实际位置。
+/// - `selected`：用于读取受管代的原来源计划。
+/// - `identity`：已经从规范槽位计算的写入所有权摘要。
+///
+/// 返回：完整公开条件和共享影响；任何文件、证书或影响证据不足均拒绝。
+fn read_group(
+    index: &source::Index<'_>,
+    position: &source::Position,
+    selected: &crate::config::TlsRuntimeCfg,
+    identity: &[u8; 32],
+) -> Result<Group, Unavailable> {
+    let impact = index
+        .impact(position)
+        .map_err(|_| Unavailable::ImpactUnproven)?;
     // 完整影响必须能在控制消息预算内交付；超量整体拒绝，不能截断为看似独立的目标。
     if impact
         .listeners
@@ -83,8 +180,8 @@ pub(crate) fn read(snapshot: &GatewaySnapshot, target: &Target) -> Result<Condit
     {
         return Err(Unavailable::Capacity);
     }
-    let (path, _) = crate::tls::active_keypair_paths_unrecovered(&selected)
-        .map_err(|_| Unavailable::Storage)?;
+    let (path, _) =
+        crate::tls::active_keypair_paths_unrecovered(selected).map_err(|_| Unavailable::Storage)?;
     let certificate = zeroize::Zeroizing::new(
         crate::io::bounded_io::read_file(&path, 1024 * 1024, "TLS material conditions")
             .map_err(|_| Unavailable::Storage)?,
@@ -92,21 +189,11 @@ pub(crate) fn read(snapshot: &GatewaySnapshot, target: &Target) -> Result<Condit
     // 错放到证书位置的私钥或非法材料不能产生对外摘要；仅确认完整的公开 X.509 链后计算 ETag。
     public_chain(&certificate)?;
     let material_generation =
-        generation::current(&selected, &certificate, None).map_err(|_| Unavailable::Storage)?;
-    let source_id = generation::target(&selected)
-        .map(|id| hex(&id))
-        .map_err(|_| Unavailable::Storage)?;
+        generation::current(selected, &certificate, None).map_err(|_| Unavailable::Storage)?;
+    let source_id = hex(identity);
     let mut affected = Vec::new();
     for listener in impact.listeners {
         for entry in listener.entries {
-            let source;
-            let source = if let Some(index) = entry {
-                source =
-                    crate::tls::targets::sni_source(listener.plan, &listener.plan.certs[index]);
-                &source
-            } else {
-                listener.plan
-            };
             let target = Target {
                 kind: listener.kind,
                 listener: listener.id.to_owned(),
@@ -116,7 +203,10 @@ pub(crate) fn read(snapshot: &GatewaySnapshot, target: &Target) -> Result<Condit
                 return Err(Unavailable::Capacity);
             }
             // seed 的读取影响与 manifest 的写入所有权不同，分别记录来源证明，不能把它们合并成一个动作。
-            let source_id = generation::target(source)
+            let source_id = index
+                .position(&target)
+                .ok_or(Unavailable::ImpactUnproven)?
+                .identity()
                 .map(|id| hex(&id))
                 .map_err(|_| Unavailable::Storage)?;
             affected.push(Affected {
@@ -137,14 +227,7 @@ pub(crate) fn read(snapshot: &GatewaySnapshot, target: &Target) -> Result<Condit
                 &right.target.entry,
             ))
     });
-    Ok(Conditions {
-        source: if selected.acme.is_some() {
-            Source::Acme
-        } else if selected.keypair_manifest_file.is_some() {
-            Source::Manifest
-        } else {
-            Source::File
-        },
+    Ok(Group {
         certificate_etag: super::certificate_etag(&certificate),
         material_generation,
         source_id,

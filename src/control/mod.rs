@@ -8,7 +8,7 @@ pub mod history;
 #[cfg(feature = "node-journal")]
 pub mod journal;
 pub mod kubernetes;
-#[cfg(feature = "admin-operations-pgsql")]
+#[cfg(any(feature = "admin-operations-pgsql", feature = "node-actions"))]
 pub(crate) mod material;
 pub mod ownership;
 #[cfg(feature = "config-providers")]

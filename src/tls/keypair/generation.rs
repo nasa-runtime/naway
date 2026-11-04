@@ -249,7 +249,7 @@ pub(super) fn declared_target(tls: &TlsRuntimeCfg) -> [u8; 32] {
 /// - `paths`：按业务角色排列的规范化路径。
 ///
 /// 返回：单次增量 SHA-256，不复制路径字节。
-fn digest_paths(kind: &[u8], paths: &[&Path]) -> [u8; 32] {
+pub(super) fn digest_paths(kind: &[u8], paths: &[&Path]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"naway-tls-material-target\0");
     digest.update(kind);

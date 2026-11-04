@@ -19,13 +19,15 @@ pub(super) fn validate(
     selected: &TlsRuntimeCfg,
     candidate: &CertifiedKey,
 ) -> Result<()> {
-    let impact = source::Impact::read(snapshot, selected)?;
+    let index = source::Index::read(snapshot)?;
+    let position = source::Position::read(selected)?;
+    let impact = index.impact(&position)?;
     for listener in &impact.listeners {
         let plan = listener.plan;
         let resolver = identity::build_sni_resolver_with(plan, |source| {
             // 已持有唯一材料锁，不重入公开 loader 的锁；其它 SNI 的未完成事务仍须先结算。
             recover_legacy_keypair_transaction_locked(source)?;
-            if impact.position.shares(&source::Position::read(source)?)? {
+            if position.shares(&source::Position::read(source)?)? {
                 ensure!(targets::writable(source), "TLS source is externally owned");
                 // 签名私钥共享已解析产物；不同身份仍各自验证自己的 OCSP 策略，不能继承目标的响应。
                 identity::apply_ocsp_policy(

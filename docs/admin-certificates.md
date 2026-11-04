@@ -166,6 +166,55 @@ false。普通查询只读公开证书与归属，已有未完成的双文件事
 影响无法证明返回409，存储或材料证据不可用返回503。响应禁止缓存，交付前重新验证当前权限。
 外部直接修改文件的进程不受这些进程内锁约束；条件快照不能代替安装时的再次复验。
 
+## 集群原目标材料条件
+
+任一具有管理发行能力的 Admin 可通过 `POST /api/certificate-conditions`，让原节点批量观察
+文件材料条件。工作区使用 `?workspace={id}`。此能力使用 `node-actions`，目标无需 PostgreSQL
+或材料提案存储。每个目标须初始化并挂接本地 journal，使用本地文件配置、认证和 RBAC，显式开启：
+
+```yaml
+admin:
+  management:
+    reporter:
+      material_previews: true
+```
+
+`material_previews` 默认关闭，独立于配置预览 `previews`、执行 `actions`、材料提案受理和
+注册中心、配置中心开关。目标沿现有 mTLS 主动上报连接接收独立签名命令；每个上报目标须配置
+同集群可信发行者。all-in-one 查询自身时共享原生结果，不经过内部 JSON 或 protobuf。
+纯 Data 不开放此 HTTP 聚合入口，但可以执行获权的节点观察。
+
+平台请求者须同时拥有 `certificate-proposals/read`、`certs/read` 和 `cluster/read`；工作区
+请求者须拥有当前工作区读取权，且所有原节点属于声明的 `cluster_nodes`。发行端和目标端都会
+复验当前主体及对象归属。同源的其它监听身份也必须全部属于请求范围；任一共享身份越界，整批
+节点结果为 `denied`，不泄露其它工作区的影响清单。
+
+正文为 `application/json`，包含 `targets` 数组，最多128项、128 KiB。每项必须显式提供
+`node_id`、`boot_id`、`base_version`、`base_fingerprint`、`node_baseline` 和 `target`。
+原节点配置事实和完整持久基线取自集群概览的对应节点；缺失时不能由接入 Admin 补成当前值。
+`target` 使用上述逻辑身份格式，同节点全部目标必须具有相同原基线，重复目标和未知字段拒绝。
+
+响应包含 `query_id`、`scope`、`target_count`、`complete_count` 和 `nodes`。每个节点保留
+原节点身份、基线、`targets` 与原请求的零起始 `indices`；成功状态为 `complete`，其
+`conditions.entries` 与该节点目标顺序一致。每个条目以 `group` 引用 `conditions.groups`，
+并独立标明 `source`。同一物理写入来源只返回一份公开条件和完整 `affected`，保留尚未激活
+manifest 与 seed 的独立写入权威。节点批次任一目标失败时，整批状态为 `unavailable`，没有
+部分条件；失败节点始终保留在原分母内。
+
+`reason` 为有限分类：`unsupported`、`disabled`、`unavailable`、`capacity`、`expired`、
+`denied`、`baseline_changed`、`target_absent`、`external_source`、`storage` 或
+`impact_unproven`。失败不能解释为材料未变。结果交付前再次检查全部成功节点的原启动、会话、
+配置及持久基线，并复验当前请求者；整个观察窗口最多20秒，超期不保留先前完成的成功。
+
+每个 Admin 同时最多两个聚合请求，工作区也受两个请求配额限制；最多128个远端投递槽，每节点
+每入口一个槽。每个目标有两个实际读取许可，单节点完整条件预算24 KiB，超量整批失败。
+同节点来源索引与公开证书按批次复用，不逐目标重复解析同源材料；管理连接维持原有两个在途 RPC
+预算。HTTP 输出借用原生条件直接编码，不产生 JSON 中间树。取消不会提前释放仍在工作的读取许可。
+
+普通读取不打开私钥，不创建材料代或候选文件；已有双文件 journal 的必要恢复仍检查完整 pair。
+结果带 `Cache-Control: no-store`，`execution_supported` 为 false。此接口不提供候选材料预检、
+审批、安装或持久交付，也不代替正式写入时的条件与权限复验。
+
 ## 独立材料提案
 
 需要跨 Admin 保存和审阅材料时，可启用[加密证书提案](admin-certificate-proposals.md)。

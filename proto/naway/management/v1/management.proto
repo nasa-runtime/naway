@@ -15,6 +15,7 @@ service NodeManagement {
   rpc ReleaseResult(ReleaseResultRequest) returns (ReleaseResultResponse);
   rpc PreviewData(PreviewDataRequest) returns (PreviewDataResponse);
   rpc PreviewResult(PreviewResultRequest) returns (PreviewResultResponse);
+  rpc MaterialConditionsResult(MaterialConditionsResultRequest) returns (MaterialConditionsResultResponse);
 }
 
 message OpenRequest {
@@ -80,6 +81,8 @@ message ReportRequest {
   bool consumers_supported = 13;
   // 当前实际安装目录的身份；配置版本不变的热换也必须撤销旧完整目录。
   optional bytes certificates_digest = 14;
+  bool material_previews_supported = 15;
+  bool material_previews_enabled = 16;
 }
 
 // 当前本地文件决定与业务就绪分开；没有历史、路径或恢复命令令牌。
@@ -128,6 +131,104 @@ message ReportResponse {
   PreviewOffer preview = 6;
   bool consumers_supported = 7;
   bool certificates_supported = 8;
+  MaterialConditionsOffer material_conditions = 9;
+}
+
+// 材料条件独立于配置候选和持久动作；原节点一次处理整批逻辑目标。
+message MaterialTarget {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_PROXY = 1;
+    KIND_STREAM = 2;
+  }
+  Kind kind = 1;
+  string listener = 2;
+  string entry = 3;
+}
+
+message MaterialConditionsTarget {
+  uint32 index = 1;
+  MaterialTarget target = 2;
+}
+
+message MaterialConditionsOffer {
+  uint32 schema = 1;
+  string query_id = 2;
+  uint32 target_count = 3;
+  repeated MaterialConditionsTarget targets = 4;
+  string node_id = 5;
+  string boot_id = 6;
+  NodeBaseline baseline = 7;
+  uint64 base_version = 8;
+  uint64 base_fingerprint = 9;
+  string scope = 10;
+  string principal = 11;
+  bytes authority_sha256 = 12;
+  string issuer_node_id = 13;
+  bytes session = 14;
+  uint64 issued_at_ms = 15;
+  uint64 expires_at_ms = 16;
+  string signature = 17;
+}
+
+enum MaterialConditionsStatus {
+  MATERIAL_CONDITIONS_STATUS_UNSPECIFIED = 0;
+  MATERIAL_CONDITIONS_STATUS_SUCCEEDED = 1;
+  MATERIAL_CONDITIONS_STATUS_UNSUPPORTED = 2;
+  MATERIAL_CONDITIONS_STATUS_DISABLED = 3;
+  MATERIAL_CONDITIONS_STATUS_UNAVAILABLE = 4;
+  MATERIAL_CONDITIONS_STATUS_CAPACITY = 5;
+  MATERIAL_CONDITIONS_STATUS_EXPIRED = 6;
+  MATERIAL_CONDITIONS_STATUS_DENIED = 7;
+  MATERIAL_CONDITIONS_STATUS_BASELINE_CHANGED = 8;
+  MATERIAL_CONDITIONS_STATUS_TARGET_ABSENT = 9;
+  MATERIAL_CONDITIONS_STATUS_EXTERNAL_SOURCE = 10;
+  MATERIAL_CONDITIONS_STATUS_STORAGE = 11;
+  MATERIAL_CONDITIONS_STATUS_IMPACT_UNPROVEN = 12;
+}
+
+enum MaterialSource {
+  MATERIAL_SOURCE_UNSPECIFIED = 0;
+  MATERIAL_SOURCE_FILE = 1;
+  MATERIAL_SOURCE_MANIFEST = 2;
+  MATERIAL_SOURCE_ACME = 3;
+}
+
+message MaterialConditionsReference {
+  uint32 index = 1;
+  uint32 group = 2;
+  MaterialSource source = 3;
+}
+
+message MaterialAffected {
+  MaterialTarget target = 1;
+  string source_id = 2;
+}
+
+message MaterialConditionsGroup {
+  string certificate_etag = 1;
+  optional string material_generation = 2;
+  string source_id = 3;
+  repeated MaterialAffected affected = 4;
+}
+
+// 相同写入来源只出现一次；影响必须完整，超量时整节点返回容量不足。
+message MaterialConditionsBatch {
+  repeated MaterialConditionsReference entries = 1;
+  repeated MaterialConditionsGroup groups = 2;
+}
+
+message MaterialConditionsResultRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  string offer_id = 4;
+  MaterialConditionsStatus status = 5;
+  MaterialConditionsBatch batch = 6;
+}
+
+message MaterialConditionsResultResponse {
+  string accepted_offer_id = 1;
 }
 
 // 独立只读证明不包含 Saga 步骤、文件方向或租约，原目标与候选不能由接收者替换。

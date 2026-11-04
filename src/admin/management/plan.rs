@@ -15,6 +15,7 @@ use std::time::Duration;
 pub(crate) struct Plan {
     pub(crate) actions_enabled: bool,
     pub(crate) previews_enabled: bool,
+    pub(crate) material_previews_enabled: bool,
     pub(super) report_metrics: bool,
     pub(super) authority: [u8; 32],
     pub(in crate::admin) node_id: String,
@@ -182,8 +183,16 @@ impl Plan {
                 !reporter.previews || cfg!(feature = "node-actions"),
                 "management reporter previews require node-actions"
             );
+            ensure!(
+                !reporter.material_previews || cfg!(feature = "node-actions"),
+                "management reporter material_previews require node-actions"
+            );
             stamp(&mut authority, &[u8::from(reporter.actions)]);
             stamp(&mut authority, &[u8::from(reporter.previews)]);
+            // 关闭的新能力不改变已有管理会话身份，开启则必须撤销不具该权限的原连接。
+            if reporter.material_previews {
+                stamp(&mut authority, b"material_previews");
+            }
             stamp(&mut authority, &[u8::from(reporter.metrics)]);
             ensure!(
                 !reporter.targets.is_empty() && reporter.targets.len() <= 8,
@@ -218,7 +227,8 @@ impl Plan {
                 stamp(&mut authority, target.authority.as_bytes());
                 let issuer = issuer::Verifier::build(&target.issuer, root, &mut authority)?;
                 ensure!(
-                    !(reporter.actions || reporter.previews) || issuer.is_some(),
+                    !(reporter.actions || reporter.previews || reporter.material_previews)
+                        || issuer.is_some(),
                     "management reporter actions and previews require trusted issuers"
                 );
                 ensure!(
@@ -256,6 +266,10 @@ impl Plan {
                 .reporter
                 .as_ref()
                 .is_some_and(|reporter| reporter.previews),
+            material_previews_enabled: cfg
+                .reporter
+                .as_ref()
+                .is_some_and(|reporter| reporter.material_previews),
             report_metrics: cfg
                 .reporter
                 .as_ref()

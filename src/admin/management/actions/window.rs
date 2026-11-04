@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MAX_SPAN_MS: u64 = 20_000;
 const CLOCK_MARGIN_MS: u64 = 1_000;
 
-pub(in crate::admin::management) struct Window {
+pub(in crate::admin) struct Window {
     received_at: Instant,
     received_wall_ms: u64,
     deadline: Instant,
@@ -32,10 +32,7 @@ impl Window {
     /// - `expires_at_ms`：当前预览签名绑定的绝对截止时刻。
     ///
     /// 返回：同时满足墙钟与单调期限的窗口；过期、倒退或跨度超限时拒绝。
-    pub(in crate::admin::management) fn preview(
-        issued_at_ms: u64,
-        expires_at_ms: u64,
-    ) -> Result<Self> {
+    pub(in crate::admin) fn preview(issued_at_ms: u64, expires_at_ms: u64) -> Result<Self> {
         Self::bounds(issued_at_ms, expires_at_ms, unix_millis()?, Instant::now())
     }
 
@@ -92,7 +89,7 @@ impl Window {
     /// 参数说明: 无。
     ///
     /// 返回：两个截止和时钟连续性都成立时成功；失败只关闭新的决定，不撤销已持久文件方向。
-    pub(in crate::admin::management) fn check(&self) -> Result<()> {
+    pub(in crate::admin) fn check(&self) -> Result<()> {
         self.check_at(unix_millis()?, Instant::now())
     }
 

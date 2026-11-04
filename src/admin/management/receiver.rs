@@ -12,6 +12,8 @@ use std::time::Instant;
 
 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
 mod actions;
+#[cfg(feature = "node-actions")]
+mod material;
 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
 mod preview;
 
@@ -41,6 +43,10 @@ struct Entry {
     previews_supported: bool,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
     previews_enabled: bool,
+    #[cfg(feature = "node-actions")]
+    material_previews_supported: bool,
+    #[cfg(feature = "node-actions")]
+    material_previews_enabled: bool,
     baseline_supported: bool,
     baseline: Option<Arc<crate::control::baseline::NodeBaseline>>,
     publication: Arc<crate::control::publication_status::PublicationStatus>,
@@ -130,6 +136,10 @@ impl Store {
                 previews_supported: false,
                 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
                 previews_enabled: false,
+                #[cfg(feature = "node-actions")]
+                material_previews_supported: false,
+                #[cfg(feature = "node-actions")]
+                material_previews_enabled: false,
                 baseline_supported: false,
                 baseline: None,
                 publication: Arc::new(
@@ -701,6 +711,7 @@ impl protocol::node_management_server::NodeManagement for Service {
         let value = request.into_inner();
         if value.actions_enabled && !value.actions_supported
             || value.previews_enabled && !value.previews_supported
+            || value.material_previews_enabled && !value.material_previews_supported
         {
             return Err(Status::invalid_argument("node action capability differs"));
         }
@@ -763,6 +774,12 @@ impl protocol::node_management_server::NodeManagement for Service {
             entry.previews_enabled = value.previews_supported && value.previews_enabled;
         }
         let interest = manager.metrics_interest();
+        #[cfg(feature = "node-actions")]
+        {
+            entry.material_previews_supported = value.material_previews_supported;
+            entry.material_previews_enabled =
+                value.material_previews_supported && value.material_previews_enabled;
+        }
         if !entry.metrics_enabled || interest == 0 {
             entry.sample = None;
         }
@@ -822,6 +839,32 @@ impl protocol::node_management_server::NodeManagement for Service {
         };
         #[cfg(not(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql")))]
         let preview = None;
+        #[cfg(feature = "node-actions")]
+        let material_conditions = if action.is_none() && release.is_none() && preview.is_none() {
+            manager
+                .material_deliveries
+                .lock()
+                .get(&node_id)
+                .filter(|offer| {
+                    store
+                        .material_session(&plan, &offer.command.intent)
+                        .is_ok_and(|session| session.as_slice() == value.session.as_slice())
+                        && offer
+                            .authorize(
+                                &manager,
+                                &node_id,
+                                &offer.command.intent.boot,
+                                &value.session,
+                                None,
+                            )
+                            .is_ok()
+                })
+                .and_then(|offer| offer.wire().ok())
+        } else {
+            None
+        };
+        #[cfg(not(feature = "node-actions"))]
+        let material_conditions = None;
         Ok(Response::new(protocol::ReportResponse {
             accepted_sequence: value.sequence,
             action,
@@ -831,7 +874,29 @@ impl protocol::node_management_server::NodeManagement for Service {
             consumers_supported: true,
             certificates_supported: true,
             preview,
+            material_conditions,
         }))
+    }
+
+    /// 业务作用：把独立材料条件结果交回原查询，不借助配置预览或持久动作受理权。
+    ///
+    /// 参数说明：
+    /// - `request`：原目标 mTLS 会话绑定的完整材料结果。
+    ///
+    /// 返回：原等待者接收后确认；缺能力、旧会话、不完整影响或越权均拒绝。
+    async fn material_conditions_result(
+        &self,
+        request: Request<protocol::MaterialConditionsResultRequest>,
+    ) -> Result<Response<protocol::MaterialConditionsResultResponse>, Status> {
+        #[cfg(feature = "node-actions")]
+        {
+            self.receive_material_result(request)
+        }
+        #[cfg(not(feature = "node-actions"))]
+        {
+            let _ = request;
+            Err(Status::unimplemented("material conditions unavailable"))
+        }
     }
 
     /// 业务作用：只向当前已获权原目标交付预览候选，未装配共享预览发行端的制品不提供正文。

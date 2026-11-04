@@ -23,6 +23,13 @@ pub struct Manager {
     pub(super) action_permits: Arc<tokio::sync::Semaphore>,
     #[cfg(feature = "node-actions")]
     pub(super) preview_permits: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "node-actions")]
+    pub(super) material_permits: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "node-actions")]
+    pub(super) material_requests: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "node-actions")]
+    pub(super) material_deliveries:
+        parking_lot::Mutex<std::collections::BTreeMap<String, Arc<super::material::Offer>>>,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
     pub(super) preview_requests: Arc<tokio::sync::Semaphore>,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
@@ -79,7 +86,7 @@ impl Manager {
     /// - cluster：原执行持久绑定的集群。
     ///
     /// 返回：仍有效的同一管理计划；停机、角色不足、证书过期或发行身份不符时拒绝。
-    #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+    #[cfg(feature = "node-actions")]
     pub(in crate::admin) fn action_plan(
         &self,
         snapshot: &Arc<GatewaySnapshot>,
@@ -197,6 +204,12 @@ impl Manager {
             action_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(feature = "node-actions")]
             preview_permits: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(feature = "node-actions")]
+            material_permits: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(feature = "node-actions")]
+            material_requests: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(feature = "node-actions")]
+            material_deliveries: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
             preview_requests: Arc::new(tokio::sync::Semaphore::new(2)),
             #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
@@ -412,6 +425,7 @@ async fn bind(
         "ActionResult",
         "PreviewData",
         "PreviewResult",
+        "MaterialConditionsResult",
     ] {
         config.method_policies.insert(
             format!("/naway.management.v1.NodeManagement/{method}"),

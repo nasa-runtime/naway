@@ -2,6 +2,7 @@
 
 use crate::config::{GatewaySnapshot, SniCertRuntime, TlsRuntimeCfg};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,7 +26,7 @@ impl Target {
     /// 参数说明: 无。
     ///
     /// 返回：归属目录中对应命名空间的唯一键，不包含文件路径。
-    #[cfg(feature = "admin-operations-pgsql")]
+    #[cfg(any(feature = "admin-operations-pgsql", feature = "node-actions"))]
     pub(crate) fn object_key(&self) -> String {
         let kind = match self.kind {
             Kind::Proxy => "certificate",
@@ -53,6 +54,19 @@ impl Target {
     ///
     /// 返回：当前唯一文件来源计划；未知入口或条目返回空，外部来源仍保留其拒绝依据。
     pub(crate) fn resolve(&self, snapshot: &GatewaySnapshot) -> Option<TlsRuntimeCfg> {
+        self.source(snapshot).map(Cow::into_owned)
+    }
+
+    /// 业务作用：读取材料条件时借用默认监听计划，避免为每个目标复制整份 SNI 与客户端策略。
+    ///
+    /// 参数说明：
+    /// - `snapshot`：调用方冻结的完整配置，借用期间不得替换其权威。
+    ///
+    /// 返回：默认身份借用原计划，SNI 仅投影自身来源；未知目标不产生文件访问。
+    pub(crate) fn source<'a>(
+        &self,
+        snapshot: &'a GatewaySnapshot,
+    ) -> Option<Cow<'a, TlsRuntimeCfg>> {
         if !self.valid() {
             return None;
         }
@@ -71,13 +85,16 @@ impl Target {
                 .as_ref()?,
         };
         if self.entry == "default" {
-            return Some(tls.clone());
+            return Some(Cow::Borrowed(tls));
         }
         // 动态身份拥有整份 listener 选证器，不能通过虚构 SNI 文件条目绕过其来源所有权。
         if tls.in_memory.is_some() || tls.spire.is_some() {
             return None;
         }
-        Some(sni_source(tls, tls.certs.get(self.sni_index()?)?))
+        Some(Cow::Owned(sni_source(
+            tls,
+            tls.certs.get(self.sni_index()?)?,
+        )))
     }
 
     /// 业务作用：严格解释声明位置，拒绝带符号、前导零和超出选证上界的等价写法。
