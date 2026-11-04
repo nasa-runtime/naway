@@ -2,13 +2,19 @@
 
 use anyhow::{Context, Result};
 use std::io::Cursor;
+use tokio_rustls::rustls::sign::CertifiedKey;
 
 /// 业务作用：在落盘前验证证书链可解析、私钥算法受 rustls 支持且 leaf/key 匹配。
 ///
 /// 参数说明：
 /// - `certificate_pem`: 待安装证书链。
 /// - `private_key_pem`: 待安装私钥。
-pub(super) fn validate_keypair(certificate_pem: &[u8], private_key_pem: &[u8]) -> Result<()> {
+///
+/// 返回：已解析且匹配的签名身份；格式、算法或密钥不匹配时失败，不访问活动文件。
+pub(super) fn validate_keypair(
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+) -> Result<CertifiedKey> {
     let mut cert_reader = Cursor::new(certificate_pem);
     let certs = rustls_pemfile::certs(&mut cert_reader)
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -25,5 +31,6 @@ pub(super) fn validate_keypair(certificate_pem: &[u8], private_key_pem: &[u8]) -
     let certified = tokio_rustls::rustls::sign::CertifiedKey::new(certs, signing_key);
     certified
         .keys_match()
-        .context("issued certificate does not match private key")
+        .context("issued certificate does not match private key")?;
+    Ok(certified)
 }

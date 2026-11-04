@@ -5,11 +5,14 @@
 //! 证书文件内容变更由 notify watcher 捕获并重建(热换证不断连,)。
 
 pub mod acme;
+mod identity;
 pub mod installed;
 pub(crate) mod keypair;
 pub mod material;
 pub mod spire;
 pub(crate) mod trust;
+
+use identity::build_sni_resolver;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -1914,116 +1917,6 @@ fn load_crls_from(path: &Path) -> Result<Vec<CertificateRevocationListDer<'stati
         path.display()
     );
     Ok(crls)
-}
-
-/// 业务作用：从默认证书 + `certs[]` 构建 SNI resolver。任一证书/私钥读不了即整体失败(坏证书不上线)。
-fn build_sni_resolver(tls: &TlsRuntimeCfg) -> Result<SniCertResolver> {
-    let (default_cert_file, default_key_file) = active_keypair_paths(tls)?;
-    let default = certified_identity(
-        &default_cert_file,
-        &default_key_file,
-        tls.private_key_provider.as_ref(),
-        tls.ocsp_stapling.as_ref(),
-    )
-    .context("build default tls certificate")?;
-    let mut exact: HashMap<String, Arc<CertifiedIdentity>> = HashMap::new();
-    let mut wildcards: Vec<(String, Arc<CertifiedIdentity>)> = Vec::new();
-    for cert in &tls.certs {
-        let key = Arc::new(
-            certified_identity(
-                &cert.cert_file,
-                &cert.key_file,
-                cert.private_key_provider.as_ref(),
-                cert.ocsp_stapling.as_ref(),
-            )
-            .with_context(|| format!("build sni tls certificate for {:?}", cert.server_names))?,
-        );
-        for name in &cert.server_names {
-            if let Some(suffix) = name.strip_prefix("*.") {
-                // 通配 `*.foo.com` → 匹配 SNI 以 `.foo.com` 结尾。
-                wildcards.push((format!(".{suffix}"), key.clone()));
-            } else {
-                exact.insert(name.clone(), key.clone());
-            }
-        }
-    }
-    Ok(SniCertResolver {
-        exact,
-        wildcards,
-        default: Arc::new(default),
-    })
-}
-
-/// 业务作用：从 PEM 身份构建 rustls 签名身份，并绑定经过密码学与 freshness 校验的 OCSP staple。
-///
-/// 参数说明：
-/// - `cert_file`：是公开证书链
-/// - `key_file`：恰有一个有效
-/// - `private_key_provider`：恰有一个有效
-/// - `ocsp`：是该证书专属的可选响应策略。
-///
-/// 返回：证书、私钥和 OCSP 响应自洽时返回握手身份；must-staple 缺响应或任何材料无效时失败。
-fn certified_identity(
-    cert_file: &Path,
-    key_file: &Path,
-    private_key_provider: Option<&crate::security::external_crypto::ExternalPrivateKeyPlan>,
-    ocsp: Option<&OcspStaplingRuntime>,
-) -> Result<CertifiedIdentity> {
-    let certs = load_certs_from(cert_file)?;
-    let signing_key = if let Some(private_key_provider) = private_key_provider {
-        let leaf = x509_cert::Certificate::from_der(certs[0].as_ref())
-            .with_context(|| format!("parse TLS leaf certificate {}", cert_file.display()))?;
-        let public_key = leaf
-            .tbs_certificate
-            .subject_public_key_info
-            .to_der()
-            .context("encode TLS leaf certificate SPKI")?;
-        private_key_provider
-            .signing_key(SubjectPublicKeyInfoDer::from(public_key))
-            .context("build external TLS signing key")?
-    } else {
-        let key = load_private_key_from(key_file)?;
-        // 本地身份只在候选构建期解析私钥，握手路径只持有不可变 signing key。
-        tokio_rustls::rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
-            .with_context(|| format!("load signing key from {}", key_file.display()))?
-    };
-    let mut certified = CertifiedKey::new(certs, signing_key);
-    // 发布前复验证书公开身份与 signing key，避免双文件更新或 signer 配置错位形成半完成身份。
-    certified.keys_match().with_context(|| {
-        format!(
-            "TLS certificate {} and signing key do not match",
-            cert_file.display()
-        )
-    })?;
-    let must_staple = certificate_requires_ocsp_staple(&certified.cert[0])?;
-    let Some(ocsp) = ocsp else {
-        anyhow::ensure!(
-            !must_staple,
-            "TLS certificate {} declares must-staple but has no ocsp_stapling config",
-            cert_file.display()
-        );
-        return Ok(CertifiedIdentity {
-            active: Arc::new(certified),
-            expired_fallback: None,
-            ocsp_valid_until: None,
-        });
-    };
-    let (staple, valid_until) = validate_ocsp_staple(&certified.cert, ocsp)?;
-    let fallback = if ocsp.required || must_staple {
-        None
-    } else {
-        Some(Arc::new(CertifiedKey::new(
-            certified.cert.clone(),
-            certified.key.clone(),
-        )))
-    };
-    // 验证与发布必须使用同一份字节，避免 response_file 在两次读取之间被替换形成 TOCTOU。
-    certified.ocsp = Some(staple);
-    Ok(CertifiedIdentity {
-        active: Arc::new(certified),
-        expired_fallback: fallback,
-        ocsp_valid_until: Some(valid_until),
-    })
 }
 
 /// 业务作用：完整验证 OCSPResponse 可被当前服务端证书安全 stapling，并计算握手截止时刻。

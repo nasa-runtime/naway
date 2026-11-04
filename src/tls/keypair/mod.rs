@@ -32,15 +32,22 @@ pub(crate) fn install_keypair_atomically(
         .lock()
         .map_err(|_| anyhow::anyhow!("TLS keypair install lock is poisoned"))?;
     recover_legacy_keypair_transaction_locked(tls)?;
-    install_keypair_atomically_locked(tls, certificate_pem, private_key_pem)
+    validate_installation(tls, certificate_pem, private_key_pem)?;
+    publish_keypair_locked(tls, certificate_pem, private_key_pem)
 }
 
 /// 手工证书 CAS 安装结果。
 pub(crate) enum KeypairCasInstallOutcome {
     /// 比较基线仍一致，完整 pair 已发布。
     Installed,
-    /// 安装前证书已变化，未写入任何文件。
+    /// 安装前证书已变化，未开始该候选的文件决定。
     Changed(String),
+    /// 材料或当前 OCSP 策略不允许安装，未开始该候选的文件决定。
+    Invalid,
+    /// 不能取得安装权或读取当前基线，未开始该候选的文件决定。
+    Unavailable,
+    /// 恢复或文件决定已经开始但未取得明确完成证据，必须重新读取事实。
+    OutcomeUnknown,
 }
 
 /// 业务作用：在与 ACME 续期共享的进程锁内复验证书摘要并安装完整 pair，防止 Console 覆盖刚完成
@@ -52,30 +59,40 @@ pub(crate) enum KeypairCasInstallOutcome {
 /// - `certificate_pem`：有界上传的完整证书 PEM。
 /// - `private_key_pem`：有界上传的完整私钥 PEM。
 ///
-/// 返回：基线一致且 pair 合法时返回 Installed；摘要变化返回当前 ETag 且无副作用；读取、校验或落盘
-/// 失败返回错误。
+/// 返回：基线及身份有效且文件提交完成时为 Installed；摘要变化携带当前 ETag；其它结果区分
+/// 候选无效、存储不可用与提交未知，不附带材料或底层文件路径。
 pub(crate) fn install_keypair_atomically_if_match(
     tls: &TlsRuntimeCfg,
     expected_etag: &str,
     certificate_pem: &[u8],
     private_key_pem: &[u8],
-) -> Result<KeypairCasInstallOutcome> {
-    let _guard = keypair_install_lock()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("TLS keypair install lock is poisoned"))?;
-    recover_legacy_keypair_transaction_locked(tls)?;
-    let (certificate_path, _) = crate::tls::active_keypair_paths_unrecovered(tls)?;
-    let current = crate::io::bounded_io::read_file(
-        &certificate_path,
-        MAX_KEYPAIR_BYTES,
-        "TLS certificate CAS baseline",
-    )?;
+) -> KeypairCasInstallOutcome {
+    let Ok(_guard) = keypair_install_lock().lock() else {
+        return KeypairCasInstallOutcome::Unavailable;
+    };
+    // 旧事务恢复可能已经改变文件；没有明确结算证据时不能声称该请求毫无副作用。
+    if recover_legacy_keypair_transaction_locked(tls).is_err() {
+        return KeypairCasInstallOutcome::OutcomeUnknown;
+    }
+    let baseline = crate::tls::active_keypair_paths_unrecovered(tls).and_then(|(path, _)| {
+        crate::io::bounded_io::read_file(&path, MAX_KEYPAIR_BYTES, "TLS certificate CAS baseline")
+    });
+    let Ok(current) = baseline else {
+        return KeypairCasInstallOutcome::Unavailable;
+    };
     let current_etag = certificate_etag(&current);
     if expected_etag.trim() != current_etag {
-        return Ok(KeypairCasInstallOutcome::Changed(current_etag));
+        return KeypairCasInstallOutcome::Changed(current_etag);
     }
-    install_keypair_atomically_locked(tls, certificate_pem, private_key_pem)?;
-    Ok(KeypairCasInstallOutcome::Installed)
+    // 候选身份与当前 staple 必须在任何准备写入之前自洽，不能先破坏磁盘材料再依赖 listener 的 LKG。
+    if validate_installation(tls, certificate_pem, private_key_pem).is_err() {
+        return KeypairCasInstallOutcome::Invalid;
+    }
+    match publish_keypair_locked(tls, certificate_pem, private_key_pem) {
+        Ok(()) => KeypairCasInstallOutcome::Installed,
+        // rename 或 fsync 的失败不证明提交未发生；调用者只能回读原目标，不能无条件重放。
+        Err(_) => KeypairCasInstallOutcome::OutcomeUnknown,
+    }
 }
 
 /// 业务作用：返回 ACME 与手工轮换共享的证书安装互斥锁，保证比较和 manifest/pair 发布不交错。
@@ -122,20 +139,45 @@ pub(crate) fn certificate_etag(certificate_pem: &[u8]) -> String {
     format!("\"sha256-{encoded}\"")
 }
 
-/// 业务作用：在调用方已持有证书安装锁时校验并发布 pair，集中维护 manifest 与兼容文件模式语义。
+/// 业务作用：在任何材料写入前证明受管文件身份与当前默认 OCSP 策略一致，复用实际握手加载的校验门。
 ///
 /// 参数说明：
-/// - `tls`：固定安装事实源的 TLS 策略。
-/// - `certificate_pem`：待校验和安装的完整证书 PEM。
-/// - `private_key_pem`：待校验和安装的完整私钥 PEM。
+/// - `tls`：当前默认身份的来源和 OCSP 策略。
+/// - `certificate_pem`：待安装的有界完整证书链。
+/// - `private_key_pem`：待安装的有界私钥。
 ///
-/// 返回：pair 合法且事实源完整切换时成功；校验或任一步 I/O 失败时返回错误。
-fn install_keypair_atomically_locked(
+/// 返回：本地文件身份满足密钥匹配和 OCSP 约束时成功；失败不创建材料目录或切换文件。
+fn validate_installation(
     tls: &TlsRuntimeCfg,
     certificate_pem: &[u8],
     private_key_pem: &[u8],
 ) -> Result<()> {
-    validate_keypair(certificate_pem, private_key_pem)?;
+    anyhow::ensure!(
+        tls.in_memory.is_none() && tls.spire.is_none() && tls.private_key_provider.is_none(),
+        "TLS identity is owned by an external source"
+    );
+    anyhow::ensure!(
+        certificate_pem.len() <= MAX_KEYPAIR_BYTES && private_key_pem.len() <= MAX_KEYPAIR_BYTES,
+        "TLS keypair material exceeds installation budget"
+    );
+    let certified = validate_keypair(certificate_pem, private_key_pem)?;
+    crate::tls::identity::apply_ocsp_policy(certified, tls.ocsp_stapling.as_ref())?;
+    Ok(())
+}
+
+/// 业务作用：在调用方持有证书安装锁且完成身份验证后发布 pair，集中维护 manifest 与兼容文件模式语义。
+///
+/// 参数说明：
+/// - `tls`：固定安装事实源的 TLS 策略。
+/// - `certificate_pem`：已通过当前身份策略校验的完整证书 PEM。
+/// - `private_key_pem`：与已验证证书匹配的完整私钥 PEM。
+///
+/// 返回：事实源完整切换时成功；任一步 I/O 失败时返回错误，调用者不能据此推断未提交。
+fn publish_keypair_locked(
+    tls: &TlsRuntimeCfg,
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+) -> Result<()> {
     if let Some(manifest_file) = &tls.keypair_manifest_file {
         let prepared = prepare_keypair_version(manifest_file, certificate_pem, private_key_pem)?;
         atomic_write(manifest_file, &prepared.manifest, false)?;

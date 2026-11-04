@@ -144,11 +144,11 @@ pub(in crate::admin) async fn upload_certificate(
         match collect_bounded_admin_body(&parts, body, MAX_CERT_UPLOAD_BYTES).await {
             Err(response) => *response,
             Ok(body) => match serde_json::from_slice::<CertificateUploadInput>(&body) {
-                Err(error) => json(
+                Err(_) => json(
                     StatusCode::BAD_REQUEST,
                     serde_json::json!({
                         "ok": false,
-                        "error": format!("invalid certificate JSON: {error}")
+                        "error": "invalid certificate JSON"
                     }),
                 ),
                 Ok(input)
@@ -318,27 +318,26 @@ pub(in crate::admin) async fn install_uploaded_certificate(
                 || crate::config::config_fingerprint(&snapshot.source_config_path).ok()
                     != Some(input.fingerprint)
             {
-                return Ok(None);
+                return None;
             }
-            crate::tls::keypair::install_keypair_atomically_if_match(
+            Some(crate::tls::keypair::install_keypair_atomically_if_match(
                 &input.tls,
                 &input.expected,
                 &input.certificate,
                 &input.private_key,
-            )
-            .map(Some)
+            ))
         })
     })
     .await;
     match installed {
-        Ok(Ok(Some(crate::tls::keypair::KeypairCasInstallOutcome::Installed))) => json(
+        Ok(Some(crate::tls::keypair::KeypairCasInstallOutcome::Installed)) => json(
             StatusCode::OK,
             serde_json::json!({
                 "ok": true,
                 "status": "installed"
             }),
         ),
-        Ok(Ok(Some(crate::tls::keypair::KeypairCasInstallOutcome::Changed(etag)))) => {
+        Ok(Some(crate::tls::keypair::KeypairCasInstallOutcome::Changed(etag))) => {
             let mut response = json(
                 StatusCode::PRECONDITION_FAILED,
                 serde_json::json!({
@@ -352,25 +351,43 @@ pub(in crate::admin) async fn install_uploaded_certificate(
             }
             response
         }
-        Ok(Ok(None)) => plain(
+        Ok(None) => plain(
             StatusCode::PRECONDITION_FAILED,
             "certificate configuration baseline changed\n",
         ),
-        Ok(Err(error)) => json(
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "ok": false,
-                "error": error.to_string()
-            }),
-        ),
-        Err(error) => json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({
-                "ok": false,
-                "error": format!("certificate worker failed: {error}")
-            }),
-        ),
+        Ok(Some(crate::tls::keypair::KeypairCasInstallOutcome::Invalid)) => {
+            installation_failure(StatusCode::BAD_REQUEST, "invalid_certificate_material")
+        }
+        Ok(Some(crate::tls::keypair::KeypairCasInstallOutcome::Unavailable)) => {
+            installation_failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "certificate_storage_unavailable",
+            )
+        }
+        Ok(Some(crate::tls::keypair::KeypairCasInstallOutcome::OutcomeUnknown)) | Err(_) => {
+            installation_failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "certificate_installation_outcome_unknown",
+            )
+        }
     }
+}
+
+/// 业务作用：向材料写入调用者交付固定失败分类，禁止底层文件路径、解析输入或私钥进入响应。
+///
+/// 参数说明：
+/// - `status`：与候选拒绝、存储不可用或结果未知对应的 HTTP 状态。
+/// - `code`：固定业务错误码，不接受底层异常文本。
+///
+/// 返回：不含秘密的 JSON；结果未知明确要求按原目标回读，不能据此重放。
+fn installation_failure(status: StatusCode, code: &'static str) -> Response<BoxBody> {
+    json(
+        status,
+        serde_json::json!({
+            "ok": false,
+            "error": code
+        }),
+    )
 }
 
 /// 业务作用：拒绝向外部身份所有者的占位文件写材料，避免将无效上传描述为成功换证。
