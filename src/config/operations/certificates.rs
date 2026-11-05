@@ -1,9 +1,11 @@
 //! 独立材料受理开关与有界钥环；关闭时不读取任何加密秘密。
 
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 use zeroize::Zeroizing;
+
+pub mod impact;
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -16,6 +18,7 @@ pub struct Config {
     pub max_total_bytes: u64,
     pub max_records: u32,
     pub max_records_per_scope: u32,
+    pub impact_approvals: impact::Config,
 }
 
 impl Default for Config {
@@ -34,6 +37,7 @@ impl Default for Config {
             max_total_bytes: 64 * 1024 * 1024,
             max_records: 4096,
             max_records_per_scope: 256,
+            impact_approvals: impact::Config::default(),
         }
     }
 }
@@ -43,11 +47,12 @@ impl Config {
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：保留独立功能开关与四项预算；不触碰已经发布的配置。
+    /// 返回：保留材料与影响审批各自的功能开关和预算；不触碰已经发布的配置。
     pub(super) fn clear_dynamic(&mut self) {
         self.accept_proposals = false;
         self.write_key_id.clear();
         self.keys.clear();
+        self.impact_approvals.clear_dynamic();
     }
 }
 
@@ -79,6 +84,7 @@ impl Keyring {
             retention,
             "certificate proposals require operations retention"
         );
+        config.impact_approvals.validate()?;
         ensure!(
             (1024..=1024 * 1024).contains(&config.max_material_bytes)
                 && (1..=4096).contains(&config.max_records)

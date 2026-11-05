@@ -3,8 +3,10 @@
 mod request;
 mod response;
 mod source;
+pub(in crate::admin::operations::certificates) use request::{Observation, confirm, observe};
+pub(in crate::admin::operations::certificates) use source::Stamp;
 
-use super::{authorization::Scope, Error, Store};
+use super::{Error, Store, authorization::Scope};
 use crate::{
     admin::{self, AdminState, BoxBody},
     config::GatewaySnapshot,
@@ -26,7 +28,27 @@ pub(super) struct Context<'a> {
 /// - `context`：当前请求原凭据、精确快照与共享存储。
 ///
 /// 返回：原请求主体、配置及发行身份仍有效时成功；停机、换代或失权立即拒绝。
-fn current(context: &Context<'_>) -> Result<(), Error> {
+pub(in crate::admin::operations::certificates) fn current(
+    context: &Context<'_>,
+) -> Result<(), Error> {
+    identity(context)?;
+    context
+        .state
+        .management
+        .action_plan(context.snapshot, &context.store.plan.config.cluster_id)
+        .map_err(|_| Error::Unavailable)?;
+    Ok(())
+}
+
+/// 业务作用：复验原请求的身份、配置和持久 owner，读取已保存影响不依赖预检通道仍然开启。
+///
+/// 参数说明：
+/// - `context`：当前请求借用的原凭据和冻结快照。
+///
+/// 返回：主体、来源、快照与存储实例均未变化时成功；任何失权或换代立即拒绝。
+pub(in crate::admin::operations::certificates) fn identity(
+    context: &Context<'_>,
+) -> Result<(), Error> {
     // 配置和存储必须仍属于原请求的同一实例；停机或同内容换代也不能延续旧材料分发资格。
     if !context.state.mode.full_control_plane()
         || context.store.stopping.is_cancelled()
@@ -54,11 +76,6 @@ fn current(context: &Context<'_>) -> Result<(), Error> {
     {
         return Err(Error::Denied);
     }
-    context
-        .state
-        .management
-        .action_plan(context.snapshot, &context.store.plan.config.cluster_id)
-        .map_err(|_| Error::Unavailable)?;
     Ok(())
 }
 

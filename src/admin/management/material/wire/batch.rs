@@ -6,13 +6,9 @@ use crate::{
         material::{command::Intent, Reason},
         protocol,
     },
-    tls::{
-        keypair::conditions::{Affected, Batch, Group, Reference, Source},
-        targets::Target,
-    },
+    tls::keypair::conditions::{Affected, Batch, Group, Reference, Source},
 };
 use nasa::grpc::codegen::prost::Message;
-use std::collections::BTreeSet;
 
 /// 业务作用：同源材料仅传送一份，原请求位置单独引用来源组，不复制证书关系数组。
 ///
@@ -131,73 +127,9 @@ pub(in crate::admin::management) fn decode_batch(
 ///
 /// 返回：所有组均被引用、原目标均包含在自己的影响内且整体小于消息预算才成功。
 pub(in crate::admin::management) fn validate(batch: &Batch, intent: &Intent) -> Result<(), Reason> {
-    if batch.entries.len() != intent.targets.len()
-        || batch.groups.is_empty()
-        || batch.groups.len() > batch.entries.len()
-    {
-        return Err(Reason::Denied);
-    }
-    let mut used = BTreeSet::new();
-    for (entry, target) in batch.entries.iter().zip(&intent.targets) {
-        let group = batch.groups.get(entry.group).ok_or(Reason::Denied)?;
-        if !group
-            .affected
-            .iter()
-            .any(|affected| &affected.target == target && affected.source_id == group.source_id)
-        {
-            return Err(Reason::Denied);
-        }
-        used.insert(entry.group);
-    }
-    if used.len() != batch.groups.len() {
-        return Err(Reason::Denied);
-    }
-    let mut sources = BTreeSet::new();
-    // 逐字段预留 protobuf 标签与长度的保守上界；本机路径不为预算再序列化一份结果。
-    let mut bytes = 32 * batch.entries.len();
-    for group in &batch.groups {
-        if !crate::tls::keypair::valid_material_generation(&group.source_id)
-            || !sources.insert(&group.source_id)
-            || group
-                .material_generation
-                .as_ref()
-                .is_some_and(|value| !crate::tls::keypair::valid_material_generation(value))
-            || !group
-                .certificate_etag
-                .strip_prefix("\"sha256-")
-                .and_then(|value| value.strip_suffix('"'))
-                .is_some_and(crate::tls::keypair::valid_material_generation)
-            || group.affected.is_empty()
-            || group.affected.len() > 128
-            || !group
-                .affected
-                .windows(2)
-                .all(|pair| identity(&pair[0].target) < identity(&pair[1].target))
-        {
-            return Err(Reason::Denied);
-        }
-        bytes += 256;
-        for affected in &group.affected {
-            if !affected.target.valid()
-                || !crate::tls::keypair::valid_material_generation(&affected.source_id)
-            {
-                return Err(Reason::Denied);
-            }
-            bytes += 112 + affected.target.listener.len() + affected.target.entry.len();
-            if bytes > 24 * 1024 {
-                return Err(Reason::Capacity);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 业务作用：保持共享影响的唯一规范顺序，重复或乱序目标不能被结果聚合忽略。
-///
-/// 参数说明：
-/// - `target`：已经验证的逻辑身份。
-///
-/// 返回：借用字段组成的排序键，不分配对象名称。
-fn identity(target: &Target) -> (u8, &str, &str) {
-    (target.kind as u8, &target.listener, &target.entry)
+    use crate::control::material::conditions::{self, Invalid};
+    conditions::validate(batch, intent.targets.iter()).map_err(|reason| match reason {
+        Invalid::Structure => Reason::Denied,
+        Invalid::Capacity => Reason::Capacity,
+    })
 }

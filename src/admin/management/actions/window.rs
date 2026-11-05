@@ -93,6 +93,17 @@ impl Window {
         self.check_at(unix_millis()?, Instant::now())
     }
 
+    /// 业务作用：把原观察窗口剩余的单调预算交给持久登记，不在数据库阶段重新创建期限。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：原墙钟连续性仍成立时的剩余单调时长；过期或时钟异常拒绝后续登记。
+    #[cfg(all(feature = "admin-operations-pgsql", feature = "node-actions"))]
+    pub(in crate::admin) fn remaining(&self) -> Result<Duration> {
+        self.check()?;
+        Ok(self.deadline.saturating_duration_since(Instant::now()))
+    }
+
     /// 业务作用：检查当前墙钟与单调流逝是否仍证明原窗口有效，允许误差不会累积到后续受理。
     ///
     /// 参数说明：

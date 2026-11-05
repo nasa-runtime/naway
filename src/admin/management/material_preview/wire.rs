@@ -135,7 +135,7 @@ pub(super) fn proof(batch: Batch, intent: &Intent, impact: &[u8]) -> Result<Proo
     {
         return Err(Reason::MaterialChanged);
     }
-    let expected = crate::tls::keypair::preview::impact(&batch);
+    let expected = crate::control::material::conditions::digest(&batch);
     if impact != expected {
         return Err(Reason::ImpactUnproven);
     }

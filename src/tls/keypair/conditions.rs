@@ -2,7 +2,7 @@
 
 use super::{generation, keypair_install_lock, recover_legacy_keypair_transaction_locked, source};
 use crate::{config::GatewaySnapshot, tls::targets::Target};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
 pub(crate) struct Conditions {
@@ -11,7 +11,8 @@ pub(crate) struct Conditions {
     pub group: Group,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Group {
     pub certificate_etag: String,
     pub material_generation: Option<String>,
@@ -19,7 +20,7 @@ pub(crate) struct Group {
     pub affected: Vec<Affected>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Source {
     File,
@@ -27,7 +28,8 @@ pub(crate) enum Source {
     Acme,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Affected {
     pub target: Target,
     pub source_id: String,
@@ -43,13 +45,15 @@ pub(crate) enum Unavailable {
     ImpactUnproven,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Batch {
     pub entries: Vec<Reference>,
     pub groups: Vec<Group>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Reference {
     pub source: Source,
     pub group: usize,

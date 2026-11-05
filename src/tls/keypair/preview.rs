@@ -2,7 +2,6 @@
 
 use super::{conditions, generation, preflight};
 use crate::{config::GatewaySnapshot, tls::targets::Target};
-use sha2::{Digest, Sha256};
 use tokio_rustls::rustls::sign::CertifiedKey;
 
 pub(crate) struct Expected<'a> {
@@ -83,67 +82,9 @@ pub(crate) fn inspect(
                 .map_err(|_| Rejected::Invalid)?;
         }
         Ok(Proof {
-            impact: impact(&batch),
+            impact: crate::control::material::conditions::digest(&batch),
             conditions: batch,
         })
     })
     .map_err(Rejected::Conditions)?
-}
-
-/// 业务作用：给同次完整来源影响生成独立证明，原仅含 pair 条件的批准不能被解释为已批准该摘要。
-///
-/// 参数说明：
-/// - `batch`：同一材料锁内生成的全部原引用与完整影响。
-///
-/// 返回：带数量、顺序和字段边界的固定摘要，不序列化 JSON，不包含文件路径或私钥摘要。
-pub(crate) fn impact(batch: &conditions::Batch) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"naway-material-preview-impact\0");
-    hash.update((batch.entries.len() as u32).to_be_bytes());
-    for entry in &batch.entries {
-        hash.update([match entry.source {
-            conditions::Source::File => 1,
-            conditions::Source::Manifest => 2,
-            conditions::Source::Acme => 3,
-        }]);
-        hash.update((entry.group as u32).to_be_bytes());
-    }
-    hash.update((batch.groups.len() as u32).to_be_bytes());
-    for group in &batch.groups {
-        for field in [
-            group.source_id.as_bytes(),
-            group.certificate_etag.as_bytes(),
-            group
-                .material_generation
-                .as_deref()
-                .unwrap_or_default()
-                .as_bytes(),
-        ] {
-            stamp(&mut hash, field);
-        }
-        hash.update((group.affected.len() as u32).to_be_bytes());
-        for affected in &group.affected {
-            hash.update([affected.target.kind as u8]);
-            for field in [
-                affected.target.listener.as_bytes(),
-                affected.target.entry.as_bytes(),
-                affected.source_id.as_bytes(),
-            ] {
-                stamp(&mut hash, field);
-            }
-        }
-    }
-    hash.finalize().into()
-}
-
-/// 业务作用：在影响证明中保留相邻字段的边界，字符串拼接不能改变逻辑身份解释。
-///
-/// 参数说明：
-/// - `hash`：本批独立影响摘要。
-/// - `bytes`：当前字段的原始借用内容。
-///
-/// 返回：增量加入长度和字段内容，不分配中间编码。
-fn stamp(hash: &mut Sha256, bytes: &[u8]) {
-    hash.update((bytes.len() as u64).to_be_bytes());
-    hash.update(bytes);
 }

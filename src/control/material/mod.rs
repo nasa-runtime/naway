@@ -1,7 +1,11 @@
 //! 材料控制域共享原生身份和授权，持久存储与网络适配由各自入口负责。
 
 pub(crate) mod authorization;
+#[cfg(feature = "node-actions")]
+pub(crate) mod conditions;
 mod frame;
+#[cfg(all(feature = "admin-operations-pgsql", feature = "node-actions"))]
+pub(crate) mod impact;
 #[cfg(feature = "admin-operations-pgsql")]
 mod target;
 pub(crate) use frame::Material;

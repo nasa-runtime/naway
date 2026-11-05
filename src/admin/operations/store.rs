@@ -1,14 +1,14 @@
 //! 同事务保存候选和幂等收据；跨 Admin 容量由数据库行锁裁决。
 
-use super::model::{hex, Candidate, Decision, Error, Record, Review};
+use super::model::{Candidate, Decision, Error, Record, Review, hex};
 use crate::config::operations::Plan;
 use nasa::idempotency::{
-    pgsql::{PgIdempotencyStore, PgIdempotencyTransactionError},
     ExecutionLease, IdempotencyKey, IdempotencyOutcome, IdempotencyStore, RequestFingerprint,
     StoredResponse,
+    pgsql::{PgIdempotencyStore, PgIdempotencyTransactionError},
 };
 use nasa::tx::pgsql::TxDecision;
-use sqlx::{postgres::PgRow, Row};
+use sqlx::{Row, postgres::PgRow};
 use std::{future::Future, sync::Arc, time::Duration};
 
 pub(super) const DATASOURCE: &str = "naway_admin_operations";
@@ -20,6 +20,7 @@ pub struct Store {
     pub(super) workflow_installed: bool,
     pub(super) delivery_installed: bool,
     pub(super) certificates_installed: bool,
+    pub(super) material_impact_installed: bool,
     pub(super) certificate_workers: Option<Arc<tokio::sync::Semaphore>>,
     #[cfg(feature = "admin-operations-workflow-pgsql")]
     pub(super) workflow: std::sync::OnceLock<super::workflow::Workflow>,
@@ -76,6 +77,11 @@ impl Store {
             store.close().await;
             anyhow::bail!("certificate material authority unavailable or differs");
         }
+        // 影响批准依赖原材料身份，必须在材料 owner 成立后登记独立预算，不能反向创建材料权威。
+        if super::certificates::impact::register(&store).await.is_err() {
+            store.close().await;
+            anyhow::bail!("certificate impact authority unavailable or differs");
+        }
         Ok(store)
     }
 
@@ -110,6 +116,7 @@ impl Store {
             workflow_installed: installed.workflow,
             delivery_installed: installed.delivery,
             certificates_installed: installed.certificates,
+            material_impact_installed: installed.material_impact,
             #[cfg(feature = "admin-operations-workflow-pgsql")]
             workflow: std::sync::OnceLock::new(),
             #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]

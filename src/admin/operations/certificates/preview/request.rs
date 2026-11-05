@@ -22,9 +22,17 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub(super) struct Observed {
+pub(in crate::admin::operations::certificates) struct Observed {
     pub intent: Arc<Intent>,
     pub result: Result<Completed, Reason>,
+}
+
+pub(in crate::admin::operations::certificates) struct Observation {
+    pub source: Source,
+    pub observed: Vec<Observed>,
+    pub issued: u64,
+    pub expires: u64,
+    pub window: material::RequestWindow,
 }
 
 /// 业务作用：只预检原持久候选和原目标，最终原记录、当前身份或窗口变化时不交付旧成功。
@@ -42,6 +50,36 @@ pub(super) async fn inspect(
     bytes: &[u8],
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<http::Response<BoxBody>, Error> {
+    let observation = observe(context, id, bytes, permit).await?;
+    let result = response::encode(
+        context,
+        id,
+        &observation.source,
+        &observation.observed,
+        observation.issued,
+        observation.expires,
+    )?;
+    // 编码也可能跨越撤权或期限，最终返回前不能把已知失效结果留给管理页面。
+    observation.window.check().map_err(|_| Error::Conflict)?;
+    current(context)?;
+    Ok(result)
+}
+
+/// 业务作用：共享同一原候选的完整观察流程，影响登记只消费真实节点结果而不能接受客户端证明。
+///
+/// 参数说明：
+/// - `context`：当前原请求身份和冻结的管理权威。
+/// - `id`：唯一原材料提案身份。
+/// - `bytes`：只能为空对象的确认正文。
+/// - `permit`：材料最后一个实际持有者释放前保留的整请求名额。
+///
+/// 返回：全分母原生结果及完整原记录标记；失败节点仍在结果中，登记方必须全部成功才可持久化。
+pub(in crate::admin::operations::certificates) async fn observe(
+    context: &Context<'_>,
+    id: &str,
+    bytes: &[u8],
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<Observation, Error> {
     confirm(bytes)?;
     current(context)?;
     let started = Instant::now();
@@ -110,11 +148,14 @@ pub(super) async fn inspect(
     source.recheck(context, id).await?;
     window.check().map_err(|_| Error::Conflict)?;
     observed.sort_unstable_by(|left, right| left.intent.node.cmp(&right.intent.node));
-    let result = response::encode(context, id, &source, &observed, issued, expires)?;
-    // 编码也可能跨越撤权或期限，最终返回前不能把已知失效结果留给管理页面。
-    window.check().map_err(|_| Error::Conflict)?;
     current(context)?;
-    Ok(result)
+    Ok(Observation {
+        source,
+        observed,
+        issued,
+        expires,
+        window,
+    })
 }
 
 /// 业务作用：只接受空 JSON 对象的预检确认，数组和任何替代材料字段都不能触发候选分发。
@@ -123,7 +164,7 @@ pub(super) async fn inspect(
 /// - `bytes`：已受 HTTP 体积门限制的原始正文。
 ///
 /// 返回：正文仅包含一对对象大括号和 JSON 空白时成功；不分配对象或反射输入内容。
-fn confirm(bytes: &[u8]) -> Result<(), Error> {
+pub(in crate::admin::operations::certificates) fn confirm(bytes: &[u8]) -> Result<(), Error> {
     if bytes.len() > 256 {
         return Err(Error::Invalid);
     }

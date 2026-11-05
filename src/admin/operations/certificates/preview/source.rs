@@ -1,20 +1,20 @@
 //! 原材料预检只读取同一持久记录，开始与交付前精确核对状态和认证上下文。
 
-use super::{current, Context};
+use super::{Context, current};
 use crate::admin::{
     management::material_preview::Content,
     operations::{
-        certificates::{authorization, crypto, model::Target, Error},
+        certificates::{Error, authorization, crypto, model::Target},
         connection::Reading,
     },
 };
 use crate::control::ownership::config::Action;
 use sha2::{Digest, Sha256};
-use sqlx::{postgres::PgRow, Row};
+use sqlx::{Row, postgres::PgRow};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::OwnedSemaphorePermit;
 
-pub(super) struct Source {
+pub(in crate::admin::operations::certificates) struct Source {
     pub targets: Arc<[Target]>,
     pub content: Arc<Content>,
     pub certificate: crate::control::material::Summary,
@@ -23,7 +23,7 @@ pub(super) struct Source {
 }
 
 #[derive(PartialEq, Eq)]
-pub(super) struct Stamp {
+pub(in crate::admin::operations::certificates) struct Stamp {
     pub context: crypto::Context,
     pub authority: [u8; 32],
     targets: Vec<u8>,
@@ -34,6 +34,32 @@ pub(super) struct Stamp {
     state: String,
     reviewer: Option<String>,
     updated: i64,
+}
+
+impl Stamp {
+    /// 业务作用：最终登记在父材料行锁内精确复验最初观察标记，取消、审阅或密文变化优先于早到证明。
+    ///
+    /// 参数说明：
+    /// - `connection`：已依次锁定集群和影响 owner 的同源事务。
+    ///
+    /// 返回：原完整记录仍有效才持锁成功；任何字段变化、过期或存储换代都拒绝本次登记。
+    pub(in crate::admin::operations::certificates) async fn lock(
+        &self,
+        connection: &mut sqlx::PgConnection,
+    ) -> Result<(), Error> {
+        let row: Option<String> = sqlx::query_scalar("SELECT p.id FROM naway_certificate_proposals p JOIN naway_certificate_owners o ON o.cluster_id=p.cluster_id WHERE p.cluster_id=$1 AND p.scope=$2 AND p.id=$3 AND o.store_id=$4 AND p.admission_epoch=$5 AND p.creator=$6 AND p.intent_digest=$7 AND p.authority=$8 AND p.key_id=$9 AND p.targets=$10 AND p.summary=$11 AND p.material_bytes=$12 AND octet_length(p.ciphertext)=$13 AND pg_catalog.sha256(pg_catalog.convert_to(p.ciphertext,'UTF8'))=$14 AND p.state=$15 AND p.reviewer IS NOT DISTINCT FROM $16 AND p.created_at_ms=$17 AND p.expires_at_ms=$18 AND p.updated_at_ms=$19 AND NOT p.execution_started AND p.expires_at_ms > floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint FOR UPDATE OF p")
+            .bind(&self.context.cluster).bind(&self.context.scope).bind(&self.context.id)
+            .bind(&self.context.store_id).bind(self.context.epoch).bind(&self.context.creator)
+            .bind(self.context.intent.as_slice()).bind(self.authority.as_slice()).bind(&self.context.key_id)
+            .bind(&self.targets).bind(&self.summary).bind(self.material_bytes).bind(self.ciphertext_bytes)
+            .bind(self.ciphertext_sha256.as_slice()).bind(&self.state).bind(&self.reviewer)
+            .bind(self.context.created).bind(self.context.expires).bind(self.updated)
+            .fetch_optional(connection).await.map_err(|_| Error::Unavailable)?;
+        if row.is_none() {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
 }
 
 /// 业务作用：只装载原提案的有限元数据和密文摘要，尚未授权原目标时不把密文送入解密任务。

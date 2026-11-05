@@ -2,17 +2,19 @@
 
 use crate::config::operations::Plan;
 use nasa::migration::pgsql::{MigrationMode, MigrationSettings, Migrator};
-use sqlx::{postgres::PgPoolOptions, ConnectOptions, PgPool, SqlSafeStr};
+use sqlx::{ConnectOptions, PgPool, SqlSafeStr, postgres::PgPoolOptions};
 use std::{str::FromStr, time::Duration};
 
 mod certificates;
 mod delivery;
+mod material_impact;
 mod workflow;
 
 pub(super) struct Installed {
     pub workflow: bool,
     pub delivery: bool,
     pub certificates: bool,
+    pub material_impact: bool,
 }
 
 const MIGRATION: &str = concat!(
@@ -108,7 +110,7 @@ pub(super) async fn connect(plan: &Plan) -> anyhow::Result<PgPool> {
 /// - `apply`：仅命令行显式初始化可置真。
 /// - `with_workflow`：显式工作流初始化时包含工作流和交付合同；否则只验证已经提交的尾部。
 ///
-/// 返回：所有已安装结构匹配时返回工作流、交付及材料合同的初始化事实；漂移或缺失阻断启动。
+/// 返回：所有已安装结构匹配时返回工作流、交付、材料和影响合同的初始化事实；漂移或缺失阻断启动。
 pub(super) async fn gate(
     pool: &PgPool,
     plan: &Plan,
@@ -116,8 +118,11 @@ pub(super) async fn gate(
     with_workflow: bool,
 ) -> anyhow::Result<Installed> {
     let installed = installed_tail(pool).await?;
+    let with_material_impact = installed >= 8
+        || (plan.config.certificates.enabled && plan.config.certificates.impact_approvals.enabled);
     // 已安装材料合同不能随运行开关关闭而逃过结构复验；新启用则必须先由显式迁移建立完整前置结构。
-    let with_certificates = installed >= 7 || plan.config.certificates.enabled;
+    let with_certificates =
+        installed >= 7 || plan.config.certificates.enabled || with_material_impact;
     let with_delivery = installed >= 6 || (apply && with_workflow) || with_certificates;
     let with_workflow = with_workflow || installed >= 5 || with_certificates;
     let mut migrations = vec![
@@ -177,6 +182,15 @@ pub(super) async fn gate(
             false,
         ));
     }
+    if with_material_impact {
+        migrations.push(sqlx::migrate::Migration::new(
+            8,
+            "certificate impact approvals".into(),
+            sqlx::migrate::MigrationType::Simple,
+            material_impact::MIGRATION.into_sql_str(),
+            false,
+        ));
+    }
     let migrator = Migrator::with_migrations(migrations);
     let settings = MigrationSettings {
         mode: if apply {
@@ -191,7 +205,9 @@ pub(super) async fn gate(
         nasa::migration::pgsql::run_gate(pool, &plan.config.schema, &migrator, &settings).await
     {
         // 等待迁移锁期间另一入口可能已提交工作流尾部；只允许按该已存在事实重选一次完整合同。
-        let selected = if with_certificates {
+        let selected = if with_material_impact {
+            8
+        } else if with_certificates {
             7
         } else if with_delivery {
             6
@@ -201,7 +217,7 @@ pub(super) async fn gate(
             4
         };
         let committed = installed_tail(pool).await?;
-        if committed > selected && committed <= 7 {
+        if committed > selected && committed <= 8 {
             return Box::pin(gate(pool, plan, apply, false)).await;
         }
         return Err(error.into());
@@ -242,10 +258,19 @@ pub(super) async fn gate(
         )
         .await?;
     }
+    if with_material_impact {
+        verify_shape(
+            pool,
+            "SELECT shape::text FROM naway_material_impact_schema WHERE singleton",
+            material_impact::SHAPE,
+        )
+        .await?;
+    }
     Ok(Installed {
         workflow: with_workflow,
         delivery: with_delivery,
         certificates: with_certificates,
+        material_impact: with_material_impact,
     })
 }
 

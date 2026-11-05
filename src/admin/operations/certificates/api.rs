@@ -1,10 +1,11 @@
 //! 证书材料的独立有界接口；所有响应明确区分受理、目标证明和实际交付。
 
 use super::{
+    Error, Store,
     authorization::{self, Scope},
     model::{Candidate, Record, Submission},
     reading::{self, Selection},
-    response, review, storage, Error, Store,
+    response, review, storage,
 };
 use crate::{
     admin::{self, AdminRequest, AdminState, BoxBody},
@@ -86,6 +87,22 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Result<Response<
         .path()
         .strip_prefix("/api/certificate-proposals")
         .ok_or(Error::Missing)?;
+    #[cfg(feature = "node-actions")]
+    if super::impact::matches(suffix) {
+        return super::impact::dispatch(
+            &super::preview::Context {
+                state: &state,
+                store,
+                snapshot: &snapshot,
+                request: &request,
+                scope: &query.scope,
+                principal: &identity.principal_id,
+            },
+            suffix,
+            body,
+        )
+        .await;
+    }
     if request.method == Method::GET {
         let value = read(
             store,
@@ -451,7 +468,7 @@ fn query(raw: Option<&str>) -> Result<Query, Error> {
 /// - `name`：代码指定的身份头名称。
 ///
 /// 返回：唯一文本借用；缺失、重复或非文本值拒绝。
-fn header<'a>(request: &'a http::request::Parts, name: &str) -> Result<&'a str, Error> {
+pub(super) fn header<'a>(request: &'a http::request::Parts, name: &str) -> Result<&'a str, Error> {
     let mut values = request.headers.get_all(name).iter();
     let value = values
         .next()

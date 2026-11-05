@@ -4,6 +4,7 @@ mod api;
 mod authorization;
 mod capacity;
 mod crypto;
+pub(super) mod impact;
 mod model;
 #[cfg(feature = "node-actions")]
 mod preview;
@@ -13,7 +14,7 @@ mod retention;
 mod review;
 mod storage;
 
-use super::{model::Error, Store};
+use super::{Store, model::Error};
 pub(in crate::admin) use api::handle;
 pub(super) use capacity::register;
 pub(super) use retention::collect;

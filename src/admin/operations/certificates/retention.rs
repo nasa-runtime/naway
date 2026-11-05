@@ -24,6 +24,7 @@ pub(in crate::admin::operations) async fn collect(
         return Ok(0);
     }
     super::capacity::owner(connection, store).await?;
+    super::impact::lock_retention(store, connection).await?;
     let cluster = &store.plan.config.cluster_id;
     let rows = sqlx::query("SELECT id,scope,creator,client_key,admission_epoch FROM naway_certificate_proposals WHERE cluster_id=$1 AND NOT execution_started AND admission_epoch < $2 AND (CASE WHEN state IN ('rejected','cancelled') THEN updated_at_ms ELSE expires_at_ms END) <= $3 ORDER BY id LIMIT $4 FOR UPDATE")
         .bind(cluster).bind(epoch).bind(cutoff).bind(limit as i64).fetch_all(&mut *connection).await.map_err(super::database_error)?;
@@ -32,12 +33,14 @@ pub(in crate::admin::operations) async fn collect(
         let scope: String = row.try_get("scope").map_err(|_| Error::Unavailable)?;
         let creator: String = row.try_get("creator").map_err(|_| Error::Unavailable)?;
         let key: String = row.try_get("client_key").map_err(|_| Error::Unavailable)?;
-        let epoch: i64 = row
+        let original_epoch: i64 = row
             .try_get("admission_epoch")
             .map_err(|_| Error::Unavailable)?;
+        // 子影响及其原收据先于父材料释放，任一子责任未结束会回滚整批，避免留下孤立批准。
+        super::impact::collect(store, connection, &id, epoch).await?;
         // 精确原收据缺失或仍在途时保留整份密文，不用清理重置尚未解决的结果未知。
         let receipt = sqlx::query("DELETE FROM idempotency_record_v2 WHERE tenant=$1 AND subject=$2 AND route_id=$3 AND client_key=$4 AND state=1 AND status=201 AND body=$5 AND headers=$6")
-            .bind(cluster).bind(creator).bind(super::route(&scope, epoch)).bind(key).bind(id.as_bytes()).bind(b"[]".as_slice())
+            .bind(cluster).bind(creator).bind(super::route(&scope, original_epoch)).bind(key).bind(id.as_bytes()).bind(b"[]".as_slice())
             .execute(&mut *connection).await.map_err(super::database_error)?;
         if receipt.rows_affected() != 1 {
             return Err(Error::Conflict);
