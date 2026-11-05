@@ -1,12 +1,14 @@
 //! 兼容双文件材料的持久决定与崩溃恢复，部分写入不能成为完整身份。
 
-use super::{atomic_write, generation, sync_directory, validate_keypair, MAX_KEYPAIR_BYTES};
+use super::{atomic_write, generation, sync_directory, MAX_KEYPAIR_BYTES};
 use crate::config::TlsRuntimeCfg;
 use anyhow::{Context, Result};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
+
+mod recovery;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,18 +28,21 @@ struct TransactionState {
 /// - `tls`：固定证书与私钥目标路径的 TLS 策略。
 /// - `certificate_pem`：已经完成密钥对密码学校验的证书 PEM。
 /// - `private_key_pem`：已经完成密钥对密码学校验的私钥 PEM。
+/// - `next`：上层为该完整 pair 预分配的材料记录，不由文件事务重新生成。
 ///
 /// 返回：两个目标及材料代均已提交且 journal 已结算时返回新代；失败时尝试恢复，不保证没有提交。
 pub(super) fn install_legacy_keypair_transaction(
     tls: &TlsRuntimeCfg,
     certificate_pem: &[u8],
     private_key_pem: &[u8],
+    next: generation::Record,
 ) -> Result<String> {
-    recover_legacy_keypair_transaction_locked(tls)?;
+    // 准备身份必须先于恢复或写入复验；错来源或错正文不能借旧事务恢复取得副作用。
     let target = generation::target(tls)?;
+    next.require_material(&target, certificate_pem, private_key_pem)?;
+    recover_legacy_keypair_transaction_locked(tls)?;
     let generation_path = generation::legacy_path(tls)?;
     let old_generation = generation::read(&generation_path, &target)?;
-    let next = generation::Record::new(target, certificate_pem, private_key_pem)?;
     let transaction = legacy_keypair_transaction_dir(tls)?;
     let parent = transaction
         .parent()
@@ -66,7 +71,8 @@ pub(super) fn install_legacy_keypair_transaction(
             &tls.key_file,
             MAX_KEYPAIR_BYTES,
             "legacy TLS private key backup",
-        )?;
+        )?
+        .map(zeroize::Zeroizing::new);
         if let Some(bytes) = &old_cert {
             atomic_write(&temporary.join("old-cert.pem"), bytes, false)?;
         }
@@ -128,7 +134,7 @@ pub(super) fn install_legacy_keypair_transaction(
     Ok(next.generation)
 }
 
-/// 业务作用：检查旧式 pair journal；完整新代已落盘则提交，否则按备份恢复安装前状态。
+/// 业务作用：检查旧式 pair journal，只确认完整新代或在原旧新边界成立时恢复原材料。
 ///
 /// 参数说明：
 /// - `tls`：固定 journal 身份和两个目标；调用方持有全局安装锁。
@@ -160,78 +166,7 @@ pub(super) fn recover_legacy_keypair_transaction_locked(tls: &TlsRuntimeCfg) -> 
         "legacy keypair transaction path is not a directory"
     );
     let state = read_transaction_state(&transaction)?;
-    let target = generation::target(tls)?;
-    let generation_path = generation::legacy_path(tls)?;
-    // 旧 journal 没有归属证据，不能覆盖来源不明的受管材料代。
-    if state.schema_version == 1 {
-        anyhow::ensure!(
-            generation::read(&generation_path, &target)?.is_none(),
-            "legacy TLS transaction has no material ownership authority"
-        );
-    }
-    let new_cert = crate::io::bounded_io::read_file(
-        &transaction.join("new-cert.pem"),
-        MAX_KEYPAIR_BYTES,
-        "legacy keypair transaction new certificate",
-    )?;
-    let new_key = crate::io::bounded_io::read_file(
-        &transaction.join("new-key.pem"),
-        MAX_KEYPAIR_BYTES,
-        "legacy keypair transaction new key",
-    )?;
-    validate_keypair(&new_cert, &new_key)?;
-    if let Some(next) = &state.generation {
-        next.validate(&target)?;
-        anyhow::ensure!(
-            next.matches(&new_cert, Some(&new_key)),
-            "TLS transaction generation does not match prepared materials"
-        );
-    }
-    let live_cert = crate::io::bounded_io::read_optional_file(
-        &tls.cert_file,
-        MAX_KEYPAIR_BYTES,
-        "legacy TLS live certificate",
-    )?;
-    let live_key = crate::io::bounded_io::read_optional_file(
-        &tls.key_file,
-        MAX_KEYPAIR_BYTES,
-        "legacy TLS live key",
-    )?;
-    if live_cert.as_deref() == Some(new_cert.as_slice())
-        && live_key.as_deref() == Some(new_key.as_slice())
-    {
-        // 即使新旧字节相同，也按已准备的唯一新代结算，禁止旧动作在 A→B→A 后恢复写入资格。
-        if let Some(next) = &state.generation {
-            next.publish(&generation_path)?;
-        }
-        return finish_legacy_keypair_transaction(&transaction);
-    }
-
-    // 新代不完整就先恢复 secret key、再恢复证书；loader 持有同一安装锁，恢复期间不能发布中间态。
-    restore_legacy_file(
-        &tls.key_file,
-        &transaction.join("old-key.pem"),
-        state.old_key_present,
-        true,
-    )?;
-    restore_legacy_file(
-        &tls.cert_file,
-        &transaction.join("old-cert.pem"),
-        state.old_cert_present,
-        false,
-    )?;
-    if state.schema_version == 2 {
-        // 回滚 pair 与归属必须一起恢复；代恢复失败时保留活动 journal，不能发布半完成材料事实。
-        if state.old_generation_present {
-            let (_, previous) =
-                generation::read(&transaction.join("old-generation.json"), &target)?
-                    .context("TLS previous material generation missing")?;
-            previous.publish(&generation_path)?;
-        } else {
-            restore_legacy_file(&generation_path, Path::new(""), false, true)?;
-        }
-    }
-    finish_legacy_keypair_transaction(&transaction)
+    recovery::settle(tls, &transaction, &state)
 }
 
 /// 业务作用：恢复前核对完整事务格式，未知或残缺材料代不能被解释为旧式无条件恢复。
@@ -254,26 +189,6 @@ fn read_transaction_state(transaction: &Path) -> Result<TransactionState> {
         "legacy keypair transaction schema is invalid"
     );
     Ok(state)
-}
-
-/// 业务作用：在证书安装事务未完成时恢复单个旧文件，避免遗留新旧不配对的证书材料。
-fn restore_legacy_file(target: &Path, backup: &Path, present: bool, secret: bool) -> Result<()> {
-    if present {
-        let bytes = crate::io::bounded_io::read_file(
-            backup,
-            MAX_KEYPAIR_BYTES,
-            "legacy keypair transaction backup",
-        )?;
-        atomic_write(target, &bytes, secret)
-    } else {
-        match fs::remove_file(target) {
-            Ok(()) => sync_directory(target.parent().unwrap_or_else(|| Path::new("."))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => {
-                Err(error).with_context(|| format!("remove partial TLS file {}", target.display()))
-            }
-        }
-    }
 }
 
 /// 业务作用：为固定证书路径定位配对安装事务目录，恢复记录不能跨目标复用。

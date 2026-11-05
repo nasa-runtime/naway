@@ -20,6 +20,7 @@ pub(super) struct PreparedKeypairVersion {
 /// - `manifest_file`：固定当前指针及材料归属的文件位置。
 /// - `certificate_pem`：已验证的完整证书链。
 /// - `private_key_pem`：已验证且与证书匹配的私钥。
+/// - `owner`：上层已经为该来源和完整 pair 准备的唯一材料记录。
 ///
 /// 返回：完整材料目录、待激活的指针及唯一材料代；失败不改变当前指针。
 /// 指针只有经调用者原子安装后才生效，此前崩溃仅留下未激活目录。
@@ -27,9 +28,11 @@ pub(super) fn prepare_keypair_version(
     manifest_file: &Path,
     certificate_pem: &[u8],
     private_key_pem: &[u8],
+    owner: generation::Record,
 ) -> Result<PreparedKeypairVersion> {
-    let owner = generation::Record::new(
-        generation::manifest_target(manifest_file)?,
+    // 不可变目录必须携带上层已经固定的同一代，不能在落盘阶段另造无法关联原动作的身份。
+    owner.require_material(
+        &generation::manifest_target(manifest_file)?,
         certificate_pem,
         private_key_pem,
     )?;

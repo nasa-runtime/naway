@@ -249,8 +249,12 @@ fn publish_keypair_locked(
     certificate_pem: &[u8],
     private_key_pem: &[u8],
 ) -> Result<String> {
+    // 所有新写入先取得完整准备身份，再交给同一底层事务；相同字节仍产生新代，外部不能指定该身份。
+    let owner =
+        generation::Record::new(generation::target(tls)?, certificate_pem, private_key_pem)?;
     if let Some(manifest_file) = &tls.keypair_manifest_file {
-        let prepared = prepare_keypair_version(manifest_file, certificate_pem, private_key_pem)?;
+        let prepared =
+            prepare_keypair_version(manifest_file, certificate_pem, private_key_pem, owner)?;
         atomic_write(manifest_file, &prepared.manifest, false)?;
         tracing::info!(
             directory = %prepared.directory.display(),
@@ -268,6 +272,6 @@ fn publish_keypair_locked(
         }
         Ok(prepared.generation)
     } else {
-        install_legacy_keypair_transaction(tls, certificate_pem, private_key_pem)
+        install_legacy_keypair_transaction(tls, certificate_pem, private_key_pem, owner)
     }
 }

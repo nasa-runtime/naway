@@ -2,7 +2,7 @@
 
 use super::atomic_write;
 use crate::config::TlsRuntimeCfg;
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ const MAX_RECORD_BYTES: usize = 4096;
 pub(super) const MANIFEST_RECORD: &str = "ownership.json";
 
 /// 私有元数据绑定完整 pair 和来源计划；对外只能提供不可重用的随机代。
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Record {
     schema: u32,
@@ -67,6 +67,28 @@ impl Record {
         self.certificate == <[u8; 32]>::from(Sha256::digest(certificate))
             && private_key
                 .is_none_or(|key| self.private_key == <[u8; 32]>::from(Sha256::digest(key)))
+    }
+
+    /// 业务作用：文件事务只接收与原来源及完整候选一致的预分配材料代，不能在下层替换准备身份。
+    ///
+    /// 参数说明：
+    /// - `target`：实际文件事务重新解析的来源摘要。
+    /// - `certificate`：本次准备写入的完整证书链。
+    /// - `private_key`：本次准备写入的完整私钥。
+    ///
+    /// 返回：原记录格式、来源与完整 pair 全部匹配时成功；不授予基线覆盖权，也不写入任何文件。
+    pub(super) fn require_material(
+        &self,
+        target: &[u8; 32],
+        certificate: &[u8],
+        private_key: &[u8],
+    ) -> Result<()> {
+        self.validate(target)?;
+        ensure!(
+            self.matches(certificate, Some(private_key)),
+            "TLS prepared material differs from its generation"
+        );
+        Ok(())
     }
 
     /// 业务作用：在材料事务决定内持久化唯一归属，权限从临时文件创建时即限制为当前用户。
