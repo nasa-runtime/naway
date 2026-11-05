@@ -261,8 +261,6 @@ pub(super) fn owner(
     let Some(bytes) = io::read(target, 4096)? else {
         return Ok(None);
     };
-    let record: generation::Record =
-        serde_json::from_slice(&bytes).context("parse TLS generation")?;
-    record.validate(source)?;
+    let record = generation::decode(&bytes, source)?;
     Ok(Some((bytes, record)))
 }

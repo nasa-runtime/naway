@@ -193,9 +193,25 @@ pub(super) fn read(path: &Path, target: &[u8; 32]) -> Result<Option<(Vec<u8>, Re
     else {
         return Ok(None);
     };
-    let record: Record = serde_json::from_slice(&bytes).context("parse TLS material generation")?;
-    record.validate(target)?;
+    let record = decode(&bytes, target)?;
     Ok(Some((bytes, record)))
+}
+
+/// 业务作用：让路径读取与固定句柄读取共用完整归属格式门，不重新打开另一来源补充owner。
+///
+/// 参数说明：
+/// - `bytes`：已由调用者按归属记录上限读取的原文字节。
+/// - `target`：此次读取允许的唯一材料来源摘要。
+///
+/// 返回：完整合法且属于原来源的记录；未知字段、容量或身份不符均拒绝。
+pub(super) fn decode(bytes: &[u8], target: &[u8; 32]) -> Result<Record> {
+    ensure!(
+        bytes.len() <= MAX_RECORD_BYTES,
+        "TLS generation record exceeds limit"
+    );
+    let record: Record = serde_json::from_slice(bytes).context("parse TLS material generation")?;
+    record.validate(target)?;
+    Ok(record)
 }
 
 /// 业务作用：只从当前活动来源读取材料代，旧目录和 seed 文件不能冒充已激活的 manifest 材料。

@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+pub(super) const MAGIC: &[u8; 8] = b"NCERT001";
+pub(super) const HEADER_BYTES: usize = 16;
+
 #[derive(Debug)]
 pub(crate) struct Invalid;
 
@@ -21,19 +24,7 @@ impl Material {
     ///
     /// 返回：原证书与私钥切片；不分配副本，也不读取文件。
     pub(crate) fn parts(&self) -> Result<(&[u8], &[u8]), Invalid> {
-        let bytes = &self.0;
-        if bytes.len() < 16 || bytes.len() > 1024 * 1024 + 16 || &bytes[..8] != b"NCERT001" {
-            return Err(Invalid);
-        }
-        let cert = u32::from_be_bytes(bytes[8..12].try_into().map_err(|_| Invalid)?) as usize;
-        let key = u32::from_be_bytes(bytes[12..16].try_into().map_err(|_| Invalid)?) as usize;
-        if cert == 0
-            || key == 0
-            || cert.checked_add(key).and_then(|n| n.checked_add(16)) != Some(bytes.len())
-        {
-            return Err(Invalid);
-        }
-        Ok((&bytes[16..16 + cert], &bytes[16 + cert..]))
+        parts(&self.0, 1024 * 1024, 1024 * 1024 + HEADER_BYTES)
     }
 
     /// 业务作用：复用安装端的密码学匹配门并解析公开叶证书，受理不冒充完整目标 TLS 策略预检。
@@ -64,6 +55,41 @@ impl Material {
             not_after_seconds: certificate.validity().not_after.timestamp(),
         })
     }
+}
+
+/// 业务作用：候选与本机原材料共用长度布局，但由各自用途保持独立的单文件和完整帧上限。
+///
+/// 参数说明：
+/// - `bytes`：调用者持有的唯一清零原文帧。
+/// - `part_limit`：证书与私钥各自允许的最大长度。
+/// - `frame_limit`：当前用途允许的完整帧长度，包含固定头。
+///
+/// 返回：完整、非空、无尾随且符合两层预算时借用两个切片；不复制或序列化秘密。
+pub(super) fn parts(
+    bytes: &[u8],
+    part_limit: usize,
+    frame_limit: usize,
+) -> Result<(&[u8], &[u8]), Invalid> {
+    if bytes.len() < HEADER_BYTES || bytes.len() > frame_limit || &bytes[..8] != MAGIC {
+        return Err(Invalid);
+    }
+    let cert = u32::from_be_bytes(bytes[8..12].try_into().map_err(|_| Invalid)?) as usize;
+    let key = u32::from_be_bytes(bytes[12..16].try_into().map_err(|_| Invalid)?) as usize;
+    if cert == 0
+        || key == 0
+        || cert > part_limit
+        || key > part_limit
+        || cert
+            .checked_add(key)
+            .and_then(|n| n.checked_add(HEADER_BYTES))
+            != Some(bytes.len())
+    {
+        return Err(Invalid);
+    }
+    Ok((
+        &bytes[HEADER_BYTES..HEADER_BYTES + cert],
+        &bytes[HEADER_BYTES + cert..],
+    ))
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Eq)]

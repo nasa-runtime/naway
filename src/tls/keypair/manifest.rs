@@ -282,7 +282,18 @@ pub(crate) fn current_material_directory(manifest_file: &Path) -> Result<Option<
         Some(bytes) => bytes,
         None => return Ok(None),
     };
-    let manifest: KeypairManifest = serde_json::from_slice(&bytes)
+    parse_material_directory(manifest_file, &bytes).map(Some)
+}
+
+/// 业务作用：只解释调用方已固定的同一份指针原文，句柄捕获不能为取得目录再次打开可变manifest。
+///
+/// 参数说明：
+/// - `manifest_file`：本次原指针所在的确定位置。
+/// - `bytes`：一次有界读取取得的完整指针原文。
+///
+/// 返回：合法相对目录在该父目录下的位置；格式、代际或路径越界拒绝，不再读取文件系统。
+pub(super) fn parse_material_directory(manifest_file: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let manifest: KeypairManifest = serde_json::from_slice(bytes)
         .with_context(|| format!("parse TLS keypair manifest {}", manifest_file.display()))?;
     anyhow::ensure!(
         manifest.schema_version == 1,
@@ -302,5 +313,5 @@ pub(crate) fn current_material_directory(manifest_file: &Path) -> Result<Option<
     );
     let parent = manifest_file.parent().unwrap_or_else(|| Path::new("."));
     let directory = parent.join(relative);
-    Ok(Some(directory))
+    Ok(directory)
 }

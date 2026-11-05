@@ -54,33 +54,38 @@ pub(crate) fn inspect(
         }
         let mut checked = std::collections::BTreeSet::new();
         let mut positions = Vec::with_capacity(batch.groups.len());
+        let mut held = Vec::with_capacity(batch.groups.len());
         for ((original, entry), source) in expected.iter().zip(&batch.entries).zip(sources) {
             if !checked.insert(entry.group) {
                 continue;
             }
             // 公开 ETag 不能证明私钥未被单独替换；候选下载和完整构建前都验证原受管 pair。
-            let captured = super::capture::Files::capture(source)
+            let mut captured = super::source::held::Source::capture(source, 1024 * 1024)
                 .map_err(|_| Rejected::Conditions(conditions::Unavailable::Storage))?;
-            let (certificate_path, key_path) = captured.paths();
-            let read = |path: &std::path::Path| {
-                crate::io::secret_file::read_file(path, 1024 * 1024, "TLS material preview")
-                    .map_err(|_| Rejected::Conditions(conditions::Unavailable::Storage))
-            };
-            let certificate = read(&certificate_path)?;
-            let private_key = read(&key_path)?;
-            let current = captured
-                .current(&certificate, Some(&private_key))
+            let backup = captured
+                .read(1024 * 1024)
+                .map_err(|_| Rejected::Conditions(conditions::Unavailable::Storage))?
+                .ok_or(Rejected::Changed)?;
+            let (certificate, _) = backup
+                .parts()
                 .map_err(|_| Rejected::Conditions(conditions::Unavailable::Storage))?;
-            if current.as_deref() != Some(original.material_generation)
-                || super::certificate_etag(&certificate) != original.certificate_etag
+            if captured.generation() != original.material_generation
+                || super::certificate_etag(certificate) != original.certificate_etag
             {
                 return Err(Rejected::Changed);
             }
             positions.push(index.position(original.target).ok_or(Rejected::Changed)?);
+            held.push(captured);
         }
         if let Some(candidate) = candidate {
             preflight::validate_sources(index, &positions, candidate)
                 .map_err(|_| Rejected::Invalid)?;
+        }
+        // 全批策略检查期间仍保留所有原句柄；早先来源被替换时不能只凭最后一组成功交付证明。
+        for source in &held {
+            source
+                .require_current()
+                .map_err(|_| Rejected::Conditions(conditions::Unavailable::Storage))?;
         }
         Ok(Proof {
             impact: crate::control::material::conditions::digest(&batch),

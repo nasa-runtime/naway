@@ -6,6 +6,8 @@ use crate::tls::targets::Kind;
 use anyhow::{ensure, Result};
 use std::path::PathBuf;
 
+#[cfg(feature = "node-actions")]
+pub(super) mod held;
 mod index;
 pub(super) use index::Index;
 
