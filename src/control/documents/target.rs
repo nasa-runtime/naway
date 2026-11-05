@@ -1,20 +1,13 @@
 //! 明确文件目标的受限访问与原文字节比较。
 
 use super::LIMIT;
-use anyhow::{ensure, Context, Result};
-use cap_std::fs::{Dir, File, Metadata, OpenOptions, Permissions};
+use anyhow::{ensure, Result};
+use cap_std::fs::{File, Metadata, Permissions};
 use sha2::{Digest as _, Sha256};
-use std::ffi::OsString;
-use std::io::{ErrorKind, Read};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::io::Read;
 
-#[derive(Clone)]
-pub(in crate::control) struct Target {
-    pub(in crate::control) directory: Arc<Dir>,
-    pub(in crate::control) path: PathBuf,
-    pub(in crate::control) name: OsString,
-}
+pub(super) use crate::io::file_target::same_file;
+pub(in crate::control) use crate::io::file_target::Target;
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,56 +23,13 @@ pub(in crate::control) struct Original {
 }
 
 impl Target {
-    /// 业务作用：固定已存在的真实父目录及单个文件名，别名归一化不能扩大到任意目录创建。
-    ///
-    /// 参数说明：
-    /// - `path`：已验证配置声明的部署目标。
-    ///
-    /// 返回：固定目录能力和真实目标位置；父目录缺失或目标名非法时拒绝。
-    pub(in crate::control) fn open(path: &Path) -> Result<Self> {
-        let name = path
-            .file_name()
-            .context("configuration target has no file name")?
-            .to_os_string();
-        let parent = path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let parent =
-            std::fs::canonicalize(parent).context("configuration target parent must exist")?;
-        let directory = Arc::new(Dir::open_ambient_dir(
-            &parent,
-            cap_std::ambient_authority(),
-        )?);
-        Ok(Self {
-            directory,
-            path: parent.join(&name),
-            name,
-        })
-    }
-
     /// 业务作用：读取普通单链接目标，禁止符号链接或特殊文件成为发布与补偿依据。
     ///
     /// 参数说明: 无。
     ///
     /// 返回：缺失为空；存在时给出同一句柄及元数据，类型、长度或打开失败拒绝。
     pub(in crate::control) fn file(&self) -> Result<Option<(File, Metadata)>> {
-        match self.directory.symlink_metadata(&self.name) {
-            Ok(metadata) => regular(&metadata)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use cap_std::fs::OpenOptionsExt as _;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let file = self.directory.open_with(&self.name, &options)?;
-        let metadata = file.metadata()?;
-        regular(&metadata)?;
-        Ok(Some((file, metadata)))
+        self.open_regular(LIMIT)
     }
 
     /// 业务作用：仅为确实需要补偿的控制面文件保留一份有界原文，后续比较使用流式摘要。
@@ -150,16 +100,6 @@ impl Target {
         }
         Ok(total == expected.length && <[u8; 32]>::from(hash.finalize()) == expected.sha256)
     }
-
-    /// 业务作用：确认本次目录项替换或删除，不把正文同步当成文件名已持久提交。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：固定目录同步成功，否则保留未确认提交的错误语义。
-    pub(in crate::control) fn sync(&self) -> Result<()> {
-        self.directory.try_clone()?.into_std_file().sync_all()?;
-        Ok(())
-    }
 }
 
 impl Fingerprint {
@@ -203,51 +143,6 @@ impl Fingerprint {
             length: bytes.len() as u64,
             sha256: Sha256::digest(bytes).into(),
         }
-    }
-}
-
-/// 业务作用：把发布目标限制为有界普通单链接文件，防止链接或设备扩大写入影响。
-///
-/// 参数说明：
-/// - `metadata`：路径检查或实际打开句柄的元数据。
-///
-/// 返回：类型、硬链接数和长度满足时成功，否则在读取或写入前拒绝。
-fn regular(metadata: &Metadata) -> Result<()> {
-    ensure!(
-        metadata.is_file() && metadata.len() <= LIMIT as u64,
-        "configuration target type or size differs"
-    );
-    #[cfg(unix)]
-    {
-        use cap_std::fs::MetadataExt as _;
-        ensure!(
-            metadata.nlink() == 1,
-            "configuration target cannot have hard links"
-        );
-    }
-    Ok(())
-}
-
-/// 业务作用：只有仍指向原临时文件的目录项才能由owner清理，防止删除后来占用同名路径的内容。
-///
-/// 参数说明：
-/// - `current`：当前目录项的元数据。
-/// - `original`：owner仍持有的原文件句柄元数据。
-///
-/// 返回：Unix设备与inode及普通单链接条件一致时为真，未支持平台保持内容不删。
-pub(super) fn same_file(current: &Metadata, original: &Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use cap_std::fs::MetadataExt as _;
-        current.is_file()
-            && current.nlink() == 1
-            && current.dev() == original.dev()
-            && current.ino() == original.ino()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (current, original);
-        false
     }
 }
 

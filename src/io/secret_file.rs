@@ -17,8 +17,7 @@ use zeroize::Zeroizing;
 ///
 /// 返回：从读取开始即受清零保护的唯一原文缓冲；类型、长度变化或 I/O 异常拒绝。
 pub(crate) fn read_file(path: &Path, limit: usize, kind: &str) -> Result<Zeroizing<Vec<u8>>> {
-    let file = open(path).with_context(|| format!("cannot open {kind}"))?;
-    read_open(file, limit).with_context(|| format!("cannot read {kind}"))
+    read_optional_file(path, limit, kind)?.with_context(|| format!("{kind} is absent"))
 }
 
 /// 业务作用：保留材料事务中的真实缺席状态，同时保证部分读取失败不遗留普通秘密缓冲。
@@ -69,7 +68,7 @@ fn open(path: &Path) -> std::io::Result<File> {
 /// - `limit`：分配和读取共同遵守的硬上限。
 ///
 /// 返回：长度未变且完整读至 EOF 的清零缓冲；不声明其它进程不能修改相同长度的内容。
-fn read_open(mut file: File, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn read_open(mut file: File, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
     let metadata = file.metadata()?;
     ensure!(metadata.is_file(), "secret source must be a regular file");
     let length = usize::try_from(metadata.len()).context("secret source length exceeds bounds")?;

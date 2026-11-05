@@ -1,12 +1,11 @@
 //! 本地文件决定的有限元数据；所有路径与正文引用在副作用之前固定。
 
-use crate::control::documents::{Fingerprint, Target};
+use crate::control::documents::Fingerprint;
+use crate::io::file_target::validate_path;
+pub(super) use crate::io::file_target::Location;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeSet,
-    path::{Component, Path, PathBuf},
-};
+use std::collections::BTreeSet;
 
 pub(super) const LIMIT: usize = crate::config::document::MAX_DOCUMENT_BYTES;
 pub(super) const BODY_NAMES: [&str; 6] = [
@@ -31,14 +30,6 @@ pub(in crate::control::journal) enum Direction {
 pub(super) struct Body {
     pub(super) slot: u8,
     pub(super) fingerprint: Fingerprint,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Location {
-    pub(super) path: PathBuf,
-    device: u64,
-    inode: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,38 +63,6 @@ pub(in crate::control::journal) struct Plan {
     pub(in crate::control::journal) direction: Direction,
     pub(super) baseline: [Document; 3],
     pub(super) targets: [Destination; 3],
-}
-
-impl Location {
-    /// 业务作用：绑定真实父目录与文件名，进程重启后不能把旧决定应用到替换过的目录。
-    ///
-    /// 参数说明：
-    /// - `target`：已经取得父目录能力的配置位置。
-    ///
-    /// 返回：有界绝对路径与父目录设备/inode；平台或路径不能稳定表达时拒绝。
-    pub(super) fn capture(target: &Target) -> Result<Self> {
-        validate_path(&target.path)?;
-        let (device, inode) = directory_identity(target)?;
-        Ok(Self {
-            path: target.path.clone(),
-            device,
-            inode,
-        })
-    }
-
-    /// 业务作用：恢复前重新取得相同父目录能力，路径相同而目录已换代时保留保护状态。
-    ///
-    /// 参数说明: 无。
-    ///
-    /// 返回：父目录和真实路径均匹配的目标；缺失、别名漂移或目录替换拒绝。
-    pub(super) fn open(&self) -> Result<Target> {
-        let target = Target::open(&self.path)?;
-        ensure!(
-            Self::capture(&target)? == *self,
-            "local publication parent identity differs"
-        );
-        Ok(target)
-    }
 }
 
 impl Body {
@@ -270,49 +229,6 @@ pub(super) fn stage_name(operation: &str, index: usize, direction: Direction) ->
         Direction::Preparing => "preparing",
     };
     format!(".naway-local-{operation}-{index}-{direction}")
-}
-
-/// 业务作用：限定持久路径的长度和组件，恢复不能解释父目录跳转或非规范绝对路径。
-///
-/// 参数说明：
-/// - `path`：待编码或解码的真实配置位置。
-///
-/// 返回：有界UTF-8绝对文件路径时成功，否则拒绝。
-fn validate_path(path: &Path) -> Result<()> {
-    let text = path
-        .to_str()
-        .context("local publication path must be UTF-8")?;
-    ensure!(
-        text.len() <= 4096
-            && !text.as_bytes().contains(&0)
-            && path.is_absolute()
-            && path.file_name().is_some()
-            && path
-                .components()
-                .all(|component| matches!(component, Component::RootDir | Component::Normal(_))),
-        "local publication path differs"
-    );
-    Ok(())
-}
-
-/// 业务作用：提取固定父目录身份，不能仅凭文本位置承认恢复副作用。
-///
-/// 参数说明：
-/// - `target`：持有父目录能力的目标。
-///
-/// 返回：Unix设备与inode；未支持平台拒绝持久文件恢复。
-fn directory_identity(target: &Target) -> Result<(u64, u64)> {
-    #[cfg(unix)]
-    {
-        use cap_std::fs::MetadataExt as _;
-        let metadata = target.directory.dir_metadata()?;
-        Ok((metadata.dev(), metadata.ino()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = target;
-        anyhow::bail!("local publication requires Unix filesystem semantics")
-    }
 }
 
 /// 业务作用：把访问权限纳入精确文件身份，后续恢复不能撤销另一写者设置的新权限。

@@ -101,6 +101,17 @@ impl Record {
         let bytes = serde_json::to_vec(self).context("encode TLS material generation")?;
         atomic_write(path, &bytes, true)
     }
+
+    /// 业务作用：沿用文件事务已固定的父目录提交归属，不因再次解析路径而把材料代写入另一目录。
+    ///
+    /// 参数说明：
+    /// - `target`：原事务绑定的唯一归属槽。
+    ///
+    /// 返回：原目录中的记录及目录项同步成功；失败保留提交未知语义。
+    pub(super) fn publish_to(&self, target: &crate::io::file_target::Target) -> Result<()> {
+        let bytes = serde_json::to_vec(self).context("encode TLS material generation")?;
+        super::io::write(target, &bytes, true)
+    }
 }
 
 /// 业务作用：约束材料条件令牌为固定长度小写随机身份，不接受路径、通配或弱比较形式。

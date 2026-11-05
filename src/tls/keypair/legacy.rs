@@ -1,13 +1,15 @@
 //! 兼容双文件材料的持久决定与崩溃恢复，部分写入不能成为完整身份。
 
-use super::{atomic_write, generation, sync_directory, MAX_KEYPAIR_BYTES};
+use super::{generation, io, MAX_KEYPAIR_BYTES};
 use crate::config::TlsRuntimeCfg;
+use crate::io::file_target::Target;
 use anyhow::{Context, Result};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
+mod bound;
 mod recovery;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -20,6 +22,8 @@ struct TransactionState {
     old_generation_present: bool,
     #[serde(default)]
     generation: Option<generation::Record>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    locations: Option<bound::Locations>,
 }
 
 /// 业务作用：以持久 journal 发布旧式 cert/key 双文件，并在任一步失败时恢复安装前事实。
@@ -41,95 +45,88 @@ pub(super) fn install_legacy_keypair_transaction(
     let target = generation::target(tls)?;
     next.require_material(&target, certificate_pem, private_key_pem)?;
     recover_legacy_keypair_transaction_locked(tls)?;
-    let generation_path = generation::legacy_path(tls)?;
-    let old_generation = generation::read(&generation_path, &target)?;
+    for path in [&tls.cert_file, &tls.key_file] {
+        fs::create_dir_all(path.parent().context("TLS material parent absent")?)?;
+    }
     let transaction = legacy_keypair_transaction_dir(tls)?;
-    let parent = transaction
-        .parent()
-        .context("legacy keypair transaction has no parent")?;
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "create legacy keypair transaction parent {}",
-            parent.display()
-        )
-    })?;
-    let mut random = [0_u8; 8];
-    getrandom::getrandom(&mut random).context("generate legacy keypair transaction suffix")?;
-    let temporary = parent.join(format!(
-        ".naway-keypair-prepare-{:016x}",
-        u64::from_le_bytes(random)
-    ));
-    fs::create_dir(&temporary)
-        .with_context(|| format!("create legacy keypair transaction {}", temporary.display()))?;
+    let targets = bound::Targets::capture(tls, &transaction)?;
+    // 打开父目录后复验原材料身份，路径别名变化不能把此前预分配的代移到另一来源。
+    next.require_material(&targets.source(), certificate_pem, private_key_pem)?;
+    let locations = targets.locations()?;
+    targets.require_current()?;
+    let old_generation = bound::owner(&targets.owner, &target)?;
+    let mut journal = bound::Journal::create(&targets.transaction)?;
     let prepared = (|| -> Result<generation::Record> {
-        let old_cert = crate::io::secret_file::read_optional_file(
-            &tls.cert_file,
-            MAX_KEYPAIR_BYTES,
-            "legacy TLS certificate backup",
-        )?;
-        let old_key = crate::io::secret_file::read_optional_file(
-            &tls.key_file,
-            MAX_KEYPAIR_BYTES,
-            "legacy TLS private key backup",
-        )?;
+        let old_cert = io::read(&targets.certificate, MAX_KEYPAIR_BYTES)?;
+        let old_key = io::read(&targets.private_key, MAX_KEYPAIR_BYTES)?;
+        // 原owner必须拥有完整备份，否则不能创建一个恢复时无法证明的受管旧边界。
+        if let Some((_, owner)) = &old_generation {
+            owner.require_material(
+                &target,
+                old_cert
+                    .as_deref()
+                    .context("TLS previous certificate absent")?,
+                old_key
+                    .as_deref()
+                    .context("TLS previous private key absent")?,
+            )?;
+        }
         if let Some(bytes) = &old_cert {
-            atomic_write(&temporary.join("old-cert.pem"), bytes, false)?;
+            io::write(&journal.file("old-cert.pem")?, bytes, false)?;
         }
         if let Some(bytes) = &old_key {
-            atomic_write(&temporary.join("old-key.pem"), bytes, true)?;
+            io::write(&journal.file("old-key.pem")?, bytes, true)?;
         }
-        atomic_write(&temporary.join("new-cert.pem"), certificate_pem, false)?;
-        atomic_write(&temporary.join("new-key.pem"), private_key_pem, true)?;
+        io::write(&journal.file("new-cert.pem")?, certificate_pem, false)?;
+        io::write(&journal.file("new-key.pem")?, private_key_pem, true)?;
         if let Some((bytes, _)) = &old_generation {
-            atomic_write(&temporary.join("old-generation.json"), bytes, true)?;
+            io::write(&journal.file("old-generation.json")?, bytes, true)?;
         }
         let mut state = TransactionState {
-            schema_version: 2,
+            schema_version: 3,
             old_cert_present: old_cert.is_some(),
             old_key_present: old_key.is_some(),
             old_generation_present: old_generation.is_some(),
             generation: Some(next),
+            locations: Some(locations),
         };
-        atomic_write(
-            &temporary.join("state.json"),
-            &serde_json::to_vec(&state)?,
-            true,
-        )?;
-        sync_directory(&temporary)?;
-        fs::rename(&temporary, &transaction).with_context(|| {
-            format!(
-                "publish legacy keypair transaction {}",
-                transaction.display()
-            )
-        })?;
-        sync_directory(parent)?;
+        let bytes = serde_json::to_vec(&state)?;
+        anyhow::ensure!(
+            bytes.len() <= 64 * 1024,
+            "TLS transaction state exceeds limit"
+        );
+        io::write(&journal.file("state.json")?, &bytes, true)?;
+        targets.require_current()?;
         Ok(state
             .generation
             .take()
-            .expect("new transaction owns a material generation"))
+            .expect("transaction owns its prepared generation"))
     })();
     let next = match prepared {
         Ok(next) => next,
         Err(error) => {
-            let _ = fs::remove_dir_all(&temporary);
+            let _ = journal.discard();
             return Err(error);
         }
     };
-
+    // 完整state及原目录证据先于活动入口；发布后的同步错误只能保留恢复责任，不能清理journal。
+    journal.publish(&targets.transaction)?;
     let publish = (|| -> Result<()> {
-        // journal 已经持久化，两个 rename 之间即使崩溃也能在下一次读取前恢复旧代或确认新代。
-        atomic_write(&tls.key_file, private_key_pem, true)?;
-        atomic_write(&tls.cert_file, certificate_pem, false)?;
-        Ok(())
+        targets.require_current()?;
+        journal.require_current()?;
+        io::write(&targets.private_key, private_key_pem, true)?;
+        io::write(&targets.certificate, certificate_pem, false)?;
+        targets.require_current()
     })();
     if let Err(error) = publish {
         recover_legacy_keypair_transaction_locked(tls)
             .context("restore legacy TLS pair after failed publish")?;
         return Err(error);
     }
-    // 完整 pair 的持久决定先于材料代发布；原 journal 在代发布完成前始终可恢复。
-    next.publish(&generation_path)?;
-    finish_legacy_keypair_transaction(&transaction)?;
+    // 完整pair决定先于材料归属发布，原journal直到两者均确认后才退休。
+    next.publish_to(&targets.owner)?;
+    targets.require_current()?;
+    journal.finish()?;
     Ok(next.generation)
 }
 
@@ -164,8 +161,19 @@ pub(super) fn recover_legacy_keypair_transaction_locked(tls: &TlsRuntimeCfg) -> 
         metadata.is_dir() && !metadata.file_type().is_symlink(),
         "legacy keypair transaction path is not a directory"
     );
-    let state = read_transaction_state(&transaction)?;
-    recovery::settle(tls, &transaction, &state)
+    let journal = bound::Journal::open(Target::open(&transaction)?)?;
+    let state = read_transaction_state(&journal)?;
+    let targets = bound::Targets::capture(tls, &transaction)?;
+    // 新记录必须匹配原父目录；同字节备份和同名新目录也不能继承原事务写权。
+    if let Some(expected) = &state.locations {
+        anyhow::ensure!(
+            targets.locations()? == *expected,
+            "TLS transaction source locations changed"
+        );
+    }
+    targets.require_current()?;
+    journal.require_current()?;
+    recovery::settle(&targets, &journal, &state)
 }
 
 /// 业务作用：恢复前核对完整事务格式，未知或残缺材料代不能被解释为旧式无条件恢复。
@@ -174,17 +182,22 @@ pub(super) fn recover_legacy_keypair_transaction_locked(tls: &TlsRuntimeCfg) -> 
 /// - `transaction`：当前 pair 唯一活动 journal 目录。
 ///
 /// 返回：旧格式无材料代，或新格式具有完整新代时成功；不在读取失败后补造恢复事实。
-fn read_transaction_state(transaction: &Path) -> Result<TransactionState> {
-    let bytes = crate::io::bounded_io::read_file(
-        &transaction.join("state.json"),
-        64 * 1024,
-        "legacy keypair transaction state",
-    )?;
+fn read_transaction_state(transaction: &bound::Journal) -> Result<TransactionState> {
+    let bytes = io::read(&transaction.file("state.json")?, 64 * 1024)?
+        .context("TLS transaction state absent")?;
     let state: TransactionState =
         serde_json::from_slice(&bytes).context("parse legacy keypair transaction state")?;
     anyhow::ensure!(
-        (state.schema_version == 1 && state.generation.is_none() && !state.old_generation_present)
-            || (state.schema_version == 2 && state.generation.is_some()),
+        (state.schema_version == 1
+            && state.generation.is_none()
+            && !state.old_generation_present
+            && state.locations.is_none())
+            || (state.schema_version == 2
+                && state.generation.is_some()
+                && state.locations.is_none())
+            || (state.schema_version == 3
+                && state.generation.is_some()
+                && state.locations.is_some()),
         "legacy keypair transaction schema is invalid"
     );
     Ok(state)
@@ -230,25 +243,4 @@ fn legacy_directory_for_paths(certificate: &Path, private_key: &Path) -> Result<
         write!(&mut suffix, "{byte:02x}").expect("writing digest to String cannot fail");
     }
     Ok(parent.join(format!(".naway-keypair-transaction-{suffix}")))
-}
-
-/// 业务作用：完成或恢复证书配对事务，并在一致性确认后清理对应事务状态。
-fn finish_legacy_keypair_transaction(transaction: &Path) -> Result<()> {
-    let parent = transaction.parent().unwrap_or_else(|| Path::new("."));
-    let mut random = [0u8; 16];
-    getrandom::getrandom(&mut random).context("TLS journal retirement entropy unavailable")?;
-    let retired = parent.join(format!(
-        ".naway-keypair-retired-{:032x}",
-        u128::from_le_bytes(random)
-    ));
-    // 先撤下恢复入口并同步目录，再删除已退休备份；崩溃不能留下一个会被恢复器误读的半删 journal。
-    fs::rename(transaction, &retired).context("retire completed TLS keypair transaction")?;
-    sync_directory(parent)?;
-    fs::remove_dir_all(&retired).with_context(|| {
-        format!(
-            "remove retired legacy keypair transaction {}",
-            retired.display()
-        )
-    })?;
-    sync_directory(parent)
 }

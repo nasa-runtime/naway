@@ -1373,6 +1373,11 @@ bind、连接、权限、provider 或锁初始化失败时，旧快照与旧 gen
 ACME DNS-01 可直接使用 Cloudflare、RFC2136 HMAC-SHA256 TSIG、Vault action endpoint，或兼容的
 无 shell command provider；所有内建凭据只从 SecretSource 解析。manifest 证书模式保护当前与恢复
 指针后按保留代数回收，旧双文件模式通过持久 journal 在任何读取前恢复完整 pair。
+双文件新事务在活动材料变化前绑定证书、私钥、归属和 journal 的原父目录身份。恢复时发现
+同名目录被替换、原材料归属变化或内容超出原旧新边界，会保留现场并拒绝覆盖。读写及目录项
+替换沿用已打开的目录句柄；受管写入与恢复要求普通单链接文件，日常加载仍允许读取指向普通
+文件的 Secret 轮换链接。没有目录身份字段的旧事务只按其原完整材料与归属证据恢复，不能证明
+原父目录身份。持久文件事务依赖 Unix 文件系统语义；已删除的恢复记录不能由文件摘要重建。
 
 OPA route 默认通过外部 Data API 执行 head-only 授权，也可用 `opa-embedded` feature 从 detached
 Ed25519 签名的标准 tar.gz bundle 构建本地 Rego 引擎。bundle 的压缩/解压字节、文件数、路径、

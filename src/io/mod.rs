@@ -2,6 +2,7 @@
 
 pub(crate) mod bounded_io;
 pub(crate) mod compression;
+pub(crate) mod file_target;
 #[cfg(feature = "media-streaming")]
 pub mod media;
 pub mod net;
