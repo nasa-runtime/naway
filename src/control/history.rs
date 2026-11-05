@@ -209,6 +209,19 @@ impl ConfigHistory {
         Ok(())
     }
 
+    /// 业务作用：本机证书安装在配置文件读事务内检查持久材料保留，读锁本身不授予覆盖材料的权利。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：没有材料责任或未启用journal时成功；目录异常或保留状态拒绝实际材料写入。
+    pub(crate) fn require_material_idle(&self) -> Result<()> {
+        #[cfg(feature = "node-journal")]
+        if let Some(journal) = self.node_journal.get() {
+            return journal.require_material_idle();
+        }
+        Ok(())
+    }
+
     /// 业务作用：唯一发布者在最终文件事务内确认持久文件决定，资源尚未准备好时不得调用。
     ///
     /// 参数说明：

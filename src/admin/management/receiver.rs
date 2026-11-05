@@ -1,7 +1,7 @@
 //! 节点上报使用证书绑定和接收端会话令牌，迟到报告不能覆盖新启动实例。
 
 use super::{
-    FRESHNESS, Manager, Plan, catalog, certificates, consumers, protocol, security, telemetry,
+    catalog, certificates, consumers, protocol, security, telemetry, Manager, Plan, FRESHNESS,
 };
 use crate::admin::cluster::facts::Facts;
 use nasa::grpc::{PeerIdentity, Request, Response, Status};
@@ -49,7 +49,9 @@ struct Entry {
     material_previews_supported: bool,
     #[cfg(feature = "node-actions")]
     material_previews_enabled: bool,
+    #[cfg(feature = "node-actions")]
     material_installations_supported: bool,
+    #[cfg(feature = "node-actions")]
     material_installations_enabled: bool,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
     material_candidates_supported: bool,
@@ -148,7 +150,9 @@ impl Store {
                 material_previews_supported: false,
                 #[cfg(feature = "node-actions")]
                 material_previews_enabled: false,
+                #[cfg(feature = "node-actions")]
                 material_installations_supported: false,
+                #[cfg(feature = "node-actions")]
                 material_installations_enabled: false,
                 #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
                 material_candidates_supported: false,

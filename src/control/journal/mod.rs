@@ -5,6 +5,8 @@ mod actions;
 mod filesystem;
 mod identity;
 mod local;
+#[cfg(feature = "node-actions")]
+mod material;
 mod observation;
 mod storage;
 
@@ -213,6 +215,11 @@ impl Journal {
     pub fn validate_snapshot(&self, snapshot: &crate::config::GatewaySnapshot) -> Result<()> {
         let storage = self.storage.lock();
         self.verify_expected(storage.as_ref())?;
+        // 材料保留仍绑定原配置与共享来源，普通候选不能借快照换代撤销其恢复责任。
+        #[cfg(feature = "node-actions")]
+        if let Some(current) = storage.as_ref() {
+            current.require_no_material()?;
+        }
         ensure!(
             !snapshot
                 .admin_management
@@ -244,6 +251,21 @@ impl Journal {
     /// 返回：永久身份和已提交存储仍与owner承认的事实相同时成功；缺席、损坏、未知内容或外部换代拒绝。
     pub(crate) fn verify(&self) -> Result<()> {
         self.verify_expected(self.storage.lock().as_ref())
+    }
+
+    /// 业务作用：本机证书写者在真实安装任务内复验材料保留门，不能覆盖独立动作仍持有的来源。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：目录完整且没有材料保留责任时成功；未知目录或保留记录拒绝后续材料写入。
+    pub(crate) fn require_material_idle(&self) -> Result<()> {
+        let storage = self.storage.lock();
+        self.verify_expected(storage.as_ref())?;
+        #[cfg(feature = "node-actions")]
+        if let Some(current) = storage.as_ref() {
+            current.require_no_material()?;
+        }
+        Ok(())
     }
 
     /// 业务作用：持状态锁复验外部事实，自己的完整提交之外的任何换代都不能取得写权。

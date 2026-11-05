@@ -279,6 +279,10 @@ pub(in crate::admin) async fn install_uploaded_certificate(
         let _publication = publication;
         // 锁顺序固定为配置发布权、配置文件读事务、证书安装锁；受管写者不能在复验与写入之间换权限或原文。
         state.config_history.with_stable_local_files(|| {
+            // 原材料动作仍有保留责任时，本机HTTP或审批不能利用另一入口覆盖它；门跟随真实阻塞工作。
+            if state.config_history.require_material_idle().is_err() {
+                return Some(crate::tls::keypair::KeypairCasInstallOutcome::Unavailable);
+            }
             if !Arc::ptr_eq(&snapshot, &state.snap.load_full())
                 || crate::config::config_fingerprint(&snapshot.source_config_path).ok()
                     != Some(input.fingerprint)

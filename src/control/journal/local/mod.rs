@@ -134,6 +134,11 @@ impl Journal {
     pub(super) fn recover_local(&self, main: &Path) -> Result<()> {
         let mut storage = self.storage.lock();
         self.verify_expected(storage.as_ref())?;
+        // 材料记录有独立恢复责任，配置启动恢复不能忽略它后开放业务路由。
+        #[cfg(feature = "node-actions")]
+        if let Some(current) = storage.as_ref() {
+            current.require_no_material()?;
+        }
         #[cfg(feature = "node-actions")]
         if self.recover_action(&mut storage, main)? {
             return Ok(());

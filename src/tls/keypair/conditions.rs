@@ -11,7 +11,7 @@ pub(crate) struct Conditions {
     pub group: Group,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Group {
     pub certificate_etag: String,
@@ -28,7 +28,7 @@ pub(crate) enum Source {
     Acme,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Affected {
     pub target: Target,
@@ -45,14 +45,14 @@ pub(crate) enum Unavailable {
     ImpactUnproven,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Batch {
     pub entries: Vec<Reference>,
     pub groups: Vec<Group>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Reference {
     pub source: Source,

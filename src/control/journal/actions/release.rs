@@ -37,6 +37,8 @@ impl Journal {
         let current = storage
             .as_ref()
             .context("node journal action storage is not initialized")?;
+        // 旧配置释放不认识材料证据，不能因迟到终态清理或推进材料当前代际。
+        current.require_no_material()?;
         ensure!(
             release.intent.node_id == self.identity.node_id
                 && release.intent.baseline.cluster_id == self.identity.cluster_id

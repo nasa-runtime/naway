@@ -60,6 +60,12 @@ pub(super) struct State {
     #[cfg(feature = "node-actions")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) action: Option<super::super::actions::model::Record>,
+    #[cfg(feature = "node-actions")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) material_fence: Option<super::super::material::Fence>,
+    #[cfg(feature = "node-actions")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) material: Option<std::sync::Arc<super::super::material::Record>>,
 }
 
 impl State {
@@ -80,6 +86,10 @@ impl State {
             highest_fence: 0,
             #[cfg(feature = "node-actions")]
             action: None,
+            #[cfg(feature = "node-actions")]
+            material_fence: None,
+            #[cfg(feature = "node-actions")]
+            material: None,
         }
     }
 
@@ -105,6 +115,17 @@ impl State {
         }
         #[cfg(feature = "node-actions")]
         {
+            if let Some(fence) = &self.material_fence {
+                fence.validate()?;
+            }
+            if let Some(material) = &self.material {
+                material.validate(identity, self.admission_epoch, self.material_fence.as_ref())?;
+                // 同一head中只允许一个材料或配置写者保留权威，终态配置槽也不能冒充材料释放。
+                ensure!(
+                    self.local_publication.is_none() && self.action.is_none(),
+                    "node journal material and configuration owners overlap"
+                );
+            }
             ensure!(
                 self.highest_fence <= i64::MAX as u64,
                 "node journal fence exceeds bounds"

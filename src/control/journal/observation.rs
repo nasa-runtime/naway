@@ -60,7 +60,7 @@ impl Journal {
                 return Observation::empty("uninitialized");
             };
             #[cfg(feature = "node-actions")]
-            if storage.action().is_some() {
+            if storage.action().is_some() || storage.material().is_some() {
                 // 现有文件状态协议不能表达远程效果；撤下新提案基线，不能把仍占用动作槽的节点报为空闲。
                 return Observation::empty("protected");
             }

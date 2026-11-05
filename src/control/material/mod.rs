@@ -3,11 +3,13 @@
 pub(crate) mod authorization;
 #[cfg(feature = "node-actions")]
 pub(crate) mod conditions;
-#[cfg(feature = "node-actions")]
-pub(crate) mod installation;
 mod frame;
 #[cfg(all(feature = "admin-operations-pgsql", feature = "node-actions"))]
 pub(crate) mod impact;
+#[cfg(feature = "node-actions")]
+pub(crate) mod installation;
+#[cfg(feature = "node-actions")]
+pub(crate) mod node;
 #[cfg(feature = "admin-operations-pgsql")]
 mod target;
 pub(crate) use frame::Material;

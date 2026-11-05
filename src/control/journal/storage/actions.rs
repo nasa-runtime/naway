@@ -38,6 +38,7 @@ pub(in crate::control::journal) fn transition(
     current: &Snapshot,
     next: Record,
 ) -> Result<Snapshot> {
+    current.require_no_material()?;
     next.validate(identity, current.admission_epoch(), next.fence)?;
     match current.action() {
         Some(previous) => previous.require_successor(&next)?,
@@ -82,6 +83,7 @@ pub(in crate::control::journal) fn release(
     fence: u64,
     allow_empty: bool,
 ) -> Result<Snapshot> {
+    current.require_no_material()?;
     // 缺失收据不是终态；Prepared 仍可能应用，方向未确认或 HALTED 更不能自动回收。
     ensure!(
         current.local().is_none()

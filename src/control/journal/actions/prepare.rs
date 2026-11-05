@@ -61,6 +61,8 @@ impl Journal {
         let current = storage
             .as_ref()
             .context("node journal action storage is not initialized")?;
+        // 配置动作不能抢占材料保留，即使原配置基线和较高配置fence仍然匹配。
+        current.require_no_material()?;
         // 新意图只能消费本启动的空槽和更高 fence，不能借准备覆盖其它操作或未决本地文件方向。
         ensure!(
             current.action().is_none()

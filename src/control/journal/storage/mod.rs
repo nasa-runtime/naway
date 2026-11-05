@@ -36,6 +36,9 @@ pub(super) struct Status {
     compare_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     local_publication: Option<super::local::Status>,
+    #[cfg(feature = "node-actions")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    material_action: Option<super::material::Status>,
 }
 
 impl Snapshot {
@@ -69,6 +72,8 @@ impl Snapshot {
             closed_epoch: self.state.closed_epoch,
             compare_token: self.head.token(),
             local_publication: self.local().map(super::local::Status::from_plan),
+            #[cfg(feature = "node-actions")]
+            material_action: self.material().map(super::material::Record::status),
         }
     }
 
@@ -79,6 +84,30 @@ impl Snapshot {
     /// 返回：当前唯一文件决定的借用；空表示没有未决本地发布。
     pub(super) fn local(&self) -> Option<&super::local::Plan> {
         self.state.local_publication.as_ref()
+    }
+
+    /// 业务作用：读取同一head中保留的材料责任，不把其它状态槽或当前文件摘要当作动作事实。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：当前完整材料记录的借用；不存在时为空，不声明旧动作未执行。
+    #[cfg(feature = "node-actions")]
+    pub(super) fn material(&self) -> Option<&super::material::Record> {
+        self.state.material.as_deref()
+    }
+
+    /// 业务作用：在普通写入和旧释放协议前保护材料保留责任，不允许借关闭代际遗失恢复证据。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：没有材料记录时成功；任何保留阶段都拒绝，不依据终态猜测释放许可。
+    #[cfg(feature = "node-actions")]
+    pub(super) fn require_no_material(&self) -> Result<()> {
+        ensure!(
+            self.material().is_none(),
+            "node journal retains material authority"
+        );
+        Ok(())
     }
 
     /// 业务作用：要求离线维护请求绑定完整当前提交，旧令牌不能改变文件方向。
@@ -224,6 +253,8 @@ pub(super) fn close_epoch(root: &Root, identity: &Identity, expected: &str) -> R
     let current =
         load(root, identity)?.context("node journal action storage is not initialized")?;
     current.compare(expected)?;
+    #[cfg(feature = "node-actions")]
+    current.require_no_material()?;
     // 未决文件决定仍依赖当前受理事实，维护不能通过推进代际抹去其正文与恢复权威。
     ensure!(
         current.local().is_none(),
@@ -262,6 +293,8 @@ pub(super) fn transition(
     current: &Snapshot,
     plan: Option<super::local::Plan>,
 ) -> Result<Snapshot> {
+    #[cfg(feature = "node-actions")]
+    current.require_no_material()?;
     let mut state = current.state.clone();
     state.revision = state
         .revision

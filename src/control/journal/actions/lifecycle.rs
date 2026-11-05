@@ -21,6 +21,9 @@ impl Journal {
     pub(in crate::control::journal) fn require_local_action_slot(
         storage: Option<&storage::Snapshot>,
     ) -> Result<()> {
+        if let Some(current) = storage {
+            current.require_no_material()?;
+        }
         ensure!(
             storage
                 .and_then(storage::Snapshot::action)
