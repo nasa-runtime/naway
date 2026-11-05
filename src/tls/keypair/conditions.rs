@@ -1,6 +1,6 @@
 //! 材料条件来自同一安装锁下的实际来源，不能替代已安装监听事实或持续写入许可。
 
-use super::{generation, keypair_install_lock, recover_legacy_keypair_transaction_locked, source};
+use super::{keypair_install_lock, recover_legacy_keypair_transaction_locked, source};
 use crate::{config::GatewaySnapshot, tls::targets::Target};
 use serde::{Deserialize, Serialize};
 
@@ -213,15 +213,16 @@ fn read_group(
     {
         return Err(Unavailable::Capacity);
     }
-    let (path, _) =
-        crate::tls::active_keypair_paths_unrecovered(selected).map_err(|_| Unavailable::Storage)?;
+    let source = super::capture::Files::capture(selected).map_err(|_| Unavailable::Storage)?;
+    let (path, _) = source.paths();
     let certificate =
         crate::io::secret_file::read_file(&path, 1024 * 1024, "TLS material conditions")
             .map_err(|_| Unavailable::Storage)?;
     // 错放到证书位置的私钥或非法材料不能产生对外摘要；仅确认完整的公开 X.509 链后计算 ETag。
     public_chain(&certificate)?;
-    let material_generation =
-        generation::current(selected, &certificate, None).map_err(|_| Unavailable::Storage)?;
+    let material_generation = source
+        .current(&certificate, None)
+        .map_err(|_| Unavailable::Storage)?;
     let source_id = hex(identity);
     let mut affected = Vec::new();
     for listener in impact.listeners {

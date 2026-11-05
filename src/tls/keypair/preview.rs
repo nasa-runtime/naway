@@ -1,6 +1,6 @@
 //! 原材料条件和完整监听策略在同一锁内验证，候选只驻留内存，不产生安装决定。
 
-use super::{conditions, generation, preflight};
+use super::{conditions, preflight};
 use crate::{config::GatewaySnapshot, tls::targets::Target};
 use tokio_rustls::rustls::sign::CertifiedKey;
 
@@ -59,15 +59,17 @@ pub(crate) fn inspect(
                 continue;
             }
             // 公开 ETag 不能证明私钥未被单独替换；候选下载和完整构建前都验证原受管 pair。
-            let (certificate_path, key_path) = crate::tls::active_keypair_paths_unrecovered(source)
+            let captured = super::capture::Files::capture(source)
                 .map_err(|_| Rejected::Conditions(conditions::Unavailable::Storage))?;
+            let (certificate_path, key_path) = captured.paths();
             let read = |path: &std::path::Path| {
                 crate::io::secret_file::read_file(path, 1024 * 1024, "TLS material preview")
                     .map_err(|_| Rejected::Conditions(conditions::Unavailable::Storage))
             };
             let certificate = read(&certificate_path)?;
             let private_key = read(&key_path)?;
-            let current = generation::current(source, &certificate, Some(&private_key))
+            let current = captured
+                .current(&certificate, Some(&private_key))
                 .map_err(|_| Rejected::Conditions(conditions::Unavailable::Storage))?;
             if current.as_deref() != Some(original.material_generation)
                 || super::certificate_etag(&certificate) != original.certificate_etag

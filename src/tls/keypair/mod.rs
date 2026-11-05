@@ -1,5 +1,6 @@
 //! 证书材料安装与条件写入共用唯一事务门；签发来源不决定文件发布语义。
 
+mod capture;
 pub(crate) mod conditions;
 mod generation;
 mod io;
@@ -90,9 +91,16 @@ pub(crate) fn install_keypair_atomically_if_match(
     if recover_legacy_keypair_transaction_locked(tls).is_err() {
         return KeypairCasInstallOutcome::OutcomeUnknown;
     }
-    let baseline = crate::tls::active_keypair_paths_unrecovered(tls).and_then(|(path, _)| {
-        crate::io::secret_file::read_file(&path, MAX_KEYPAIR_BYTES, "TLS certificate CAS baseline")
-    });
+    // 来源无法固定时没有完整CAS基线，不能读取另一目录并继续使用原条件。
+    let Ok(source) = capture::Files::capture(tls) else {
+        return KeypairCasInstallOutcome::Unavailable;
+    };
+    let (certificate_path, private_key_path) = source.paths();
+    let baseline = crate::io::secret_file::read_file(
+        &certificate_path,
+        MAX_KEYPAIR_BYTES,
+        "TLS certificate CAS baseline",
+    );
     let Ok(current) = baseline else {
         return KeypairCasInstallOutcome::Unavailable;
     };
@@ -102,16 +110,16 @@ pub(crate) fn install_keypair_atomically_if_match(
     }
     let current_generation = if expected_generation.is_some() {
         // 材料代与完整 pair 在同一锁内复验；A→B→A 或私钥单独改变不能复活旧动作的所有权。
-        crate::tls::active_keypair_paths_unrecovered(tls).and_then(|(_, key)| {
+        (|| -> Result<Option<String>> {
             let private_key = crate::io::secret_file::read_file(
-                &key,
+                &private_key_path,
                 MAX_KEYPAIR_BYTES,
                 "TLS material ownership private key",
             )?;
-            generation::current(tls, &current, Some(&private_key))
-        })
+            source.current(&current, Some(&private_key))
+        })()
     } else {
-        generation::current(tls, &current, None)
+        source.current(&current, None)
     };
     let Ok(current_generation) = current_generation else {
         return KeypairCasInstallOutcome::Unavailable;

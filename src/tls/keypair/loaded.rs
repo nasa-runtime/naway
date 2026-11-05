@@ -1,6 +1,8 @@
 //! 同一次受管材料读取同时提供签名输入和原生归属，解析过程不重新读取当前文件。
 
-use super::{generation, keypair_install_lock, recover_legacy_keypair_transaction_locked};
+use super::{
+    capture::Files, generation, keypair_install_lock, recover_legacy_keypair_transaction_locked,
+};
 use crate::{config::TlsRuntimeCfg, tls::material::MaterialProvenance};
 use anyhow::Result;
 use zeroize::Zeroizing;
@@ -27,7 +29,18 @@ pub(in crate::tls) fn read(tls: &TlsRuntimeCfg) -> Result<Loaded> {
         .map_err(|_| anyhow::anyhow!("TLS keypair install lock is poisoned"))?;
     // 先结算原文件决定再取样，半份 pair 不能和完整材料代共同进入待安装 resolver。
     recover_legacy_keypair_transaction_locked(tls)?;
-    let (certificate, private_key) = crate::tls::active_keypair_paths_unrecovered(tls)?;
+    let source = Files::capture(tls)?;
+    read_source(&source)
+}
+
+/// 业务作用：从已经选定的来源读取 pair 和同源 owner，读取途中外部切换 manifest 不能替换归属位置。
+///
+/// 参数说明：
+/// - `source`：调用方在同一材料锁内固定的来源解析。
+///
+/// 返回：唯一原文缓冲及该来源的完整归属；材料读取失败拒绝，归属缺失或损坏不冒充受管安装。
+fn read_source(source: &Files<'_>) -> Result<Loaded> {
+    let (certificate, private_key) = source.paths();
     let certificate = crate::io::secret_file::read_file(
         &certificate,
         super::MAX_KEYPAIR_BYTES,
@@ -39,8 +52,10 @@ pub(in crate::tls) fn read(tls: &TlsRuntimeCfg) -> Result<Loaded> {
         "TLS loaded private key",
     )?;
     // 外部合法换材可以继续服务，但损坏或不匹配的归属不能为未来交付补发安装证明。
-    let provenance =
-        generation::loaded(tls, &certificate, &private_key).unwrap_or(MaterialProvenance::Unproven);
+    let provenance = source
+        .owner()
+        .map(|owner| generation::loaded(owner, &certificate, &private_key))
+        .unwrap_or(MaterialProvenance::Unproven);
     Ok(Loaded {
         certificate,
         private_key,
