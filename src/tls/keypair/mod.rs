@@ -6,6 +6,8 @@ mod io;
 mod legacy;
 mod manifest;
 mod preflight;
+#[cfg(feature = "node-actions")]
+pub(crate) mod preview;
 mod source;
 mod validation;
 

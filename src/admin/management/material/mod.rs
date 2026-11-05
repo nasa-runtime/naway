@@ -6,7 +6,7 @@ mod delivery;
 mod node;
 mod run;
 mod session;
-mod wire;
+pub(in crate::admin::management) mod wire;
 
 pub(in crate::admin) use super::actions::window::Window as RequestWindow;
 pub(in crate::admin::management) use client::Channel;

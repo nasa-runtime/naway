@@ -1,7 +1,10 @@
 //! 原生材料帧由受理和目标预检共用，公开摘要不包含私钥信息。
 
+#[cfg(feature = "admin-operations-pgsql")]
 use super::hex;
+#[cfg(feature = "admin-operations-pgsql")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "admin-operations-pgsql")]
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -38,6 +41,7 @@ impl Material {
     /// 参数说明: 无。
     ///
     /// 返回：只含公开证书摘要和有效期的有限投影；不保留私钥解析产物或返回底层错误。
+    #[cfg(feature = "admin-operations-pgsql")]
     pub(crate) fn inspect(&self) -> Result<Summary, Invalid> {
         let (cert, key) = self.parts()?;
         let identity = crate::tls::keypair::validate_keypair(cert, key).map_err(|_| Invalid)?;
@@ -64,6 +68,7 @@ impl Material {
 
 #[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "admin-operations-pgsql")]
 pub(crate) struct Summary {
     pub certificate_sha256: String,
     pub leaf_sha256: String,

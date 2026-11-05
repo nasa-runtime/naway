@@ -43,7 +43,7 @@ pub(in crate::admin) async fn handle(
 /// - `req`：原始有界管理请求。
 /// - `state`：已经启动的管理运行态。
 ///
-/// 返回：已确认的低敏事实或封闭错误；不提供候选下载、节点预检或交付入口。
+/// 返回：已确认的低敏事实或封闭错误；原目标预检不改变审批，也不授予持久交付资格。
 async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Result<Response<BoxBody>, Error> {
     // Data 不开放持久材料管理入口，不能通过共用制品绕过部署职责。
     if !state.mode.full_control_plane() {
@@ -106,6 +106,47 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Result<Response<
     if request.method != Method::POST || !admin::request_content_type(&request, "application/json")
     {
         return Err(Error::Invalid);
+    }
+    #[cfg(feature = "node-actions")]
+    if let Some(id) = suffix
+        .strip_prefix('/')
+        .and_then(|value| value.strip_suffix("/preview"))
+    {
+        if !super::model::valid_hex(id, 32)
+            || form_urlencoded::parse(request.uri.query().unwrap_or_default().as_bytes())
+                .any(|(key, _)| key != "workspace")
+        {
+            return Err(Error::Invalid);
+        }
+        // 预检会向原受信节点交付秘密并读取完整TLS依赖，普通读取或单独审阅权不能触发该工作。
+        authorization::check(
+            &query.scope,
+            &snapshot,
+            &identity.principal_id,
+            Action::Write,
+        )?;
+        let permit = state
+            .management
+            .admit_material_preview()
+            .map_err(|_| Error::Capacity)?;
+        let bytes = match admin::collect_bounded_admin_body(&request, body, 256).await {
+            Ok(bytes) => bytes,
+            Err(response) => return Ok(*response),
+        };
+        return super::preview::inspect(
+            &super::preview::Context {
+                state: &state,
+                store,
+                snapshot: &snapshot,
+                request: &request,
+                scope: &query.scope,
+                principal: &identity.principal_id,
+            },
+            id,
+            &bytes,
+            permit,
+        )
+        .await;
     }
     let review_id = suffix
         .strip_prefix('/')

@@ -14,6 +14,8 @@ use std::time::Instant;
 mod actions;
 #[cfg(feature = "node-actions")]
 mod material;
+#[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+mod material_preview;
 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
 mod preview;
 
@@ -47,6 +49,10 @@ struct Entry {
     material_previews_supported: bool,
     #[cfg(feature = "node-actions")]
     material_previews_enabled: bool,
+    #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+    material_candidates_supported: bool,
+    #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+    material_candidates_enabled: bool,
     baseline_supported: bool,
     baseline: Option<Arc<crate::control::baseline::NodeBaseline>>,
     publication: Arc<crate::control::publication_status::PublicationStatus>,
@@ -140,6 +146,10 @@ impl Store {
                 material_previews_supported: false,
                 #[cfg(feature = "node-actions")]
                 material_previews_enabled: false,
+                #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+                material_candidates_supported: false,
+                #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+                material_candidates_enabled: false,
                 baseline_supported: false,
                 baseline: None,
                 publication: Arc::new(
@@ -712,6 +722,8 @@ impl protocol::node_management_server::NodeManagement for Service {
         if value.actions_enabled && !value.actions_supported
             || value.previews_enabled && !value.previews_supported
             || value.material_previews_enabled && !value.material_previews_supported
+            || value.material_candidates_enabled
+                && (!value.material_candidates_supported || !value.material_previews_enabled)
         {
             return Err(Status::invalid_argument("node action capability differs"));
         }
@@ -776,6 +788,12 @@ impl protocol::node_management_server::NodeManagement for Service {
         let interest = manager.metrics_interest();
         #[cfg(feature = "node-actions")]
         {
+            #[cfg(feature = "admin-operations-pgsql")]
+            {
+                entry.material_candidates_supported = value.material_candidates_supported;
+                entry.material_candidates_enabled =
+                    value.material_candidates_supported && value.material_candidates_enabled;
+            }
             entry.material_previews_supported = value.material_previews_supported;
             entry.material_previews_enabled =
                 value.material_previews_supported && value.material_previews_enabled;
@@ -865,6 +883,40 @@ impl protocol::node_management_server::NodeManagement for Service {
         };
         #[cfg(not(feature = "node-actions"))]
         let material_conditions = None;
+        #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+        let material_preview = if action.is_none()
+            && release.is_none()
+            && preview.is_none()
+            && material_conditions.is_none()
+        {
+            let offer = manager
+                .material_preview_deliveries
+                .lock()
+                .get(&node_id)
+                .cloned();
+            offer
+                .filter(|offer| {
+                    store
+                        .material_preview_session(&plan, &offer.command.intent)
+                        .is_ok_and(|session| {
+                            session.as_slice() == value.session.as_slice()
+                                && offer
+                                    .authorize(
+                                        &manager,
+                                        &node_id,
+                                        &offer.command.intent.boot,
+                                        &value.session,
+                                        None,
+                                    )
+                                    .is_ok()
+                        })
+                })
+                .and_then(|offer| offer.wire().ok())
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "node-actions", feature = "admin-operations-pgsql")))]
+        let material_preview = None;
         Ok(Response::new(protocol::ReportResponse {
             accepted_sequence: value.sequence,
             action,
@@ -875,6 +927,7 @@ impl protocol::node_management_server::NodeManagement for Service {
             certificates_supported: true,
             preview,
             material_conditions,
+            material_preview,
         }))
     }
 
@@ -893,6 +946,48 @@ impl protocol::node_management_server::NodeManagement for Service {
             self.receive_material_result(request)
         }
         #[cfg(not(feature = "node-actions"))]
+        {
+            let _ = request;
+            Err(Status::unimplemented("material conditions unavailable"))
+        }
+    }
+
+    /// 业务作用：把独立材料候选预检结果交回原查询，不借助配置预览或持久动作受理权。
+    ///
+    /// 参数说明：
+    /// - `request`：原目标 mTLS 会话绑定的完整材料结果。
+    ///
+    /// 返回：原等待者接收后确认；缺能力、旧会话、不完整影响或越权均拒绝。
+    async fn material_preview_result(
+        &self,
+        request: Request<protocol::MaterialPreviewResultRequest>,
+    ) -> Result<Response<protocol::MaterialPreviewResultResponse>, Status> {
+        #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+        {
+            self.receive_material_preview_result(request)
+        }
+        #[cfg(not(all(feature = "node-actions", feature = "admin-operations-pgsql")))]
+        {
+            let _ = request;
+            Err(Status::unimplemented("material conditions unavailable"))
+        }
+    }
+
+    /// 业务作用：只向原受信节点交付独立材料预检分片，普通读权限不能取得候选秘密。
+    ///
+    /// 参数说明：
+    /// - `request`：原目标 mTLS 会话绑定的命令摘要与精确连续偏移。
+    ///
+    /// 返回：已授权的有限二进制分片；缺能力、旧会话或错偏移均拒绝，不延长原期限。
+    async fn material_preview_data(
+        &self,
+        request: Request<protocol::MaterialPreviewDataRequest>,
+    ) -> Result<Response<protocol::MaterialPreviewDataResponse>, Status> {
+        #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+        {
+            self.read_material_preview_data(request)
+        }
+        #[cfg(not(all(feature = "node-actions", feature = "admin-operations-pgsql")))]
         {
             let _ = request;
             Err(Status::unimplemented("material conditions unavailable"))

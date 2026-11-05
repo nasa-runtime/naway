@@ -31,6 +31,8 @@ struct Target {
     previews: super::preview::Channel,
     #[cfg(feature = "node-actions")]
     material: super::material::Channel,
+    #[cfg(feature = "node-actions")]
+    material_preview: super::material_preview::Channel,
 }
 
 /// 同次报告借用唯一事实和样本，各目标只保留自己的会话与传输进度。
@@ -118,6 +120,8 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     previews: super::preview::Channel::default(),
                     #[cfg(feature = "node-actions")]
                     material: super::material::Channel::default(),
+                    #[cfg(feature = "node-actions")]
+                    material_preview: super::material_preview::Channel::default(),
                 })
                 .collect();
             generation = Arc::downgrade(&plan);
@@ -262,7 +266,11 @@ async fn send(target: &mut Target, round: &Round<'_>) {
         target.failures = 0;
         target.next = Instant::now();
         #[cfg(feature = "node-actions")]
-        if target.actions.busy() || target.previews.busy() || target.material.busy() {
+        if target.actions.busy()
+            || target.previews.busy()
+            || target.material.busy()
+            || target.material_preview.busy()
+        {
             // 动作或预览已经占用第二条 RPC，心跳独立继续，目录和样本不能挤占工作或突破连接预算。
             return;
         }
@@ -341,6 +349,8 @@ async fn send(target: &mut Target, round: &Round<'_>) {
             target.previews.clear();
             #[cfg(feature = "node-actions")]
             target.material.clear();
+            #[cfg(feature = "node-actions")]
+            target.material_preview.clear();
         }
     }
 }
@@ -506,6 +516,11 @@ async fn exchange(
             .material
             .open(plan.clone(), target.issuer.clone(), &session)
             .map_err(|_| Status::permission_denied("material conditions session denied"))?;
+        #[cfg(feature = "node-actions")]
+        target
+            .material_preview
+            .open(plan.clone(), target.issuer.clone(), &session)
+            .map_err(|_| Status::permission_denied("material preview session denied"))?;
         target.session = session;
     }
     let request = timed_request(
@@ -529,6 +544,10 @@ async fn exchange(
                 && state.mode.runs_data(),
             previews_supported: cfg!(feature = "node-actions"),
             material_previews_supported: cfg!(feature = "node-actions"),
+            material_candidates_supported: cfg!(feature = "node-actions"),
+            material_candidates_enabled: cfg!(feature = "node-actions")
+                && plan.material_previews_enabled
+                && state.mode.runs_data(),
             material_previews_enabled: cfg!(feature = "node-actions")
                 && plan.material_previews_enabled
                 && state.mode.runs_data(),
@@ -565,26 +584,50 @@ async fn exchange(
         response.release,
         response.preview,
         response.material_conditions,
+        response.material_preview,
     ) {
-        (Some(offer), None, None, None) if !target.previews.busy() && !target.material.busy() => {
+        (Some(offer), None, None, None, None)
+            if !target.previews.busy()
+                && !target.material.busy()
+                && !target.material_preview.busy() =>
+        {
             // 无效或忙碌命令不撤销已经成功的心跳；发行端仍须依靠持久结果判断是否重投。
             let _ = target
                 .actions
                 .start(state.clone(), target.client.clone(), offer);
         }
-        (None, Some(offer), None, None) if !target.previews.busy() && !target.material.busy() => {
+        (None, Some(offer), None, None, None)
+            if !target.previews.busy()
+                && !target.material.busy()
+                && !target.material_preview.busy() =>
+        {
             let _ = target
                 .actions
                 .start_release(state.clone(), target.client.clone(), offer);
         }
-        (None, None, Some(offer), None) if !target.actions.busy() && !target.material.busy() => {
+        (None, None, Some(offer), None, None)
+            if !target.actions.busy()
+                && !target.material.busy()
+                && !target.material_preview.busy() =>
+        {
             let _ = target
                 .previews
                 .start(state.clone(), target.client.clone(), offer);
         }
-        (None, None, None, Some(offer)) if !target.actions.busy() && !target.previews.busy() => {
+        (None, None, None, Some(offer), None)
+            if !target.actions.busy()
+                && !target.previews.busy()
+                && !target.material_preview.busy() =>
+        {
             let _ = target
                 .material
+                .start(state.clone(), target.client.clone(), offer);
+        }
+        (None, None, None, None, Some(offer))
+            if !target.actions.busy() && !target.previews.busy() && !target.material.busy() =>
+        {
+            let _ = target
+                .material_preview
                 .start(state.clone(), target.client.clone(), offer);
         }
         // 单槽不可能合法地同时产生多类声明，矛盾响应不选择其中任意一个执行。

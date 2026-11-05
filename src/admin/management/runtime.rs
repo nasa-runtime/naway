@@ -26,6 +26,13 @@ pub struct Manager {
     #[cfg(feature = "node-actions")]
     pub(super) material_permits: Arc<tokio::sync::Semaphore>,
     #[cfg(feature = "node-actions")]
+    pub(super) material_preview_permits: Arc<tokio::sync::Semaphore>,
+    #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+    pub(super) material_preview_requests: Arc<tokio::sync::Semaphore>,
+    #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+    pub(super) material_preview_deliveries:
+        parking_lot::Mutex<std::collections::BTreeMap<String, Arc<super::material_preview::Offer>>>,
+    #[cfg(feature = "node-actions")]
     pub(super) material_requests: Arc<tokio::sync::Semaphore>,
     #[cfg(feature = "node-actions")]
     pub(super) material_deliveries:
@@ -206,6 +213,12 @@ impl Manager {
             preview_permits: Arc::new(tokio::sync::Semaphore::new(2)),
             #[cfg(feature = "node-actions")]
             material_permits: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(feature = "node-actions")]
+            material_preview_permits: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+            material_preview_requests: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
+            material_preview_deliveries: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(feature = "node-actions")]
             material_requests: Arc::new(tokio::sync::Semaphore::new(2)),
             #[cfg(feature = "node-actions")]
@@ -426,6 +439,8 @@ async fn bind(
         "PreviewData",
         "PreviewResult",
         "MaterialConditionsResult",
+        "MaterialPreviewData",
+        "MaterialPreviewResult",
     ] {
         config.method_policies.insert(
             format!("/naway.management.v1.NodeManagement/{method}"),

@@ -62,44 +62,11 @@ impl Candidate {
         {
             return Err(Error::Invalid);
         }
-        input.targets.sort_unstable_by(|left, right| {
-            (
-                &left.node_id,
-                left.target.kind as u8,
-                &left.target.listener,
-                &left.target.entry,
-            )
-                .cmp(&(
-                    &right.node_id,
-                    right.target.kind as u8,
-                    &right.target.listener,
-                    &right.target.entry,
-                ))
-        });
-        for (index, target) in input.targets.iter().enumerate() {
-            if !crate::config::operations::token(&target.node_id, 128)
-                || !crate::config::operations::token(&target.boot_id, 128)
-                || target.base_version == 0
-                || !valid_hex(&target.base_fingerprint, 16)
-                || !target.node_baseline.valid()
-                || target.node_baseline.cluster_id != cluster
-                || !target.target.valid()
-                || !valid_hex(&target.material_generation, 64)
-                || !target
-                    .certificate_etag
-                    .strip_prefix("\"sha256-")
-                    .and_then(|value| value.strip_suffix('"'))
-                    .is_some_and(|value| valid_hex(value, 64))
-                || index > 0
-                    && input.targets[index - 1].node_id == target.node_id
-                    && (input.targets[index - 1].target == target.target
-                        || input.targets[index - 1].boot_id != target.boot_id
-                        || input.targets[index - 1].base_version != target.base_version
-                        || input.targets[index - 1].base_fingerprint != target.base_fingerprint
-                        || input.targets[index - 1].node_baseline != target.node_baseline)
-            {
-                return Err(Error::Invalid);
-            }
+        input
+            .targets
+            .sort_unstable_by(|left, right| left.identity().cmp(&right.identity()));
+        if !Target::valid_set(&input.targets, cluster) {
+            return Err(Error::Invalid);
         }
         let target_bytes = serde_json::to_vec(&input.targets).map_err(|_| Error::Invalid)?;
         if target_bytes.len() > 65536 {

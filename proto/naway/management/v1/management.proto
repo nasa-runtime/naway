@@ -16,6 +16,8 @@ service NodeManagement {
   rpc PreviewData(PreviewDataRequest) returns (PreviewDataResponse);
   rpc PreviewResult(PreviewResultRequest) returns (PreviewResultResponse);
   rpc MaterialConditionsResult(MaterialConditionsResultRequest) returns (MaterialConditionsResultResponse);
+  rpc MaterialPreviewData(MaterialPreviewDataRequest) returns (MaterialPreviewDataResponse);
+  rpc MaterialPreviewResult(MaterialPreviewResultRequest) returns (MaterialPreviewResultResponse);
 }
 
 message OpenRequest {
@@ -83,6 +85,9 @@ message ReportRequest {
   optional bytes certificates_digest = 14;
   bool material_previews_supported = 15;
   bool material_previews_enabled = 16;
+  // 候选预检独立协商；只有公开条件查询能力的节点不能接收秘密材料。
+  bool material_candidates_supported = 17;
+  bool material_candidates_enabled = 18;
 }
 
 // 当前本地文件决定与业务就绪分开；没有历史、路径或恢复命令令牌。
@@ -132,6 +137,75 @@ message ReportResponse {
   bool consumers_supported = 7;
   bool certificates_supported = 8;
   MaterialConditionsOffer material_conditions = 9;
+  MaterialPreviewOffer material_preview = 10;
+}
+
+// 原目标字段复用结构，内层 signature 必须为空；只有外层独立签名可以授权候选下载。
+message MaterialPreviewOffer {
+  uint32 schema = 1;
+  MaterialConditionsOffer original = 2;
+  string proposal_id = 3;
+  string store_id = 4;
+  int64 admission_epoch = 5;
+  string creator = 6;
+  bytes proposal_authority_sha256 = 7;
+  bytes proposal_intent_sha256 = 8;
+  repeated MaterialPreviewPair pairs = 9;
+  uint32 candidate_bytes = 10;
+  bytes candidate_sha256 = 11;
+  string signature = 12;
+}
+
+message MaterialPreviewPair {
+  string certificate_etag = 1;
+  string material_generation = 2;
+}
+
+message MaterialPreviewDataRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  string offer_id = 4;
+  uint32 offset = 5;
+}
+
+message MaterialPreviewDataResponse {
+  string offer_id = 1;
+  uint32 offset = 2;
+  bytes body = 3;
+  bool eof = 4;
+}
+
+enum MaterialPreviewStatus {
+  MATERIAL_PREVIEW_STATUS_UNSPECIFIED = 0;
+  MATERIAL_PREVIEW_STATUS_SUCCEEDED = 1;
+  MATERIAL_PREVIEW_STATUS_UNSUPPORTED = 2;
+  MATERIAL_PREVIEW_STATUS_DISABLED = 3;
+  MATERIAL_PREVIEW_STATUS_UNAVAILABLE = 4;
+  MATERIAL_PREVIEW_STATUS_CAPACITY = 5;
+  MATERIAL_PREVIEW_STATUS_EXPIRED = 6;
+  MATERIAL_PREVIEW_STATUS_DENIED = 7;
+  MATERIAL_PREVIEW_STATUS_BASELINE_CHANGED = 8;
+  MATERIAL_PREVIEW_STATUS_TARGET_ABSENT = 9;
+  MATERIAL_PREVIEW_STATUS_EXTERNAL_SOURCE = 10;
+  MATERIAL_PREVIEW_STATUS_STORAGE = 11;
+  MATERIAL_PREVIEW_STATUS_IMPACT_UNPROVEN = 12;
+  MATERIAL_PREVIEW_STATUS_MATERIAL_CHANGED = 13;
+  MATERIAL_PREVIEW_STATUS_CANDIDATE_INVALID = 14;
+}
+
+message MaterialPreviewResultRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  string offer_id = 4;
+  MaterialPreviewStatus status = 5;
+  MaterialConditionsBatch batch = 6;
+  bytes impact_sha256 = 7;
+}
+
+message MaterialPreviewResultResponse {
+  string accepted_offer_id = 1;
 }
 
 // 材料条件独立于配置候选和持久动作；原节点一次处理整批逻辑目标。

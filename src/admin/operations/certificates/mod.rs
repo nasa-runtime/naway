@@ -5,6 +5,8 @@ mod authorization;
 mod capacity;
 mod crypto;
 mod model;
+#[cfg(feature = "node-actions")]
+mod preview;
 mod reading;
 mod response;
 mod retention;

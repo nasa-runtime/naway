@@ -69,6 +69,7 @@ struct SharedSessionTickets {
 }
 
 /// 单张服务端证书及其 OCSP 运行门禁。
+#[derive(Clone)]
 struct CertifiedIdentity {
     active: Arc<CertifiedKey>,
     expired_fallback: Option<Arc<CertifiedKey>>,

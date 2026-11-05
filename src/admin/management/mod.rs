@@ -9,6 +9,8 @@ mod consumers;
 mod issuer;
 #[cfg(feature = "node-actions")]
 pub(in crate::admin) mod material;
+#[cfg(feature = "node-actions")]
+pub(in crate::admin) mod material_preview;
 pub(in crate::admin) mod metrics;
 mod plan;
 #[cfg(feature = "node-actions")]

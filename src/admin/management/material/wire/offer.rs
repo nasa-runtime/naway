@@ -20,7 +20,7 @@ use nasa::grpc::{codegen::prost::Message, Status};
 /// - `value`：同一受信连接接收的材料条件声明。
 ///
 /// 返回：完整命令和独立签名；字段缺失、未知身份、超限或无效基线均拒绝。
-pub(in crate::admin::management::material) fn decode(
+pub(in crate::admin::management) fn decode(
     value: protocol::MaterialConditionsOffer,
 ) -> Result<(Command, String), Reason> {
     if value.schema != 1 || value.encoded_len() > 24 * 1024 {
@@ -79,7 +79,7 @@ pub(in crate::admin::management::material) fn decode(
 /// - `signature`：绑定全部字段的材料条件证明。
 ///
 /// 返回：保留原索引与分母的协议消息；任何无效或超量命令拒绝。
-pub(in crate::admin::management::material) fn encode(
+pub(in crate::admin::management) fn encode(
     command: &Command,
     signature: &str,
 ) -> Result<protocol::MaterialConditionsOffer, Status> {

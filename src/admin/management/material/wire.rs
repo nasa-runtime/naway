@@ -2,8 +2,8 @@
 
 mod batch;
 mod offer;
-pub(super) use batch::{decode_batch, encode_batch, validate};
-pub(super) use offer::{decode, encode};
+pub(in crate::admin::management) use batch::{decode_batch, encode_batch, validate};
+pub(in crate::admin::management) use offer::{decode, encode};
 
 use super::Reason;
 use crate::{

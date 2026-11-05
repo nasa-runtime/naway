@@ -9,6 +9,7 @@ use tokio::sync::{OwnedMutexGuard, Semaphore};
 use zeroize::Zeroizing;
 
 /// 全部字段来自冻结意图或同事务数据库权威，不从客户端接受密文上下文。
+#[derive(PartialEq, Eq)]
 pub(super) struct Context {
     pub cluster: String,
     pub store_id: String,
@@ -52,6 +53,11 @@ impl Context {
 pub(super) struct Sealed {
     pub ciphertext: String,
     pub summary: Vec<u8>,
+}
+
+pub(super) struct Opened {
+    pub material: Material,
+    pub summary: Summary,
 }
 
 /// 业务作用：在已获共享容量与配置权威后验证材料并封装为 NASA NC2 密文，不把秘密送入 SQL。
@@ -98,6 +104,34 @@ pub(super) fn verify(
     authority: &[u8; 32],
     summary: &[u8],
 ) -> Result<(), Error> {
+    let Opened {
+        material,
+        summary,
+    } = open(ciphertext, key, context, targets, authority, summary)?;
+    drop(material);
+    drop(summary);
+    Ok(())
+}
+
+/// 业务作用：认证原密文和完整意图后交付唯一原生材料，供原目标预检共享而不重复解密。
+///
+/// 参数说明：
+/// - `ciphertext`：原提案保存的有界 NC2 密文。
+/// - `key`：按原 key id 从当前钥环取得的秘密。
+/// - `context`：原受理、存储身份和有效期限组成的认证上下文。
+/// - `targets`：原提案完整目标编码，不能由当前成员重新生成。
+/// - `authority`：当前必须仍成立的原冻结权限摘要。
+/// - `summary`：原持久公开证书投影，必须与认证材料完全一致。
+///
+/// 返回：通过认证的唯一清零材料和已解析公开摘要；任何失败都不交付明文。
+pub(super) fn open(
+    ciphertext: &str,
+    key: &str,
+    context: &Context,
+    targets: &[u8],
+    authority: &[u8; 32],
+    summary: &[u8],
+) -> Result<Opened, Error> {
     // 只接受本合同固定的有界 KDF 参数，数据库被篡改也不能扩大算法内存或退回无 AAD 格式。
     if !ciphertext.starts_with("NC2.65536.3.4.") || ciphertext.len() > 2 * (1024 * 1024 + 16) + 256
     {
@@ -112,15 +146,18 @@ pub(super) fn verify(
         .checked_sub(context.created)
         .ok_or(Error::Unavailable)?;
     let ttl = u32::try_from(ttl_ms / 1000).map_err(|_| Error::Unavailable)?;
+    let summary = serde_json::from_slice::<Summary>(summary).map_err(|_| Error::Unavailable)?;
     if ttl_ms % 1000 != 0
         || !(60..=86400).contains(&ttl)
         || model::fingerprint(&material, targets, context.epoch, ttl, authority) != context.intent
-        || material.inspect().map_err(|_| Error::Unavailable)?
-            != serde_json::from_slice::<Summary>(summary).map_err(|_| Error::Unavailable)?
+        || material.inspect().map_err(|_| Error::Unavailable)? != summary
     {
         return Err(Error::Unavailable);
     }
-    Ok(())
+    Ok(Opened {
+        material,
+        summary,
+    })
 }
 
 /// 业务作用：把算法并发许可和配置发布权交给实际阻塞任务，HTTP 取消不能提前释放仍在运行的 KDF。

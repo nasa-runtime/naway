@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 /// - `intent`：冻结原全局索引的签名意图。
 ///
 /// 返回：移动既有字符串与数组的协议结果；超量或身份不一致拒绝。
-pub(in crate::admin::management::material) fn encode_batch(
+pub(in crate::admin::management) fn encode_batch(
     batch: Batch,
     intent: &Intent,
 ) -> Result<protocol::MaterialConditionsBatch, Reason> {
@@ -68,7 +68,7 @@ pub(in crate::admin::management::material) fn encode_batch(
 /// - `intent`：原请求唯一分母及逻辑目标。
 ///
 /// 返回：移动原分配的完整原生批次；未知状态、来源、索引或超量影响均拒绝。
-pub(in crate::admin::management::material) fn decode_batch(
+pub(in crate::admin::management) fn decode_batch(
     value: protocol::MaterialConditionsBatch,
     intent: &Intent,
 ) -> Result<Batch, Reason> {
@@ -130,10 +130,7 @@ pub(in crate::admin::management::material) fn decode_batch(
 /// - `intent`：原请求逻辑身份与固定数量。
 ///
 /// 返回：所有组均被引用、原目标均包含在自己的影响内且整体小于消息预算才成功。
-pub(in crate::admin::management::material) fn validate(
-    batch: &Batch,
-    intent: &Intent,
-) -> Result<(), Reason> {
+pub(in crate::admin::management) fn validate(batch: &Batch, intent: &Intent) -> Result<(), Reason> {
     if batch.entries.len() != intent.targets.len()
         || batch.groups.is_empty()
         || batch.groups.len() > batch.entries.len()

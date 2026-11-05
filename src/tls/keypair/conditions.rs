@@ -84,6 +84,26 @@ pub(crate) fn read_many(
     snapshot: &GatewaySnapshot,
     targets: &[Target],
 ) -> Result<Batch, Unavailable> {
+    with_many(snapshot, targets, |_, _, batch| batch)
+}
+
+/// 业务作用：让条件观察与后续原条件预检共用一次材料锁和来源索引，避免两阶段之间被受管换证穿插。
+///
+/// 参数说明：
+/// - `snapshot`：调用方已经持有配置发布权的完整原配置。
+/// - `targets`：本次全部逻辑身份，顺序保持原请求分母。
+/// - `inspect`：在同一材料锁内消费完整条件并继续检查，不得重入安装锁或发布活动监听。
+///
+/// 返回：观察成功后在锁内执行回调；来源、恢复或证据不足时不调用回调，不生成部分条件。
+pub(super) fn with_many<T, L: std::borrow::Borrow<Target>>(
+    snapshot: &GatewaySnapshot,
+    targets: &[L],
+    inspect: impl FnOnce(
+        &source::Index<'_>,
+        &[std::borrow::Cow<'_, crate::config::TlsRuntimeCfg>],
+        Batch,
+    ) -> T,
+) -> Result<T, Unavailable> {
     if !(1..=128).contains(&targets.len()) {
         return Err(Unavailable::Capacity);
     }
@@ -106,7 +126,10 @@ pub(crate) fn read_many(
     let selected = targets
         .iter()
         .map(|target| {
-            let source = target.source(snapshot).ok_or(Unavailable::TargetAbsent)?;
+            let source = target
+                .borrow()
+                .source(snapshot)
+                .ok_or(Unavailable::TargetAbsent)?;
             if !crate::tls::targets::writable(&source) {
                 return Err(Unavailable::ExternalSource);
             }
@@ -125,7 +148,9 @@ pub(crate) fn read_many(
     let mut entries = Vec::with_capacity(targets.len());
     let mut positions = std::collections::BTreeMap::new();
     for (target, selected) in targets.iter().zip(&selected) {
-        let position = index.position(target).ok_or(Unavailable::ImpactUnproven)?;
+        let position = index
+            .position(target.borrow())
+            .ok_or(Unavailable::ImpactUnproven)?;
         let identity = position.identity().map_err(|_| Unavailable::Storage)?;
         let group = if let Some(group) = positions.get(&identity) {
             *group
@@ -146,10 +171,14 @@ pub(crate) fn read_many(
             group,
         });
     }
-    Ok(Batch {
-        entries,
-        groups,
-    })
+    Ok(inspect(
+        &index,
+        &selected,
+        Batch {
+            entries,
+            groups,
+        },
+    ))
 }
 
 /// 业务作用：为一个唯一写入来源生成公开条件，来源索引与材料读取必须处在同一锁内。
