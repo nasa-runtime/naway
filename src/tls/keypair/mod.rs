@@ -263,7 +263,7 @@ fn publish_keypair_locked(
     if let Some(manifest_file) = &tls.keypair_manifest_file {
         let prepared =
             prepare_keypair_version(manifest_file, certificate_pem, private_key_pem, owner)?;
-        atomic_write(manifest_file, &prepared.manifest, false)?;
+        prepared.publish()?;
         tracing::info!(
             directory = %prepared.directory.display(),
             manifest = %manifest_file.display(),
@@ -278,7 +278,7 @@ fn publish_keypair_locked(
             // 当前 manifest 已持久化；回收失败只留下额外历史，不能谎称激活失败并诱发重复签发。
             tracing::warn!(error = %format!("{error:#}"), "TLS keypair history cleanup failed");
         }
-        Ok(prepared.generation)
+        Ok(prepared.generation().to_owned())
     } else {
         install_legacy_keypair_transaction(tls, certificate_pem, private_key_pem, owner)
     }

@@ -1,6 +1,5 @@
 //! 材料代只属于受管文件事务；摘要相同不能使已经退休的写入重新获得所有权。
 
-use super::atomic_write;
 use crate::config::TlsRuntimeCfg;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -89,17 +88,6 @@ impl Record {
             "TLS prepared material differs from its generation"
         );
         Ok(())
-    }
-
-    /// 业务作用：在材料事务决定内持久化唯一归属，权限从临时文件创建时即限制为当前用户。
-    ///
-    /// 参数说明：
-    /// - `path`：由受管文件计划或当前不可变目录确定的元数据位置。
-    ///
-    /// 返回：元数据与目录项同步完成时成功；I/O 失败不能解释为没有完成替换。
-    pub(super) fn publish(&self, path: &Path) -> Result<()> {
-        let bytes = serde_json::to_vec(self).context("encode TLS material generation")?;
-        atomic_write(path, &bytes, true)
     }
 
     /// 业务作用：沿用文件事务已固定的父目录提交归属，不因再次解析路径而把材料代写入另一目录。

@@ -1,97 +1,16 @@
 //! 不可变材料目录以单一 manifest 激活，回收始终保留当前及恢复指针。
 
-use super::{atomic_write, generation, sync_directory};
+mod bound;
+mod prepared;
+
+pub(super) use prepared::prepare_keypair_version;
+
+use super::{generation, sync_directory};
 use anyhow::{Context, Result};
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
-
-pub(super) struct PreparedKeypairVersion {
-    pub(super) directory: PathBuf,
-    pub(super) manifest: Vec<u8>,
-    pub(super) generation: String,
-}
-
-/// 业务作用：把完整 pair 写入不可变版本目录，但不切换当前 manifest。
-///
-/// 参数说明：
-/// - `manifest_file`：固定当前指针及材料归属的文件位置。
-/// - `certificate_pem`：已验证的完整证书链。
-/// - `private_key_pem`：已验证且与证书匹配的私钥。
-/// - `owner`：上层已经为该来源和完整 pair 准备的唯一材料记录。
-///
-/// 返回：完整材料目录、待激活的指针及唯一材料代；失败不改变当前指针。
-/// 指针只有经调用者原子安装后才生效，此前崩溃仅留下未激活目录。
-pub(super) fn prepare_keypair_version(
-    manifest_file: &Path,
-    certificate_pem: &[u8],
-    private_key_pem: &[u8],
-    owner: generation::Record,
-) -> Result<PreparedKeypairVersion> {
-    // 不可变目录必须携带上层已经固定的同一代，不能在落盘阶段另造无法关联原动作的身份。
-    owner.require_material(
-        &generation::manifest_target(manifest_file)?,
-        certificate_pem,
-        private_key_pem,
-    )?;
-    let parent = manifest_file.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create keypair manifest dir {}", parent.display()))?;
-    let versions_root = parent.join(".gateway-keypairs");
-    fs::create_dir_all(&versions_root)
-        .with_context(|| format!("create keypair versions dir {}", versions_root.display()))?;
-    let mut random = [0_u8; 8];
-    getrandom::getrandom(&mut random).context("generate keypair version suffix")?;
-    let suffix = u64::from_le_bytes(random);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let directory = versions_root.join(format!("v-{timestamp}-{suffix:016x}"));
-    fs::create_dir(&directory)
-        .with_context(|| format!("create keypair version {}", directory.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("chmod keypair version {}", directory.display()))?;
-    }
-    let result = (|| -> Result<Vec<u8>> {
-        atomic_write(&directory.join("key.pem"), private_key_pem, true)?;
-        atomic_write(&directory.join("cert.pem"), certificate_pem, false)?;
-        // 当前指针只能指向已经持久化完整 pair 与材料代的目录，不能在激活后补记归属。
-        owner.publish(&directory.join(generation::MANIFEST_RECORD))?;
-        sync_directory(&directory)?;
-        let relative = directory.strip_prefix(parent).with_context(|| {
-            format!(
-                "keypair version {} is outside manifest dir {}",
-                directory.display(),
-                parent.display()
-            )
-        })?;
-        let relative = relative
-            .to_str()
-            .context("keypair version path is not UTF-8")?;
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
-            "directory": relative,
-        }))
-        .context("serialize keypair manifest")
-    })();
-    match result {
-        Ok(manifest) => Ok(PreparedKeypairVersion {
-            directory,
-            manifest,
-            generation: owner.generation,
-        }),
-        Err(error) => {
-            let _ = fs::remove_dir_all(&directory);
-            Err(error)
-        }
-    }
-}
 
 /// 业务作用：按保留代数回收 manifest 历史目录，同时永久保护当前指针和崩溃遗留临时指针。
 ///
@@ -260,7 +179,7 @@ fn valid_keypair_version_name(name: &str) -> bool {
         && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct KeypairManifest {
     schema_version: u32,
