@@ -1,5 +1,7 @@
 //! 材料保留记录独占写入资格，秘密预算与配置正文槽分别计费。
 
+pub(super) mod bodies;
+
 use super::identity::Identity;
 use crate::control::material::node::{hexadecimal, Intent, MAX_GROUPS};
 use anyhow::{ensure, Result};

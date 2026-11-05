@@ -91,7 +91,7 @@ pub(crate) fn install_keypair_atomically_if_match(
         return KeypairCasInstallOutcome::OutcomeUnknown;
     }
     let baseline = crate::tls::active_keypair_paths_unrecovered(tls).and_then(|(path, _)| {
-        crate::io::bounded_io::read_file(&path, MAX_KEYPAIR_BYTES, "TLS certificate CAS baseline")
+        crate::io::secret_file::read_file(&path, MAX_KEYPAIR_BYTES, "TLS certificate CAS baseline")
     });
     let Ok(current) = baseline else {
         return KeypairCasInstallOutcome::Unavailable;
@@ -103,7 +103,7 @@ pub(crate) fn install_keypair_atomically_if_match(
     let current_generation = if expected_generation.is_some() {
         // 材料代与完整 pair 在同一锁内复验；A→B→A 或私钥单独改变不能复活旧动作的所有权。
         crate::tls::active_keypair_paths_unrecovered(tls).and_then(|(_, key)| {
-            let private_key = crate::io::bounded_io::read_file(
+            let private_key = crate::io::secret_file::read_file(
                 &key,
                 MAX_KEYPAIR_BYTES,
                 "TLS material ownership private key",

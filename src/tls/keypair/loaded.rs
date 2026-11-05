@@ -28,16 +28,16 @@ pub(in crate::tls) fn read(tls: &TlsRuntimeCfg) -> Result<Loaded> {
     // 先结算原文件决定再取样，半份 pair 不能和完整材料代共同进入待安装 resolver。
     recover_legacy_keypair_transaction_locked(tls)?;
     let (certificate, private_key) = crate::tls::active_keypair_paths_unrecovered(tls)?;
-    let certificate = Zeroizing::new(crate::io::bounded_io::read_file(
+    let certificate = crate::io::secret_file::read_file(
         &certificate,
         super::MAX_KEYPAIR_BYTES,
         "TLS loaded certificate",
-    )?);
-    let private_key = Zeroizing::new(crate::io::bounded_io::read_file(
+    )?;
+    let private_key = crate::io::secret_file::read_file(
         &private_key,
         super::MAX_KEYPAIR_BYTES,
         "TLS loaded private key",
-    )?);
+    )?;
     // 外部合法换材可以继续服务，但损坏或不匹配的归属不能为未来交付补发安装证明。
     let provenance =
         generation::loaded(tls, &certificate, &private_key).unwrap_or(MaterialProvenance::Unproven);

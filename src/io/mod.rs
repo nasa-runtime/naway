@@ -7,6 +7,7 @@ pub mod media;
 pub mod net;
 pub(crate) mod request_decompression;
 pub mod resp;
+pub(crate) mod secret_file;
 pub mod static_serve;
 #[cfg(feature = "webdav")]
 pub mod webdav;

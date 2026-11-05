@@ -1,7 +1,7 @@
 //! 恢复仅处理原事务的完整新代或可证明旧新边界，材料接管不能被旧备份覆盖。
 
 use super::{atomic_write, generation, sync_directory, TransactionState, MAX_KEYPAIR_BYTES};
-use crate::{config::TlsRuntimeCfg, io::bounded_io, tls::keypair::validate_keypair};
+use crate::{config::TlsRuntimeCfg, io::secret_file, tls::keypair::validate_keypair};
 use anyhow::{ensure, Context, Result};
 use std::{fs, path::Path};
 use zeroize::Zeroizing;
@@ -111,18 +111,14 @@ pub(super) fn settle(
     super::finish_legacy_keypair_transaction(transaction)
 }
 
-/// 业务作用：有界读取恢复所需的确定材料，并将已读完整原文交给释放清零容器。
+/// 业务作用：有界读取恢复所需的确定材料，完整与部分读取失败均在清零容器内处理。
 ///
 /// 参数说明：
 /// - `path`：原事务已经固定的材料位置。
 ///
 /// 返回：完整有限材料；缺失、超限或读取异常拒绝，不把缺失解释为空文件。
 fn read_required(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
-    Ok(Zeroizing::new(bounded_io::read_file(
-        path,
-        MAX_KEYPAIR_BYTES,
-        "TLS recovery material",
-    )?))
+    secret_file::read_file(path, MAX_KEYPAIR_BYTES, "TLS recovery material")
 }
 
 /// 业务作用：保留活动文件的真实缺席状态，使首次安装中断与外部删除按原事务边界分别裁决。
@@ -132,10 +128,7 @@ fn read_required(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
 ///
 /// 返回：存在时为释放清零的有限原文，缺失为空；其它错误保留保护。
 fn read_optional(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>> {
-    Ok(
-        bounded_io::read_optional_file(path, MAX_KEYPAIR_BYTES, "TLS recovery current material")?
-            .map(Zeroizing::new),
-    )
+    secret_file::read_optional_file(path, MAX_KEYPAIR_BYTES, "TLS recovery current material")
 }
 
 /// 业务作用：只写入已完成全 pair 验证的原备份，不在两个恢复写入之间重新读取可变备份。

@@ -133,6 +133,10 @@ impl Snapshot {
 ///
 /// 返回：当前格式可解释的文件名返回true，未知目录项始终拒绝。
 pub(super) fn known(name: &OsStr, initializing: bool) -> bool {
+    #[cfg(feature = "node-actions")]
+    if super::material::bodies::known(name) {
+        return true;
+    }
     [MARKER, HEAD, PENDING, Slot::A.name(), Slot::B.name()]
         .iter()
         .any(|candidate| name == OsStr::new(candidate))
@@ -151,6 +155,8 @@ pub(super) fn load(root: &Root, identity: &Identity) -> Result<Option<Snapshot>>
     root.inspect(false)?;
     let Some(marker) = root.read_raw(MARKER, SMALL_LIMIT)? else {
         super::local::inspect(root, false)?;
+        #[cfg(feature = "node-actions")]
+        super::material::bodies::inspect(root, None)?;
         for name in [HEAD, PENDING, Slot::A.name(), Slot::B.name()] {
             // 未安装永久存储标记的动作记录不能冒充identity-only目录，也不能由普通启动收尾。
             ensure!(
@@ -211,6 +217,8 @@ fn read_selected(root: &Root, identity: &Identity, bytes: &[u8]) -> Result<Snaps
     root.read_raw(head.slot.other().name(), STATE_LIMIT)?;
     root.read_raw(PENDING, SMALL_LIMIT)?;
     super::local::inspect(root, true)?;
+    #[cfg(feature = "node-actions")]
+    super::material::bodies::inspect(root, state.material.as_deref())?;
     Ok(Snapshot {
         head,
         state,

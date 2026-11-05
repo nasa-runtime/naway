@@ -62,17 +62,16 @@ pub(super) fn install_legacy_keypair_transaction(
     fs::create_dir(&temporary)
         .with_context(|| format!("create legacy keypair transaction {}", temporary.display()))?;
     let prepared = (|| -> Result<generation::Record> {
-        let old_cert = crate::io::bounded_io::read_optional_file(
+        let old_cert = crate::io::secret_file::read_optional_file(
             &tls.cert_file,
             MAX_KEYPAIR_BYTES,
             "legacy TLS certificate backup",
         )?;
-        let old_key = crate::io::bounded_io::read_optional_file(
+        let old_key = crate::io::secret_file::read_optional_file(
             &tls.key_file,
             MAX_KEYPAIR_BYTES,
             "legacy TLS private key backup",
-        )?
-        .map(zeroize::Zeroizing::new);
+        )?;
         if let Some(bytes) = &old_cert {
             atomic_write(&temporary.join("old-cert.pem"), bytes, false)?;
         }

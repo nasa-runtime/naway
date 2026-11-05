@@ -24,6 +24,8 @@ pub(super) fn initialize(root: &Root, identity: &Identity) -> Result<Snapshot> {
         return Ok(snapshot);
     }
     super::super::local::inspect(root, false)?;
+    #[cfg(feature = "node-actions")]
+    super::super::material::bodies::inspect(root, None)?;
     let marker = encode(identity, STORAGE_MAGIC, SMALL_LIMIT)?;
     let intent = root.read_raw(INITIALIZING, SMALL_LIMIT)?;
     if intent.is_none() {

@@ -215,10 +215,9 @@ fn read_group(
     }
     let (path, _) =
         crate::tls::active_keypair_paths_unrecovered(selected).map_err(|_| Unavailable::Storage)?;
-    let certificate = zeroize::Zeroizing::new(
-        crate::io::bounded_io::read_file(&path, 1024 * 1024, "TLS material conditions")
-            .map_err(|_| Unavailable::Storage)?,
-    );
+    let certificate =
+        crate::io::secret_file::read_file(&path, 1024 * 1024, "TLS material conditions")
+            .map_err(|_| Unavailable::Storage)?;
     // 错放到证书位置的私钥或非法材料不能产生对外摘要；仅确认完整的公开 X.509 链后计算 ETag。
     public_chain(&certificate)?;
     let material_generation =

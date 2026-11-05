@@ -62,8 +62,7 @@ pub(crate) fn inspect(
             let (certificate_path, key_path) = crate::tls::active_keypair_paths_unrecovered(source)
                 .map_err(|_| Rejected::Conditions(conditions::Unavailable::Storage))?;
             let read = |path: &std::path::Path| {
-                crate::io::bounded_io::read_file(path, 1024 * 1024, "TLS material preview")
-                    .map(zeroize::Zeroizing::new)
+                crate::io::secret_file::read_file(path, 1024 * 1024, "TLS material preview")
                     .map_err(|_| Rejected::Conditions(conditions::Unavailable::Storage))
             };
             let certificate = read(&certificate_path)?;
