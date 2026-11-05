@@ -1,22 +1,21 @@
 //! 原提案按节点聚合但保留全部目标分母，缺席或拒绝不会变成省略的成功。
 
-use super::{current, response, source::Source, Context};
+use super::{Context, current, response, source::Source};
 use crate::{
     admin::{
+        BoxBody,
         management::{
             material,
             material_preview::{
-                self,
+                self, Completed, Reason,
                 command::{Intent, Pair},
-                Completed, Reason,
             },
         },
         operations::certificates::Error,
-        BoxBody,
     },
     control::material::authorization,
 };
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -205,6 +204,7 @@ fn intents(context: &Context<'_>, source: &Source, query: &str) -> Result<Vec<Ar
                 .ok_or(Error::Denied)?;
         result.push(Arc::new(Intent {
             original: Arc::new(material::command::Intent {
+                query_kind: material::command::Query::Conditions,
                 query: query.into(),
                 count: source.targets.len() as u32,
                 indices: (start..end).map(|index| index as u32).collect(),

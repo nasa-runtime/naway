@@ -1,9 +1,9 @@
 //! 每个已声明Admin只保留一条复用通道与两条有界在途流，故障不积压历史报告。
 
-use super::{catalog, certificates, consumers, protocol, telemetry, Plan, RPC_TIMEOUT};
-use crate::admin::catalog::Catalog;
+use super::{Plan, RPC_TIMEOUT, catalog, certificates, consumers, protocol, telemetry};
 use crate::admin::AdminState;
-use futures::{stream, StreamExt};
+use crate::admin::catalog::Catalog;
+use futures::{StreamExt, stream};
 use nasa::grpc::{Channel, Code, Request, Status};
 use protocol::node_management_client::NodeManagementClient;
 use std::sync::{Arc, Weak};
@@ -545,6 +545,10 @@ async fn exchange(
             previews_supported: cfg!(feature = "node-actions"),
             material_previews_supported: cfg!(feature = "node-actions"),
             material_candidates_supported: cfg!(feature = "node-actions"),
+            material_installations_supported: cfg!(feature = "node-actions"),
+            material_installations_enabled: cfg!(feature = "node-actions")
+                && plan.material_installations_enabled
+                && state.mode.runs_data(),
             material_candidates_enabled: cfg!(feature = "node-actions")
                 && plan.material_previews_enabled
                 && state.mode.runs_data(),

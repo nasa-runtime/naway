@@ -11,7 +11,12 @@ pub(in crate::admin::management) mod wire;
 pub(in crate::admin) use super::actions::window::Window as RequestWindow;
 pub(in crate::admin::management) use client::Channel;
 pub(in crate::admin::management) use delivery::Offer;
-pub(in crate::admin) use run::{inspect, recheck, Completed};
+pub(in crate::admin) use run::{Completed, inspect, recheck};
+
+pub(in crate::admin) struct Inspection {
+    pub batch: crate::tls::keypair::conditions::Batch,
+    pub installations: Option<crate::control::material::installation::Batch>,
+}
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]

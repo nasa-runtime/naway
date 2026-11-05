@@ -1,11 +1,11 @@
 //! 材料条件查询投递槽只服务一次有限请求，取消后精确回收，不产生重试或执行收据。
 
-use super::{command::Command, wire, Reason};
-use crate::admin::management::{actions::window::Window, protocol, Manager};
+use super::{Inspection, Reason, command::Command, wire};
+use crate::admin::management::{Manager, actions::window::Window, protocol};
 use crate::config::GatewaySnapshot;
 use nasa::grpc::Status;
 use std::sync::{Arc, Weak};
-use tokio::sync::{oneshot, OwnedSemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, oneshot};
 
 pub(in crate::admin::management) struct Offer {
     pub(in crate::admin::management) command: Command,
@@ -13,15 +13,13 @@ pub(in crate::admin::management) struct Offer {
     message: String,
     signature: String,
     window: Window,
-    reply: parking_lot::Mutex<
-        Option<oneshot::Sender<Result<crate::tls::keypair::conditions::Batch, Reason>>>,
-    >,
+    reply: parking_lot::Mutex<Option<oneshot::Sender<Result<Inspection, Reason>>>>,
 }
 
 pub(in crate::admin) struct Ticket {
     manager: Weak<Manager>,
     offer: Arc<Offer>,
-    reply: oneshot::Receiver<Result<crate::tls::keypair::conditions::Batch, Reason>>,
+    reply: oneshot::Receiver<Result<Inspection, Reason>>,
 }
 
 impl Manager {
@@ -153,15 +151,16 @@ impl Offer {
         request: protocol::MaterialConditionsResultRequest,
     ) -> Result<(), Status> {
         let result = if request.status == protocol::MaterialConditionsStatus::Succeeded as i32 {
-            Ok(wire::decode_batch(
+            Ok(wire::decode_result(
                 request.batch.ok_or_else(|| {
                     Status::invalid_argument("material conditions summary absent")
                 })?,
+                request.installations,
                 &self.command.intent,
             )
             .map_err(|_| Status::invalid_argument("material conditions result invalid"))?)
         } else {
-            if request.batch.is_some() {
+            if request.batch.is_some() || request.installations.is_some() {
                 return Err(Status::invalid_argument(
                     "failed material conditions includes summary",
                 ));
@@ -175,6 +174,7 @@ impl Offer {
                 &self.snapshot,
                 &self.command.intent.node,
                 batch
+                    .batch
                     .groups
                     .iter()
                     .flat_map(|group| group.affected.iter().map(|affected| &affected.target)),
@@ -227,9 +227,7 @@ impl Ticket {
     /// 参数说明: 无。
     ///
     /// 返回：仍有当前授权的原目标结果；等待取消或原节点失去资格时保持明确失败。
-    pub(in crate::admin) async fn receive(
-        &mut self,
-    ) -> Result<crate::tls::keypair::conditions::Batch, Reason> {
+    pub(in crate::admin) async fn receive(&mut self) -> Result<Inspection, Reason> {
         loop {
             // 新报告已经撤下原基线时立即结束等待；不能把已知换代留到网络期限后误报为超时。
             self.authorize()?;

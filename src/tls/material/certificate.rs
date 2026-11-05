@@ -63,6 +63,12 @@ pub struct CertificateBinding {
     pub leaf: Arc<CertificateLeaf>,
     pub ocsp_valid_until: Option<i64>,
     pub ocsp_required: bool,
+    /// 加载时完整 pair 的原生归属独立于公开叶证书目录，不能通过普通目录扩张为稳定执行收据。
+    #[serde(skip)]
+    pub provenance: super::MaterialProvenance,
+    /// 原配置代中的实际选证声明；默认身份为空，网络目录不使用该内部位置授予执行权。
+    #[serde(skip)]
+    pub declaration: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -213,6 +219,8 @@ pub(crate) fn single_certificate(
                 leaf,
                 ocsp_valid_until: None,
                 ocsp_required: false,
+                provenance: super::MaterialProvenance::External,
+                declaration: None,
             }]),
         }),
         Err(state) => unavailable(state),
@@ -306,6 +314,12 @@ fn collect_resolver(
                 bytes += std::mem::size_of::<CertificateLeaf>()
                     + value.names.capacity() * std::mem::size_of::<String>()
                     + value.names.iter().map(String::capacity).sum::<usize>();
+                // 同一签名身份的 SNI 别名共享归属；只计一次真实 Arc 分配，观察预算仍覆盖新增原生证据。
+                if let super::MaterialProvenance::Managed(material) = &identity.provenance {
+                    bytes += std::mem::size_of::<super::ManagedMaterial>()
+                        + 2 * std::mem::size_of::<usize>()
+                        + material.generation.capacity();
+                }
                 entry.insert(value).clone()
             }
         };
@@ -328,6 +342,8 @@ fn collect_resolver(
                 .map(|deadline| deadline.timestamp()),
             ocsp_required: identity.ocsp_valid_until.is_some()
                 && identity.expired_fallback.is_none(),
+            provenance: identity.provenance.clone(),
+            declaration: identity.declaration,
         });
     }
     bindings.sort_unstable_by(|left, right| left.name.cmp(&right.name));

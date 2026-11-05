@@ -5,14 +5,13 @@ mod response;
 
 use crate::{
     admin::{
-        self,
-        management::material::{self, command::Intent, Completed, Reason},
-        AdminRequest, AdminState, BoxBody,
+        self, AdminRequest, AdminState, BoxBody,
+        management::material::{self, Completed, Reason, command::Intent},
     },
     config::GatewaySnapshot,
     control::{material::authorization, ownership::config::Action},
 };
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use http::{Response, StatusCode};
 use std::sync::Arc;
 
@@ -26,11 +25,13 @@ struct Observed {
 /// 参数说明：
 /// - `request`：带真实凭据、精确 scope 和完整原目标基线的有界请求。
 /// - `state`：本 Admin 的当前授权、发行身份及集群通信 owner。
+/// - `kind`：路由明确选择的文件条件或实际安装观察，两者不共享授权签名域。
 ///
 /// 返回：完整分母的低敏结果；无权限、无能力或非法输入拒绝，不提交任何材料或安装动作。
 pub(in crate::admin) async fn handle(
     request: AdminRequest,
     state: Arc<AdminState>,
+    kind: material::command::Query,
 ) -> Response<BoxBody> {
     let (parts, body) = request.into_parts();
     let snapshot = state.snap.load_full();
@@ -40,7 +41,7 @@ pub(in crate::admin) async fn handle(
             return response::failure(
                 StatusCode::BAD_REQUEST,
                 "invalid_material_conditions_request",
-            )
+            );
         }
     };
     let principal = match authorize(&state, &parts, &snapshot, &scope) {
@@ -61,7 +62,7 @@ pub(in crate::admin) async fn handle(
             return response::failure(
                 StatusCode::TOO_MANY_REQUESTS,
                 "material_conditions_capacity",
-            )
+            );
         }
     };
     let _workspace = if let Some(workspace) = scope.strip_prefix("workspace.") {
@@ -74,7 +75,7 @@ pub(in crate::admin) async fn handle(
                 return response::failure(
                     StatusCode::TOO_MANY_REQUESTS,
                     "material_conditions_capacity",
-                )
+                );
             }
         }
     } else {
@@ -90,7 +91,7 @@ pub(in crate::admin) async fn handle(
             return response::failure(
                 StatusCode::BAD_REQUEST,
                 "invalid_material_conditions_request",
-            )
+            );
         }
     };
     let mut nonce = [0; 16];
@@ -104,7 +105,7 @@ pub(in crate::admin) async fn handle(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let intents = match input::prepare(input, &snapshot, &scope, &principal, &query) {
+    let intents = match input::prepare(input, &snapshot, &scope, &principal, &query, kind) {
         Ok(intents) => intents,
         Err(code) => return response::failure(code, "material_conditions_request_denied"),
     };
@@ -132,7 +133,7 @@ pub(in crate::admin) async fn handle(
             return response::failure(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "material_conditions_unavailable",
-            )
+            );
         }
     };
     let mut observed = stream::iter(intents.into_iter().map(|intent| {

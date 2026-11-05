@@ -1,5 +1,8 @@
 //! 监听器安装事实与 generation 权威；控制面发布门不进入握手或请求路径。
 
+#[cfg(feature = "node-actions")]
+pub(crate) mod material;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

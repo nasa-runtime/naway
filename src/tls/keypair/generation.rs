@@ -2,7 +2,7 @@
 
 use super::atomic_write;
 use crate::config::TlsRuntimeCfg;
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -178,6 +178,47 @@ pub(super) fn current(
     certificate: &[u8],
     private_key: Option<&[u8]>,
 ) -> Result<Option<String>> {
+    Ok(current_record(tls)?
+        .filter(|record| record.matches(certificate, private_key))
+        .map(|record| record.generation))
+}
+
+/// 业务作用：从加载时的完整 pair 取得不可变归属，不把证书有效或叶身份相同解释为受管安装成功。
+///
+/// 参数说明：
+/// - `tls`：同一材料锁内解析的实际文件来源。
+/// - `certificate`：本次将交给签名身份解析器的完整证书字节。
+/// - `private_key`：同次读取的完整私钥字节，只参与原生校验，不进入公开事实。
+///
+/// 返回：原代和完整 pair 一致时共享受管证据；无记录与不匹配分别返回明确状态，损坏由调用方保持不可证明。
+pub(super) fn loaded(
+    tls: &TlsRuntimeCfg,
+    certificate: &[u8],
+    private_key: &[u8],
+) -> Result<crate::tls::material::MaterialProvenance> {
+    use crate::tls::material::{ManagedMaterial, MaterialProvenance};
+    let Some(record) = current_record(tls)? else {
+        return Ok(MaterialProvenance::Unmanaged);
+    };
+    // 记录仍存在不代表它拥有当前字节；任何一个槽位改变都撤销完整 pair 的安装证明。
+    if !record.matches(certificate, Some(private_key)) {
+        return Ok(MaterialProvenance::Unproven);
+    }
+    Ok(MaterialProvenance::Managed(std::sync::Arc::new(
+        ManagedMaterial {
+            source_id: record.target,
+            generation: record.generation,
+        },
+    )))
+}
+
+/// 业务作用：统一定位当前活动来源的归属记录，普通条件读取和真实加载不能采用不同的 manifest 解释。
+///
+/// 参数说明：
+/// - `tls`：已经完成原事务恢复的文件计划。
+///
+/// 返回：当前已验证记录或明确未受管；未知、损坏或跨来源元数据拒绝，不查询退休目录。
+fn current_record(tls: &TlsRuntimeCfg) -> Result<Option<Record>> {
     let path = if let Some(manifest) = &tls.keypair_manifest_file {
         let Some(directory) = super::manifest::current_material_directory(manifest)? else {
             return Ok(None);
@@ -186,9 +227,7 @@ pub(super) fn current(
     } else {
         legacy_path(tls)?
     };
-    Ok(read(&path, &target(tls)?)?
-        .filter(|(_, record)| record.matches(certificate, private_key))
-        .map(|(_, record)| record.generation))
+    Ok(read(&path, &target(tls)?)?.map(|(_, record)| record))
 }
 
 /// 业务作用：固定实际父目录及文件槽位，目录别名和点路径不能形成两套受管材料所有权。

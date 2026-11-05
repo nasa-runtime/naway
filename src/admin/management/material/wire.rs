@@ -1,8 +1,10 @@
 //! 传输边界只转换原生有界字段，不把材料条件嵌套为 JSON。
 
 mod batch;
+mod installations;
 mod offer;
 pub(in crate::admin::management) use batch::{decode_batch, encode_batch, validate};
+pub(in crate::admin::management) use installations::{decode_result, encode_result};
 pub(in crate::admin::management) use offer::{decode, encode};
 
 use super::Reason;

@@ -4,6 +4,7 @@ pub(crate) mod conditions;
 mod generation;
 mod io;
 mod legacy;
+pub(in crate::tls) mod loaded;
 mod manifest;
 mod preflight;
 #[cfg(feature = "node-actions")]

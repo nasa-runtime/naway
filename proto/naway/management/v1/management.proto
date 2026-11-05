@@ -88,6 +88,9 @@ message ReportRequest {
   // 候选预检独立协商；只有公开条件查询能力的节点不能接收秘密材料。
   bool material_candidates_supported = 17;
   bool material_candidates_enabled = 18;
+  // 实际安装归属采用独立能力和签名域，不能从文件条件能力推断。
+  bool material_installations_supported = 19;
+  bool material_installations_enabled = 20;
 }
 
 // 当前本地文件决定与业务就绪分开；没有历史、路径或恢复命令令牌。
@@ -243,6 +246,7 @@ message MaterialConditionsOffer {
   uint64 issued_at_ms = 15;
   uint64 expires_at_ms = 16;
   string signature = 17;
+  bool installations = 18;
 }
 
 enum MaterialConditionsStatus {
@@ -299,6 +303,41 @@ message MaterialConditionsResultRequest {
   string offer_id = 4;
   MaterialConditionsStatus status = 5;
   MaterialConditionsBatch batch = 6;
+  MaterialInstallationsBatch installations = 7;
+}
+
+enum MaterialInstallationState {
+  MATERIAL_INSTALLATION_STATE_UNSPECIFIED = 0;
+  MATERIAL_INSTALLATION_STATE_CURRENT = 1;
+  MATERIAL_INSTALLATION_STATE_DIFFERENT_MATERIAL = 2;
+  MATERIAL_INSTALLATION_STATE_UNMANAGED = 3;
+  MATERIAL_INSTALLATION_STATE_UNPROVEN = 4;
+  MATERIAL_INSTALLATION_STATE_EXTERNAL = 5;
+  MATERIAL_INSTALLATION_STATE_PENDING = 6;
+  MATERIAL_INSTALLATION_STATE_NOT_SELECTED = 7;
+  MATERIAL_INSTALLATION_STATE_CAPACITY = 8;
+  MATERIAL_INSTALLATION_STATE_UNAVAILABLE = 9;
+}
+
+message MaterialInstallationObservation {
+  // 只接受 https、http3 或 stream_tls，顺序按该原目标的真实协议固定。
+  string protocol = 1;
+  MaterialInstallationState state = 2;
+  uint32 bindings = 3;
+  optional string material_generation = 4;
+}
+
+message MaterialInstallationTarget {
+  repeated MaterialInstallationObservation protocols = 1;
+}
+
+message MaterialInstallationGroup {
+  // 位置精确对应同批文件条件的 affected，不能删去未安装的共享目标。
+  repeated MaterialInstallationTarget targets = 1;
+}
+
+message MaterialInstallationsBatch {
+  repeated MaterialInstallationGroup groups = 1;
 }
 
 message MaterialConditionsResultResponse {

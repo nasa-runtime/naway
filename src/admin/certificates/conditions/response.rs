@@ -2,7 +2,7 @@
 
 use super::Observed;
 use crate::{
-    admin::{self, management::material::Reason, BoxBody},
+    admin::{self, BoxBody, management::material::Reason},
     tls::{keypair::conditions::Batch, targets::Target},
 };
 use http::{Response, StatusCode};
@@ -22,6 +22,8 @@ struct Node<'a> {
     reason: Option<Reason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     conditions: Option<&'a Batch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installations: Option<&'a crate::control::material::installation::Batch>,
 }
 
 #[derive(Serialize)]
@@ -30,11 +32,13 @@ struct View<'a> {
     scope: &'a str,
     target_count: usize,
     complete_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installed_count: Option<usize>,
     nodes: Vec<Node<'a>>,
     execution_supported: bool,
 }
 
-/// 业务作用：保留全部原目标及失败分母，共享来源只输出一次且不形成安装或审批结论。
+/// 业务作用：保留全部原目标及失败分母，区分观察完整与全部共享协议已安装，不形成持久收据或审批结论。
 ///
 /// 参数说明：
 /// - `query`：本次只读查询随机身份。
@@ -55,6 +59,28 @@ pub(super) fn encode(query: &str, scope: &str, observed: &[Observed]) -> Respons
             .filter(|value| value.result.is_ok())
             .map(|value| value.intent.targets.len())
             .sum(),
+        installed_count: observed
+            .first()
+            .filter(|value| {
+                value.intent.query_kind
+                    == crate::admin::management::material::command::Query::Installations
+            })
+            .map(|_| {
+                observed
+                    .iter()
+                    .filter_map(|value| value.result.as_ref().ok())
+                    .map(|value| {
+                        value.installations.as_ref().map_or(0, |installations| {
+                            value
+                                .batch
+                                .entries
+                                .iter()
+                                .filter(|entry| installations.current(entry.group))
+                                .count()
+                        })
+                    })
+                    .sum()
+            }),
         nodes: observed
             .iter()
             .map(|value| Node {
@@ -72,6 +98,11 @@ pub(super) fn encode(query: &str, scope: &str, observed: &[Observed]) -> Respons
                 },
                 reason: value.result.as_ref().err().copied(),
                 conditions: value.result.as_ref().ok().map(|value| &value.batch),
+                installations: value
+                    .result
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.installations.as_ref()),
             })
             .collect(),
         execution_supported: false,

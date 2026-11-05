@@ -1,7 +1,7 @@
 //! 候选预检独立绑定原提案和材料，条件查询签名不能授权秘密下载。
 
 use crate::admin::management::material::command as conditions;
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -74,7 +74,8 @@ impl Command {
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         };
         ensure!(
-            hexadecimal(&intent.proposal, 32)
+            intent.original.query_kind == conditions::Query::Conditions
+                && hexadecimal(&intent.proposal, 32)
                 && hexadecimal(&intent.store, 64)
                 && intent.epoch > 0
                 && crate::config::operations::token(&intent.creator, 128)

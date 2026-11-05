@@ -1,7 +1,7 @@
 //! 节点上报使用证书绑定和接收端会话令牌，迟到报告不能覆盖新启动实例。
 
 use super::{
-    catalog, certificates, consumers, protocol, security, telemetry, Manager, Plan, FRESHNESS,
+    FRESHNESS, Manager, Plan, catalog, certificates, consumers, protocol, security, telemetry,
 };
 use crate::admin::cluster::facts::Facts;
 use nasa::grpc::{PeerIdentity, Request, Response, Status};
@@ -49,6 +49,8 @@ struct Entry {
     material_previews_supported: bool,
     #[cfg(feature = "node-actions")]
     material_previews_enabled: bool,
+    material_installations_supported: bool,
+    material_installations_enabled: bool,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
     material_candidates_supported: bool,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
@@ -146,6 +148,8 @@ impl Store {
                 material_previews_supported: false,
                 #[cfg(feature = "node-actions")]
                 material_previews_enabled: false,
+                material_installations_supported: false,
+                material_installations_enabled: false,
                 #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
                 material_candidates_supported: false,
                 #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
@@ -722,6 +726,7 @@ impl protocol::node_management_server::NodeManagement for Service {
         if value.actions_enabled && !value.actions_supported
             || value.previews_enabled && !value.previews_supported
             || value.material_previews_enabled && !value.material_previews_supported
+            || value.material_installations_enabled && !value.material_installations_supported
             || value.material_candidates_enabled
                 && (!value.material_candidates_supported || !value.material_previews_enabled)
         {
@@ -797,6 +802,9 @@ impl protocol::node_management_server::NodeManagement for Service {
             entry.material_previews_supported = value.material_previews_supported;
             entry.material_previews_enabled =
                 value.material_previews_supported && value.material_previews_enabled;
+            entry.material_installations_supported = value.material_installations_supported;
+            entry.material_installations_enabled =
+                value.material_installations_supported && value.material_installations_enabled;
         }
         if !entry.metrics_enabled || interest == 0 {
             entry.sample = None;

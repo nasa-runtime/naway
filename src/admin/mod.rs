@@ -550,7 +550,21 @@ pub async fn admin_config_current_publish_mvc(
 async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody> {
     #[cfg(feature = "node-actions")]
     if req.uri().path() == "/api/certificate-conditions" {
-        return Box::pin(certificates::conditions::handle(req, state)).await;
+        return Box::pin(certificates::conditions::handle(
+            req,
+            state,
+            management::material::command::Query::Conditions,
+        ))
+        .await;
+    }
+    #[cfg(feature = "node-actions")]
+    if req.uri().path() == "/api/certificate-installations" {
+        return Box::pin(certificates::conditions::handle(
+            req,
+            state,
+            management::material::command::Query::Installations,
+        ))
+        .await;
     }
     #[cfg(feature = "admin-operations-pgsql")]
     if req.uri().path() == "/api/certificate-proposals"

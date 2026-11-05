@@ -1,10 +1,10 @@
 //! 同一原目标批次分别走本机材料观察或受信主动通道，不替换目标或转发到任意管理地址。
 
 use super::{
+    Reason,
     command::{Command, Intent},
     node,
     session::{Session, Work},
-    Reason,
 };
 use crate::{admin::AdminState, config::GatewaySnapshot};
 use std::{sync::Arc, time::Duration};
@@ -13,6 +13,7 @@ struct LocalSession(Arc<Session>);
 
 pub(in crate::admin) struct Completed {
     pub batch: crate::tls::keypair::conditions::Batch,
+    pub installations: Option<crate::control::material::installation::Batch>,
     pub session: Option<[u8; 32]>,
 }
 
@@ -43,7 +44,7 @@ pub(in crate::admin) async fn recheck(
         return Ok(());
     }
     if !state.mode.runs_data()
-        || !plan.material_previews_enabled
+        || !intent.query_kind.enabled(&plan)
         || !state.ready.load(std::sync::atomic::Ordering::Acquire)
         || state.monitor.boot_id() != intent.boot
         || snapshot.version != intent.version
@@ -122,7 +123,8 @@ pub(in crate::admin) async fn inspect(
             .await
             .map_err(|_| Reason::Expired)??;
         return Ok(Completed {
-            batch,
+            batch: batch.batch,
+            installations: batch.installations,
             session: None,
         });
     }
@@ -143,7 +145,8 @@ pub(in crate::admin) async fn inspect(
         .await
         .map_err(|_| Reason::Expired)??;
     Ok(Completed {
-        batch,
+        batch: batch.batch,
+        installations: batch.installations,
         session: Some(session),
     })
 }

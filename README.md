@@ -444,6 +444,9 @@ Admin 节点以及本次随机挑战、node/boot/session 的绑定；不支持�
 独立 `material_previews` 开关还提供原目标批量材料条件查询：任一 Admin 保留全部原节点分母，
 由目标观察公开 PEM 条件、受管材料代和完整共享影响，并检查工作区归属。此查询不授予安装权；
 部署条件、接口与容量见[集群原目标材料条件](docs/admin-certificates.md#集群原目标材料条件)。
+独立 `material_installations` 开关提供[集群实际安装观察](docs/admin-certificate-installations.md)：
+逐项核对完整共享来源的 HTTPS、HTTP/3 和 stream TLS 实际加载代，观察完整与安装完成分别计数；
+旧材料、未知或失联节点均保留在原分母内，不把当前快照当作持久执行收据。
 启用共享材料存储后，还可对原加密提案发起[原目标预检](docs/admin-certificates.md#原加密提案的目标预检)：
 任一 Admin 按全部原目标交付候选，节点复验完整 pair、共享对象权限和 TLS 策略，缺席或失败保留在
 原分母内。候选认证解密一次，同进程共享原生帧，跨节点使用独立有界 gRPC 分片；预检不改变批准、

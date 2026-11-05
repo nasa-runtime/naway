@@ -3,6 +3,8 @@
 pub(crate) mod authorization;
 #[cfg(feature = "node-actions")]
 pub(crate) mod conditions;
+#[cfg(feature = "node-actions")]
+pub(crate) mod installation;
 mod frame;
 #[cfg(all(feature = "admin-operations-pgsql", feature = "node-actions"))]
 pub(crate) mod impact;

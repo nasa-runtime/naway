@@ -215,6 +215,13 @@ manifest 与 seed 的独立写入权威。节点批次任一目标失败时，�
 结果带 `Cache-Control: no-store`，`execution_supported` 为 false。此接口不提供候选材料预检、
 审批、安装或持久交付，也不代替正式写入时的条件与权限复验。
 
+## 集群实际安装观察
+
+`POST /api/certificate-installations` 使用独立默认关闭的 `reporter.material_installations`，
+按相同原目标基线取得完整文件条件及实际加载事实。它区分完整观察与全部共享协议已经安装，
+不会用磁盘材料代或相同叶证书代替监听器加载证明。部署、返回字段与失败语义见
+[集群证书实际安装观察](admin-certificate-installations.md)。
+
 ## 原加密提案的目标预检
 
 `POST /api/certificate-proposals/{id}/preview` 使用原持久材料提案，工作区传

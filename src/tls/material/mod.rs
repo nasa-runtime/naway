@@ -2,6 +2,9 @@
 
 mod build;
 mod certificate;
+mod provenance;
+
+pub use provenance::{ManagedMaterial, MaterialProvenance};
 
 pub use build::build_server_material;
 pub(super) use build::build_with_resolver;

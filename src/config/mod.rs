@@ -1292,9 +1292,9 @@ fn build_snapshot_from_config(
     anyhow::ensure!(
         !admin_management
             .as_ref()
-            .is_some_and(|plan| plan.material_previews_enabled)
+            .is_some_and(|plan| plan.material_previews_enabled || plan.material_installations_enabled)
             || (admin_auth.enabled && admin_auth.rbac_enabled && !cfg.config_source.nacos.enabled),
-        "management reporter material_previews require authenticated RBAC and local file source"
+        "management reporter material observations require authenticated RBAC and local file source"
     );
     validate_admin_rollout(
         &cfg.admin.rollout,

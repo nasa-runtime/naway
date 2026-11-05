@@ -10,14 +10,21 @@ use super::*;
 /// 返回：全部身份可加载时返回选证目录；任一身份不满足策略时拒绝整个候选。
 pub(super) fn build_sni_resolver(tls: &TlsRuntimeCfg) -> Result<SniCertResolver> {
     build_sni_resolver_with(tls, |source| {
-        // 默认与 SNI 文件均先结算原 pair journal，不能把崩溃遗留的半份身份交给选证器。
-        let (certificate, private_key) = active_keypair_paths(source)?;
-        certified_identity(
-            &certificate,
-            &private_key,
-            source.private_key_provider.as_ref(),
-            source.ocsp_stapling.as_ref(),
-        )
+        if source.private_key_provider.is_some() {
+            let (certificate, private_key) = active_keypair_paths(source)?;
+            return certified_identity(
+                &certificate,
+                &private_key,
+                source.private_key_provider.as_ref(),
+                source.ocsp_stapling.as_ref(),
+            );
+        }
+        let loaded = keypair::loaded::read(source)?;
+        // 材料锁只冻结读取及归属；密码学解析复用已读缓冲，不占用写入门，也不重新附会当前磁盘代。
+        let certified = keypair::validate_keypair(&loaded.certificate, &loaded.private_key)?;
+        let mut identity = apply_ocsp_policy(certified, source.ocsp_stapling.as_ref())?;
+        identity.provenance = loaded.provenance;
+        Ok(identity)
     })
 }
 
@@ -32,12 +39,17 @@ pub(super) fn build_sni_resolver_with(
     tls: &TlsRuntimeCfg,
     mut load: impl FnMut(&TlsRuntimeCfg) -> Result<CertifiedIdentity>,
 ) -> Result<SniCertResolver> {
-    let default = load(tls).context("build default tls certificate")?;
+    let mut default = load(tls).context("build default tls certificate")?;
+    default.declaration = None;
     let mut exact: HashMap<String, Arc<CertifiedIdentity>> = HashMap::new();
     let mut wildcards: Vec<(String, Arc<CertifiedIdentity>)> = Vec::new();
-    for cert in &tls.certs {
+    for (index, cert) in tls.certs.iter().enumerate() {
         let source = targets::sni_source(tls, cert);
-        let key = Arc::new(load(&source).context("build sni tls certificate")?);
+        let mut identity = load(&source).context("build sni tls certificate")?;
+        // 声明位置随实际选证身份冻结；同名覆盖后只能证明 resolver 真正选中的那一项。
+        identity.declaration =
+            Some(u16::try_from(index).context("SNI declaration exceeds bounds")?);
+        let key = Arc::new(identity);
         for name in &cert.server_names {
             if let Some(suffix) = name.strip_prefix("*.") {
                 // 通配 `*.foo.com` → 匹配 SNI 以 `.foo.com` 结尾。
@@ -92,7 +104,13 @@ pub(super) fn certified_identity(
     certified
         .keys_match()
         .context("TLS certificate and signing key do not match")?;
-    apply_ocsp_policy(certified, ocsp)
+    let mut identity = apply_ocsp_policy(certified, ocsp)?;
+    identity.provenance = if private_key_provider.is_some() {
+        material::MaterialProvenance::External
+    } else {
+        material::MaterialProvenance::Unproven
+    };
+    Ok(identity)
 }
 
 /// 业务作用：为已匹配的签名身份统一执行 must-staple 和 OCSP 门，材料写入与实际加载不能采用不同标准。
@@ -116,6 +134,8 @@ pub(super) fn apply_ocsp_policy(
             active: Arc::new(certified),
             expired_fallback: None,
             ocsp_valid_until: None,
+            provenance: material::MaterialProvenance::Candidate,
+            declaration: None,
         });
     };
     let (staple, valid_until) = validate_ocsp_staple(&certified.cert, ocsp)?;
@@ -133,5 +153,7 @@ pub(super) fn apply_ocsp_policy(
         active: Arc::new(certified),
         expired_fallback: fallback,
         ocsp_valid_until: Some(valid_until),
+        provenance: material::MaterialProvenance::Candidate,
+        declaration: None,
     })
 }

@@ -5,14 +5,14 @@ use crate::{
     admin::management::{
         baseline,
         material::{
-            command::{Command, Intent},
             Reason,
+            command::{Command, Intent, Query},
         },
         protocol,
     },
     control::baseline::NodeBaseline,
 };
-use nasa::grpc::{codegen::prost::Message, Status};
+use nasa::grpc::{Status, codegen::prost::Message};
 
 /// 业务作用：在验签前按原生字段恢复整批意图，非法字段不进入文件读取或任务名额。
 ///
@@ -42,6 +42,11 @@ pub(in crate::admin::management) fn decode(
     }
     let command = Command {
         intent: std::sync::Arc::new(Intent {
+            query_kind: if value.installations {
+                Query::Installations
+            } else {
+                Query::Conditions
+            },
             query: value.query_id,
             count: value.target_count,
             indices,
@@ -88,6 +93,7 @@ pub(in crate::admin::management) fn encode(
         .map_err(|_| Status::invalid_argument("invalid material conditions command"))?;
     let intent = &command.intent;
     let value = protocol::MaterialConditionsOffer {
+        installations: intent.query_kind == Query::Installations,
         schema: 1,
         query_id: intent.query.clone(),
         target_count: intent.count,

@@ -1,6 +1,7 @@
 //! 与快照同代的对象归属和依赖图；只有配置权威可建立工作区及跨域引用。
 
 pub mod admission;
+mod authority;
 mod cluster;
 pub mod config;
 mod inventory;
@@ -15,10 +16,9 @@ pub use reservation::ReservationDenied;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use serde_json::{Value, json};
 
 use crate::config::model::GatewayConfig;
 use config::{Action, OwnershipCfg, Role, WorkspaceCfg};
@@ -337,12 +337,7 @@ impl OwnershipCatalog {
                 "workspace object quota exceeded"
             );
         }
-        let digest = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&json!({
-                "objects":builder.objects,"authority":cfg
-            }))?)
-        );
+        let digest = authority::digest(&builder.objects, cfg)?;
         Ok(Arc::new(Self {
             enabled: true,
             read_authorities: cluster::compile(&cfg.workspaces)?,

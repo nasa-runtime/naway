@@ -74,6 +74,8 @@ struct CertifiedIdentity {
     active: Arc<CertifiedKey>,
     expired_fallback: Option<Arc<CertifiedKey>>,
     ocsp_valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    provenance: material::MaterialProvenance,
+    declaration: Option<u16>,
 }
 
 #[derive(Clone)]

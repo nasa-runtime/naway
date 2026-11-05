@@ -61,6 +61,7 @@ pub(super) fn scope(raw: Option<&str>) -> Option<String> {
 /// - `scope`：已通过材料读取权的唯一范围。
 /// - `principal`：实际请求者，不能由 JSON 自报。
 /// - `query`：本次服务器随机查询身份。
+/// - `kind`：由入口路由固定的只读类别，不能由正文替换。
 ///
 /// 返回：共享原生意图；非法字段或当前归属不足整体拒绝，未知节点留给后续明确返回缺席。
 pub(super) fn prepare(
@@ -69,6 +70,7 @@ pub(super) fn prepare(
     scope: &str,
     principal: &str,
     query: &str,
+    kind: crate::admin::management::material::command::Query,
 ) -> Result<Vec<Arc<Intent>>, StatusCode> {
     let count = input.targets.len();
     if !(1..=128).contains(&count) {
@@ -115,6 +117,7 @@ pub(super) fn prepare(
         let group = groups
             .entry(target.node_id.clone())
             .or_insert_with(|| Intent {
+                query_kind: kind,
                 query: query.into(),
                 count: count as u32,
                 indices: Vec::new(),

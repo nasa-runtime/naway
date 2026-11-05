@@ -1,15 +1,15 @@
 //! 材料观察保持当前会话与实际工作许可，取消等待不能释放仍在访问文件的任务。
 
-use super::{command::Command, Reason};
+use super::{Reason, command::Command};
 use crate::{
     admin::{
-        management::{actions::window::Window, issuer::Verifier, Plan},
         AdminState,
+        management::{Plan, actions::window::Window, issuer::Verifier},
     },
     config::GatewaySnapshot,
     control::{material::authorization, ownership::config::Action},
 };
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{Arc, atomic::Ordering};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 
@@ -51,7 +51,7 @@ impl Session {
         issuer: Arc<Verifier>,
         token: &[u8],
     ) -> Result<Arc<Self>, Reason> {
-        if !plan.material_previews_enabled {
+        if !plan.material_previews_enabled && !plan.material_installations_enabled {
             return Err(Reason::Disabled);
         }
         let expires_at = plan
@@ -82,7 +82,7 @@ impl Session {
     ///
     /// 返回：只供本次材料观察的随机会话；无材料开关、发行身份或随机源时拒绝。
     pub(super) fn local(plan: Arc<Plan>) -> Result<Arc<Self>, Reason> {
-        if !plan.material_previews_enabled {
+        if !plan.material_previews_enabled && !plan.material_installations_enabled {
             return Err(Reason::Disabled);
         }
         let receiver = plan.receiver.as_ref().ok_or(Reason::Unavailable)?;
@@ -127,6 +127,10 @@ impl Session {
     ) -> Result<Verified, Reason> {
         if self.revoked.is_cancelled() {
             return Err(Reason::Denied);
+        }
+        // 共享握手不共享读取权，验签与工作受理之前必须复验该命令类别自己的独立开关。
+        if !command.intent.query_kind.enabled(&self.plan) {
+            return Err(Reason::Disabled);
         }
         let message = self
             .issuer
@@ -201,7 +205,7 @@ impl Work {
                 .admin_management
                 .as_ref()
                 .is_some_and(|plan| Arc::ptr_eq(plan, &self.session.plan))
-            || !self.session.plan.material_previews_enabled
+            || !intent.query_kind.enabled(&self.session.plan)
             || self.session.plan.node_id != intent.node
             || state.monitor.boot_id() != intent.boot
             || current.version != intent.version

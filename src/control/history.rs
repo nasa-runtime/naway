@@ -183,9 +183,10 @@ impl ConfigHistory {
                 .as_ref()
                 .is_some_and(|plan| plan.actions_enabled
                     || plan.previews_enabled
-                    || plan.material_previews_enabled)
+                    || plan.material_previews_enabled
+                    || plan.material_installations_enabled)
                 || self.node_journal.get().is_some(),
-            "node actions, configuration previews and material previews require an installed journal owner"
+            "node actions, previews and material observations require an installed journal owner"
         );
         #[cfg(feature = "node-journal")]
         if let Some(journal) = self.node_journal.get() {

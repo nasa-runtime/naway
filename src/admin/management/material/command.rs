@@ -5,10 +5,32 @@ use crate::{
     control::{actions::authorization::Scope, baseline::NodeBaseline},
     tls::targets::Target,
 };
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::admin) enum Query {
+    Conditions,
+    Installations,
+}
+
+impl Query {
+    /// 业务作用：每种材料读取只使用自己的显式开关，文件条件许可不能授予实际安装观察权。
+    ///
+    /// 参数说明：
+    /// - `plan`：当前已发布并绑定本会话的管理计划。
+    ///
+    /// 返回：对应只读能力已经明确启用时为真，不推断其它材料或执行能力。
+    pub(in crate::admin) fn enabled(self, plan: &super::super::Plan) -> bool {
+        match self {
+            Self::Conditions => plan.material_previews_enabled,
+            Self::Installations => plan.material_installations_enabled,
+        }
+    }
+}
+
 pub(in crate::admin) struct Intent {
+    pub query_kind: Query,
     pub query: String,
     pub count: u32,
     pub indices: Vec<u32>,
@@ -36,7 +58,7 @@ impl Command {
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：固定材料条件域的 SHA-256 文本；非法或无界声明拒绝，不授予文件写权。
+    /// 返回：对应只读查询独立域的 SHA-256 文本；非法或无界声明拒绝，不授予文件写权。
     pub(in crate::admin) fn message(&self) -> Result<String> {
         let intent = &self.intent;
         ensure!(
@@ -77,7 +99,10 @@ impl Command {
             "duplicate material conditions target"
         );
         let mut hash = Sha256::new();
-        hash.update(b"naway-material-conditions-command\0");
+        hash.update(match intent.query_kind {
+            Query::Conditions => b"naway-material-conditions-command\0".as_slice(),
+            Query::Installations => b"naway-material-installations-command\0".as_slice(),
+        });
         hash.update(1_u32.to_be_bytes());
         for field in [
             intent.query.as_bytes(),

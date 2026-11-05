@@ -1,11 +1,7 @@
 //! 材料条件在固定锁序内读取，原请求取消不释放仍在访问文件的实际许可。
 
-use super::{session::Work, Reason};
-use crate::{
-    admin::AdminState,
-    control::material::authorization,
-    tls::keypair::conditions::{self, Batch},
-};
+use super::{Inspection, Reason, command::Query, session::Work};
+use crate::{admin::AdminState, control::material::authorization, tls::keypair::conditions};
 use std::{sync::Arc, time::Duration};
 
 /// 业务作用：让原节点一次观察同批材料条件并复验完整共享范围，读取不授予后续安装权。
@@ -15,7 +11,7 @@ use std::{sync::Arc, time::Duration};
 /// - `work`：已验签且持有真实节点名额的短期工作。
 ///
 /// 返回：原基线与当前共享归属仍有效的完整批次；无法证明时整节点拒绝且不泄露路径。
-pub(super) async fn inspect(state: Arc<AdminState>, work: Arc<Work>) -> Result<Batch, Reason> {
+pub(super) async fn inspect(state: Arc<AdminState>, work: Arc<Work>) -> Result<Inspection, Reason> {
     work.baseline(&state).await?;
     let publication = Arc::new(
         tokio::time::timeout(Duration::from_secs(2), state.apply_coordinator.lock_owned())
@@ -48,14 +44,31 @@ pub(super) async fn inspect(state: Arc<AdminState>, work: Arc<Work>) -> Result<B
                     .flat_map(|group| group.affected.iter().map(|affected| &affected.target)),
             )
             .ok_or(Reason::Denied)?;
-            Ok::<Batch, Reason>(batch)
+            let installations = if intent.query_kind == Query::Installations {
+                // 先确认全部共享归属，再读取实际安装；文件条件与当前监听证据分别保留，不由前者补齐后者。
+                Some(
+                    crate::tls::installed::material::collect(
+                        &current.active,
+                        &owner.installed_certificates.snapshot(),
+                        &batch,
+                    )
+                    .ok_or(Reason::Capacity)?,
+                )
+            } else {
+                None
+            };
+            current.authorize(&owner)?;
+            Ok::<Inspection, Reason>(Inspection {
+                batch,
+                installations,
+            })
         })
     })
     .await
     .map_err(|_| Reason::Unavailable)??;
     // 节点目录在读取期间失去原基线时，磁盘读成功也不构成可以交付的证明。
     work.baseline(&state).await?;
-    super::wire::validate(&batch, &work.command.intent)?;
+    super::wire::validate(&batch.batch, &work.command.intent)?;
     Ok(batch)
 }
 

@@ -43,6 +43,9 @@ pub struct Reporter {
     /// 允许受信发行者查询原目标材料条件，独立于 YAML 预览与持久执行且默认关闭。
     pub material_previews: bool,
     #[serde(default)]
+    /// 允许受信发行者读取实际监听材料归属，独立于文件条件、候选预检和持久执行且默认关闭。
+    pub material_installations: bool,
+    #[serde(default)]
     pub metrics: bool,
     pub tls: Tls,
     pub targets: Vec<Target>,

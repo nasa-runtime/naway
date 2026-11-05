@@ -1,9 +1,9 @@
 //! 材料条件查询读取与回报沿用当前 mTLS 会话，只接受原目标的同代完整事实。
 
-use super::{protocol, Service, Store};
+use super::{Service, Store, protocol};
 use crate::admin::management::{
-    material::{command::Intent, Offer, Reason},
-    Manager, Plan, FRESHNESS,
+    FRESHNESS, Manager, Plan,
+    material::{Offer, Reason, command::Intent},
 };
 use crate::config::GatewaySnapshot;
 use nasa::grpc::{PeerIdentity, Request, Response, Status};
@@ -64,10 +64,20 @@ impl Store {
         {
             return Err(Reason::Unavailable);
         }
-        if !entry.material_previews_supported {
+        let (supported, enabled) = match intent.query_kind {
+            crate::admin::management::material::command::Query::Conditions => (
+                entry.material_previews_supported,
+                entry.material_previews_enabled,
+            ),
+            crate::admin::management::material::command::Query::Installations => (
+                entry.material_installations_supported,
+                entry.material_installations_enabled,
+            ),
+        };
+        if !supported {
             return Err(Reason::Unsupported);
         }
-        if !entry.material_previews_enabled {
+        if !enabled {
             return Err(Reason::Disabled);
         }
         // 材料条件查询没有跨重启恢复语义；原 boot 或原基线缺失必须保留失败，不能从当前节点补齐。

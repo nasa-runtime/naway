@@ -1,13 +1,13 @@
 //! 材料条件查询沿节点主动管理连接执行，单连接不积压任务或保留历史结果。
 
 use super::{
-    node,
+    Reason, node,
     session::{Session, Work},
-    wire, Reason,
+    wire,
 };
 use crate::admin::{
-    management::{issuer::Verifier, protocol, reporter::timed_request, Plan, RPC_TIMEOUT},
     AdminState,
+    management::{Plan, RPC_TIMEOUT, issuer::Verifier, protocol, reporter::timed_request},
 };
 use nasa::grpc::Channel as GrpcChannel;
 use std::{sync::Arc, time::Duration};
@@ -37,7 +37,7 @@ impl Channel {
         token: &[u8],
     ) -> Result<(), Reason> {
         self.clear();
-        if plan.material_previews_enabled {
+        if plan.material_previews_enabled || plan.material_installations_enabled {
             self.session = Some(Session::new(plan, issuer.ok_or(Reason::Denied)?, token)?);
         }
         Ok(())
@@ -103,10 +103,14 @@ impl Channel {
                     Ok(work) => work.authorize(&state).and(result),
                     Err(_) => result,
                 };
-                let result = result.and_then(|batch| wire::encode_batch(batch, &command.intent));
-                let (status, batch) = match result {
-                    Ok(batch) => (protocol::MaterialConditionsStatus::Succeeded, Some(batch)),
-                    Err(reason) => (wire::status(reason), None),
+                let result = result.and_then(|batch| wire::encode_result(batch, &command.intent));
+                let (status, batch, installations) = match result {
+                    Ok((batch, installations)) => (
+                        protocol::MaterialConditionsStatus::Succeeded,
+                        Some(batch),
+                        installations,
+                    ),
+                    Err(reason) => (wire::status(reason), None, None),
                 };
                 let request = protocol::MaterialConditionsResultRequest {
                     node_id: command.intent.node.clone(),
@@ -115,6 +119,7 @@ impl Channel {
                     offer_id: message.clone(),
                     status: status as i32,
                     batch,
+                    installations,
                 };
                 if let Ok(request) =
                     timed_request(request, tokio::time::Instant::now() + RPC_TIMEOUT)
