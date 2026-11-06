@@ -50,6 +50,22 @@ export async function request(path, options = {}) {
     throw new Error("管理接口需要同源 HTTPS，本机回环地址可使用 HTTP。");
   }
   const epoch = generation;
+  const method = (options.method ?? "GET").toUpperCase();
+  const impact =
+    /^\/api\/certificate-proposals\/[0-9a-f]{32}\/impact(?:\/review|\/resolve)?$/.test(
+      target.pathname,
+    );
+  const execution =
+    /^\/api\/certificate-proposals\/[0-9a-f]{32}\/execution$/.test(
+      target.pathname,
+    );
+  const materialWrite =
+    method === "POST" &&
+    (target.pathname === "/api/certificate-proposals" ||
+      target.pathname === "/api/certificate-conditions" ||
+      /^\/api\/certificate-proposals\/[0-9a-f]{32}\/(?:preview|review|impact(?:\/review)?|execution)$/.test(
+        target.pathname,
+      ));
   const controller = new AbortController();
   /**
    * 业务作用：把视图退出或绝对期限传递到网络读取，禁止无限等待。
@@ -64,7 +80,11 @@ export async function request(path, options = {}) {
   }
   options.signal?.addEventListener("abort", cancel, { once: true });
   active.add(controller);
-  const timer = setTimeout(cancel, 5000);
+  // 原材料预检与完整影响读取有独立有界窗口；普通管理请求仍保持短期限。
+  const timer = setTimeout(
+    cancel,
+    materialWrite || (method === "GET" && (impact || execution)) ? 26000 : 5000,
+  );
   const headers = new Headers(options.headers);
   if (authorization) {
     headers.set("Authorization", authorization);
@@ -102,20 +122,37 @@ export async function request(path, options = {}) {
     const chunks = [];
     let length = 0;
     const capacity =
-      target.pathname === "/api/cluster/catalog" ||
-      target.pathname === "/api/cluster/consumers" ||
-      target.pathname === "/api/cluster/certificates" ||
-      /^\/api\/workspaces\/[^/]+\/cluster\/certificates$/.test(
-        target.pathname,
-      ) ||
-      /^\/api\/workspaces\/[^/]+\/cluster\/consumers$/.test(target.pathname) ||
-      target.pathname === "/api/operations/proposals" ||
-      /^\/api\/operations\/proposals\/[0-9a-f]{32}\/preview$/.test(
-        target.pathname,
-      ) ||
-      target.pathname === "/api/operations/proposals/draft"
-        ? 4 * 1024 * 1024
-        : 1024 * 1024;
+      method === "GET" && execution
+        ? 4 * 1024 * 1024 + 128 * 128 * 1024 + 65536
+        : impact && ["GET", "POST"].includes(method)
+          ? 4 * 1024 * 1024 + 16384
+          : (method === "POST" &&
+                target.pathname === "/api/certificate-conditions") ||
+              (method === "GET" &&
+                (target.pathname === "/api/certificate-proposals" ||
+                  /^\/api\/certificate-proposals\/targets(?:\/[A-Za-z0-9_.-]{1,128})?$/.test(
+                    target.pathname,
+                  ))) ||
+              (method === "POST" &&
+                /^\/api\/certificate-proposals\/[0-9a-f]{32}\/preview$/.test(
+                  target.pathname,
+                )) ||
+              target.pathname === "/api/cluster/catalog" ||
+              target.pathname === "/api/cluster/consumers" ||
+              target.pathname === "/api/cluster/certificates" ||
+              /^\/api\/workspaces\/[^/]+\/cluster\/certificates$/.test(
+                target.pathname,
+              ) ||
+              /^\/api\/workspaces\/[^/]+\/cluster\/consumers$/.test(
+                target.pathname,
+              ) ||
+              target.pathname === "/api/operations/proposals" ||
+              /^\/api\/operations\/proposals\/[0-9a-f]{32}\/preview$/.test(
+                target.pathname,
+              ) ||
+              target.pathname === "/api/operations/proposals/draft"
+            ? 4 * 1024 * 1024
+            : 1024 * 1024;
     try {
       while (true) {
         const { value, done } = await reader.read();
@@ -144,6 +181,17 @@ export async function request(path, options = {}) {
             "invalid_proposal",
             "proposal_conflict",
             "proposal_capacity",
+            "invalid_certificate_proposal",
+            "certificate_proposal_conflict",
+            "certificate_proposal_capacity",
+            "material_authority_unavailable",
+            "invalid_material_conditions_request",
+            "material_conditions_capacity",
+            "material_conditions_unavailable",
+            "material_conditions_request_denied",
+            "material_conditions_denied",
+            "material_conditions_authority_changed",
+            "material_conditions_response_capacity",
             "admission_epoch_expired",
             "authority_unavailable",
             "outcome_unknown",

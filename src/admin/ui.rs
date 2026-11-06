@@ -16,8 +16,15 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
         return None;
     }
     let (mime, content): (&str, &[u8]) = match path {
-        "/monitor" | "/cluster" | "/catalog" | "/operations" | "/traffic" | "/services"
-        | "/consumers" | "/certificates" => (
+        "/monitor"
+        | "/cluster"
+        | "/catalog"
+        | "/operations"
+        | "/traffic"
+        | "/services"
+        | "/consumers"
+        | "/certificates"
+        | "/certificate-proposals" => (
             "text/html; charset=utf-8",
             include_bytes!("assets/index.html"),
         ),
@@ -64,6 +71,46 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
         "/ui/views/certificates/render.js" => (
             "application/javascript; charset=utf-8",
             include_bytes!("assets/views/certificates/render.js"),
+        ),
+        "/ui/views/materials.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/materials.js"),
+        ),
+        "/ui/views/materials/api.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/materials/api.js"),
+        ),
+        "/ui/views/materials/common.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/materials/common.js"),
+        ),
+        "/ui/views/materials/conditions.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/materials/conditions.js"),
+        ),
+        "/ui/views/materials/targets.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/materials/targets.js"),
+        ),
+        "/ui/views/materials/form.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/materials/form.js"),
+        ),
+        "/ui/views/materials/detail.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/materials/detail.js"),
+        ),
+        "/ui/views/materials/impact.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/materials/impact.js"),
+        ),
+        "/ui/views/materials/execution.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/materials/execution.js"),
+        ),
+        "/ui/views/materials/recovery.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/materials/recovery.js"),
         ),
         "/ui/views/consumers.js" => (
             "application/javascript; charset=utf-8",

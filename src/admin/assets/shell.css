@@ -91,7 +91,8 @@
   padding: 16px;
   background: var(--bg);
 }
-.proposal-check {
+.proposal-check,
+.proposal-form .proposal-check {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -99,6 +100,10 @@
 }
 .proposal-check input {
   width: auto;
+}
+.proposal-picker select {
+  max-width: 100%;
+  min-width: 0;
 }
 * {
   box-sizing: border-box;

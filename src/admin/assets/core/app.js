@@ -8,6 +8,7 @@ import { mount as routeTraffic } from "../views/routes.js";
 import { mount as services } from "../views/services.js";
 import { mount as consumers } from "../views/consumers.js";
 import { mount as certificates } from "../views/certificates.js";
+import { mount as materials } from "../views/materials.js";
 
 const root = document.getElementById("view");
 const loginForm = document.getElementById("login");
@@ -49,6 +50,18 @@ function navigate(name, service = "") {
     document.getElementById("subtitle").textContent =
       "共享集群候选 · 双人审阅与集群执行";
     dispose = operations(root, session);
+  } else if (
+    name === "materials" &&
+    session.operations?.enabled &&
+    (["certificate-proposals", "certs", "cluster"].every((resource) =>
+      allowed(resource),
+    ) ||
+      session.workspaces?.length)
+  ) {
+    document.getElementById("title").textContent = "证书材料";
+    document.getElementById("subtitle").textContent =
+      "完整原目标 · 双人审批、共享影响与实际交付";
+    dispose = materials(root, session);
   } else if (
     name === "traffic" &&
     ((allowed("cluster") && allowed("routes")) || session.workspaces?.length)
@@ -209,33 +222,43 @@ async function login(event) {
       (allowed("cluster") && allowed("certs")) ||
       session.workspaces?.length
     );
+    document.getElementById("materials-nav").disabled = !(
+      session.operations?.enabled &&
+      (["certificate-proposals", "certs", "cluster"].every((resource) =>
+        allowed(resource),
+      ) ||
+        session.workspaces?.length)
+    );
     document.getElementById("catalog-nav").disabled =
       !allowed("cluster") ||
       !["routes", "config", "upstreams"].some((resource) => allowed(resource));
     notice.textContent = "";
     navigate(
-      location.pathname === "/certificates" &&
-        !document.getElementById("certificates-nav").disabled
-        ? "certificates"
-        : location.pathname === "/consumers" &&
-            !document.getElementById("consumers-nav").disabled
-          ? "consumers"
-          : location.pathname === "/services" &&
-              !document.getElementById("services-nav").disabled
-            ? "services"
-            : location.pathname === "/traffic" &&
-                !document.getElementById("traffic-nav").disabled
-              ? "traffic"
-              : location.pathname === "/operations"
-                ? "operations"
-                : allowed("cluster")
-                  ? location.pathname === "/catalog" &&
-                    !document.getElementById("catalog-nav").disabled
-                    ? "catalog"
-                    : location.pathname === "/cluster"
-                      ? "nodes"
-                      : "monitor"
-                  : "system",
+      location.pathname === "/certificate-proposals" &&
+        !document.getElementById("materials-nav").disabled
+        ? "materials"
+        : location.pathname === "/certificates" &&
+            !document.getElementById("certificates-nav").disabled
+          ? "certificates"
+          : location.pathname === "/consumers" &&
+              !document.getElementById("consumers-nav").disabled
+            ? "consumers"
+            : location.pathname === "/services" &&
+                !document.getElementById("services-nav").disabled
+              ? "services"
+              : location.pathname === "/traffic" &&
+                  !document.getElementById("traffic-nav").disabled
+                ? "traffic"
+                : location.pathname === "/operations"
+                  ? "operations"
+                  : allowed("cluster")
+                    ? location.pathname === "/catalog" &&
+                      !document.getElementById("catalog-nav").disabled
+                      ? "catalog"
+                      : location.pathname === "/cluster"
+                        ? "nodes"
+                        : "monitor"
+                    : "system",
     );
   } catch (error) {
     if (attempt === epoch && error.name !== "AbortError") {
