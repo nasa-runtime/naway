@@ -28,6 +28,13 @@ function lists(kind, values) {
       type: "instance",
     });
   }
+  if (kind === "stream") {
+    result.push({
+      path: ["routes"],
+      title: "流路由",
+      type: "stream_route",
+    });
+  }
   for (const [key, value] of Object.entries(values)) {
     if (
       key !== "id" &&
@@ -188,8 +195,13 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
       fields = draftFieldPanel(selected.type, current, capacity);
       body.append(fields.node);
     } else if (["insert", "set"].includes(operation.value)) {
-      if (["instance", "tls_identity"].includes(selected.type)) {
-        fields = draftFieldPanel(selected.type, {}, capacity);
+      if (
+        ["instance", "tls_identity", "stream_route"].includes(selected.type)
+      ) {
+        // 原元素仍按稳定身份编辑；只有新建或整值替换才能明确提供新路由身份。
+        const type =
+          selected.type === "stream_route" ? "stream_route_new" : selected.type;
+        fields = draftFieldPanel(type, {}, capacity);
         body.append(
           element(
             "p",
@@ -224,12 +236,14 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
       const label =
         typeof entry === "string"
           ? entry
-          : typeof entry?.uri === "string"
-            ? entry.uri
-            : Array.isArray(entry?.server_names) &&
-                entry.server_names.every((name) => typeof name === "string")
-              ? entry.server_names.join(", ")
-              : "元素";
+          : typeof entry?.id === "string"
+            ? entry.id
+            : typeof entry?.uri === "string"
+              ? entry.uri
+              : Array.isArray(entry?.server_names) &&
+                  entry.server_names.every((name) => typeof name === "string")
+                ? entry.server_names.join(", ")
+                : "元素";
       const option = element("option", index + " · " + label.slice(0, 160));
       option.value = String(index);
       item.append(option);
@@ -301,6 +315,12 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           : value.read();
         if (!action || action.remove) {
           throw new Error("请明确设置新元素值。");
+        }
+        if (
+          selected.type === "stream_route" &&
+          (typeof action.fields?.id !== "string" || !action.fields.id.trim())
+        ) {
+          throw new Error("新流路由必须明确填写非空的稳定身份 id。");
         }
         edit = {
           op,

@@ -17,6 +17,20 @@ const upstreamProxyFields = [
   ["version", "发送版本：v1 / v2", "string"],
 ];
 
+export const streamRouteFields = [
+  ["sni", "精确匹配的 TLS SNI", "string"],
+  ["mqtt_client_id", "精确匹配的 MQTT client id", "string"],
+  ["default", "默认流路由", "boolean"],
+  ["terminate_tls", "选中后终止下游 TLS", "boolean"],
+  ["upstream", "单一上游地址", "string"],
+  [
+    "weighted_upstreams",
+    "带权上游列表（完整声明，非空时覆盖单一上游）",
+    "json",
+  ],
+  ["tls", "上游 TLS 策略（完整声明）", "json"],
+];
+
 /**
  * 业务作用：为流监听器区分首段预读、UDP 会话预算和上游来源前导，保持各传输的配置边界。
  * 参数说明：

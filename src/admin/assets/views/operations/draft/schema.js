@@ -1,7 +1,13 @@
 import { tlsIdentityFields } from "./tls.js";
+import { streamRouteFields } from "./stream.js";
 
 const definitions = {
   tls_identity: tlsIdentityFields,
+  stream_route: streamRouteFields,
+  stream_route_new: [
+    ["id", "新流路由的稳定身份", "string"],
+    ...streamRouteFields,
+  ],
 
   consumer_binding: [["plan", "消费者显式套餐", "string"]],
 
