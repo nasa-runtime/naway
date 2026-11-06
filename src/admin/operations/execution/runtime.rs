@@ -1,8 +1,11 @@
-//! 固定三个任务独立推进命令、定时器和终态释放，关闭开关不读取或改变共享工作流。
+//! 固定三个任务共用唯一命令扫描器，两类执行分别授权定时器与终态释放。
 
 use super::{authority, cache::Cache, publisher::Publisher, release::Cursor};
 use crate::admin::{
-    operations::{model::Error, store::DATASOURCE, Store},
+    operations::{
+        certificates::execution::authority as material_authority, model::Error, store::DATASOURCE,
+        workflow::dispatch::Family, Store,
+    },
     AdminState,
 };
 use anyhow::{ensure, Context, Result};
@@ -41,6 +44,10 @@ impl Store {
         if self.plan.config.execution.enabled {
             authority::running(state, self, &state.snap.load_full())
                 .map_err(|_| anyhow::anyhow!("operations execution authority unavailable"))?;
+        }
+        if self.plan.config.certificates.execution.enabled {
+            material_authority::running(state, self, &state.snap.load_full())
+                .map_err(|_| anyhow::anyhow!("material execution authority unavailable"))?;
         }
         ensure!(
             self.executor.get().is_none(),
@@ -120,6 +127,9 @@ async fn drive(
     cache: Arc<Cache>,
 ) {
     let mut cursor = Cursor::default();
+    let mut materials =
+        crate::admin::operations::certificates::execution::release::Cursor::default();
+    let mut material_turn = false;
     let name = crate::admin::operations::model::hex(&owner);
     let mut last: Option<(Error, Instant)> = None;
     loop {
@@ -132,21 +142,42 @@ async fn drive(
             break;
         };
         let snapshot = state.snap.load_full();
-        if authority::running(&state, &store, &snapshot).is_err() {
+        let enabled = |family| enabled(&state, &store, &snapshot, family);
+        let authorize = || running(&state, &store, &snapshot);
+        if !enabled(Family::Material) {
+            // 撤销独立材料运行权时释放缓存自己的秘密引用，原数据库与节点责任仍保持到合法恢复。
+            store.material_cache.clear();
+        }
+        if authorize().is_err() {
             continue;
         }
         let run = async {
             match task {
                 Task::Timers => store
-                    .advance_timers(&name, &|| {
-                        authority::running(&state, &store, &snapshot).map(|_| ())
-                    })
+                    .advance_timers(&name, &authorize, &enabled)
                     .await
                     .map(|_| ()),
-                Task::Release => cursor.advance(&state, &store, &owner, &cache).await,
+                Task::Release => {
+                    let configuration = enabled(Family::Configuration);
+                    let material = enabled(Family::Material);
+                    let use_material = material && (material_turn || !configuration);
+                    material_turn = !use_material;
+                    if use_material {
+                        materials.advance(&state, &store, &owner).await
+                    } else if configuration {
+                        cursor.advance(&state, &store, &owner, &cache).await
+                    } else {
+                        Ok(())
+                    }
+                }
                 Task::Dispatch => {
-                    cache.refresh(&store).await?;
-                    authority::running(&state, &store, &snapshot)?;
+                    if enabled(Family::Configuration) {
+                        cache.refresh(&store).await?;
+                    }
+                    if enabled(Family::Material) {
+                        store.material_cache.refresh(&store).await?;
+                    }
+                    authorize()?;
                     let outbox = nasa::outbox::pgsql::PgOutbox::with_datasource(DATASOURCE)
                         .map_err(|_| Error::Unavailable)?;
                     let report = outbox
@@ -189,5 +220,48 @@ async fn drive(
                 }
             }
         }
+    }
+}
+
+/// 业务作用：按原业务域复验精确快照与独立执行开关，共享扫描和计时器不合并两种写权。
+///
+/// 参数说明：
+/// - `state`：实际控制面owner。
+/// - `store`：原命名数据库资源。
+/// - `snapshot`：本轮共同使用的精确活动实例。
+/// - `family`：原不可变工作流所属业务域。
+///
+/// 返回：该域当前全部运行门成立时为真；其它域开启不能改变结论。
+fn enabled(
+    state: &AdminState,
+    store: &Store,
+    snapshot: &Arc<crate::config::GatewaySnapshot>,
+    family: Family,
+) -> bool {
+    match family {
+        Family::Configuration => authority::running(state, store, snapshot).is_ok(),
+        Family::Material => material_authority::running(state, store, snapshot).is_ok(),
+    }
+}
+
+/// 业务作用：只在至少一个业务域有当前运行权时允许共享基础任务工作，具体迁移仍须原域再次授权。
+///
+/// 参数说明：
+/// - `state`：实际管理角色和当前快照owner。
+/// - `store`：已绑定集群的共享存储。
+/// - `snapshot`：本轮领取、事务和提交复用的活动实例。
+///
+/// 返回：共同运行门成立时成功；两个域均关闭、快照变化或停机时拒绝读取和推进。
+fn running(
+    state: &AdminState,
+    store: &Store,
+    snapshot: &Arc<crate::config::GatewaySnapshot>,
+) -> Result<(), Error> {
+    if enabled(state, store, snapshot, Family::Configuration)
+        || enabled(state, store, snapshot, Family::Material)
+    {
+        Ok(())
+    } else {
+        Err(Error::Unavailable)
     }
 }

@@ -1,6 +1,6 @@
 //! 数据库确认和单调期限共同授予一次投递权，未知 COMMIT 或时钟分歧不产生签名。
 
-mod clock;
+pub(in crate::admin::operations) mod clock;
 
 use crate::{
     admin::operations::{model::Error, store::DATASOURCE, Store},

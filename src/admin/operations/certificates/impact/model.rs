@@ -6,7 +6,7 @@ use serde::Serialize;
 use sqlx::{postgres::PgRow, Row};
 
 #[derive(Serialize)]
-pub(super) struct Record {
+pub(in crate::admin::operations::certificates) struct Record {
     pub id: String,
     pub proposal_id: String,
     pub cluster_id: String,
@@ -19,9 +19,13 @@ pub(super) struct Record {
     pub status: String,
     pub material_status: String,
     pub parent_active: bool,
+    pub execution_started: bool,
+    pub material_execution_started: bool,
     pub execution_supported: bool,
     pub validation: &'static str,
     pub impact_sha256: String,
+    #[serde(skip_serializing)]
+    pub impact_digest: [u8; 32],
     pub proof: Proof,
     pub issued_at_ms: u64,
     pub observed_until_ms: u64,
@@ -46,7 +50,30 @@ pub(super) struct Record {
 /// - `row`：固定查询取得的有限公开证明及原材料元数据，不含密文。
 ///
 /// 返回：完整分母、摘要、原材料和身份一致的记录；异常持久内容不交付半份事实。
-pub(super) fn parse(row: PgRow) -> Result<Record, Error> {
+pub(in crate::admin::operations::certificates) fn parse(row: PgRow) -> Result<Record, Error> {
+    parse_record(row, false)
+}
+
+/// 业务作用：为已经存在的原执行保留两份批准的真实存储状态，过期投影不能抹去已提交任务的原身份。
+///
+/// 参数说明：
+/// - `row`：同一查询已证明关联原执行的完整父子记录。
+///
+/// 返回：保留原批准状态且仍经过全量证明校验的记录；调用方必须另行核对任务关联与父保留标志。
+pub(in crate::admin::operations::certificates) fn parse_execution(
+    row: PgRow,
+) -> Result<Record, Error> {
+    parse_record(row, true)
+}
+
+/// 业务作用：共用完整原影响解析和校验，按实际读取用途决定是否投影未执行审批的期限。
+///
+/// 参数说明：
+/// - `row`：同一父子快照的持久字段。
+/// - `original_state`：恢复原执行时保留原始审批状态，普通读取仍显示未执行审批到期。
+///
+/// 返回：完整原生记录；摘要、分母、来源或父身份异常都拒绝。
+fn parse_record(row: PgRow, original_state: bool) -> Result<Record, Error> {
     let read = || -> Result<Record, sqlx::Error> {
         let failure = || sqlx::Error::Protocol("material impact evidence differs".into());
         let fixed = |name| -> Result<[u8; 32], sqlx::Error> {
@@ -79,9 +106,12 @@ pub(super) fn parse(row: PgRow) -> Result<Record, Error> {
             status: row.try_get("state")?,
             material_status: row.try_get("material_state")?,
             parent_active: false,
+            execution_started: row.try_get("execution_started")?,
+            material_execution_started: row.try_get("material_execution_started")?,
             execution_supported: false,
             validation: "original_target_tls_policy",
             impact_sha256: super::super::super::model::hex(&fixed("impact_digest")?),
+            impact_digest: fixed("impact_digest")?,
             proof,
             issued_at_ms: row
                 .try_get::<i64, _>("issued_at_ms")?
@@ -134,22 +164,27 @@ pub(super) fn parse(row: PgRow) -> Result<Record, Error> {
             return Err(failure());
         }
         let now: i64 = row.try_get("now_ms")?;
-        if now >= record.expires_at_ms {
-            if matches!(record.status.as_str(), "awaiting_approval" | "approved") {
+        if !original_state && now >= record.expires_at_ms {
+            // 已提交执行继续保留原批准责任，审批TTL只能阻止新建，不能抹掉在途恢复或补偿所需状态。
+            if !record.execution_started
+                && matches!(record.status.as_str(), "awaiting_approval" | "approved")
+            {
                 record.status = "expired".into();
             }
-            if matches!(
-                record.material_status.as_str(),
-                "awaiting_approval" | "approved"
-            ) {
+            if !record.material_execution_started
+                && matches!(
+                    record.material_status.as_str(),
+                    "awaiting_approval" | "approved"
+                )
+            {
                 record.material_status = "expired".into();
             }
         }
         record.parent_active = matches!(
             record.material_status.as_str(),
             "awaiting_approval" | "approved"
-        ) && !row.try_get::<bool, _>("execution_started")?
-            && !row.try_get::<bool, _>("material_execution_started")?;
+        ) && !record.execution_started
+            && !record.material_execution_started;
         Ok(record)
     };
     read().map_err(|_| Error::Unavailable)

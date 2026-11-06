@@ -120,7 +120,7 @@ fn validate(
 /// 参数说明: 无。
 ///
 /// 返回：当前正毫秒时间；没有同源事务或数据库不可用时拒绝状态推进。
-pub(super) async fn database_now() -> Result<i64, Error> {
+pub(in crate::admin::operations) async fn database_now() -> Result<i64, Error> {
     let mut connection = nasa::tx::pgsql::mandatory_conn_for(DATASOURCE)
         .await
         .map_err(|_| Error::Unavailable)?;

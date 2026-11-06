@@ -40,7 +40,10 @@ impl Write for Buffer {
 /// - `limit`：调用方代码固定的完整编码字节预算。
 ///
 /// 返回：唯一完整缓冲；超量或编码失败不返回部分对象。
-pub(super) fn bytes(value: &impl serde::Serialize, limit: usize) -> Result<Vec<u8>, Error> {
+pub(in crate::admin::operations::certificates) fn bytes(
+    value: &impl serde::Serialize,
+    limit: usize,
+) -> Result<Vec<u8>, Error> {
     let mut buffer = Buffer {
         bytes: Vec::with_capacity(8192.min(limit)),
         limit,

@@ -1,6 +1,6 @@
 //! 独立材料受理开关与有界钥环；关闭时不读取任何加密秘密。
 
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 use zeroize::Zeroizing;
@@ -19,6 +19,7 @@ pub struct Config {
     pub max_records: u32,
     pub max_records_per_scope: u32,
     pub impact_approvals: impact::Config,
+    pub execution: super::Execution,
 }
 
 impl Default for Config {
@@ -38,6 +39,7 @@ impl Default for Config {
             max_records: 4096,
             max_records_per_scope: 256,
             impact_approvals: impact::Config::default(),
+            execution: super::Execution::default(),
         }
     }
 }

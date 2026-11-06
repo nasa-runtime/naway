@@ -7,7 +7,7 @@ pub(super) mod cache;
 #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
 pub(super) mod frozen;
 #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
-mod lease;
+pub(super) mod lease;
 mod namespace;
 #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
 pub(super) mod publisher;

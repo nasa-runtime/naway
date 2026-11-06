@@ -2,8 +2,11 @@
 
 mod api;
 mod authorization;
+mod capability;
 mod capacity;
 mod crypto;
+#[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+pub(in crate::admin::operations) mod execution;
 pub(super) mod impact;
 mod model;
 #[cfg(feature = "node-actions")]
@@ -14,7 +17,7 @@ mod retention;
 mod review;
 mod storage;
 
-use super::{Store, model::Error};
+use super::{model::Error, Store};
 pub(in crate::admin) use api::handle;
 pub(super) use capacity::register;
 pub(super) use retention::collect;

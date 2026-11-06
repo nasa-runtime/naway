@@ -1,6 +1,6 @@
 //! 完整影响是固定原目标的独立批准对象，摘要不依赖 JSON 表示或网络消息类型。
 
-use super::{Summary, Target, authorization, conditions};
+use super::{authorization, conditions, Summary, Target};
 use crate::{config::GatewaySnapshot, tls::keypair::conditions::Batch};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -111,25 +111,13 @@ impl Proof {
     /// 返回：覆盖全部节点、完整来源及影响顺序的当前权威摘要；任一对象不属于当前域则为空。
     pub(crate) fn authority(&self, scope: &str, snapshot: &GatewaySnapshot) -> Option<[u8; 32]> {
         authorization::targets(scope, snapshot, &self.targets)?;
-        let mut hash = Sha256::new();
-        hash.update(b"naway-material-impact-authority\0");
-        hash.update((self.nodes.len() as u32).to_be_bytes());
-        for node in &self.nodes {
-            let targets = || {
-                node.conditions
-                    .groups
-                    .iter()
-                    .flat_map(|group| group.affected.iter().map(|affected| &affected.target))
-            };
-            authorization::logical_targets(scope, snapshot, &node.node_id, targets())?;
-            field(&mut hash, node.node_id.as_bytes());
-            hash.update(authorization::logical_authority(
-                scope,
-                snapshot,
-                targets(),
-            )?);
-        }
-        Some(hash.finalize().into())
+        source_authority(
+            scope,
+            snapshot,
+            self.nodes
+                .iter()
+                .map(|node| (node.node_id.as_str(), &node.conditions)),
+        )
     }
 
     /// 业务作用：绑定原材料身份、所有原条件和完整影响，独立审批不能重放到另一 owner 或候选。
@@ -212,6 +200,43 @@ impl Proof {
         }
         Some(hash.finalize().into())
     }
+}
+
+/// 业务作用：让审批原证明和已冻结节点任务复用同一完整来源权威，不复制影响树或改变摘要顺序。
+///
+/// 参数说明：
+/// - `scope`：原批准的唯一平台或工作区域。
+/// - `snapshot`：当前完整权限与对象归属快照。
+/// - `nodes`：按原顺序借用的全部物理节点及完整来源，不允许在线过滤。
+///
+/// 返回：全部共享对象当前仍归属该域时生成既有审批摘要；缺失权限或节点分母非法时拒绝。
+pub(crate) fn source_authority<'a>(
+    scope: &str,
+    snapshot: &GatewaySnapshot,
+    nodes: impl ExactSizeIterator<Item = (&'a str, &'a Batch)>,
+) -> Option<[u8; 32]> {
+    if !(1..=crate::config::operations::MAX_TARGETS).contains(&nodes.len()) {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"naway-material-impact-authority\0");
+    hash.update((nodes.len() as u32).to_be_bytes());
+    for (node, conditions) in nodes {
+        let targets = || {
+            conditions
+                .groups
+                .iter()
+                .flat_map(|group| group.affected.iter().map(|affected| &affected.target))
+        };
+        authorization::logical_targets(scope, snapshot, node, targets())?;
+        field(&mut hash, node.as_bytes());
+        hash.update(authorization::logical_authority(
+            scope,
+            snapshot,
+            targets(),
+        )?);
+    }
+    Some(hash.finalize().into())
 }
 
 /// 业务作用：统一固定身份和公开摘要的唯一文本表示，不能接受大小写或长度歧义。

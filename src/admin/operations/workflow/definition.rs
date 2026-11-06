@@ -17,7 +17,7 @@ pub(in crate::admin::operations) struct Summary {
 ///
 /// 参数说明: 无。
 ///
-/// 返回：最多一百二十八份固定定义；构造或 NASA 合同校验不成立时拒绝工作流就绪。
+/// 返回：配置与材料各自最多一百二十八份独立定义；不具备节点动作时只登记配置定义，未知历史定义拒绝就绪。
 pub(super) fn registry() -> anyhow::Result<(DefinitionRegistry, Summary)> {
     let mut registry = DefinitionRegistry::new();
     let mut digest = Sha256::new();
@@ -31,6 +31,21 @@ pub(super) fn registry() -> anyhow::Result<(DefinitionRegistry, Summary)> {
         digest.update(workflow.version().get().to_be_bytes());
         digest.update(workflow.digest().as_bytes());
         registry.register(workflow)?;
+    }
+    #[cfg(feature = "node-actions")]
+    {
+        // 材料与配置共享同一个引擎和配额，但必须保留独立定义；开关关闭也不能把历史材料实例解释为配置动作。
+        digest.update(b"naway-material-workflows\0");
+        digest.update((MAX_TARGETS as u32).to_be_bytes());
+        for nodes in 1..=MAX_TARGETS {
+            let workflow = crate::control::material::execution::definition::definition(nodes)?;
+            let name = workflow.name().as_str();
+            digest.update((name.len() as u32).to_be_bytes());
+            digest.update(name.as_bytes());
+            digest.update(workflow.version().get().to_be_bytes());
+            digest.update(workflow.digest().as_bytes());
+            registry.register(workflow)?;
+        }
     }
     let summary = Summary {
         definitions: registry.len(),

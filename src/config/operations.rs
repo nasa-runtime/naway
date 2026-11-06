@@ -151,6 +151,14 @@ impl Plan {
             "admin.operations.execution requires workflow and node-actions"
         );
         ensure!(
+            !config.certificates.execution.enabled
+                || (config.certificates.enabled
+                    && config.certificates.impact_approvals.enabled
+                    && config.workflow.enabled
+                    && cfg!(feature = "node-actions")),
+            "certificate execution requires material and impact storage, workflow and node-actions"
+        );
+        ensure!(
             token(&config.cluster_id, 128),
             "invalid admin.operations.cluster_id"
         );
@@ -219,6 +227,8 @@ impl Plan {
         right.accept_proposals = false;
         left.execution.enabled = false;
         right.execution.enabled = false;
+        left.certificates.execution.enabled = false;
+        right.certificates.execution.enabled = false;
         left.certificates.clear_dynamic();
         right.certificates.clear_dynamic();
         left == right && self.database_url == other.database_url

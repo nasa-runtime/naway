@@ -104,7 +104,7 @@ pub(super) fn authorize(
 /// - `suffix`：独立影响路径后缀。
 /// - `body`：仍受实际接收限额约束的原始正文流。
 ///
-/// 返回：已确认的完整低敏事实；未知提交只通过原幂等身份恢复，不声称可以执行材料。
+/// 返回：已确认的完整低敏事实；未知提交只通过原幂等身份恢复，批准本身不触发材料执行。
 pub(in crate::admin::operations::certificates) async fn dispatch(
     context: &Context<'_>,
     suffix: &str,
@@ -403,7 +403,7 @@ fn original<'a>(
 /// 参数说明：
 /// - `record`：已经复验范围和当前身份的完整持久记录。
 ///
-/// 返回：唯一完整影响对象及明确不可执行状态，不返回私钥、路径或下载令牌。
+/// 返回：唯一完整影响对象及该审批入口的能力边界，不返回私钥、路径或下载令牌。
 fn record_response(record: &Record) -> Result<Response<BoxBody>, Error> {
     #[derive(serde::Serialize)]
     struct Response<'a> {

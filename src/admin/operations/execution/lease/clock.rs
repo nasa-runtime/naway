@@ -3,12 +3,12 @@
 use crate::admin::operations::model::Error;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub(super) struct Stamp {
+pub(in crate::admin::operations) struct Stamp {
     wall: u64,
     monotonic: Instant,
 }
 
-pub(super) struct Proof {
+pub(in crate::admin::operations) struct Proof {
     confirmed: Stamp,
     deadline: Instant,
     wall_limit: u64,
@@ -20,7 +20,7 @@ impl Stamp {
     /// 参数说明: 无。
     ///
     /// 返回：合法当前观察；时间在 epoch 之前或超过协议整数域时不可签发。
-    pub(super) fn now() -> Result<Self, Error> {
+    pub(in crate::admin::operations) fn now() -> Result<Self, Error> {
         let monotonic = Instant::now();
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -47,7 +47,7 @@ impl Proof {
     /// - `expires`：同一事务保存的三十秒租约绝对截止。
     ///
     /// 返回：原单调安全截止和墙钟上限；长往返、时钟分歧或期限不合约均拒绝。
-    pub(super) fn confirmed(
+    pub(in crate::admin::operations) fn confirmed(
         started: Stamp,
         finished: Stamp,
         observed: i64,
@@ -91,7 +91,7 @@ impl Proof {
     /// - `now`：即将签名时的本机双时钟观察。
     ///
     /// 返回：最多二十秒且仍有至少两秒的窗口；漂移、倒退或预算不足拒绝。
-    pub(super) fn window(self, now: Stamp) -> Result<(u64, u64), Error> {
+    pub(in crate::admin::operations) fn window(self, now: Stamp) -> Result<(u64, u64), Error> {
         let elapsed = now
             .monotonic
             .checked_duration_since(self.confirmed.monotonic)

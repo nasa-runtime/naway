@@ -3,7 +3,13 @@
 mod batch;
 mod installations;
 mod offer;
+pub(in crate::admin::management) use batch::decode_fields;
+#[cfg(feature = "admin-operations-workflow-pgsql")]
+pub(in crate::admin::management) use batch::encode_fields;
 pub(in crate::admin::management) use batch::{decode_batch, encode_batch, validate};
+#[cfg(feature = "admin-operations-workflow-pgsql")]
+pub(in crate::admin::management) use installations::decode_observed;
+pub(in crate::admin::management) use installations::encode_observed;
 pub(in crate::admin::management) use installations::{decode_result, encode_result};
 pub(in crate::admin::management) use offer::{decode, encode};
 
@@ -19,7 +25,7 @@ use crate::{
 /// - `target`：已经验证的逻辑身份。
 ///
 /// 返回：不含文件路径的原生 protobuf 身份。
-fn target(target: Target) -> protocol::MaterialTarget {
+pub(in crate::admin::management) fn target(target: Target) -> protocol::MaterialTarget {
     protocol::MaterialTarget {
         kind: match target.kind {
             Kind::Proxy => protocol::material_target::Kind::Proxy,
@@ -36,7 +42,9 @@ fn target(target: Target) -> protocol::MaterialTarget {
 /// - `value`：传输中的完整目标字段。
 ///
 /// 返回：合法逻辑身份；非法种类、名字或条目拒绝。
-fn native_target(value: Option<protocol::MaterialTarget>) -> Result<Target, Reason> {
+pub(in crate::admin::management) fn native_target(
+    value: Option<protocol::MaterialTarget>,
+) -> Result<Target, Reason> {
     let value = value.ok_or(Reason::Denied)?;
     let target = Target {
         kind: match protocol::material_target::Kind::try_from(value.kind) {

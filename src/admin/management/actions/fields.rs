@@ -95,7 +95,9 @@ pub(super) fn decode_intent(intent: protocol::ActionIntent) -> Result<Intent, St
 ///
 /// 返回：固定协议字段；会话仅复制32字节到 protobuf 的必要容器。
 #[cfg(feature = "admin-operations-workflow-pgsql")]
-pub(super) fn encode_delivery(delivery: Delivery) -> protocol::ActionDelivery {
+pub(in crate::admin::management) fn encode_delivery(
+    delivery: Delivery,
+) -> protocol::ActionDelivery {
     protocol::ActionDelivery {
         issuer_node_id: delivery.issuer_node_id,
         receiving_boot_id: delivery.receiving_boot_id,
@@ -113,7 +115,9 @@ pub(super) fn encode_delivery(delivery: Delivery) -> protocol::ActionDelivery {
 /// - delivery：有界但尚未验证签名的投递字段。
 ///
 /// 返回：固定宽度正确的原声明；不授予当前会话或写入权威。
-pub(super) fn decode_delivery(delivery: protocol::ActionDelivery) -> Result<Delivery, Status> {
+pub(in crate::admin::management) fn decode_delivery(
+    delivery: protocol::ActionDelivery,
+) -> Result<Delivery, Status> {
     Ok(Delivery {
         issuer_node_id: delivery.issuer_node_id,
         receiving_boot_id: delivery.receiving_boot_id,
@@ -131,7 +135,7 @@ pub(super) fn decode_delivery(delivery: protocol::ActionDelivery) -> Result<Deli
 /// - `bytes`：从当前 protobuf 消息移动得到的固定宽度字段。
 ///
 /// 返回：精确三十二字节时成功，否则拒绝整个 offer。
-fn fixed(bytes: Vec<u8>) -> Result<[u8; 32], Status> {
+pub(in crate::admin::management) fn fixed(bytes: Vec<u8>) -> Result<[u8; 32], Status> {
     bytes
         .try_into()
         .map_err(|_| Status::invalid_argument("invalid node command fixed field"))

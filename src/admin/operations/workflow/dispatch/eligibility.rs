@@ -91,8 +91,7 @@ pub(super) fn classify(
         return Ok(Disposition::Deferred);
     }
     let current = instance.current_step.as_ref().ok_or(Error::Unavailable)?;
-    let definition = crate::control::actions::definition::cached(pending.target_count)
-        .map_err(|_| Error::Unavailable)?;
+    let definition = pending.family.definition(pending.target_count)?;
     if definition.step(current).is_none() {
         return Err(Error::Unavailable);
     }

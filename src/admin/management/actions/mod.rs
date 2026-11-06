@@ -6,7 +6,7 @@ mod client;
 #[cfg(feature = "admin-operations-workflow-pgsql")]
 mod delivery;
 mod execution;
-mod fields;
+pub(in crate::admin::management) mod fields;
 #[cfg(feature = "admin-operations-workflow-pgsql")]
 pub(in crate::admin) mod local;
 mod release;

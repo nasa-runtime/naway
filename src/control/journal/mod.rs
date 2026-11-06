@@ -13,6 +13,8 @@ mod storage;
 #[cfg(feature = "node-actions")]
 pub(crate) use actions::{Application, EffectState, Preparation, Stage};
 pub(crate) use local::{Input as LocalInput, Receipt as LocalReceipt};
+#[cfg(feature = "node-actions")]
+pub(crate) use material::{MaterialEffect, Stage as MaterialStage};
 pub(crate) use observation::Observation;
 
 use anyhow::{ensure, Context, Result};
@@ -217,9 +219,7 @@ impl Journal {
         self.verify_expected(storage.as_ref())?;
         // 材料保留仍绑定原配置与共享来源，普通候选不能借快照换代撤销其恢复责任。
         #[cfg(feature = "node-actions")]
-        if let Some(current) = storage.as_ref() {
-            current.require_no_material()?;
-        }
+        self.require_material_snapshot(storage.as_ref(), snapshot)?;
         ensure!(
             !snapshot
                 .admin_management
@@ -227,7 +227,8 @@ impl Journal {
                 .is_some_and(|plan| plan.actions_enabled
                     || plan.previews_enabled
                     || plan.material_previews_enabled
-                    || plan.material_installations_enabled)
+                    || plan.material_installations_enabled
+                    || plan.material_actions_enabled)
                 || storage.is_some(),
             "node actions, previews and material observations require initialized journal storage"
         );

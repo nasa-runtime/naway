@@ -3,6 +3,8 @@
 #[cfg(feature = "node-actions")]
 pub(super) mod actions;
 mod install;
+#[cfg(feature = "node-actions")]
+pub(super) mod material;
 mod record;
 
 use super::{filesystem::Root, identity::Identity};
@@ -345,6 +347,26 @@ pub(super) fn confirm(root: &Root, identity: &Identity, current: &Snapshot) -> R
 ///
 /// 返回：head和目录同步完成后提供新快照；任何失败保留未知提交语义。
 fn commit(root: &Root, identity: &Identity, current: &Snapshot, state: State) -> Result<Snapshot> {
+    commit_reserving(root, identity, current, state, 0)
+}
+
+/// 业务作用：在首次持久受理前把未来必须保存的事实纳入同一元数据上限，容量失败不写任何新槽。
+///
+/// 参数说明：
+/// - `root`：整个提交期间独占的目录。
+/// - `identity`：该目录的永久身份。
+/// - `current`：调用方已经承认的当前状态。
+/// - `state`：待提交的下一状态。
+/// - `reserve`：该首次状态之后所有合法后继所需的额外字节上界。
+///
+/// 返回：一次编码且未来空间足够时提交新head；容量、原head或同步异常不推进内存事实。
+fn commit_reserving(
+    root: &Root,
+    identity: &Identity,
+    current: &Snapshot,
+    state: State,
+    reserve: usize,
+) -> Result<Snapshot> {
     ensure!(
         load(root, identity)?.as_ref() == Some(current),
         "node journal storage changed before commit"
@@ -352,6 +374,11 @@ fn commit(root: &Root, identity: &Identity, current: &Snapshot, state: State) ->
     state.validate(identity)?;
     let slot = current.head.slot.other();
     let bytes = encode(&state, STATE_MAGIC, STATE_LIMIT)?;
+    // 秘密和外部文件尚未获得本次写权时先拒绝容量不足，后继收据与清理不得被首次小记录挤出预算。
+    ensure!(
+        reserve <= STATE_LIMIT - bytes.len(),
+        "node journal future metadata exceeds limit"
+    );
     let head = Head::new(&state, slot, &bytes);
     let head_bytes = encode(&head, HEAD_MAGIC, SMALL_LIMIT)?;
     // 上次rename后若目录同步报错，回读只能证明当前可见；复用旧槽前先确认当前head及其状态已持久化。

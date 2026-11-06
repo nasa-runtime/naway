@@ -122,8 +122,12 @@ impl Manager {
         *offer.reply.lock() = Some(sender);
         let offer = Arc::new(offer);
         let mut slots = self.action_deliveries.lock();
-        // 同一目标不得在未知结果期间换槽；全局固定上限也覆盖配置移除后尚未退出的任务。
-        if slots.len() >= 128 || slots.contains_key(offer.node()) {
+        let materials = self.material_action_deliveries.lock();
+        // 两类写入按配置槽、材料槽的固定锁序原子排他；未知结果期间不能交付同节点另一类动作。
+        if slots.len() + materials.len() >= 128
+            || slots.contains_key(offer.node())
+            || materials.contains_key(offer.node())
+        {
             return Err(Status::resource_exhausted(
                 "node delivery capacity unavailable",
             ));

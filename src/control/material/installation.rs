@@ -1,13 +1,13 @@
 //! 安装观察按完整来源组和原影响位置引用事实，不以文件条件或叶证书相同代替实际加载代。
 
 use crate::tls::{installed::CertificateProtocol, keypair::conditions};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_WIRE_BYTES: usize = 7 * 1024;
 pub(crate) const MAX_TARGETS: usize = 256;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum State {
     Current,
@@ -21,7 +21,8 @@ pub(crate) enum State {
     Unavailable,
 }
 
-#[derive(Serialize)]
+#[derive(PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Observation {
     pub protocol: CertificateProtocol,
     pub state: State,
@@ -29,19 +30,94 @@ pub(crate) struct Observation {
     pub material_generation: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Target {
     pub protocols: Vec<Observation>,
 }
 
-#[derive(Serialize)]
+#[derive(PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Group {
     pub targets: Vec<Target>,
 }
 
-#[derive(Serialize)]
+#[derive(PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Batch {
     pub groups: Vec<Group>,
+}
+
+/// 完整安装观察的内存与线协议预算，准备分母和实际观察使用同一计费规则。
+pub(crate) struct Budget {
+    targets: usize,
+    bytes: usize,
+    wire_bytes: usize,
+}
+
+impl Budget {
+    /// 业务作用：为完整来源数组登记固定内存，不能把额外预分配空间藏在逻辑长度之外。
+    ///
+    /// 参数说明：
+    /// - `groups_capacity`：来源数组实际或准备时精确分配的容量。
+    ///
+    /// 返回：尚未加入目标和协议的预算，不分配观察对象。
+    pub(crate) fn new(groups_capacity: usize) -> Self {
+        Self {
+            targets: 0,
+            bytes: std::mem::size_of::<Batch>()
+                .saturating_add(groups_capacity.saturating_mul(std::mem::size_of::<Group>())),
+            wire_bytes: 0,
+        }
+    }
+
+    /// 业务作用：把一个来源的全部共享目标容器纳入完整观察预算，不能只登记选中的别名。
+    ///
+    /// 参数说明：
+    /// - `targets_capacity`：该来源目标数组实际或精确预分配容量。
+    ///
+    /// 返回：累加来源封装和目标数组内存，溢出按超限处理。
+    pub(crate) fn group(&mut self, targets_capacity: usize) {
+        self.wire_bytes = self.wire_bytes.saturating_add(8);
+        self.bytes = self
+            .bytes
+            .saturating_add(targets_capacity.saturating_mul(std::mem::size_of::<Target>()));
+    }
+
+    /// 业务作用：登记原逻辑目标及其全部协议槽，HTTP3不能因当前未观察到而省略计费。
+    ///
+    /// 参数说明：
+    /// - `protocols_capacity`：该目标协议数组实际或精确预分配容量。
+    ///
+    /// 返回：增加目标数、封装和协议槽内存，尚不包含材料代字符串。
+    pub(crate) fn target(&mut self, protocols_capacity: usize) {
+        self.targets = self.targets.saturating_add(1);
+        self.wire_bytes = self.wire_bytes.saturating_add(8);
+        self.bytes = self
+            .bytes
+            .saturating_add(protocols_capacity.saturating_mul(std::mem::size_of::<Observation>()));
+    }
+
+    /// 业务作用：计入每协议实际材料代的传输长度和内存，成功观察不能借缺席代的较小占用获得受理。
+    ///
+    /// 参数说明：
+    /// - `length`：代字符串实际字节数，成功目标为64。
+    /// - `capacity`：该字符串实际或精确预分配容量。
+    ///
+    /// 返回：计入协议封装和材料代，任何累计溢出保持超限。
+    pub(crate) fn observation(&mut self, length: usize, capacity: usize) {
+        self.wire_bytes = self.wire_bytes.saturating_add(32).saturating_add(length);
+        self.bytes = self.bytes.saturating_add(capacity);
+    }
+
+    /// 业务作用：按共同目标数、内存和线协议上限决定完整观察能否表达，超限不截断分母。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：全部预算同时满足才为真，不证明各协议的实际安装状态。
+    pub(crate) fn fits(&self) -> bool {
+        self.targets <= MAX_TARGETS && self.bytes <= MAX_BYTES && self.wire_bytes <= MAX_WIRE_BYTES
+    }
 }
 
 impl Batch {
@@ -55,21 +131,15 @@ impl Batch {
         if self.groups.len() != conditions.groups.len() {
             return false;
         }
-        let mut targets = 0usize;
         // 原条件最多占 24 KiB，附加证据只占 7 KiB，余量留给已有 32 KiB 管理消息的身份与封装。
-        let mut wire_bytes = 0usize;
-        let mut bytes =
-            std::mem::size_of::<Self>() + self.groups.capacity() * std::mem::size_of::<Group>();
+        let mut budget = Budget::new(self.groups.capacity());
         for (observed, source) in self.groups.iter().zip(&conditions.groups) {
-            wire_bytes = wire_bytes.saturating_add(8);
+            budget.group(observed.targets.capacity());
             if observed.targets.len() != source.affected.len() {
                 return false;
             }
-            targets = targets.saturating_add(observed.targets.len());
-            bytes =
-                bytes.saturating_add(observed.targets.capacity() * std::mem::size_of::<Target>());
             for (target, affected) in observed.targets.iter().zip(&source.affected) {
-                wire_bytes = wire_bytes.saturating_add(8);
+                budget.target(target.protocols.capacity());
                 use crate::tls::targets::Kind;
                 use CertificateProtocol::{Http3, Https, StreamTls};
                 let correct = match affected.target.kind {
@@ -84,17 +154,12 @@ impl Batch {
                 if !correct {
                     return false;
                 }
-                bytes = bytes.saturating_add(
-                    target.protocols.capacity() * std::mem::size_of::<Observation>(),
-                );
                 for observation in &target.protocols {
-                    wire_bytes = wire_bytes.saturating_add(
-                        32 + observation
+                    budget.observation(
+                        observation
                             .material_generation
                             .as_ref()
                             .map_or(0, String::len),
-                    );
-                    bytes = bytes.saturating_add(
                         observation
                             .material_generation
                             .as_ref()
@@ -138,7 +203,7 @@ impl Batch {
                 }
             }
         }
-        targets <= MAX_TARGETS && bytes <= MAX_BYTES && wire_bytes <= MAX_WIRE_BYTES
+        budget.fits()
     }
 
     /// 业务作用：判断一个完整来源的所有共享目标与实际协议是否都已加载当前受管代，任一未知保持失败。

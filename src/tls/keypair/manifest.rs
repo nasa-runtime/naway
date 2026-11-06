@@ -3,6 +3,8 @@
 mod bound;
 mod prepared;
 
+#[cfg(feature = "node-actions")]
+pub(super) use prepared::prepare_decided;
 pub(super) use prepared::prepare_keypair_version;
 
 use super::{generation, sync_directory};

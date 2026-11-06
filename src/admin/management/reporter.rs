@@ -1,9 +1,9 @@
 //! 每个已声明Admin只保留一条复用通道与两条有界在途流，故障不积压历史报告。
 
-use super::{Plan, RPC_TIMEOUT, catalog, certificates, consumers, protocol, telemetry};
-use crate::admin::AdminState;
+use super::{catalog, certificates, consumers, protocol, telemetry, Plan, RPC_TIMEOUT};
 use crate::admin::catalog::Catalog;
-use futures::{StreamExt, stream};
+use crate::admin::AdminState;
+use futures::{stream, StreamExt};
 use nasa::grpc::{Channel, Code, Request, Status};
 use protocol::node_management_client::NodeManagementClient;
 use std::sync::{Arc, Weak};
@@ -33,6 +33,8 @@ struct Target {
     material: super::material::Channel,
     #[cfg(feature = "node-actions")]
     material_preview: super::material_preview::Channel,
+    #[cfg(feature = "node-actions")]
+    material_actions: super::material_actions::Channel,
 }
 
 /// 同次报告借用唯一事实和样本，各目标只保留自己的会话与传输进度。
@@ -122,6 +124,8 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     material: super::material::Channel::default(),
                     #[cfg(feature = "node-actions")]
                     material_preview: super::material_preview::Channel::default(),
+                    #[cfg(feature = "node-actions")]
+                    material_actions: super::material_actions::Channel::default(),
                 })
                 .collect();
             generation = Arc::downgrade(&plan);
@@ -270,6 +274,7 @@ async fn send(target: &mut Target, round: &Round<'_>) {
             || target.previews.busy()
             || target.material.busy()
             || target.material_preview.busy()
+            || target.material_actions.busy()
         {
             // 动作或预览已经占用第二条 RPC，心跳独立继续，目录和样本不能挤占工作或突破连接预算。
             return;
@@ -351,6 +356,8 @@ async fn send(target: &mut Target, round: &Round<'_>) {
             target.material.clear();
             #[cfg(feature = "node-actions")]
             target.material_preview.clear();
+            #[cfg(feature = "node-actions")]
+            target.material_actions.clear();
         }
     }
 }
@@ -521,6 +528,11 @@ async fn exchange(
             .material_preview
             .open(plan.clone(), target.issuer.clone(), &session)
             .map_err(|_| Status::permission_denied("material preview session denied"))?;
+        #[cfg(feature = "node-actions")]
+        target
+            .material_actions
+            .open(plan.clone(), target.issuer.clone(), &session)
+            .map_err(|_| Status::permission_denied("material action session denied"))?;
         target.session = session;
     }
     let request = timed_request(
@@ -539,6 +551,10 @@ async fn exchange(
                 .and_then(super::baseline::encode),
             local_publication: super::publication::encode(&baseline.local_publication),
             actions_supported: cfg!(feature = "node-actions"),
+            material_actions_supported: cfg!(feature = "node-actions"),
+            material_actions_enabled: cfg!(feature = "node-actions")
+                && plan.material_actions_enabled
+                && state.mode.runs_data(),
             actions_enabled: cfg!(feature = "node-actions")
                 && plan.actions_enabled
                 && state.mode.runs_data(),
@@ -589,50 +605,80 @@ async fn exchange(
         response.preview,
         response.material_conditions,
         response.material_preview,
+        response.material_action,
+        response.material_release,
     ) {
-        (Some(offer), None, None, None, None)
+        (Some(offer), None, None, None, None, None, None)
             if !target.previews.busy()
                 && !target.material.busy()
-                && !target.material_preview.busy() =>
+                && !target.material_preview.busy()
+                && !target.material_actions.busy() =>
         {
             // 无效或忙碌命令不撤销已经成功的心跳；发行端仍须依靠持久结果判断是否重投。
             let _ = target
                 .actions
                 .start(state.clone(), target.client.clone(), offer);
         }
-        (None, Some(offer), None, None, None)
+        (None, Some(offer), None, None, None, None, None)
             if !target.previews.busy()
                 && !target.material.busy()
-                && !target.material_preview.busy() =>
+                && !target.material_preview.busy()
+                && !target.material_actions.busy() =>
         {
             let _ = target
                 .actions
                 .start_release(state.clone(), target.client.clone(), offer);
         }
-        (None, None, Some(offer), None, None)
+        (None, None, Some(offer), None, None, None, None)
             if !target.actions.busy()
                 && !target.material.busy()
-                && !target.material_preview.busy() =>
+                && !target.material_preview.busy()
+                && !target.material_actions.busy() =>
         {
             let _ = target
                 .previews
                 .start(state.clone(), target.client.clone(), offer);
         }
-        (None, None, None, Some(offer), None)
+        (None, None, None, Some(offer), None, None, None)
             if !target.actions.busy()
                 && !target.previews.busy()
-                && !target.material_preview.busy() =>
+                && !target.material_preview.busy()
+                && !target.material_actions.busy() =>
         {
             let _ = target
                 .material
                 .start(state.clone(), target.client.clone(), offer);
         }
-        (None, None, None, None, Some(offer))
-            if !target.actions.busy() && !target.previews.busy() && !target.material.busy() =>
+        (None, None, None, None, Some(offer), None, None)
+            if !target.actions.busy()
+                && !target.previews.busy()
+                && !target.material.busy()
+                && !target.material_actions.busy() =>
         {
             let _ = target
                 .material_preview
                 .start(state.clone(), target.client.clone(), offer);
+        }
+        (None, None, None, None, None, Some(offer), None)
+            if !target.actions.busy()
+                && !target.previews.busy()
+                && !target.material.busy()
+                && !target.material_preview.busy() =>
+        {
+            let _ = target
+                .material_actions
+                .start(state.clone(), target.client.clone(), offer);
+        }
+        (None, None, None, None, None, None, Some(offer))
+            if !target.actions.busy()
+                && !target.previews.busy()
+                && !target.material.busy()
+                && !target.material_preview.busy() =>
+        {
+            let _ =
+                target
+                    .material_actions
+                    .start_release(state.clone(), target.client.clone(), offer);
         }
         // 单槽不可能合法地同时产生多类声明，矛盾响应不选择其中任意一个执行。
         _ => {}

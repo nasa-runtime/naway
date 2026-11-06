@@ -136,8 +136,8 @@ impl Journal {
         self.verify_expected(storage.as_ref())?;
         // 材料记录有独立恢复责任，配置启动恢复不能忽略它后开放业务路由。
         #[cfg(feature = "node-actions")]
-        if let Some(current) = storage.as_ref() {
-            current.require_no_material()?;
+        if self.recover_material(&mut storage, main)? {
+            return Ok(());
         }
         #[cfg(feature = "node-actions")]
         if self.recover_action(&mut storage, main)? {
@@ -171,6 +171,10 @@ impl Journal {
         self.validate_snapshot(snapshot)?;
         let mut storage = self.storage.lock();
         self.verify_expected(storage.as_ref())?;
+        #[cfg(feature = "node-actions")]
+        if self.require_material_snapshot(storage.as_ref(), snapshot)? {
+            return Ok(());
+        }
         #[cfg(feature = "node-actions")]
         if self.before_action_publication(&mut storage, snapshot)? {
             return Ok(());
@@ -220,6 +224,10 @@ impl Journal {
         {
             use super::actions::model::Stage;
             let mut storage = storage;
+            // 外部策略没有原材料方向的发布权，即使语义相同也不能越过独立保留责任。
+            if let Some(current) = storage.as_ref() {
+                current.require_no_material()?;
+            }
             ensure!(
                 storage
                     .as_ref()

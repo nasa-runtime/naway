@@ -7,14 +7,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::TlsRuntimeCfg;
 use crate::tls::material::{CertificateObservation, CertificateSnapshot};
 
 const MAX_LISTENERS: usize = 1024;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CertificateProtocol {
     Https,

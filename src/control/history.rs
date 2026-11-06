@@ -184,7 +184,8 @@ impl ConfigHistory {
                 .is_some_and(|plan| plan.actions_enabled
                     || plan.previews_enabled
                     || plan.material_previews_enabled
-                    || plan.material_installations_enabled)
+                    || plan.material_installations_enabled
+                    || plan.material_actions_enabled)
                 || self.node_journal.get().is_some(),
             "node actions, previews and material observations require an installed journal owner"
         );

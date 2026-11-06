@@ -12,6 +12,9 @@ service NodeManagement {
   rpc Sample(stream SampleRequest) returns (SampleResponse);
   rpc ActionData(ActionDataRequest) returns (ActionDataResponse);
   rpc ActionResult(ActionResultRequest) returns (ActionResultResponse);
+  rpc MaterialActionData(MaterialActionDataRequest) returns (MaterialActionDataResponse);
+  rpc MaterialActionResult(MaterialActionResultRequest) returns (MaterialActionResultResponse);
+  rpc MaterialReleaseResult(MaterialReleaseResultRequest) returns (MaterialReleaseResultResponse);
   rpc ReleaseResult(ReleaseResultRequest) returns (ReleaseResultResponse);
   rpc PreviewData(PreviewDataRequest) returns (PreviewDataResponse);
   rpc PreviewResult(PreviewResultRequest) returns (PreviewResultResponse);
@@ -91,6 +94,9 @@ message ReportRequest {
   // 实际安装归属采用独立能力和签名域，不能从文件条件能力推断。
   bool material_installations_supported = 19;
   bool material_installations_enabled = 20;
+  // 材料执行独立启用，配置动作或预检能力不能隐式授予文件写权。
+  bool material_actions_supported = 21;
+  bool material_actions_enabled = 22;
 }
 
 // 当前本地文件决定与业务就绪分开；没有历史、路径或恢复命令令牌。
@@ -141,6 +147,8 @@ message ReportResponse {
   bool certificates_supported = 8;
   MaterialConditionsOffer material_conditions = 9;
   MaterialPreviewOffer material_preview = 10;
+  MaterialActionOffer material_action = 11;
+  MaterialReleaseOffer material_release = 12;
 }
 
 // 原目标字段复用结构，内层 signature 必须为空；只有外层独立签名可以授权候选下载。
@@ -226,6 +234,209 @@ message MaterialTarget {
 message MaterialConditionsTarget {
   uint32 index = 1;
   MaterialTarget target = 2;
+}
+
+// 原完整批准与物理位置属于材料执行域，不继承配置动作或预检的签名权威。
+message MaterialActionPosition {
+  uint32 index = 1;
+  uint32 count = 2;
+}
+
+message MaterialActionIntent {
+  uint32 schema = 1;
+  string operation_id = 2;
+  string execution_store = 3;
+  string proposal_id = 4;
+  string material_store = 5;
+  uint64 material_epoch = 6;
+  string impact_id = 7;
+  string impact_store = 8;
+  uint64 impact_epoch = 9;
+  string material_creator = 10;
+  string material_reviewer = 11;
+  string impact_creator = 12;
+  string impact_reviewer = 13;
+  string scope = 14;
+  bytes material_intent_sha256 = 15;
+  bytes impact_sha256 = 16;
+  bytes authority_sha256 = 17;
+  bytes impact_authority_sha256 = 18;
+  uint32 target_count = 19;
+  string node_id = 20;
+  string original_boot_id = 21;
+  NodeBaseline baseline = 22;
+  uint64 base_version = 23;
+  uint64 base_fingerprint = 24;
+  uint32 candidate_bytes = 25;
+  bytes candidate_sha256 = 26;
+  repeated MaterialConditionsTarget selections = 27;
+  MaterialConditionsBatch conditions = 28;
+}
+
+message MaterialActionOffer {
+  uint32 schema = 1;
+  ActionIdentity identity = 2;
+  MaterialActionIntent intent = 3;
+  MaterialActionPosition position = 4;
+  ActionDelivery delivery = 5;
+  string signature = 6;
+}
+
+message MaterialReleaseOffer {
+  uint32 schema = 1;
+  MaterialActionIntent intent = 2;
+  MaterialActionPosition position = 3;
+  string definition_digest = 4;
+  ReleaseTerminal terminal = 5;
+  ActionDelivery delivery = 6;
+  string signature = 7;
+}
+
+// 报告只绑定共享任务保留的原意图，不能传送路径、备份正文或重复缩减的目标清单。
+message MaterialExecutionReport {
+  uint32 schema = 1;
+  uint64 revision = 2;
+  MaterialActionPosition position = 3;
+  bytes intent_sha256 = 4;
+  uint64 fence = 5;
+  MaterialExecutionStage stage = 6;
+  bool prepared = 7;
+  MaterialExecutionDirection direction = 8;
+  repeated MaterialExecutionSource sources = 9;
+  repeated ActionIdentity admissions = 10;
+  repeated MaterialExecutionReceipt receipts = 11;
+  MaterialExecutionAbsence absence = 12;
+  MaterialExecutionReason protection = 13;
+  MaterialExecutionRelease release = 14;
+}
+
+enum MaterialExecutionStage {
+  MATERIAL_EXECUTION_STAGE_UNSPECIFIED = 0;
+  MATERIAL_EXECUTION_STAGE_RESERVED = 1;
+  MATERIAL_EXECUTION_STAGE_PREPARED = 2;
+  MATERIAL_EXECUTION_STAGE_INVALIDATED = 3;
+  MATERIAL_EXECUTION_STAGE_FORWARD = 4;
+  MATERIAL_EXECUTION_STAGE_APPLIED = 5;
+  MATERIAL_EXECUTION_STAGE_BACKWARD = 6;
+  MATERIAL_EXECUTION_STAGE_REVERTED = 7;
+  MATERIAL_EXECUTION_STAGE_REJECTED = 8;
+  MATERIAL_EXECUTION_STAGE_COMPENSATED = 9;
+  MATERIAL_EXECUTION_STAGE_PROTECTED = 10;
+  MATERIAL_EXECUTION_STAGE_CLEANING = 11;
+}
+
+enum MaterialExecutionDirection {
+  MATERIAL_EXECUTION_DIRECTION_UNSPECIFIED = 0;
+  MATERIAL_EXECUTION_DIRECTION_FORWARD = 1;
+  MATERIAL_EXECUTION_DIRECTION_BACKWARD = 2;
+}
+
+enum MaterialExecutionProtocols {
+  MATERIAL_EXECUTION_PROTOCOLS_UNSPECIFIED = 0;
+  MATERIAL_EXECUTION_PROTOCOLS_HTTPS = 1;
+  MATERIAL_EXECUTION_PROTOCOLS_HTTPS_AND_HTTP3 = 2;
+  MATERIAL_EXECUTION_PROTOCOLS_STREAM_TLS = 3;
+}
+
+message MaterialExecutionSource {
+  string source_id = 1;
+  string forward = 2;
+  optional string backward = 3;
+  repeated MaterialExecutionProtocols protocols = 4;
+}
+
+enum MaterialExecutionReason {
+  MATERIAL_EXECUTION_REASON_UNSPECIFIED = 0;
+  MATERIAL_EXECUTION_REASON_EFFECT_NOT_ADMITTED = 1;
+  MATERIAL_EXECUTION_REASON_CANDIDATE_INVALID = 2;
+  MATERIAL_EXECUTION_REASON_SOURCE_CHANGED = 3;
+  MATERIAL_EXECUTION_REASON_BASELINE_CHANGED = 4;
+  MATERIAL_EXECUTION_REASON_AUTHORITY_CHANGED = 5;
+  MATERIAL_EXECUTION_REASON_GATE_HALTED = 6;
+  MATERIAL_EXECUTION_REASON_PREPARATION_INTERRUPTED = 7;
+}
+
+message MaterialExecutionReceipt {
+  ActionIdentity admission = 1;
+  ActionOutcome outcome = 2;
+  MaterialExecutionReason reason = 3;
+  MaterialExecutionEvidence evidence = 4;
+}
+
+message MaterialExecutionEvidence {
+  string boot_id = 1;
+  MaterialInstallationsBatch observed = 2;
+}
+
+enum MaterialExecutionStep {
+  MATERIAL_EXECUTION_STEP_UNSPECIFIED = 0;
+  MATERIAL_EXECUTION_STEP_PREPARE = 1;
+  MATERIAL_EXECUTION_STEP_APPLY = 2;
+}
+
+message MaterialExecutionAbsence {
+  MaterialExecutionStep step = 1;
+  string effect_id = 2;
+  string definition_digest = 3;
+}
+
+message MaterialExecutionRelease {
+  string definition_digest = 1;
+  ReleaseTerminal terminal = 2;
+}
+
+message MaterialActionDataRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  string offer_id = 4;
+  uint32 offset = 5;
+}
+
+message MaterialActionDataResponse {
+  string offer_id = 1;
+  uint32 offset = 2;
+  bytes body = 3;
+  bool eof = 4;
+}
+
+// 空槽与关闭仅描述读取事实，不能成为NASA稳定效果或替代独立终态释放确认。
+enum MaterialExecutionMissing {
+  MATERIAL_EXECUTION_MISSING_UNSPECIFIED = 0;
+  MATERIAL_EXECUTION_MISSING_VACANT = 1;
+  MATERIAL_EXECUTION_MISSING_CLOSED = 2;
+}
+
+message MaterialActionResultRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  string offer_id = 4;
+  oneof observation {
+    MaterialExecutionReport report = 5;
+    MaterialExecutionMissing missing = 6;
+  }
+}
+
+message MaterialActionResultResponse {
+  string accepted_offer_id = 1;
+}
+
+message MaterialReleaseResultRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+  string release_id = 4;
+  bytes intent_sha256 = 5;
+  string execution_store = 6;
+  string node_admission_epoch = 7;
+  string definition_digest = 8;
+  ReleaseTerminal terminal = 9;
+  bool closed = 10;
+}
+
+message MaterialReleaseResultResponse {
+  string accepted_release_id = 1;
 }
 
 message MaterialConditionsOffer {

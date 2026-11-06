@@ -5,6 +5,8 @@ mod command;
 #[cfg(feature = "node-actions")]
 mod material;
 #[cfg(feature = "node-actions")]
+mod material_actions;
+#[cfg(feature = "node-actions")]
 mod material_preview;
 #[cfg(feature = "node-actions")]
 mod preview;

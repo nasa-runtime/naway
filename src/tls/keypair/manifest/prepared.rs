@@ -45,6 +45,65 @@ pub(in crate::tls::keypair) fn prepare_keypair_version<'a>(
     private_key_pem: &[u8],
     owner: generation::Record,
 ) -> Result<PreparedKeypairVersion<'a>> {
+    prepare(
+        manifest_file,
+        certificate_pem,
+        private_key_pem,
+        owner,
+        None,
+        || Ok(()),
+    )
+}
+
+/// 业务作用：整批材料方向使用原根目录和预分配归属准备完整不可变pair，不能重建缺席原目录。
+///
+/// 参数说明：
+/// - `manifest_file`：原本机配置固定的活动指针。
+/// - `certificate`：该方向的完整证书借用。
+/// - `private_key`：同一pair的完整私钥借用。
+/// - `owner`：整批决定之前持久分配的目标材料代。
+/// - `root`：原准备阶段冻结的材料根目录位置证据。
+/// - `require_original`：复验原本机声明、目录及当前完整旧pair的门，不得重入安装锁。
+///
+/// 返回：沿用原目录能力且尚未激活的完整材料；原边界不符拒绝并保留未知结果语义。
+#[cfg(feature = "node-actions")]
+pub(in crate::tls::keypair) fn prepare_decided<'a>(
+    manifest_file: &'a Path,
+    certificate: &[u8],
+    private_key: &[u8],
+    owner: generation::Record,
+    root: &crate::io::file_target::Location,
+    require_original: impl Fn() -> Result<()>,
+) -> Result<PreparedKeypairVersion<'a>> {
+    prepare(
+        manifest_file,
+        certificate,
+        private_key,
+        owner,
+        Some(root),
+        require_original,
+    )
+}
+
+/// 业务作用：共享普通安装与整批原决定的不可变目录准备顺序，来源证明先于每一批材料副作用。
+///
+/// 参数说明：
+/// - `manifest_file`：本机活动指针声明。
+/// - `certificate_pem`：完整证书链原文。
+/// - `private_key_pem`：匹配的私钥原文。
+/// - `owner`：上层预分配的完整归属记录。
+/// - `expected_root`：整批动作要求已有原根目录，普通安装允许创建材料根。
+/// - `require_original`：整批原来源复验，普通安装由唯一指针能力保护。
+///
+/// 返回：完整准备能力；错误只清理仍属本次且未激活的精确目录。
+fn prepare<'a>(
+    manifest_file: &'a Path,
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+    owner: generation::Record,
+    expected_root: Option<&crate::io::file_target::Location>,
+    require_original: impl Fn() -> Result<()>,
+) -> Result<PreparedKeypairVersion<'a>> {
     ensure!(
         !certificate_pem.is_empty()
             && !private_key_pem.is_empty()
@@ -52,6 +111,7 @@ pub(in crate::tls::keypair) fn prepare_keypair_version<'a>(
             && private_key_pem.len() <= super::super::MAX_KEYPAIR_BYTES,
         "TLS prepared material exceeds bounds"
     );
+    require_original()?;
     let pointer = Pointer::capture(manifest_file)?;
     // 不允许目录创建先于来源和完整pair验证，错误的预分配代不能留下可被误认的材料。
     owner.require_material(
@@ -59,12 +119,21 @@ pub(in crate::tls::keypair) fn prepare_keypair_version<'a>(
         certificate_pem,
         private_key_pem,
     )?;
-    let root = Directory::create(
-        pointer
-            .target
-            .sibling(std::ffi::OsStr::new(".gateway-keypairs"))?,
-        true,
-    )?;
+    let root_target = pointer
+        .target
+        .sibling(std::ffi::OsStr::new(".gateway-keypairs"))?;
+    let root = if let Some(expected) = expected_root {
+        // 已决定批次不补建原根；必须先匹配其真实目录身份，才能创建本次候选子目录。
+        let root = Directory::open(root_target)?;
+        ensure!(
+            crate::io::file_target::Location::capture(&root.entry(".naway-binding")?)? == *expected,
+            "TLS decided material root changed"
+        );
+        root
+    } else {
+        Directory::create(root_target, true)?
+    };
+    require_original()?;
     let mut random = [0u8; 8];
     getrandom::getrandom(&mut random).context("TLS material directory entropy unavailable")?;
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -72,6 +141,7 @@ pub(in crate::tls::keypair) fn prepare_keypair_version<'a>(
     let material = Directory::create(root.entry(&name)?, false)?;
     let result = (|| -> Result<_> {
         pointer.require_original()?;
+        require_original()?;
         root.require_current()?;
         material.require_current()?;
         let certificate = material.entry("cert.pem")?;
@@ -91,6 +161,7 @@ pub(in crate::tls::keypair) fn prepare_keypair_version<'a>(
         material.sync()?;
         root.sync()?;
         pointer.require_original()?;
+        require_original()?;
         let manifest = serde_json::to_vec(&super::KeypairManifest {
             schema_version: 1,
             directory: format!(".gateway-keypairs/{name}"),

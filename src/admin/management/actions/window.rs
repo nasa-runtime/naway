@@ -21,7 +21,7 @@ impl Window {
     /// - `delivery`：已绑定发行者和会话的完整签名期限。
     ///
     /// 返回：同时受墙钟和单调时钟限制的窗口；异常系统时间、过长跨度或余量不足拒绝。
-    pub(super) fn admit(delivery: &Delivery) -> Result<Self> {
+    pub(in crate::admin::management) fn admit(delivery: &Delivery) -> Result<Self> {
         Self::at(delivery, unix_millis()?, Instant::now())
     }
 

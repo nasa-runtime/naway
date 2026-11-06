@@ -2,6 +2,8 @@
 
 mod capture;
 pub(crate) mod conditions;
+#[cfg(feature = "node-actions")]
+pub(crate) mod execution;
 mod generation;
 mod io;
 mod legacy;

@@ -11,6 +11,7 @@ use cap_std::fs::File;
 use sha2::{Digest as _, Sha256};
 use std::{
     borrow::Cow,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
@@ -38,6 +39,149 @@ pub(in crate::tls::keypair) struct Source<'a> {
 }
 
 impl<'a> Source<'a> {
+    /// 业务作用：以同次完整owner和原句柄确认所选材料代，重放不能仅凭相同证书或随机代文本跳过文件。
+    ///
+    /// 参数说明：
+    /// - `expected`：原整批决定允许的完整归属。
+    ///
+    /// 返回：原记录完全相同且当前pair两个摘要成立时成功；不分配第二份完整秘密。
+    pub(in crate::tls::keypair) fn require_owner(
+        &self,
+        expected: &generation::Record,
+    ) -> Result<()> {
+        ensure!(
+            self.record == *expected,
+            "material current complete ownership differs"
+        );
+        self.require_pair()
+    }
+
+    /// 业务作用：提交材料准备前用固定清零缓冲复验原句柄完整pair，同inode等长改写也会撤销原证据。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：原文件身份、控制原文和两个材料摘要全部一致时成功，不聚合第二份完整私钥。
+    pub(in crate::tls::keypair) fn require_pair(&self) -> Result<()> {
+        self.require_current()?;
+        let certificate = self.certificate.digest()?;
+        let private_key = self.private_key.digest()?;
+        ensure!(
+            self.record.matches_digests(&certificate, &private_key),
+            "material original pair changed during preparation"
+        );
+        self.require_current()
+    }
+
+    /// 业务作用：在整批分配秘密缓冲或持久保留之前计算原pair额度，空或过量来源不能部分受理。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：完整原生帧预算；两个角色必须非空并满足磁盘材料上限。
+    pub(in crate::tls::keypair) fn budget(&self) -> Result<u32> {
+        let limit = crate::control::material::backup::PART_LIMIT as u64;
+        ensure!(
+            (1..=limit).contains(&self.certificate.length)
+                && (1..=limit).contains(&self.private_key.length),
+            "material source backup budget differs"
+        );
+        Ok((self.certificate.length + self.private_key.length + 16) as u32)
+    }
+
+    /// 业务作用：从同次原句柄及完整备份冻结本机来源计划，路径、原代和预分配新代一起进入持久预算。
+    ///
+    /// 参数说明：
+    /// - `backup`：由这两个原句柄读出的唯一完整pair帧。
+    /// - `certificate`：已经通过整批监听策略检查的候选证书借用。
+    /// - `private_key`：同一候选帧中的私钥借用。
+    ///
+    /// 返回：尚无文件决定的原生计划；原归属、目录或预算不符时拒绝，不创建候选目录。
+    pub(in crate::tls::keypair) fn prepare(
+        &self,
+        backup: &Backup,
+        certificate: &[u8],
+        private_key: &[u8],
+    ) -> Result<super::super::execution::source::Plan> {
+        use super::super::execution::source::{Binding, Declaration, Plan};
+        use crate::io::file_target::Location;
+        self.require_current()?;
+        let budget = self.budget()?;
+        ensure!(
+            backup.bytes().len() == budget as usize,
+            "material original frame length differs"
+        );
+        let (old_certificate, old_private_key) = backup.parts()?;
+        ensure!(
+            self.record.matches(old_certificate, Some(old_private_key)),
+            "material original frame ownership differs"
+        );
+        let certificate_location = Location::capture(&self.certificate.target)?;
+        let private_key_location = Location::capture(&self.private_key.target)?;
+        let owner_location = Location::capture(&self.owner.slot.target)?;
+        let (binding, identity) = if let Some(pointer) = &self.manifest {
+            let pointer_location = Location::capture(&pointer.slot.target)?;
+            let root = pointer
+                .slot
+                .target
+                .path
+                .parent()
+                .context("material manifest parent absent")?
+                .join(".gateway-keypairs");
+            ensure!(
+                std::fs::symlink_metadata(&root)?.is_dir(),
+                "material manifest root must be an original directory"
+            );
+            let root = Location::capture(&Target::open(&root.join(".naway-binding"))?)?;
+            let identity = generation::digest_paths(b"manifest", &[&pointer_location.path]);
+            (
+                Binding::Manifest {
+                    pointer: pointer_location,
+                    root,
+                    certificate: certificate_location,
+                    private_key: private_key_location,
+                    owner: owner_location,
+                    pointer_sha256: pointer.digest,
+                },
+                identity,
+            )
+        } else {
+            let transaction_path = super::super::legacy::legacy_directory_for_paths(
+                &certificate_location.path,
+                &private_key_location.path,
+            )?;
+            let transaction = Location::capture(
+                &self.certificate.target.sibling(
+                    transaction_path
+                        .file_name()
+                        .context("material transaction name absent")?,
+                )?,
+            )?;
+            let identity = generation::digest_paths(
+                b"legacy",
+                &[&certificate_location.path, &private_key_location.path],
+            );
+            (
+                Binding::Legacy {
+                    certificate: certificate_location,
+                    private_key: private_key_location,
+                    owner: owner_location,
+                    transaction,
+                },
+                identity,
+            )
+        };
+        let plan = Plan {
+            declared: Declaration::capture(self.declared)?,
+            binding,
+            original: self.record.clone(),
+            next: generation::Record::new(identity, certificate, private_key)?,
+            backup_bytes: budget,
+            backup_sha256: Sha256::digest(backup.bytes()).into(),
+        };
+        plan.validate()?;
+        plan.require_original(self, backup)?;
+        Ok(plan)
+    }
+
     /// 业务作用：从本机声明一次固定完整受管来源，预算和后续读取均使用同一组打开的句柄。
     ///
     /// 参数说明：
@@ -176,6 +320,32 @@ impl<'a> Source<'a> {
 }
 
 impl Slot {
+    /// 业务作用：在仍持有的原文件上流式复验完整内容，当前路径不能为原读取偷偷换入另一份秘密。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：精确原长度和EOF对应的SHA-256；短读、增长、替换或读取失败拒绝。
+    fn digest(&self) -> Result<[u8; 32]> {
+        self.require_current()?;
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(0))?;
+        let mut buffer = Zeroizing::new([0u8; 8192]);
+        let mut digest = Sha256::new();
+        let mut remaining = self.length;
+        while remaining > 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..count])?;
+            digest.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        ensure!(
+            file.read(&mut buffer[..1])? == 0,
+            "material original source grew"
+        );
+        self.require_current()?;
+        Ok(digest.finalize().into())
+    }
+
     /// 业务作用：同时固定文件句柄、原长度和父目录，后续读取不能跟随同名后来文件。
     ///
     /// 参数说明：

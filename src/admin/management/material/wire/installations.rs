@@ -4,12 +4,12 @@ use super::{decode_batch, encode_batch, validate};
 use crate::{
     admin::management::{
         material::{
-            Inspection, Reason,
             command::{Intent, Query},
+            Inspection, Reason,
         },
         protocol,
     },
-    control::material::installation::{Batch, Group, MAX_WIRE_BYTES, Observation, State, Target},
+    control::material::installation::{Batch, Group, Observation, State, Target, MAX_WIRE_BYTES},
     tls::installed::CertificateProtocol,
 };
 use nasa::grpc::codegen::prost::Message;
@@ -57,10 +57,7 @@ pub(in crate::admin::management) fn decode_result(
     let installations = match (intent.query_kind, installations) {
         (Query::Conditions, None) => None,
         (Query::Installations, Some(value)) => {
-            if value.encoded_len() > MAX_WIRE_BYTES {
-                return Err(Reason::Capacity);
-            }
-            let value = decode(value)?;
+            let value = decode_observed(value)?;
             if !value.valid(&batch) {
                 return Err(Reason::Denied);
             }
@@ -122,7 +119,12 @@ fn encode(batch: Batch) -> Result<protocol::MaterialInstallationsBatch, Reason> 
 /// - `value`：已经检查实际传输字节上限的完整附加消息。
 ///
 /// 返回：原生结构，随后必须对照原文件条件验证全部位置与状态关系。
-fn decode(value: protocol::MaterialInstallationsBatch) -> Result<Batch, Reason> {
+pub(in crate::admin::management) fn decode_observed(
+    value: protocol::MaterialInstallationsBatch,
+) -> Result<Batch, Reason> {
+    if value.encoded_len() > MAX_WIRE_BYTES {
+        return Err(Reason::Capacity);
+    }
     let groups = value
         .groups
         .into_iter()
@@ -161,6 +163,50 @@ fn decode(value: protocol::MaterialInstallationsBatch) -> Result<Batch, Reason> 
     Ok(Batch {
         groups,
     })
+}
+
+/// 业务作用：在结果边界编码共享收据借用的监听树，不克隆整棵原生证据或截断原协议分母。
+///
+/// 参数说明：
+/// - `batch`：原收据保留的完整实际安装观察。
+///
+/// 返回：独立安装预算内的完整协议树；超量整批拒绝。
+pub(in crate::admin::management) fn encode_observed(
+    batch: &Batch,
+) -> Result<protocol::MaterialInstallationsBatch, Reason> {
+    let value = protocol::MaterialInstallationsBatch {
+        groups: batch
+            .groups
+            .iter()
+            .map(|group| protocol::MaterialInstallationGroup {
+                targets: group
+                    .targets
+                    .iter()
+                    .map(|target| protocol::MaterialInstallationTarget {
+                        protocols: target
+                            .protocols
+                            .iter()
+                            .map(|observation| protocol::MaterialInstallationObservation {
+                                protocol: match observation.protocol {
+                                    CertificateProtocol::Https => "https",
+                                    CertificateProtocol::Http3 => "http3",
+                                    CertificateProtocol::StreamTls => "stream_tls",
+                                }
+                                .into(),
+                                state: state(observation.state) as i32,
+                                bindings: observation.bindings,
+                                material_generation: observation.material_generation.clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    if value.encoded_len() > MAX_WIRE_BYTES {
+        return Err(Reason::Capacity);
+    }
+    Ok(value)
 }
 
 /// 业务作用：只输出实现明确支持的安装状态，未定义默认值不参与成功或失败回报。

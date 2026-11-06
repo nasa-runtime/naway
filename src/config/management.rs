@@ -46,6 +46,9 @@ pub struct Reporter {
     /// 允许受信发行者读取实际监听材料归属，独立于文件条件、候选预检和持久执行且默认关闭。
     pub material_installations: bool,
     #[serde(default)]
+    /// 允许受信发行者执行已批准的整批证书材料，独立于配置动作、观察与预检且默认关闭。
+    pub material_actions: bool,
+    #[serde(default)]
     pub metrics: bool,
     pub tls: Tls,
     pub targets: Vec<Target>,

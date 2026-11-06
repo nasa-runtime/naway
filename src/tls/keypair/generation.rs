@@ -10,7 +10,7 @@ const MAX_RECORD_BYTES: usize = 4096;
 pub(super) const MANIFEST_RECORD: &str = "ownership.json";
 
 /// 私有元数据绑定完整 pair 和来源计划；对外只能提供不可重用的随机代。
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Record {
     schema: u32,
@@ -21,6 +21,55 @@ pub(super) struct Record {
 }
 
 impl Record {
+    /// 业务作用：用原句柄流式所得摘要复验完整pair，提交前不再分配另一份完整私钥。
+    ///
+    /// 参数说明：
+    /// - `certificate`：完整证书链原文字节的摘要。
+    /// - `private_key`：完整私钥原文字节的摘要。
+    ///
+    /// 返回：两个角色都属于该owner时为真；来源和当前文件身份由调用者分别验证。
+    #[cfg(feature = "node-actions")]
+    pub(super) fn matches_digests(&self, certificate: &[u8; 32], private_key: &[u8; 32]) -> bool {
+        &self.certificate == certificate && &self.private_key == private_key
+    }
+
+    /// 业务作用：把本机完整归属绑定原审批的公开材料条件，不以叶证书相同代替完整证书链身份。
+    ///
+    /// 参数说明：
+    /// - `source`：原影响清单中的写入来源摘要。
+    /// - `generation`：原审批冻结的不可重用材料代。
+    /// - `etag`：原完整证书链的强条件值。
+    ///
+    /// 返回：三项公开条件与同一完整owner一致才成功；不替代当前私钥和目录复验。
+    #[cfg(feature = "node-actions")]
+    pub(super) fn require_condition(
+        &self,
+        source: &str,
+        generation: &str,
+        etag: &str,
+    ) -> Result<()> {
+        ensure!(
+            source == hex(&self.target)
+                && generation == self.generation
+                && etag == format!("\"sha256-{}\"", hex(&self.certificate)),
+            "material owner differs from original conditions"
+        );
+        Ok(())
+    }
+
+    /// 业务作用：让持久补偿计划证明完整原pair相同而材料代独立，不读取或复制秘密正文。
+    ///
+    /// 参数说明：
+    /// - `other`：同一来源另一方向已验证的完整归属记录。
+    ///
+    /// 返回：来源和两个材料摘要都相同才为真；不比较随机代，也不授予文件写权。
+    #[cfg(feature = "node-actions")]
+    pub(super) fn same_material(&self, other: &Self) -> bool {
+        self.target == other.target
+            && self.certificate == other.certificate
+            && self.private_key == other.private_key
+    }
+
     /// 业务作用：为一次新的受管写入生成不可重用的材料代，相同字节也不能复用旧动作所有权。
     ///
     /// 参数说明：
@@ -155,14 +204,21 @@ pub(super) fn legacy_path(tls: &TlsRuntimeCfg) -> Result<PathBuf> {
         tls.keypair_manifest_file.is_none(),
         "TLS source is not a legacy pair"
     );
-    let parent = tls
-        .cert_file
+    legacy_path_for_source(&tls.cert_file, &target(tls)?)
+}
+
+/// 业务作用：复用已经固定的来源摘要定位双文件归属，持久结构校验不重新访问路径或目录。
+///
+/// 参数说明：
+/// - `certificate`：该来源明确的证书位置。
+/// - `source`：同次原位置计算的完整来源摘要。
+///
+/// 返回：证书同目录的唯一归属槽；无父目录时拒绝。
+pub(super) fn legacy_path_for_source(certificate: &Path, source: &[u8; 32]) -> Result<PathBuf> {
+    let parent = certificate
         .parent()
         .context("TLS certificate has no parent")?;
-    Ok(parent.join(format!(
-        ".naway-keypair-generation-{}.json",
-        hex(&target(tls)?)
-    )))
+    Ok(parent.join(format!(".naway-keypair-generation-{}.json", hex(source))))
 }
 
 /// 业务作用：从确定位置读取完整有界归属证据，损坏或跨目标记录不能变成无条件写入资格。

@@ -1253,32 +1253,30 @@ fn build_snapshot_from_config(
     );
     let admin_audit = build_admin_audit(&cfg.admin, config_dir).context("build admin audit")?;
     anyhow::ensure!(
-        !admin_operations
-            .as_ref()
-            .is_some_and(|plan| plan.config.execution.enabled)
-            || (admin_audit.enabled && admin_audit.fsync),
-        "admin.operations.execution requires audit enabled and fsync"
+        !admin_operations.as_ref().is_some_and(|plan| {
+            plan.config.execution.enabled || plan.config.certificates.execution.enabled
+        }) || (admin_audit.enabled && admin_audit.fsync),
+        "configuration and material execution require audit enabled and fsync"
     );
     #[cfg(feature = "node-actions")]
     anyhow::ensure!(
-        !admin_operations
+        !admin_operations.as_ref().is_some_and(|plan| {
+            plan.config.execution.enabled || plan.config.certificates.execution.enabled
+        }) || admin_management
             .as_ref()
-            .is_some_and(|plan| plan.config.execution.enabled)
-            || admin_management
-                .as_ref()
-                .is_some_and(|plan| plan.can_issue(&cfg.admin.operations.cluster_id)),
-        "admin.operations.execution requires a matching management issuer"
+            .is_some_and(|plan| plan.can_issue(&cfg.admin.operations.cluster_id)),
+        "configuration and material execution require a matching management issuer"
     );
     #[cfg(feature = "admin-grpc")]
     anyhow::ensure!(
         !admin_management
             .as_ref()
-            .is_some_and(|plan| plan.actions_enabled)
+            .is_some_and(|plan| plan.actions_enabled || plan.material_actions_enabled)
             || (admin_auth.enabled
                 && admin_auth.rbac_enabled
                 && admin_audit.enabled
                 && !cfg.config_source.nacos.enabled),
-        "management reporter actions require authenticated RBAC, audit and local file source"
+        "management reporter actions and material_actions require authenticated RBAC, audit and local file source"
     );
     #[cfg(feature = "admin-grpc")]
     anyhow::ensure!(

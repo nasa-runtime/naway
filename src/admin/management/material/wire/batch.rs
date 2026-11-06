@@ -68,15 +68,31 @@ pub(in crate::admin::management) fn decode_batch(
     value: protocol::MaterialConditionsBatch,
     intent: &Intent,
 ) -> Result<Batch, Reason> {
-    if value.encoded_len() > 24 * 1024 || value.entries.len() != intent.indices.len() {
+    let batch = decode_fields(value, intent.indices.iter().copied())?;
+    validate(&batch, intent)?;
+    Ok(batch)
+}
+
+/// 业务作用：在材料执行与条件查询的网络边界共用完整来源字段转换，不构造另一用途的查询命令。
+///
+/// 参数说明：
+/// - `value`：已经受管理消息上限约束的完整来源字段。
+/// - `indices`：该业务原意图冻结的逻辑目标索引。
+///
+/// 返回：移动原分配的原生批次；数量、索引、来源或目标非法拒绝，调用者仍须验证其原业务完整性。
+pub(in crate::admin::management) fn decode_fields(
+    value: protocol::MaterialConditionsBatch,
+    indices: impl ExactSizeIterator<Item = u32>,
+) -> Result<Batch, Reason> {
+    if value.encoded_len() > 24 * 1024 || value.entries.len() != indices.len() {
         return Err(Reason::Capacity);
     }
     let entries = value
         .entries
         .into_iter()
-        .zip(&intent.indices)
+        .zip(indices)
         .map(|(entry, index)| {
-            if entry.index != *index {
+            if entry.index != index {
                 return Err(Reason::Denied);
             }
             Ok(Reference {
@@ -111,12 +127,64 @@ pub(in crate::admin::management) fn decode_batch(
             })
         })
         .collect::<Result<_, Reason>>()?;
-    let batch = Batch {
+    Ok(Batch {
         entries,
         groups,
+    })
+}
+
+/// 业务作用：将共享原意图中的来源树仅在网络边界编码一次，持久记录不为编码克隆完整原生树。
+///
+/// 参数说明：
+/// - `batch`：已由原业务合同验证的完整来源批次。
+/// - `indices`：原全局索引，顺序与条件引用相同。
+///
+/// 返回：有界类型化消息；数量或线预算不符拒绝，不删减任何共享影响。
+#[cfg(feature = "admin-operations-workflow-pgsql")]
+pub(in crate::admin::management) fn encode_fields(
+    batch: &Batch,
+    indices: impl ExactSizeIterator<Item = u32>,
+) -> Result<protocol::MaterialConditionsBatch, Reason> {
+    if batch.entries.len() != indices.len() {
+        return Err(Reason::Denied);
+    }
+    let value = protocol::MaterialConditionsBatch {
+        entries: batch
+            .entries
+            .iter()
+            .zip(indices)
+            .map(|(entry, index)| protocol::MaterialConditionsReference {
+                index,
+                group: entry.group as u32,
+                source: match entry.source {
+                    Source::File => protocol::MaterialSource::File,
+                    Source::Manifest => protocol::MaterialSource::Manifest,
+                    Source::Acme => protocol::MaterialSource::Acme,
+                } as i32,
+            })
+            .collect(),
+        groups: batch
+            .groups
+            .iter()
+            .map(|group| protocol::MaterialConditionsGroup {
+                certificate_etag: group.certificate_etag.clone(),
+                material_generation: group.material_generation.clone(),
+                source_id: group.source_id.clone(),
+                affected: group
+                    .affected
+                    .iter()
+                    .map(|affected| protocol::MaterialAffected {
+                        target: Some(target(affected.target.clone())),
+                        source_id: affected.source_id.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
     };
-    validate(&batch, intent)?;
-    Ok(batch)
+    if value.encoded_len() > 24 * 1024 {
+        return Err(Reason::Capacity);
+    }
+    Ok(value)
 }
 
 /// 业务作用：以相同规则验证原生和网络批次，来源不能缺失、拆分重复或隐去原目标自身。

@@ -22,7 +22,7 @@ use anyhow::{ensure, Context, Result};
 use nasa::saga::StepPhase;
 
 impl Journal {
-    /// 业务作用：在配置内容去重前确认是否仍有文件方向等待真实快照发布，避免同内容动作永久未决。
+    /// 业务作用：在配置内容去重前确认配置或材料是否仍有文件方向等待真实发布，避免同内容动作永久未决。
     ///
     /// 参数说明: 无。
     ///
@@ -31,10 +31,19 @@ impl Journal {
         let storage = self.storage.lock();
         // 去重同样会阻止业务推进，必须复验磁盘权威，不能把未接纳的 head 当作没有动作。
         self.verify_expected(storage.as_ref())?;
-        Ok(storage
-            .as_ref()
-            .and_then(storage::Snapshot::action)
-            .is_some_and(|action| matches!(action.stage, Stage::Forward | Stage::Backward)))
+        let Some(current) = storage.as_ref() else {
+            return Ok(false);
+        };
+        Ok(current
+            .action()
+            .is_some_and(|action| matches!(action.stage, Stage::Forward | Stage::Backward))
+            || current.material().is_some_and(|material| {
+                matches!(
+                    material.stage,
+                    crate::control::journal::material::Stage::Forward
+                        | crate::control::journal::material::Stage::Backward
+                )
+            }))
     }
 
     /// 业务作用：绑定现有管理监控的进程身份，所有文件效果和节点报告必须使用同一个 boot。

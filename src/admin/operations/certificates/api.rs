@@ -1,11 +1,10 @@
 //! 证书材料的独立有界接口；所有响应明确区分受理、目标证明和实际交付。
 
 use super::{
-    Error, Store,
     authorization::{self, Scope},
     model::{Candidate, Record, Submission},
     reading::{self, Selection},
-    response, review, storage,
+    response, review, storage, Error, Store,
 };
 use crate::{
     admin::{self, AdminRequest, AdminState, BoxBody},
@@ -87,6 +86,37 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Result<Response<
         .path()
         .strip_prefix("/api/certificate-proposals")
         .ok_or(Error::Missing)?;
+    if suffix == "/execution-context" {
+        if request.method != Method::GET
+            || form_urlencoded::parse(request.uri.query().unwrap_or_default().as_bytes())
+                .any(|(key, _)| key != "workspace")
+        {
+            return Err(Error::Invalid);
+        }
+        return super::capability::response(
+            &state,
+            store,
+            &snapshot,
+            &query.scope,
+            &identity.principal_id,
+        );
+    }
+    #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+    if super::execution::api::matches(suffix) {
+        return super::execution::api::dispatch(
+            &super::preview::Context {
+                state: &state,
+                store,
+                snapshot: &snapshot,
+                request: &request,
+                scope: &query.scope,
+                principal: &identity.principal_id,
+            },
+            suffix,
+            body,
+        )
+        .await;
+    }
     #[cfg(feature = "node-actions")]
     if super::impact::matches(suffix) {
         return super::impact::dispatch(

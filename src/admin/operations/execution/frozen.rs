@@ -155,7 +155,8 @@ impl Frozen {
             .targets
             .get(pending.target_index)
             .ok_or(Error::Conflict)?;
-        if pending.target_count != self.targets.len()
+        if pending.family != crate::admin::operations::workflow::dispatch::Family::Configuration
+            || pending.target_count != self.targets.len()
             || pending.envelope.saga_id != intent.operation_id
             || pending.envelope.tenant_id != intent.baseline.cluster_id
             || pending.envelope.workflow != self.definition.name().as_str()

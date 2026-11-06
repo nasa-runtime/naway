@@ -2,6 +2,7 @@
 
 use super::{
     super::{connection::Reading, model::Error, store::DATASOURCE, Store},
+    dispatch::Family,
     results::database_now,
 };
 use nasaga_backend::{SagaBackend, SagaTimerRow, TimerClaimBatch, TimerFencingToken};
@@ -14,12 +15,14 @@ impl Store {
     /// 参数说明：
     /// - owner：本进程固定随机运行身份，不能取自客户端输入。
     /// - authorize：验证当前控制面快照、执行开关和停止权。
+    /// - enabled：复验原实例业务域当前是否允许推进，关闭的域按原租约有限退避。
     ///
     /// 返回：明确提交的裁决数量；失败保留已提交领取，原 token 不重建，后续可按租约接管。
     pub(in crate::admin::operations) async fn advance_timers(
         &self,
         owner: &str,
         authorize: &(dyn Fn() -> Result<(), Error> + Send + Sync),
+        enabled: &(dyn Fn(Family) -> bool + Send + Sync),
     ) -> Result<u32, Error> {
         let batch = self.claim_execution_timers(owner, authorize).await?;
         let backend = nasa::saga::pgsql::PgSagaBackend::with_datasource(DATASOURCE)
@@ -27,7 +30,7 @@ impl Store {
         let mut applied = 0;
         for timer in batch.timers() {
             match self
-                .fire_execution_timer(timer, batch.token(), authorize)
+                .fire_execution_timer(timer, batch.token(), authorize, enabled)
                 .await?
             {
                 TimerOutcome::Applied {
@@ -100,6 +103,7 @@ impl Store {
     /// - timer：原已确认批次的单个有限任务。
     /// - token：同批次持有的不可复制消费能力。
     /// - authorize：提交前后当前控制面运行权的同步检查。
+    /// - enabled：按原不可变定义单独核对业务开关，不能由另一个域的开启续权。
     ///
     /// 返回：明确提交的 NASA 裁决；回滚时 timer 仍属于原租约，可用同一批次重试或等待到期接管。
     pub(in crate::admin::operations) async fn fire_execution_timer(
@@ -107,10 +111,37 @@ impl Store {
         timer: &SagaTimerRow,
         token: &TimerFencingToken,
         authorize: &(dyn Fn() -> Result<(), Error> + Send + Sync),
+        enabled: &(dyn Fn(Family) -> bool + Send + Sync),
     ) -> Result<TimerOutcome, Error> {
         let workflow = self.workflow.get().ok_or(Error::Unavailable)?;
         self.workflow_transaction(Box::pin(async {
             authorize()?;
+            let backend = nasa::saga::pgsql::PgSagaBackend::with_datasource(DATASOURCE)
+                .map_err(|_| Error::Unavailable)?;
+            let instance = backend
+                .store()
+                .load_instance(&timer.saga_id)
+                .await
+                .map_err(|_| Error::Unavailable)?;
+            let family = instance
+                .as_ref()
+                .map(|instance| {
+                    if instance.tenant.as_str() != self.plan.config.cluster_id {
+                        return Err(Error::Conflict);
+                    }
+                    Family::identify(
+                        instance.workflow.as_str(),
+                        instance.definition_version.get(),
+                        &instance.definition_digest,
+                    )
+                    .map(|(family, _)| family)
+                })
+                .transpose()?;
+            // 领取不授予跨域推进权；关闭域只交还原timer，不能消费后再用另一域的开关提交超时方向。
+            if family.is_some_and(|family| !enabled(family)) {
+                authorize()?;
+                return Ok(TimerOutcome::SkippedPaused);
+            }
             let now = database_now().await?;
             // 只在此事务消费和推进状态；文件动作、外部发送及租约领取不得进入该锁域。
             let result = workflow
@@ -119,6 +150,9 @@ impl Store {
                 .await
                 .map_err(|_| Error::Unavailable)?;
             authorize()?;
+            if family.is_some_and(|family| !enabled(family)) {
+                return Err(Error::Denied);
+            }
             Ok(result)
         }))
         .await

@@ -5,6 +5,8 @@ pub(crate) mod authorization;
 pub(crate) mod backup;
 #[cfg(feature = "node-actions")]
 pub(crate) mod conditions;
+#[cfg(feature = "node-actions")]
+pub(crate) mod execution;
 mod frame;
 #[cfg(all(feature = "admin-operations-pgsql", feature = "node-actions"))]
 pub(crate) mod impact;

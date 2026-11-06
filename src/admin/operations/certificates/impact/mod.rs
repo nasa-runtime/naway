@@ -4,9 +4,9 @@
 mod api;
 mod capacity;
 #[cfg(feature = "node-actions")]
-mod encoding;
+pub(super) mod encoding;
 #[cfg(feature = "node-actions")]
-mod model;
+pub(super) mod model;
 #[cfg(feature = "node-actions")]
 mod reading;
 mod retention;

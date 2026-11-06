@@ -12,6 +12,27 @@ pub(crate) const FRAME_LIMIT: usize = 2 * PART_LIMIT + HEADER_BYTES;
 pub(crate) struct Backup(Zeroizing<Vec<u8>>);
 
 impl Backup {
+    /// 业务作用：接管持久秘密槽的唯一清零缓冲，恢复不经解析重编码或复制完整pair。
+    ///
+    /// 参数说明：
+    /// - `bytes`：按原槽预算读取的完整原生帧，所有权转入备份。
+    ///
+    /// 返回：符合磁盘pair边界的备份；格式失败时原缓冲随错误路径清零。
+    pub(crate) fn from_bytes(bytes: Zeroizing<Vec<u8>>) -> Result<Self> {
+        let backup = Self(bytes);
+        backup.parts()?;
+        Ok(backup)
+    }
+
+    /// 业务作用：为固定秘密槽提供完整原帧借用，持久写入不再组合另一份私钥缓冲。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：唯一清零帧的只读切片，不延长原所有者生命周期。
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+
     /// 业务作用：用原打开句柄的完整长度一次分配原pair帧，避免分别聚合后再复制证书和私钥。
     ///
     /// 参数说明：

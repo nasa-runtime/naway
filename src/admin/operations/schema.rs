@@ -2,11 +2,12 @@
 
 use crate::config::operations::Plan;
 use nasa::migration::pgsql::{MigrationMode, MigrationSettings, Migrator};
-use sqlx::{ConnectOptions, PgPool, SqlSafeStr, postgres::PgPoolOptions};
+use sqlx::{postgres::PgPoolOptions, ConnectOptions, PgPool, SqlSafeStr};
 use std::{str::FromStr, time::Duration};
 
 mod certificates;
 mod delivery;
+mod material_execution;
 mod material_impact;
 mod workflow;
 
@@ -15,6 +16,7 @@ pub(super) struct Installed {
     pub delivery: bool,
     pub certificates: bool,
     pub material_impact: bool,
+    pub material_execution: bool,
 }
 
 const MIGRATION: &str = concat!(
@@ -118,7 +120,9 @@ pub(super) async fn gate(
     with_workflow: bool,
 ) -> anyhow::Result<Installed> {
     let installed = installed_tail(pool).await?;
-    let with_material_impact = installed >= 8
+    let with_material_execution = installed >= 9 || plan.config.certificates.execution.enabled;
+    let with_material_impact = with_material_execution
+        || installed >= 8
         || (plan.config.certificates.enabled && plan.config.certificates.impact_approvals.enabled);
     // 已安装材料合同不能随运行开关关闭而逃过结构复验；新启用则必须先由显式迁移建立完整前置结构。
     let with_certificates =
@@ -191,6 +195,15 @@ pub(super) async fn gate(
             false,
         ));
     }
+    if with_material_execution {
+        migrations.push(sqlx::migrate::Migration::new(
+            9,
+            "persistent material execution".into(),
+            sqlx::migrate::MigrationType::Simple,
+            material_execution::MIGRATION.into_sql_str(),
+            false,
+        ));
+    }
     let migrator = Migrator::with_migrations(migrations);
     let settings = MigrationSettings {
         mode: if apply {
@@ -205,7 +218,9 @@ pub(super) async fn gate(
         nasa::migration::pgsql::run_gate(pool, &plan.config.schema, &migrator, &settings).await
     {
         // 等待迁移锁期间另一入口可能已提交工作流尾部；只允许按该已存在事实重选一次完整合同。
-        let selected = if with_material_impact {
+        let selected = if with_material_execution {
+            9
+        } else if with_material_impact {
             8
         } else if with_certificates {
             7
@@ -217,7 +232,7 @@ pub(super) async fn gate(
             4
         };
         let committed = installed_tail(pool).await?;
-        if committed > selected && committed <= 8 {
+        if committed > selected && committed <= 9 {
             return Box::pin(gate(pool, plan, apply, false)).await;
         }
         return Err(error.into());
@@ -266,11 +281,20 @@ pub(super) async fn gate(
         )
         .await?;
     }
+    if with_material_execution {
+        verify_shape(
+            pool,
+            "SELECT shape::text FROM naway_material_execution_schema WHERE singleton",
+            material_execution::SHAPE,
+        )
+        .await?;
+    }
     Ok(Installed {
         workflow: with_workflow,
         delivery: with_delivery,
         certificates: with_certificates,
         material_impact: with_material_impact,
+        material_execution: with_material_execution,
     })
 }
 

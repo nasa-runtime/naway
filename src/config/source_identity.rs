@@ -163,20 +163,9 @@ impl Identity {
             read_document(&paths.guard, Some(&mut bundle))?,
             read_document(&paths.sentinel, Some(&mut bundle))?,
         ];
-        let mut digest = Sha256::new();
-        digest.update(b"naway-source-documents\0");
-        for (role, document) in ["gateway", "interface-guard", "sentinel-rules"]
-            .into_iter()
-            .zip(documents)
-        {
-            digest.update((role.len() as u32).to_be_bytes());
-            digest.update(role.as_bytes());
-            digest.update(document.length.to_be_bytes());
-            digest.update(document.sha256);
-        }
         Ok(Self {
+            sha256: documents_digest(documents.map(|document| (document.length, document.sha256))),
             documents,
-            sha256: digest.finalize().into(),
             bundle_sha256: bundle.finalize().into(),
         })
     }
@@ -194,6 +183,27 @@ impl Identity {
         }
         text
     }
+}
+
+/// 业务作用：统一实际配置与持久恢复的三base摘要算法，恢复证据不能独立重解释原角色或顺序。
+///
+/// 参数说明：
+/// - `documents`：按主文档、guard、Sentinel顺序排列的完整长度和SHA-256。
+///
+/// 返回：保留既有域、角色与长度分帧的固定集合摘要，不复制或重新解析配置正文。
+pub(crate) fn documents_digest(documents: [(u64, [u8; 32]); 3]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"naway-source-documents\0");
+    for (role, (length, sha256)) in ["gateway", "interface-guard", "sentinel-rules"]
+        .into_iter()
+        .zip(documents)
+    {
+        digest.update((role.len() as u32).to_be_bytes());
+        digest.update(role.as_bytes());
+        digest.update(length.to_be_bytes());
+        digest.update(sha256);
+    }
+    digest.finalize().into()
 }
 
 /// 业务作用：以固定缓冲读取普通配置文件，长度变化或特殊文件不能提供稳定正文证据。

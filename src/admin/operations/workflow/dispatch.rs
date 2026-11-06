@@ -10,9 +10,18 @@ use nasaga_backend::SagaBackend;
 use nasaga_runtime_core::{
     SagaCommandEnvelope, VerifiedIdentity, COMMAND_EVENT_TYPE, SAGA_AGGREGATE_TYPE,
 };
+use std::sync::Arc;
+
+/// 持久命令的业务域由独立定义确认，共用扫描器不能把同名步骤视为同一种节点动作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::admin::operations) enum Family {
+    Configuration,
+    Material,
+}
 
 /// 已复验的有限事件；正文仍在原提案中，不能由 Outbox 注入另一份候选。
 pub(in crate::admin::operations) struct Pending {
+    pub(in crate::admin::operations) family: Family,
     pub(in crate::admin::operations) envelope: SagaCommandEnvelope,
     pub(in crate::admin::operations) identity: VerifiedIdentity,
     pub(in crate::admin::operations) target_count: usize,
@@ -56,18 +65,11 @@ impl Pending {
         {
             return Err(Error::Invalid);
         }
-        let target_count: usize = envelope
-            .workflow
-            .strip_prefix("naway-config-targets-")
-            .and_then(|value| value.parse().ok())
-            .ok_or(Error::Invalid)?;
-        let definition = definition::cached(target_count).map_err(|_| Error::Invalid)?;
-        if identity.workflow != *definition.name()
-            || identity.definition_version != definition.version()
-            || identity.definition_digest != definition.digest()
-        {
-            return Err(Error::Invalid);
-        }
+        let (family, target_count) = Family::identify(
+            &envelope.workflow,
+            envelope.definition_version,
+            &envelope.definition_digest,
+        )?;
         let (step, index) = if let Some(index) = envelope.step.strip_prefix("prepare-") {
             (Step::Prepare, index)
         } else if let Some(index) = envelope.step.strip_prefix("apply-") {
@@ -80,6 +82,7 @@ impl Pending {
             return Err(Error::Invalid);
         }
         Ok(Self {
+            family,
             envelope,
             identity,
             target_count,
@@ -129,8 +132,7 @@ impl Pending {
                     .load_steps(&self.identity.saga_id)
                     .await
                     .map_err(|_| Error::Unavailable)?;
-                let definition =
-                    definition::cached(self.target_count).map_err(|_| Error::Unavailable)?;
+                let definition = self.family.definition(self.target_count)?;
                 if steps.len() != definition.steps().len()
                     || steps.iter().zip(definition.steps()).enumerate().any(
                         |(index, (row, step))| {
@@ -159,5 +161,56 @@ impl Pending {
                 eligibility::classify(self, &instance, row, attempt)
             }))
             .await
+    }
+}
+
+impl Family {
+    /// 业务作用：由原不可变定义确认业务域与完整分母，定时器不能只按步骤名借用另一域的开关。
+    ///
+    /// 参数说明：
+    /// - `workflow`：原实例或已证命令中的规范工作流名。
+    /// - `version`：该原定义的业务版本。
+    /// - `digest`：原登记的完整定义摘要。
+    ///
+    /// 返回：唯一定义的业务域和原分母；未知名称、非规范数量、版本或摘要漂移均拒绝。
+    pub(in crate::admin::operations) fn identify(
+        workflow: &str,
+        version: u32,
+        digest: &str,
+    ) -> Result<(Self, usize), Error> {
+        let (family, suffix) = if let Some(suffix) = workflow.strip_prefix("naway-config-targets-")
+        {
+            (Self::Configuration, suffix)
+        } else if let Some(suffix) = workflow.strip_prefix("naway-material-nodes-") {
+            (Self::Material, suffix)
+        } else {
+            return Err(Error::Invalid);
+        };
+        let count: usize = suffix.parse().map_err(|_| Error::Invalid)?;
+        let definition = family.definition(count)?;
+        if workflow != definition.name().as_str()
+            || version != definition.version().get()
+            || digest != definition.digest()
+        {
+            return Err(Error::Invalid);
+        }
+        Ok((family, count))
+    }
+
+    /// 业务作用：按已证业务域读取原固定定义，共享定时器和资格裁决不能借另一域的步骤合同。
+    ///
+    /// 参数说明：
+    /// - `count`：原配置目标数或原材料物理节点数，不能取当前在线数量。
+    ///
+    /// 返回：该域唯一不可变定义；未知分母和构造失败都拒绝。
+    pub(in crate::admin::operations) fn definition(
+        self,
+        count: usize,
+    ) -> Result<Arc<nasa::saga::WorkflowDefinition>, Error> {
+        match self {
+            Self::Configuration => definition::cached(count),
+            Self::Material => crate::control::material::execution::definition::cached(count),
+        }
+        .map_err(|_| Error::Invalid)
     }
 }

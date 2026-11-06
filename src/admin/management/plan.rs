@@ -2,7 +2,7 @@
 
 use super::{issuer, security};
 use crate::config::management::Config;
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use nagrpc::GrpcTlsAcceptor;
 use nasa::grpc::{Certificate, ClientTlsConfig, Endpoint, GrpcTlsIdentity, Identity};
 use sha2::{Digest, Sha256};
@@ -17,6 +17,7 @@ pub(crate) struct Plan {
     pub(crate) previews_enabled: bool,
     pub(crate) material_previews_enabled: bool,
     pub(crate) material_installations_enabled: bool,
+    pub(crate) material_actions_enabled: bool,
     pub(super) report_metrics: bool,
     pub(super) authority: [u8; 32],
     pub(in crate::admin) node_id: String,
@@ -193,6 +194,10 @@ impl Plan {
                 !reporter.material_installations || cfg!(feature = "node-actions"),
                 "management reporter material_installations require node-actions"
             );
+            ensure!(
+                !reporter.material_actions || cfg!(feature = "node-actions"),
+                "management reporter material_actions require node-actions"
+            );
             stamp(&mut authority, &[u8::from(reporter.previews)]);
             // 关闭的新能力不改变已有管理会话身份，开启则必须撤销不具该权限的原连接。
             if reporter.material_previews {
@@ -200,6 +205,9 @@ impl Plan {
             }
             if reporter.material_installations {
                 stamp(&mut authority, b"material_installations");
+            }
+            if reporter.material_actions {
+                stamp(&mut authority, b"material_actions");
             }
             stamp(&mut authority, &[u8::from(reporter.metrics)]);
             ensure!(
@@ -238,7 +246,8 @@ impl Plan {
                     !(reporter.actions
                         || reporter.previews
                         || reporter.material_previews
-                        || reporter.material_installations)
+                        || reporter.material_installations
+                        || reporter.material_actions)
                         || issuer.is_some(),
                     "management reporter actions and previews require trusted issuers"
                 );
@@ -285,6 +294,10 @@ impl Plan {
                 .reporter
                 .as_ref()
                 .is_some_and(|reporter| reporter.material_installations),
+            material_actions_enabled: cfg
+                .reporter
+                .as_ref()
+                .is_some_and(|reporter| reporter.material_actions),
             report_metrics: cfg
                 .reporter
                 .as_ref()

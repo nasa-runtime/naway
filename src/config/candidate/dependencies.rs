@@ -3,6 +3,7 @@
 use super::{Documents, Paths};
 use crate::config::{ConfigWatchPlan, GatewaySnapshot};
 use anyhow::{ensure, Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
@@ -14,6 +15,76 @@ use std::{
 const MAX_PATHS: usize = 2048;
 const MAX_FILE: u64 = 128 * 1024 * 1024;
 const MAX_TOTAL: u64 = 512 * 1024 * 1024;
+
+/// 原本机依赖列表与字节证明一起保留，启动恢复不从尚未构建的TLS快照重新选择依赖。
+#[derive(PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Frozen {
+    paths: Vec<PathBuf>,
+    sha256: [u8; 32],
+}
+
+impl Frozen {
+    /// 业务作用：保留原配置完整非base依赖的有限位置，材料决定重启恢复先核验它们再补齐文件。
+    ///
+    /// 参数说明：
+    /// - `snapshot`：原完整配置，调用者已取得发布权。
+    ///
+    /// 返回：只含原位置和摘要的证据，不复制文件正文；容量或读取不稳定时拒绝。
+    pub(crate) fn capture(snapshot: &GatewaySnapshot) -> Result<Self> {
+        let paths: Vec<_> = paths(
+            &snapshot.config_watch,
+            &snapshot.document_paths,
+            Documents {
+                gateway: &snapshot.document_paths.gateway,
+                sidecars: None,
+            },
+        )?
+        .into_iter()
+        .collect();
+        let sha256 = digest(&paths)?;
+        Ok(Self {
+            paths,
+            sha256,
+        })
+    }
+
+    /// 业务作用：限制持久依赖列表的规范顺序和位置，损坏记录不能任意扩大启动读取范围。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：原列表有界、绝对、UTF-8且严格去重时成功，不读取文件或证明当前内容。
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.paths.len() <= MAX_PATHS && self.paths.windows(2).all(|pair| pair[0] < pair[1]),
+            "frozen dependency list differs"
+        );
+        for path in &self.paths {
+            ensure!(
+                path.is_absolute()
+                    && path
+                        .to_str()
+                        .is_some_and(|text| text.len() <= 4096 && !text.as_bytes().contains(&0)),
+                "frozen dependency path differs"
+            );
+        }
+        Ok(())
+    }
+
+    /// 业务作用：按原依赖列表复验全部原文、缺失状态和文件身份，不允许当前环境缩减恢复分母。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：全部依赖保持原证明时成功；漂移或不可读拒绝文件恢复，保留原责任。
+    pub(crate) fn require_current(&self) -> Result<()> {
+        self.validate()?;
+        ensure!(
+            digest(&self.paths)? == self.sha256,
+            "material configuration dependencies changed"
+        );
+        Ok(())
+    }
+}
 
 /// 业务作用：冻结本次候选实际引用的非 base 依赖，原始文档由独立文件计划约束。
 ///
@@ -35,6 +106,23 @@ pub(crate) fn capture(snapshot: &GatewaySnapshot, documents: Documents<'_>) -> R
 ///
 /// 返回：包含缺失候选和完整内容的固定摘要；路径、容量、文件类型或读取漂移均拒绝。
 fn proof(watch: &ConfigWatchPlan, declared: &Paths, documents: Documents<'_>) -> Result<[u8; 32]> {
+    let paths: Vec<_> = paths(watch, declared, documents)?.into_iter().collect();
+    digest(&paths)
+}
+
+/// 业务作用：统一当前捕获与持久恢复所用的原依赖选择，base正文仍由独立角色证据负责。
+///
+/// 参数说明：
+/// - `watch`：同次构建给出的来源和附加依赖。
+/// - `declared`：原配置声明的三个base位置。
+/// - `documents`：此次实际base输入，用于排除隔离候选。
+///
+/// 返回：规范排序、去重且有界的绝对路径集合；不读取或改写依赖内容。
+fn paths(
+    watch: &ConfigWatchPlan,
+    declared: &Paths,
+    documents: Documents<'_>,
+) -> Result<BTreeSet<PathBuf>> {
     let root = std::env::current_dir().context("node dependency root unavailable")?;
     let mut excluded = BTreeSet::new();
     for path in declared
@@ -64,17 +152,27 @@ fn proof(watch: &ConfigWatchPlan, declared: &Paths, documents: Documents<'_>) ->
             paths.insert(path);
         }
     }
+    Ok(paths)
+}
+
+/// 业务作用：对既定依赖顺序计算相同域的完整摘要，重启复验不需要重新解析业务配置。
+///
+/// 参数说明：
+/// - `paths`：已验证并按原规范顺序排列的绝对位置。
+///
+/// 返回：原存在性、文件身份与完整内容的摘要；读取失败或超出共同预算拒绝整批。
+fn digest(paths: &[PathBuf]) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
     digest.update(b"naway-node-action-dependencies\0");
     digest.update(1_u32.to_be_bytes());
     digest.update((paths.len() as u32).to_be_bytes());
     let mut remaining = MAX_TOTAL;
-    let mut buffer = [0_u8; 16 * 1024];
+    let mut buffer = zeroize::Zeroizing::new([0_u8; 16 * 1024]);
     for path in paths {
         let text = path.to_str().expect("validated dependency path");
         digest.update((text.len() as u32).to_be_bytes());
         digest.update(text.as_bytes());
-        hash_file(&path, &mut digest, &mut remaining, &mut buffer)?;
+        hash_file(path, &mut digest, &mut remaining, buffer.as_mut())?;
     }
     Ok(digest.finalize().into())
 }

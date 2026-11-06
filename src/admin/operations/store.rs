@@ -1,14 +1,14 @@
 //! 同事务保存候选和幂等收据；跨 Admin 容量由数据库行锁裁决。
 
-use super::model::{Candidate, Decision, Error, Record, Review, hex};
+use super::model::{hex, Candidate, Decision, Error, Record, Review};
 use crate::config::operations::Plan;
 use nasa::idempotency::{
+    pgsql::{PgIdempotencyStore, PgIdempotencyTransactionError},
     ExecutionLease, IdempotencyKey, IdempotencyOutcome, IdempotencyStore, RequestFingerprint,
     StoredResponse,
-    pgsql::{PgIdempotencyStore, PgIdempotencyTransactionError},
 };
 use nasa::tx::pgsql::TxDecision;
-use sqlx::{Row, postgres::PgRow};
+use sqlx::{postgres::PgRow, Row};
 use std::{future::Future, sync::Arc, time::Duration};
 
 pub(super) const DATASOURCE: &str = "naway_admin_operations";
@@ -21,12 +21,15 @@ pub struct Store {
     pub(super) delivery_installed: bool,
     pub(super) certificates_installed: bool,
     pub(super) material_impact_installed: bool,
+    pub(super) material_execution_installed: bool,
     pub(super) certificate_workers: Option<Arc<tokio::sync::Semaphore>>,
     #[cfg(feature = "admin-operations-workflow-pgsql")]
     pub(super) workflow: std::sync::OnceLock<super::workflow::Workflow>,
     #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
     pub(super) executor:
         std::sync::OnceLock<tokio::sync::Mutex<Option<super::execution::runtime::Runtime>>>,
+    #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
+    pub(super) material_cache: super::certificates::execution::cache::Cache,
     pub(super) idempotency: PgIdempotencyStore,
     pub(super) admission: tokio::sync::Semaphore,
     pub(super) stopping: tokio_util::sync::CancellationToken,
@@ -82,6 +85,15 @@ impl Store {
             store.close().await;
             anyhow::bail!("certificate impact authority unavailable or differs");
         }
+        #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
+        if super::certificates::execution::namespace::register(&store)
+            .await
+            .is_err()
+        {
+            // 独立永久域未确认时不能让材料发行者借已就绪的配置工作流获得签发权。
+            store.close().await;
+            anyhow::bail!("certificate execution authority unavailable or differs");
+        }
         Ok(store)
     }
 
@@ -117,10 +129,13 @@ impl Store {
             delivery_installed: installed.delivery,
             certificates_installed: installed.certificates,
             material_impact_installed: installed.material_impact,
+            material_execution_installed: installed.material_execution,
             #[cfg(feature = "admin-operations-workflow-pgsql")]
             workflow: std::sync::OnceLock::new(),
             #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
             executor: std::sync::OnceLock::new(),
+            #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
+            material_cache: super::certificates::execution::cache::Cache::default(),
             idempotency,
             admission: tokio::sync::Semaphore::new(8),
             stopping: tokio_util::sync::CancellationToken::new(),
@@ -137,11 +152,15 @@ impl Store {
         // 先停止轮次并等待当前事务结束，随后关池；未知提交只能由下一进程回读收敛。
         self.stopping.cancel();
         #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
+        self.material_cache.clear();
+        #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
         if let Some(executor) = self.executor.get() {
             if let Some(mut runtime) = executor.lock().await.take() {
                 runtime.close().await;
             }
         }
+        #[cfg(all(feature = "admin-operations-workflow-pgsql", feature = "node-actions"))]
+        self.material_cache.clear();
         if let Some(cleaner) = self.cleaner.get() {
             if let Some(mut worker) = cleaner.lock().await.take() {
                 if tokio::time::timeout(Duration::from_secs(11), &mut worker)

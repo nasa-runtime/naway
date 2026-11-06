@@ -128,6 +128,20 @@ impl Directory {
             Err(error) if existing && error.kind() == ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
+        let directory = Self::open(target)?;
+        // 子目录内部文件的同步不包含父目录项；准备成功前必须确认这个目录本身可在重启后找到。
+        directory.target.sync()?;
+        Ok(directory)
+    }
+
+    /// 业务作用：取得必须已经存在的原材料目录能力，整批恢复不能通过重新建目录继承旧写权。
+    ///
+    /// 参数说明：
+    /// - `target`：原父目录内的精确目录项。
+    ///
+    /// 返回：已验证普通目录的原句柄；缺失、链接或替换拒绝，不创建任何目录。
+    pub(super) fn open(target: Target) -> Result<Self> {
+        target.require_current()?;
         ensure!(
             target.directory.symlink_metadata(&target.name)?.is_dir(),
             "TLS material location must be a directory"
@@ -145,8 +159,6 @@ impl Directory {
             directory: Arc::new(Dir::from_std_file(file.into_std())),
         };
         directory.require_current()?;
-        // 子目录内部文件的同步不包含父目录项；准备成功前必须确认这个目录本身可在重启后找到。
-        directory.target.sync()?;
         Ok(directory)
     }
 

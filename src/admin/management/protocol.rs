@@ -4,7 +4,13 @@ use super::security;
 use crate::admin::cluster::facts::Facts;
 use nasa::grpc::Status;
 
-nasa::grpc::include_proto!("naway.management.v1");
+// 受管协议保持oneof的原生字段布局；完整报告仅在有界消息入口分配和验证。
+#[allow(clippy::large_enum_variant)]
+mod generated {
+    nasa::grpc::include_proto!("naway.management.v1");
+}
+
+pub(super) use generated::*;
 
 /// 业务作用：将本进程的真实当前事实编码为固定管理协议，不从注册目录推测运行状态。
 ///

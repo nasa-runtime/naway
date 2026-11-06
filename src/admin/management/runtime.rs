@@ -45,6 +45,9 @@ pub struct Manager {
     #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
     pub(super) action_deliveries:
         parking_lot::Mutex<std::collections::BTreeMap<String, Arc<super::actions::Offer>>>,
+    #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+    pub(super) material_action_deliveries:
+        parking_lot::Mutex<std::collections::BTreeMap<String, Arc<super::material_actions::Offer>>>,
     mode: AdminPlaneMode,
     active: parking_lot::Mutex<Option<Active>>,
     reporter: OnceLock<AbortOnDropHandle<()>>,
@@ -229,6 +232,8 @@ impl Manager {
             preview_deliveries: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
             action_deliveries: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+            material_action_deliveries: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             mode,
             store: parking_lot::Mutex::new(receiver::Store::default()),
             publication: parking_lot::RwLock::new(()),
@@ -436,6 +441,9 @@ async fn bind(
         "Sample",
         "ActionData",
         "ActionResult",
+        "MaterialActionData",
+        "MaterialActionResult",
+        "MaterialReleaseResult",
         "PreviewData",
         "PreviewResult",
         "MaterialConditionsResult",

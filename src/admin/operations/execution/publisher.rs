@@ -9,7 +9,7 @@ use crate::{
         management::actions::local::Local,
         operations::{
             model::Error,
-            workflow::dispatch::{Disposition, Pending},
+            workflow::dispatch::{Disposition, Family, Pending},
             Store,
         },
         AdminState,
@@ -49,9 +49,15 @@ impl Publisher<'_> {
     ///
     /// 返回：NASA 与目标事实已明确提交或原命令已被替代；失败不重选节点、不释放持久目标。
     async fn deliver(&self, event: &OutboxEvent) -> Result<(), Error> {
+        let pending = Pending::decode(event, &self.store.plan.config.cluster_id)?;
+        if pending.family == Family::Material {
+            return super::super::certificates::execution::publisher::deliver(
+                self.state, self.store, self.owner, &pending,
+            )
+            .await;
+        }
         let snapshot = self.state.snap.load_full();
         let plan = authority::running(self.state, self.store, &snapshot)?;
-        let pending = Pending::decode(event, &self.store.plan.config.cluster_id)?;
         let resolve_compensation = match pending.disposition(self.store).await? {
             Disposition::Retired => {
                 // 只读证据不能延长已经关闭的执行运行权，确认过时事件前仍复验原完整快照。
@@ -112,8 +118,12 @@ impl Publisher<'_> {
                 .await
                 .map_err(|_| Error::Unavailable)?;
             let result = received.result.as_ref().ok_or(Error::Unavailable)?;
+            let confirm = || {
+                authorize()?;
+                received.authorize(self.state).map_err(|_| Error::Denied)
+            };
             self.store
-                .accept_target_result(&pending, &frozen, resolve_compensation, result, &authorize)
+                .accept_target_result(&pending, &frozen, resolve_compensation, result, &confirm)
                 .await?;
             received.authorize(self.state).map_err(|_| Error::Denied)?;
         } else {
@@ -124,9 +134,14 @@ impl Publisher<'_> {
                 .map_err(|_| Error::Unavailable)?;
             let received = ticket.receive().await.map_err(|_| Error::Unavailable)?;
             let result = received.result.as_ref().ok_or(Error::Unavailable)?;
+            let confirm = || {
+                authorize()?;
+                ticket.authorize().map_err(|_| Error::Denied)
+            };
             self.store
-                .accept_target_result(&pending, &frozen, resolve_compensation, result, &authorize)
+                .accept_target_result(&pending, &frozen, resolve_compensation, result, &confirm)
                 .await?;
+            confirm()?;
             // Inbox、实例和目标投影均已确认提交，才允许当前节点 RPC 收到 ACK。
             received.confirm();
         }

@@ -1,10 +1,12 @@
 //! 与提案同源的 NASA 工作流运行态；存储就绪和节点执行资格分别判定。
 
+#[cfg(feature = "node-actions")]
+pub(super) mod completion;
 mod definition;
 #[cfg(feature = "node-actions")]
 pub(super) mod dispatch;
 #[cfg(feature = "node-actions")]
-mod results;
+pub(super) mod results;
 #[cfg(feature = "node-actions")]
 pub(super) mod start;
 #[cfg(feature = "node-actions")]
@@ -18,7 +20,7 @@ use nasa::saga::pgsql::{OrchestratorConfig, PgOrchestrator};
 use std::{sync::Arc, time::Duration};
 
 pub(super) struct Workflow {
-    engine: PgOrchestrator,
+    pub(in crate::admin::operations) engine: PgOrchestrator,
     #[cfg(feature = "node-actions")]
     timer_tokens: nasaga_backend::TimerFencingTokenIssuer,
     pub(super) summary: definition::Summary,

@@ -118,6 +118,19 @@ impl Target {
 }
 
 impl Location {
+    /// 业务作用：比较两个持久角色是否属于同一原父目录，文本同名而设备或inode不同不能共享事务权威。
+    ///
+    /// 参数说明：
+    /// - `other`：另一角色准备时冻结的位置。
+    ///
+    /// 返回：真实父路径和设备/inode均一致才为真，不访问当前文件系统。
+    #[cfg(feature = "node-actions")]
+    pub(crate) fn same_directory(&self, other: &Self) -> bool {
+        self.path.parent() == other.path.parent()
+            && self.device == other.device
+            && self.inode == other.inode
+    }
+
     /// 业务作用：绑定真实父目录与文件名，进程重启后不能把旧决定应用到替换过的目录。
     ///
     /// 参数说明：

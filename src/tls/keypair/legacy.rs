@@ -12,6 +12,52 @@ use std::{
 mod bound;
 mod recovery;
 
+/// 整批材料决定冻结的原角色目录及旧完整归属，不能由底层事务重新选择目标。
+pub(in crate::tls::keypair) struct Boundary<'a> {
+    pub certificate: &'a crate::io::file_target::Location,
+    pub private_key: &'a crate::io::file_target::Location,
+    pub owner: &'a crate::io::file_target::Location,
+    pub transaction: &'a crate::io::file_target::Location,
+    pub previous: &'a generation::Record,
+}
+
+impl Boundary<'_> {
+    /// 业务作用：在恢复或创建底层事务之前核对全部原父目录，缺失目录不能被重新创建成旧权威。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：四个原角色的父目录身份仍成立时成功，不创建目录或改写任何正文。
+    fn require_locations(&self) -> Result<()> {
+        for location in [
+            self.certificate,
+            self.private_key,
+            self.owner,
+            self.transaction,
+        ] {
+            location.open()?;
+        }
+        Ok(())
+    }
+
+    /// 业务作用：把底层实际打开能力与整批原位置配对，外部别名或父目录替换不能获得原决定写权。
+    ///
+    /// 参数说明：
+    /// - `targets`：底层事务持有且后续读写一直沿用的四个目录能力。
+    ///
+    /// 返回：全部原角色位置精确相同才成功，拒绝时保持原活动材料。
+    fn require_targets(&self, targets: &bound::Targets<'_>) -> Result<()> {
+        use crate::io::file_target::Location;
+        anyhow::ensure!(
+            Location::capture(&targets.certificate)? == *self.certificate
+                && Location::capture(&targets.private_key)? == *self.private_key
+                && Location::capture(&targets.owner)? == *self.owner
+                && Location::capture(&targets.transaction)? == *self.transaction,
+            "TLS decided transaction locations differ"
+        );
+        Ok(())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TransactionState {
@@ -41,20 +87,75 @@ pub(super) fn install_legacy_keypair_transaction(
     private_key_pem: &[u8],
     next: generation::Record,
 ) -> Result<String> {
+    install(tls, certificate_pem, private_key_pem, next, None)
+}
+
+/// 业务作用：按整批已提交的原边界执行同一双文件事务，不另造材料代或向后来目录写入。
+///
+/// 参数说明：
+/// - `tls`：原本机文件声明，外层已验证配置证据并持有材料锁。
+/// - `certificate`：该方向已验证完整证书借用。
+/// - `private_key`：同一完整pair的私钥借用。
+/// - `next`：整批决定之前持久预分配的材料归属。
+/// - `boundary`：原四角色目录及该方向允许的旧owner。
+///
+/// 返回：原决定完整提交后的材料代；未知结果保留原事务，不声称未执行。
+#[cfg(feature = "node-actions")]
+pub(in crate::tls::keypair) fn install_decided(
+    tls: &TlsRuntimeCfg,
+    certificate: &[u8],
+    private_key: &[u8],
+    next: generation::Record,
+    boundary: &Boundary<'_>,
+) -> Result<String> {
+    install(tls, certificate, private_key, next, Some(boundary))
+}
+
+/// 业务作用：共享双文件写入顺序，并在具有整批约束时将原目录和旧owner门加入实际副作用位置。
+///
+/// 参数说明：
+/// - `tls`：本机文件计划，调用方持有材料安装锁。
+/// - `certificate_pem`：完整目标证书链。
+/// - `private_key_pem`：对应私钥原文。
+/// - `next`：原预分配目标材料代。
+/// - `boundary`：整批动作原边界；普通本机安装没有额外持久原位置。
+///
+/// 返回：完整事务确认后的目标代；失败沿用原恢复与未知结果语义。
+fn install(
+    tls: &TlsRuntimeCfg,
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+    next: generation::Record,
+    boundary: Option<&Boundary<'_>>,
+) -> Result<String> {
     // 准备身份必须先于恢复或写入复验；错来源或错正文不能借旧事务恢复取得副作用。
     let target = generation::target(tls)?;
     next.require_material(&target, certificate_pem, private_key_pem)?;
-    recover_legacy_keypair_transaction_locked(tls)?;
-    for path in [&tls.cert_file, &tls.key_file] {
-        fs::create_dir_all(path.parent().context("TLS material parent absent")?)?;
+    recover(tls, boundary, Some(&next))?;
+    if let Some(boundary) = boundary {
+        // 原批次只拥有已经存在的原目录，缺席后重新建目录会错误继承旧写权。
+        boundary.require_locations()?;
+    } else {
+        for path in [&tls.cert_file, &tls.key_file] {
+            fs::create_dir_all(path.parent().context("TLS material parent absent")?)?;
+        }
     }
     let transaction = legacy_keypair_transaction_dir(tls)?;
     let targets = bound::Targets::capture(tls, &transaction)?;
+    if let Some(boundary) = boundary {
+        boundary.require_targets(&targets)?;
+    }
     // 打开父目录后复验原材料身份，路径别名变化不能把此前预分配的代移到另一来源。
     next.require_material(&targets.source(), certificate_pem, private_key_pem)?;
     let locations = targets.locations()?;
     targets.require_current()?;
     let old_generation = bound::owner(&targets.owner, &target)?;
+    if let Some(boundary) = boundary {
+        anyhow::ensure!(
+            old_generation.as_ref().map(|(_, owner)| owner) == Some(boundary.previous),
+            "TLS decided previous ownership differs"
+        );
+    }
     let mut journal = bound::Journal::create(&targets.transaction)?;
     let prepared = (|| -> Result<generation::Record> {
         let old_cert = io::read(&targets.certificate, MAX_KEYPAIR_BYTES)?;
@@ -119,7 +220,7 @@ pub(super) fn install_legacy_keypair_transaction(
         targets.require_current()
     })();
     if let Err(error) = publish {
-        recover_legacy_keypair_transaction_locked(tls)
+        recover(tls, boundary, Some(&next))
             .context("restore legacy TLS pair after failed publish")?;
         return Err(error);
     }
@@ -137,6 +238,40 @@ pub(super) fn install_legacy_keypair_transaction(
 ///
 /// 返回：journal 不存在、确认提交或恢复完成时成功；任何不可信 journal/材料拒绝继续读取。
 pub(super) fn recover_legacy_keypair_transaction_locked(tls: &TlsRuntimeCfg) -> Result<()> {
+    recover(tls, None, None)
+}
+
+/// 业务作用：整批重放只结算同一预分配方向的原底层journal，后来事务不能借原计划被恢复。
+///
+/// 参数说明：
+/// - `tls`：原本机双文件声明，调用方持有材料锁。
+/// - `boundary`：原四角色目录及该方向的旧完整归属。
+/// - `next`：全批方向决定的目标归属。
+///
+/// 返回：没有活动journal或同一原事务完成恢复时成功；错代、错目录或未知旧备份拒绝。
+#[cfg(feature = "node-actions")]
+pub(in crate::tls::keypair) fn recover_decided(
+    tls: &TlsRuntimeCfg,
+    boundary: &Boundary<'_>,
+    next: &generation::Record,
+) -> Result<()> {
+    boundary.require_locations()?;
+    recover(tls, Some(boundary), Some(next))
+}
+
+/// 业务作用：共用旧格式读取和严格整批恢复，原决定约束必须先于任何备份回放或owner发布。
+///
+/// 参数说明：
+/// - `tls`：当前明确的本机声明。
+/// - `boundary`：可选的整批原目录及旧owner证据。
+/// - `next`：整批约束启用时唯一允许的目标代；普通独立恢复不额外选择目标。
+///
+/// 返回：原事务结算或明确缺失时成功；证据不符保留现场并阻止加载。
+fn recover(
+    tls: &TlsRuntimeCfg,
+    boundary: Option<&Boundary<'_>>,
+    next: Option<&generation::Record>,
+) -> Result<()> {
     if tls.keypair_manifest_file.is_some() {
         return Ok(());
     }
@@ -164,6 +299,24 @@ pub(super) fn recover_legacy_keypair_transaction_locked(tls: &TlsRuntimeCfg) -> 
     let journal = bound::Journal::open(Target::open(&transaction)?)?;
     let state = read_transaction_state(&journal)?;
     let targets = bound::Targets::capture(tls, &transaction)?;
+    if let Some(boundary) = boundary {
+        // 旧schema缺少本次整批原目录或预分配代，不能被自动提升为该方向的恢复权威。
+        boundary.require_targets(&targets)?;
+        anyhow::ensure!(
+            state.schema_version == 3
+                && state.generation.as_ref() == next
+                && next.is_some()
+                && state.old_cert_present
+                && state.old_key_present
+                && state.old_generation_present,
+            "TLS decided journal ownership differs"
+        );
+        let previous = bound::owner(&journal.file("old-generation.json")?, &targets.source())?;
+        anyhow::ensure!(
+            previous.as_ref().map(|(_, owner)| owner) == Some(boundary.previous),
+            "TLS decided journal original owner differs"
+        );
+    }
     // 新记录必须匹配原父目录；同字节备份和同名新目录也不能继承原事务写权。
     if let Some(expected) = &state.locations {
         anyhow::ensure!(
@@ -223,7 +376,10 @@ fn legacy_keypair_transaction_dir(tls: &TlsRuntimeCfg) -> Result<PathBuf> {
 /// - `private_key`：配对私钥槽位路径。
 ///
 /// 返回：证书同目录的固定事务位置；证书和私钥不能共用同一槽位。
-fn legacy_directory_for_paths(certificate: &Path, private_key: &Path) -> Result<PathBuf> {
+pub(in crate::tls::keypair) fn legacy_directory_for_paths(
+    certificate: &Path,
+    private_key: &Path,
+) -> Result<PathBuf> {
     use sha2::Digest as _;
     anyhow::ensure!(
         certificate != private_key,

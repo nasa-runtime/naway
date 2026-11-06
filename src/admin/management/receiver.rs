@@ -14,6 +14,8 @@ use std::time::Instant;
 mod actions;
 #[cfg(feature = "node-actions")]
 mod material;
+#[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+mod material_actions;
 #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
 mod material_preview;
 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
@@ -41,6 +43,8 @@ struct Entry {
     metrics_enabled: bool,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
     actions_enabled: bool,
+    #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+    material_actions_enabled: bool,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
     previews_supported: bool,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
@@ -142,6 +146,8 @@ impl Store {
                 metrics_enabled: false,
                 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
                 actions_enabled: false,
+                #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+                material_actions_enabled: false,
                 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
                 previews_supported: false,
                 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
@@ -728,6 +734,7 @@ impl protocol::node_management_server::NodeManagement for Service {
         )?;
         let value = request.into_inner();
         if value.actions_enabled && !value.actions_supported
+            || value.material_actions_enabled && !value.material_actions_supported
             || value.previews_enabled && !value.previews_supported
             || value.material_previews_enabled && !value.material_previews_supported
             || value.material_installations_enabled && !value.material_installations_supported
@@ -791,6 +798,8 @@ impl protocol::node_management_server::NodeManagement for Service {
         #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
         {
             entry.actions_enabled = value.actions_supported && value.actions_enabled;
+            entry.material_actions_enabled =
+                value.material_actions_supported && value.material_actions_enabled;
             entry.previews_supported = value.previews_supported;
             entry.previews_enabled = value.previews_supported && value.previews_enabled;
         }
@@ -819,8 +828,9 @@ impl protocol::node_management_server::NodeManagement for Service {
             0
         };
         #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+        let boot = entry.boot.clone();
+        #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
         let (action, release) = {
-            let boot = entry.boot.clone();
             if store
                 .action_authority(&plan, &node_id, &boot, &value.session)
                 .is_ok()
@@ -844,7 +854,34 @@ impl protocol::node_management_server::NodeManagement for Service {
         // 节点接收能力没有共享执行 owner，心跳不能自行创建可写动作或释放声明。
         let (action, release) = (None, None);
         #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
-        let preview = if action.is_none() && release.is_none() {
+        let (material_action, material_release) = if action.is_none()
+            && release.is_none()
+            && store
+                .material_action_authority(&plan, &node_id, &boot, &value.session)
+                .is_ok()
+        {
+            manager
+                .material_action_deliveries
+                .lock()
+                .get(&node_id)
+                .filter(|offer| {
+                    offer
+                        .authorize(&manager, &node_id, &boot, &value.session, None)
+                        .is_ok()
+                })
+                .and_then(|offer| offer.wire().ok())
+                .unwrap_or_default()
+        } else {
+            (None, None)
+        };
+        #[cfg(not(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql")))]
+        let (material_action, material_release) = (None, None);
+        #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+        let preview = if action.is_none()
+            && release.is_none()
+            && material_action.is_none()
+            && material_release.is_none()
+        {
             manager
                 .preview_deliveries
                 .lock()
@@ -870,7 +907,12 @@ impl protocol::node_management_server::NodeManagement for Service {
         #[cfg(not(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql")))]
         let preview = None;
         #[cfg(feature = "node-actions")]
-        let material_conditions = if action.is_none() && release.is_none() && preview.is_none() {
+        let material_conditions = if action.is_none()
+            && release.is_none()
+            && preview.is_none()
+            && material_action.is_none()
+            && material_release.is_none()
+        {
             manager
                 .material_deliveries
                 .lock()
@@ -898,6 +940,8 @@ impl protocol::node_management_server::NodeManagement for Service {
         #[cfg(all(feature = "node-actions", feature = "admin-operations-pgsql"))]
         let material_preview = if action.is_none()
             && release.is_none()
+            && material_action.is_none()
+            && material_release.is_none()
             && preview.is_none()
             && material_conditions.is_none()
         {
@@ -940,7 +984,72 @@ impl protocol::node_management_server::NodeManagement for Service {
             preview,
             material_conditions,
             material_preview,
+            material_action,
+            material_release,
         }))
+    }
+
+    /// 业务作用：仅向独立材料准备命令交付原秘密分片，旧配置动作通道不能读取该正文。
+    ///
+    /// 参数说明：
+    /// - `request`：mTLS绑定的当前材料投递与精确偏移。
+    ///
+    /// 返回：通过当前会话门的有限分片；缺共享执行能力时明确不可用。
+    async fn material_action_data(
+        &self,
+        request: Request<protocol::MaterialActionDataRequest>,
+    ) -> Result<Response<protocol::MaterialActionDataResponse>, Status> {
+        #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+        {
+            self.read_material_action_data(request)
+        }
+        #[cfg(not(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql")))]
+        {
+            let _ = request;
+            Err(Status::unimplemented("material execution unavailable"))
+        }
+    }
+
+    /// 业务作用：将完整原材料事实交给共享事务，接收单独状态值不能推进工作流。
+    ///
+    /// 参数说明：
+    /// - `request`：原投递绑定的完整报告或明确缺席类别。
+    ///
+    /// 返回：共享持久提交并复验当前会话后才确认，未接入执行能力时拒绝。
+    async fn material_action_result(
+        &self,
+        request: Request<protocol::MaterialActionResultRequest>,
+    ) -> Result<Response<protocol::MaterialActionResultResponse>, Status> {
+        #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+        {
+            self.receive_material_action_result(request).await
+        }
+        #[cfg(not(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql")))]
+        {
+            let _ = request;
+            Err(Status::unimplemented("material execution unavailable"))
+        }
+    }
+
+    /// 业务作用：独立接纳原材料终态关闭确认，不借业务收据清理共享责任。
+    ///
+    /// 参数说明：
+    /// - `request`：节点同步关闭后回报的精确原释放身份。
+    ///
+    /// 返回：共享释放提交与会话复验都完成后确认，其余保持未确认。
+    async fn material_release_result(
+        &self,
+        request: Request<protocol::MaterialReleaseResultRequest>,
+    ) -> Result<Response<protocol::MaterialReleaseResultResponse>, Status> {
+        #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
+        {
+            self.receive_material_release_result(request).await
+        }
+        #[cfg(not(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql")))]
+        {
+            let _ = request;
+            Err(Status::unimplemented("material execution unavailable"))
+        }
     }
 
     /// 业务作用：把独立材料条件结果交回原查询，不借助配置预览或持久动作受理权。
