@@ -1,6 +1,7 @@
 import { element } from "../../../core/dom.js";
 import { fieldRow } from "./controls.js";
 import { tlsFieldGroups } from "./tls.js";
+import { http3FieldGroups } from "./http3.js";
 
 const groups = {
   route: [
@@ -53,24 +54,6 @@ const groups = {
         ["status", "HTTP 状态码", "number"],
         ["body", "UTF-8 响应正文", "string"],
         ["headers", "响应头映射", "json"],
-      ],
-    ],
-  ],
-
-  proxy: [
-    [
-      ["http3"],
-      "HTTP/3 与 QUIC",
-      [
-        ["enabled", "启用 HTTP/3", "boolean"],
-        ["capabilities", "协议扩展（每行一项）", "lines"],
-        ["multi_node", "多节点部署", "boolean"],
-        ["early_data_shared_replay_cache", "共享早期数据重放保护", "boolean"],
-        ["advertise_alt_svc", "发布 Alt-Svc", "boolean"],
-        ["max_connections", "物理连接上限", "number"],
-        ["max_idle_timeout_ms", "空闲期限（毫秒）", "number"],
-        ["max_request_header_bytes", "请求头字节上限", "number"],
-        ["max_stream_buffer_bytes", "流缓冲字节上限", "number"],
       ],
     ],
   ],
@@ -132,9 +115,17 @@ export function nestedFields(kind, values, capacity) {
         "subtle",
       ),
     );
+    node.append(
+      element(
+        "p",
+        "HTTP/3 复用当前 TLS 入口。单向流预算包含 control/QPACK；DATAGRAM 队列满时按不可靠语义丢弃。0-RTT 还需 early_data 扩展和明确的路由授权，多节点部署必须具备共享重放保护。仅填写这些声明不会授予能力。",
+        "subtle",
+      ),
+    );
   }
   for (const [prefix, title, definitions] of [
     ...(groups[kind] ?? []),
+    ...http3FieldGroups(kind),
     ...tlsFieldGroups(kind),
   ]) {
     const group = element("details");
