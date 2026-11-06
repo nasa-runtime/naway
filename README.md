@@ -1026,6 +1026,26 @@ CertID、good 状态、`thisUpdate`/`nextUpdate` 与 must-staple；握手选证�
 限制响应类型、字节和 deadline；私网 responder 只有命中显式 CIDR allowlist 才可访问。新响应只有
 完整验证后才通过同目录 rename 原子替换，坏更新保留活动 ServerConfig。
 
+HTTP 与 TCP stream 的默认 TLS 身份均可声明 `keypair_manifest_file`，路径相对主配置目录解析，
+也可使用绝对路径。指针缺席时读取 `cert_file`/`key_file` 种子；已有指针必须指向完整有效的
+不可变材料目录，损坏时拒绝加载，在线监听保留已经安装的身份。材料切换不要求变更配置版本。
+HTTP 与 stream 声明同一指针时，共享来源条件、材料代和完整影响范围；各自的 SNI 身份不继承
+默认指针，仍按自身的文件材料或外部签名声明加载。默认 manifest 不能与该身份的
+`private_key_provider` 或 `spire` 混用。
+安装和条件写入见[证书材料管理](docs/admin-certificates.md)。
+
+```yaml
+stream:
+  listeners:
+    - id: secure-stream
+      listen: "0.0.0.0:8443"
+      upstream: "lb://payments"
+      tls:
+        cert_file: secrets/seed-cert.pem
+        key_file: secrets/seed-key.pem
+        keypair_manifest_file: secrets/current.json
+```
+
 mTLS 客户端认证可同时使用 CRL 与在线 OCSP。CRL 的 hard/soft fail 只改变“无法判定”处理，明确
 revoked 始终拒绝。在线 OCSP 在证书链验证成功后、读取任何 HTTP 或 stream 业务字节前执行，并使用
 有界并发和证书摘要缓存；`soft_fail` 同样不能放过 revoked、unknown、坏签名或错 CertID。配置 SPIFFE

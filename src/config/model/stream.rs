@@ -306,6 +306,10 @@ pub struct StreamTlsCfg {
     /// 可选 SPIRE Workload API 身份；配置后文件身份、外部 signer 与 SNI 身份必须为空。
     #[serde(default)]
     pub spire: Option<SpireWorkloadCfg>,
+    /// 默认证书 pair 的原子指针，相对主配置目录或使用绝对路径。已有指针必须指向完整的
+    /// 不可变材料目录；仅在指针尚不存在时读取 cert_file/key_file 种子，与外部身份互斥。
+    #[serde(default)]
+    pub keypair_manifest_file: Option<String>,
     /// 同一 stream socket 上按 SNI 选择的额外证书身份。
     #[serde(default)]
     pub certs: Vec<SniCertCfg>,

@@ -114,6 +114,14 @@ gRPC 汇聚同一集群的当前事实；纯 Admin 节点显示不承载业务 T
 只激活新目录，不改原 seed，继续使用 seed 的独立监听器保持原材料。预检最多检查4096个声明身份，
 超过上限拒绝安装。ACME 的来源级策略门不等同此完整手工预检，两者均不替代文件决定后的实际安装确认。
 
+HTTP 默认 TLS 与 `stream.listeners[].tls` 均支持 `keypair_manifest_file`，相对路径以主配置
+目录为基准，也接受绝对路径。同一指针的 HTTP 与 stream 默认身份属于同一写入来源；选择
+任一目标都必须核对完整共享影响及各协议的实际安装事实。SNI 条目不继承默认指针，文件材料
+和外部签名引用仍按自身声明加载。默认身份同时声明 `private_key_provider` 或 `spire` 与
+manifest 时，配置被拒绝。
+指针尚不存在时可从种子开始首次安装；已有指针损坏、指向越界位置或材料不完整时不会退回
+种子。在线监听保留已安装身份，后续材料读取和写入拒绝，须恢复有效指针或材料后再继续。
+
 本机上传以400和 `invalid_certificate_material` 表示候选不满足当前身份策略；旧材料基线无法
 读取时以503和 `certificate_storage_unavailable` 拒绝。恢复或文件决定阶段无法证明完成时，
 以503和 `certificate_installation_outcome_unknown` 表示结果未知，应重新读取原目标的材料与

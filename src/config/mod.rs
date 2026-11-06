@@ -3001,12 +3001,12 @@ fn build_stream_routes(
 }
 
 /// 业务作用：把 stream TLS 终止配置编译为与 L7 共用的 rustls server runtime，
-/// 保持默认身份、SNI 身份和客户端认证策略一致。
+/// 保持默认文件或 manifest 身份、SNI 身份和客户端认证策略一致。
 ///
 /// 参数说明：
-/// - `cfg_path`：是路径信任根
-/// - `listener`：提供业务身份
-/// - `tls`：是待编译配置
+/// - `cfg_path`：主配置路径，作为材料与信任文件的相对路径基准。
+/// - `listener`：当前流监听器的身份及绑定地址。
+/// - `tls`：默认材料来源、SNI 身份及客户端验证策略。
 /// - `crypto_catalog`：提供外部私钥引用所需的共享签名 provider。
 ///
 /// 返回：配置完整时返回可热换 TLS runtime；认证模式或路径语义无效时返回错误。
@@ -3016,6 +3016,13 @@ fn build_stream_server_tls(
     tls: &model::StreamTlsCfg,
     crypto_catalog: &crate::security::external_crypto::ExternalCryptoCatalog,
 ) -> Result<TlsRuntimeCfg> {
+    // 外部身份不能再声明本地激活指针，避免材料安装绕过外部私钥或身份订阅的控制权。
+    anyhow::ensure!(
+        tls.keypair_manifest_file.is_none()
+            || (tls.private_key_provider.is_none() && tls.spire.is_none()),
+        "listener `{}` keypair manifest cannot be combined with external private key or SPIRE identity",
+        listener.id
+    );
     let client_auth = tls
         .client_auth
         .as_ref()
@@ -3029,7 +3036,15 @@ fn build_stream_server_tls(
         .map(crate::tls::spire::build_source)
         .transpose()?;
     let (key_file, private_key_provider) = if spire.is_some() {
-        anyhow::ensure!(tls.cert_file.trim().is_empty() && tls.key_file.trim().is_empty() && tls.private_key_provider.is_none() && tls.certs.is_empty() && tls.session_tickets.is_none(), "listener `{}` SPIRE identity cannot be combined with file certificate, external signer, SNI identities, or session tickets", listener.id);
+        anyhow::ensure!(
+            tls.cert_file.trim().is_empty()
+                && tls.key_file.trim().is_empty()
+                && tls.private_key_provider.is_none()
+                && tls.certs.is_empty()
+                && tls.session_tickets.is_none(),
+            "listener `{}` SPIRE identity cannot be combined with file certificate, external signer, SNI identities, or session tickets",
+            listener.id
+        );
         (PathBuf::new(), None)
     } else {
         build_tls_private_key(
@@ -3050,7 +3065,10 @@ fn build_stream_server_tls(
         key_file,
         private_key_provider,
         spire,
-        keypair_manifest_file: None,
+        keypair_manifest_file: tls
+            .keypair_manifest_file
+            .as_deref()
+            .map(|path| resolve_relative(cfg_path, path)),
         certs: tls
             .certs
             .iter()
