@@ -3,6 +3,7 @@ import { fieldRow } from "./controls.js";
 import { tlsFieldGroups } from "./tls.js";
 import { http3FieldGroups } from "./http3.js";
 import { listenerFieldGroups } from "./listener.js";
+import { streamTransportFieldGroups } from "./stream.js";
 
 const groups = {
   route: [
@@ -131,9 +132,19 @@ export function nestedFields(kind, values, capacity) {
       ),
     );
   }
+  if (kind === "stream") {
+    node.append(
+      element(
+        "p",
+        "TLS 与 MQTT 预读不能同时启用。TLS 预读与终止组合需要显式 terminate_tls 路由。UDP 不使用 TCP 前导或协议预读，队列满时丢弃当前报文；预算不提供报文重组。前置代理信任与向上游发送前导分别声明。",
+        "subtle",
+      ),
+    );
+  }
   for (const [prefix, title, definitions] of [
     ...(groups[kind] ?? []),
     ...listenerFieldGroups(kind),
+    ...streamTransportFieldGroups(kind),
     ...http3FieldGroups(kind),
     ...tlsFieldGroups(kind),
   ]) {

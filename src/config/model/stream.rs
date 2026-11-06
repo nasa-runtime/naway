@@ -20,10 +20,10 @@ pub struct StreamListenerCfg {
     /// L4 传输协议。`tcp` 默认；`udp` 使用按客户端地址隔离的短会话。
     #[serde(default)]
     pub protocol: StreamProtocolCfg,
-    /// 可选 stream TLS 终止；与 `preread.ssl_preread` 互斥，因为前者解密、后者透传。
+    /// 可选 stream TLS 终止；与 `preread.ssl_preread` 组合时必须存在显式 `terminate_tls` 路由。
     #[serde(default)]
     pub tls: Option<StreamTlsCfg>,
-    /// UDP 短会话资源预算；TCP listener 忽略且必须保持默认值。
+    /// UDP 短会话资源预算；TCP listener 不使用这些字段。
     #[serde(default)]
     pub udp: StreamUdpCfg,
     /// 旧版单上游目标。支持 `host:port`、`tcp://host:port` 或 `lb://service`;配置 `routes[]` 时可为空。

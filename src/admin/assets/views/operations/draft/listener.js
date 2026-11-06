@@ -67,12 +67,15 @@ const proxyFields = [
 ];
 
 /**
- * 业务作用：按连接、请求和池代边界展示 HTTP 入口预算，不把不同字段的零值语义混为一谈。
+ * 业务作用：区分 HTTP 入口预算与各监听器的前置信任声明，不混淆不同字段的零值语义。
  * 参数说明：
  * - `kind`：候选对象类型。
- * 返回：HTTP 入口的精确子字段分组；不补运行默认值或授予前置代理信任。
+ * 返回：HTTP 入口预算及 HTTP、流监听器的前置协议分组；不补默认值或授予代理信任。
  */
 export function listenerFieldGroups(kind) {
+  if (kind === "stream") {
+    return [[["proxy_protocol"], "可信前置代理协议", proxyFields]];
+  }
   if (kind !== "proxy") {
     return [];
   }
@@ -88,10 +91,10 @@ export function listenerFieldGroups(kind) {
  * 业务作用：允许按原候选位置编辑前置协议版本和可信来源，不重新序列化其它声明。
  * 参数说明：
  * - `kind`：所属候选对象类型。
- * 返回：HTTP 入口的两个字符串列表；其它对象不获得前置协议列表入口。
+ * 返回：HTTP 和流监听器的两个字符串列表；其它对象不获得前置协议列表入口。
  */
 export function listenerDraftLists(kind) {
-  if (kind !== "proxy") {
+  if (!["proxy", "stream"].includes(kind)) {
     return [];
   }
   return proxyFields
