@@ -137,7 +137,15 @@ HTTP 与 stream 入口的 TLS 子字段覆盖默认文件或 manifest 来源、�
 客户端 CA/CRL/SPIFFE 验证、客户端在线 OCSP、当前身份的 OCSP staple 及会话票据。
 stream 单独提供握手期限，HTTP 的 TLS 监听地址不会写入 stream TLS 对象。切换来源时必须
 显式移除不再适用的声明；表单不会替调用者清空互斥配置，也不会解析 SecretSource。
-ACME 等其它复杂策略仍可按完整值或原始 YAML 编辑，是否可用由原目标完整预检确认。
+HTTP 默认 TLS 身份还提供 ACME 账户、签发、续期、锁与存储子字段，以及 command、Cloudflare、
+RFC2136、Vault 的 DNS-01 配置。域名、账户联系地址和固定命令参数支持逐项列表编辑。
+DNS 凭据只编辑 SecretSource 原文引用，固定命令参数不得携带秘密；页面不会读取凭据、创建
+账户或订单，也不会证明 DNS 控制权。切换 provider 不会自动删除其它字段。Redis 续期锁必须
+配合 `shared-file` 和实际共享卷，是否可用由原目标完整预检及运行时签发确认。stream 和 SNI
+身份没有独立 ACME 声明。新增 HTTP TLS 身份、改变账户凭据路径、directory CA 路径或
+DNS provider 声明属于目标节点本地配置，不能通过共享预检和执行切换。保留已有身份与秘密
+引用时，域名、续期窗口等签发设置仍须经过原目标完整预检与审批。草稿能生成不代表共享任务
+有权发布。其它复杂策略仍可按完整值或原始 YAML 编辑。
 
 “SNI 证书身份”列表按当前候选的原下标选择、插入、替换或移动身份。每个身份提供名称、
 证书链、私钥、外部签名引用与自己的 OCSP 控件，不继承默认 manifest、SPIRE 或 OCSP。

@@ -1,3 +1,5 @@
+import { acmeFieldGroups } from "./acme.js";
+
 const tlsFileFields = [
   ["cert_file", "证书链路径", "string"],
   ["key_file", "私钥路径", "string"],
@@ -117,6 +119,7 @@ export function tlsFieldGroups(kind) {
     ],
     [["tls", "session_tickets"], "会话票据密钥与轮换", tlsTicketFields],
     [["tls", "spire"], "SPIRE 身份订阅", tlsSpireFields],
+    ...acmeFieldGroups(kind),
   );
   return groups;
 }

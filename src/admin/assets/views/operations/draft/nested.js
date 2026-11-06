@@ -124,6 +124,15 @@ export function nestedFields(kind, values, capacity) {
       ),
     );
   }
+  if (kind === "proxy") {
+    node.append(
+      element(
+        "p",
+        "ACME 只为 HTTP 默认 TLS 身份签发。新增身份或更换账户路径、DNS provider 声明须在目标节点本地配置；共享预检会拒绝改变这些引用。DNS 凭据使用 SecretSource 引用，固定命令参数不要包含秘密；切换 provider 时请显式处理旧字段。Redis 续期锁必须配合 shared-file 和实际共享卷。编辑候选不会创建订单或检查 DNS 控制权。",
+        "subtle",
+      ),
+    );
+  }
   for (const [prefix, title, definitions] of [
     ...(groups[kind] ?? []),
     ...tlsFieldGroups(kind),
