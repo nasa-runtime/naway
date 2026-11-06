@@ -16,6 +16,7 @@ mod response;
 mod retention;
 mod review;
 mod storage;
+mod targets;
 
 use super::{model::Error, Store};
 pub(in crate::admin) use api::handle;

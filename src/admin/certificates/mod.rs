@@ -6,12 +6,12 @@ pub(super) mod local;
 mod model;
 pub(super) mod read;
 
-#[cfg(any(test, feature = "admin-grpc"))]
-pub(in crate::admin) use model::digest;
 #[cfg(feature = "admin-grpc")]
 pub(in crate::admin) use model::valid_directory;
 #[cfg(feature = "admin-grpc")]
 pub(in crate::admin) use model::MAX_ENTRIES;
+#[cfg(any(test, feature = "admin-grpc"))]
+pub(in crate::admin) use model::{digest, targets_digest};
 pub(in crate::admin) use model::{Directory, Entry, MAX_BYTES};
 
 use crate::config::GatewaySnapshot;

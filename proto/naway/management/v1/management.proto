@@ -97,6 +97,8 @@ message ReportRequest {
   // 材料执行独立启用，配置动作或预检能力不能隐式授予文件写权。
   bool material_actions_supported = 21;
   bool material_actions_enabled = 22;
+  // 逻辑材料目标独立绑定到原证书目录，缺席时只支持公开身份观察。
+  optional bytes certificate_targets_digest = 23;
 }
 
 // 当前本地文件决定与业务就绪分开；没有历史、路径或恢复命令令牌。
@@ -972,6 +974,8 @@ message CertificateEntry {
   string workspace = 10;
   string tenant = 11;
   string environment = 12;
+  // 原配置中的声明身份，不是选证优先级，也不授予写入权限。
+  optional string material_entry = 13;
 }
 
 message CertificatesRequest {
@@ -985,4 +989,5 @@ message CertificatesRequest {
   uint32 offset = 8;
   bool capacity = 9;
   repeated CertificateEntry entries = 10;
+  optional bytes targets_digest = 11;
 }

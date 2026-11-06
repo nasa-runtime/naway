@@ -543,6 +543,10 @@ async fn exchange(
             metrics_supported: true,
             consumers_supported: true,
             certificates_digest: Some(round.certificates.digest.to_vec()),
+            certificate_targets_digest: round
+                .certificates
+                .targets_digest
+                .map(|value| value.to_vec()),
             metrics_enabled,
             baseline_supported: baseline.availability != "unsupported",
             node_baseline: baseline

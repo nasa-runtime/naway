@@ -332,6 +332,9 @@ fn read(
         hash.update(facts.map_or(0, |facts| facts.config_version).to_be_bytes());
         if let Some(directory) = directory {
             hash.update(directory.digest);
+            if let Some(targets) = directory.targets_digest {
+                hash.update(targets);
+            }
         }
     }
     let etag = format!("\"{:x}\"", hash.finalize());

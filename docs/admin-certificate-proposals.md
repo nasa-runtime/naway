@@ -16,6 +16,26 @@
 执行能力、当前开关和发行就绪由 `execution-context` 单独查询，不能从 pair-only 响应推定。
 管理证书页面仍展示[集群活动证书](admin-certificates.md)，暂不提供材料提案表单。
 
+## 选择原节点与材料目标
+
+`GET /api/certificate-proposals/targets` 返回当前授权范围内的全部节点及明确可用性，
+`GET /api/certificate-proposals/targets/{node_id}` 返回一个节点的原 boot、配置、journal 基线
+和去重逻辑目标。工作区入口只附加 `?workspace={id}`，使用本域成员权限与精确对象归属；
+无需借用平台监控权限。两个入口均要求材料存储已启用及当前材料读权，纯 Data 不开放。
+
+目标以 `kind`、`listener`、`entry` 定位；`entry` 为 `default` 或原配置中的 `sni-N` 声明位置。
+同一声明的多个 SNI 名称及 HTTPS/HTTP3 协议合并显示，名称、通配匹配次序和叶证书摘要都
+不能用于推断声明编号。外部 signer、ACME、SDS、SPIRE 不提供可选材料写入目标。
+
+节点清单最多128项，单节点最多2048条目录绑定，响应最多4 MiB。失联、目录超限、旧协议、
+原基线缺失及工作区归属不一致分别保留不可用状态；失联节点仍在原成员分母内。未知节点
+不会返回旧基线或可选目标。旧节点的活动证书目录仍可观察，但缺少目标引用证明时不能选择。
+
+响应带 `Cache-Control: no-store` 和 `x-naway-sample-age-ms`。只有原观察年龄加请求耗时小于
+6000毫秒时才可用于选择；采样中返回202，配置换代或过期返回409。客户端选择后仍必须调用
+[完整材料条件查询](admin-certificates.md#集群原目标材料条件)，取得全部原目标的公开 PEM ETag、
+受管材料代及共享来源关系，再冻结提案。目录本身不读取材料、采用未受管文件或授予执行权。
+
 ## 配置与初始化
 
 制品需要 `admin-operations-pgsql`，使用 `admin` 或 `all-in-one` 模式，并启用管理认证、RBAC 和

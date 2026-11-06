@@ -43,6 +43,7 @@ fn decode(value: protocol::CertificateEntry) -> Result<Entry, Status> {
         protocol: value.protocol,
         binding: value.binding,
         selection_order: value.selection_order,
+        material_entry: value.material_entry,
         state: value.state,
         source: value.source,
         leaf,
@@ -66,6 +67,7 @@ fn encode(value: &Entry) -> protocol::CertificateEntry {
         protocol: value.protocol.clone(),
         binding: value.binding.clone(),
         selection_order: value.selection_order,
+        material_entry: value.material_entry.clone(),
         state: value.state.clone(),
         source: value.source.clone(),
         leaf: value.leaf.as_ref().map(|leaf| protocol::CertificateLeaf {

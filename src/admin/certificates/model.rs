@@ -15,6 +15,8 @@ pub(in crate::admin) struct Entry {
     pub protocol: String,
     pub binding: String,
     pub selection_order: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub material_entry: Option<String>,
     pub state: String,
     pub source: String,
     pub leaf: Option<Arc<CertificateLeaf>>,
@@ -30,6 +32,7 @@ pub(in crate::admin) struct Directory {
     pub fingerprint: Option<u64>,
     pub capacity: bool,
     pub digest: [u8; 32],
+    pub targets_digest: Option<[u8; 32]>,
     pub entries: Arc<[Entry]>,
     pub bytes: usize,
 }
@@ -64,6 +67,13 @@ impl Entry {
             && text_valid(&self.binding, 254)
             && matches!(self.protocol.as_str(), "https" | "http3" | "stream_tls")
             && self.selection_order <= 512
+            && self.material_entry.as_ref().is_none_or(|entry| {
+                self.state == "complete"
+                    && matches!(self.source.as_str(), "file" | "manifest")
+                    && self.logical_target().is_some_and(|target| {
+                        target.valid() && (entry == "default") == self.binding.is_empty()
+                    })
+            })
             && matches!(
                 self.source.as_str(),
                 "" | "file" | "manifest" | "acme" | "sds" | "spire"
@@ -119,6 +129,7 @@ impl Entry {
     /// 返回：结构体、文本和完整公开叶证书的容量总量。
     pub(in crate::admin) fn bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + self.material_entry.as_ref().map_or(0, String::capacity)
             + self
                 .texts()
                 .iter()
@@ -130,6 +141,45 @@ impl Entry {
                     + leaf.names.iter().map(String::capacity).sum::<usize>()
             })
     }
+
+    /// 业务作用：从节点明确报告的原声明身份构造材料目标，不从SNI名称或匹配次序推断写入位置。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：有原声明且协议属于已知TLS入口时返回逻辑目标，缺能力或未知协议为空。
+    pub(in crate::admin) fn logical_target(&self) -> Option<crate::tls::targets::Target> {
+        use crate::tls::targets::{Kind, Target};
+        Some(Target {
+            kind: match self.protocol.as_str() {
+                "https" | "http3" => Kind::Proxy,
+                "stream_tls" => Kind::Stream,
+                _ => return None,
+            },
+            listener: self.listener.clone(),
+            entry: self.material_entry.clone()?,
+        })
+    }
+}
+
+/// 业务作用：独立绑定原目录的完整逻辑目标映射，旧目录摘要保持兼容，新增位置不能脱离原公开身份。
+///
+/// 参数说明：
+/// - `directory`：原有公开证书目录的完整摘要。
+/// - `entries`：相同顺序的完整条目，包含明确缺席的目标引用。
+///
+/// 返回：带域、存在位和长度边界的映射摘要，不授予材料文件读取或写入权。
+pub(in crate::admin) fn targets_digest(directory: &[u8; 32], entries: &[Entry]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"naway-certificate-logical-targets\0");
+    hash.update(directory);
+    hash.update((entries.len() as u64).to_be_bytes());
+    for entry in entries {
+        hash.update([u8::from(entry.material_entry.is_some())]);
+        if let Some(identity) = &entry.material_entry {
+            field(&mut hash, identity);
+        }
+    }
+    hash.finalize().into()
 }
 
 /// 业务作用：计算材料目录的独立身份，使配置不变的热换、等待和动态失权也能撤销旧目录。
@@ -243,6 +293,7 @@ impl Builder<'_> {
             .into(),
             binding: String::new(),
             selection_order: 0,
+            material_entry: None,
             state: match state {
                 Some(ObservationState::Complete) => "complete",
                 Some(ObservationState::Waiting) => "waiting",
@@ -266,6 +317,28 @@ impl Builder<'_> {
                 let mut entry = template.clone();
                 entry.binding = binding.name.clone();
                 entry.selection_order = binding.selection_order;
+                // 声明位置来自已安装的真实resolver；外部身份不可选，目录引用也不能替代后续材料条件复验。
+                if matches!(
+                    binding.source,
+                    CertificateSource::File | CertificateSource::Manifest
+                ) && tls.in_memory.is_none()
+                    && tls.spire.is_none()
+                {
+                    entry.material_entry = match binding.declaration {
+                        None if binding.name.is_empty() && crate::tls::targets::writable(tls) => {
+                            Some("default".into())
+                        }
+                        Some(index)
+                            if tls
+                                .certs
+                                .get(usize::from(index))
+                                .is_some_and(|source| source.private_key_provider.is_none()) =>
+                        {
+                            Some(format!("sni-{index}"))
+                        }
+                        _ => None,
+                    };
+                }
                 entry.source = match binding.source {
                     CertificateSource::File => "file",
                     CertificateSource::Manifest => "manifest",
@@ -355,11 +428,13 @@ pub(super) fn collect(
     builder
         .entries
         .sort_unstable_by(|left, right| left.key().cmp(&right.key()));
+    let digest = digest(&builder.entries, builder.capacity);
     Directory {
         version: snapshot.version,
         fingerprint: snapshot.config_fingerprint,
         capacity: builder.capacity,
-        digest: digest(&builder.entries, builder.capacity),
+        digest,
+        targets_digest: Some(targets_digest(&digest, &builder.entries)),
         entries: builder.entries.into(),
         bytes: builder.bytes,
     }

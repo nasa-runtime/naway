@@ -9,6 +9,8 @@ pub(super) mod transport;
 
 pub(super) use overview::current;
 pub(super) use overview::Coverage;
+#[cfg(feature = "admin-operations-pgsql")]
+pub(super) use overview::Node;
 pub(super) use overview::{read, start, Runtime};
 
 /// 业务作用：把当前集群事实按禁止缓存的固定响应合同发布给授权读取方。

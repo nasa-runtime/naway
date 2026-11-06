@@ -8,9 +8,17 @@ use protocol::node_management_client::NodeManagementClient;
 
 #[derive(Default)]
 pub(in crate::admin::management) struct Upload {
-    generation: Option<(u64, Option<u64>, [u8; 32])>,
+    generation: Option<Generation>,
     offset: usize,
     complete: bool,
+}
+
+#[derive(PartialEq, Eq)]
+struct Generation {
+    version: u64,
+    fingerprint: Option<u64>,
+    directory: [u8; 32],
+    targets: Option<[u8; 32]>,
 }
 
 impl Upload {
@@ -32,8 +40,13 @@ impl Upload {
         directory: &Directory,
         deadline: tokio::time::Instant,
     ) -> Result<(), Status> {
-        let generation = (directory.version, directory.fingerprint, directory.digest);
-        if self.generation != Some(generation) {
+        let generation = Generation {
+            version: directory.version,
+            fingerprint: directory.fingerprint,
+            directory: directory.digest,
+            targets: directory.targets_digest,
+        };
+        if self.generation.as_ref() != Some(&generation) {
             self.generation = Some(generation);
             self.offset = 0;
             self.complete = false;
@@ -70,6 +83,7 @@ impl Upload {
                 offset: self.offset as u32,
                 capacity: directory.capacity,
                 entries,
+                targets_digest: directory.targets_digest.map(|value| value.to_vec()),
             };
             let response = match client
                 .certificates(super::super::reporter::timed_request(request, deadline)?)

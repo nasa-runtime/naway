@@ -2,7 +2,7 @@
 
 use super::{decode, protocol, CHUNK};
 use crate::admin::certificates::{
-    digest, valid_directory, Directory, Entry, MAX_BYTES, MAX_ENTRIES,
+    digest, targets_digest, valid_directory, Directory, Entry, MAX_BYTES, MAX_ENTRIES,
 };
 use nasa::grpc::Status;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ pub(in crate::admin::management) struct Partial {
     version: u64,
     fingerprint: Option<u64>,
     digest: [u8; 32],
+    targets_digest: Option<[u8; 32]>,
     capacity: bool,
     total: usize,
     entries: Vec<Entry>,
@@ -70,6 +71,15 @@ impl State {
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid certificate digest"))?;
+        let targets: Option<[u8; 32]> = request
+            .targets_digest
+            .as_deref()
+            .map(|value| {
+                value
+                    .try_into()
+                    .map_err(|_| Status::invalid_argument("invalid certificate targets digest"))
+            })
+            .transpose()?;
         if total > MAX_ENTRIES
             || request.entries.len() > CHUNK
             || offset > total
@@ -84,7 +94,9 @@ impl State {
             .into_iter()
             .map(decode)
             .collect::<Result<Vec<_>, _>>()?;
-        if entries.iter().any(|value| !value.valid())
+        if entries
+            .iter()
+            .any(|value| !value.valid() || (targets.is_none() && value.material_entry.is_some()))
             || entries
                 .windows(2)
                 .any(|pair| pair[0].key() >= pair[1].key())
@@ -95,6 +107,7 @@ impl State {
             if value.version != request.config_version
                 || value.fingerprint != request.config_fingerprint
                 || value.digest != expected
+                || value.targets_digest != targets
                 || value.capacity != request.capacity
                 || value.entries.len() != total
                 || value.entries.get(offset..offset + entries.len()) != Some(entries.as_slice())
@@ -122,6 +135,7 @@ impl State {
                 version: request.config_version,
                 fingerprint: request.config_fingerprint,
                 digest: expected,
+                targets_digest: targets,
                 capacity: request.capacity,
                 total,
                 entries: Vec::with_capacity(total),
@@ -134,6 +148,7 @@ impl State {
         if partial.version != request.config_version
             || partial.fingerprint != request.config_fingerprint
             || partial.digest != expected
+            || partial.targets_digest != targets
             || partial.capacity != request.capacity
             || partial.total != total
         {
@@ -178,6 +193,7 @@ impl State {
         }
         if !valid_directory(&partial.entries)
             || digest(&partial.entries, partial.capacity) != expected
+            || targets.is_some_and(|value| targets_digest(&expected, &partial.entries) != value)
         {
             // 完整内容不符时释放整份候选，摘要失败不能留下可读取的半成品。
             *self = Self::Empty;
@@ -190,6 +206,7 @@ impl State {
             version: partial.version,
             fingerprint: partial.fingerprint,
             digest: partial.digest,
+            targets_digest: partial.targets_digest,
             capacity: partial.capacity,
             entries: partial.entries.into(),
             bytes: partial.bytes,

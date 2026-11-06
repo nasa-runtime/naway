@@ -86,6 +86,21 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Result<Response<
         .path()
         .strip_prefix("/api/certificate-proposals")
         .ok_or(Error::Missing)?;
+    if suffix == "/targets" || suffix.starts_with("/targets/") {
+        if request.method != Method::GET
+            || form_urlencoded::parse(request.uri.query().unwrap_or_default().as_bytes())
+                .any(|(key, _)| key != "workspace")
+        {
+            return Err(Error::Invalid);
+        }
+        return super::targets::read(
+            &state,
+            &snapshot,
+            &query.scope,
+            &plan.config.cluster_id,
+            suffix.strip_prefix("/targets/"),
+        );
+    }
     if suffix == "/execution-context" {
         if request.method != Method::GET
             || form_urlencoded::parse(request.uri.query().unwrap_or_default().as_bytes())

@@ -39,6 +39,7 @@ struct Entry {
     consumers_supported: bool,
     certificates: certificates::State,
     certificates_digest: Option<[u8; 32]>,
+    certificate_targets_digest: Option<[u8; 32]>,
     metrics_supported: bool,
     metrics_enabled: bool,
     #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
@@ -142,6 +143,7 @@ impl Store {
                 consumers_supported: false,
                 certificates: certificates::State::default(),
                 certificates_digest: None,
+                certificate_targets_digest: None,
                 metrics_supported: false,
                 metrics_enabled: false,
                 #[cfg(all(feature = "node-actions", feature = "admin-operations-workflow-pgsql"))]
@@ -222,6 +224,7 @@ impl Store {
             entry.consumers = consumers::State::default();
             entry.certificates = certificates::State::default();
             entry.certificates_digest = None;
+            entry.certificate_targets_digest = None;
             entry.sample = None;
         }
         entry.facts = Some(Arc::new(facts));
@@ -352,6 +355,11 @@ impl Store {
                 .as_ref()
                 .map(|value| value.as_slice())
                 != Some(request.digest.as_slice())
+            || entry
+                .certificate_targets_digest
+                .as_ref()
+                .map(|value| value.as_slice())
+                != request.targets_digest.as_deref()
             || entry.boot != request.boot_id
             || !crate::security::auth::constant_time_eq(&entry.session, &request.session)
             || now.saturating_duration_since(entry.at) > FRESHNESS
@@ -771,6 +779,21 @@ impl protocol::node_management_server::NodeManagement for Service {
                     .map_err(|_| Status::invalid_argument("invalid certificate directory digest"))
             })
             .transpose()?;
+        let certificate_targets_digest: Option<[u8; 32]> = value
+            .certificate_targets_digest
+            .as_deref()
+            .map(|digest| {
+                digest
+                    .try_into()
+                    .map_err(|_| Status::invalid_argument("invalid certificate targets digest"))
+            })
+            .transpose()?;
+        // 目标映射只扩展同一份公开目录，孤立映射不能建立可选择的材料事实。
+        if certificate_targets_digest.is_some() && certificates_digest.is_none() {
+            return Err(Status::invalid_argument(
+                "certificate targets lack directory",
+            ));
+        }
         let node_id = facts.node_id.clone().expect("validated node id");
         let mut store = manager.store.lock();
         store.reconcile(&plan);
@@ -783,10 +806,13 @@ impl protocol::node_management_server::NodeManagement for Service {
         entry.baseline_supported = value.baseline_supported;
         entry.baseline = baseline;
         entry.publication = publication;
-        if entry.certificates_digest != certificates_digest {
+        if entry.certificates_digest != certificates_digest
+            || entry.certificate_targets_digest != certificate_targets_digest
+        {
             // 热换不一定改变配置版本；当前会话声明新摘要后旧目录立即失权，迟到分片不能倒退材料。
             entry.certificates = certificates::State::default();
             entry.certificates_digest = certificates_digest;
+            entry.certificate_targets_digest = certificate_targets_digest;
         }
         entry.consumers_supported = value.consumers_supported;
         if !entry.consumers_supported {
