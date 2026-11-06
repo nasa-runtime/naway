@@ -1,5 +1,6 @@
 import { element } from "../../../core/dom.js";
 import { fieldRow } from "./controls.js";
+import { tlsFieldGroups } from "./tls.js";
 
 const groups = {
   route: [
@@ -58,16 +59,6 @@ const groups = {
 
   proxy: [
     [
-      ["tls"],
-      "TLS 监听与材料路径",
-      [
-        ["listen", "TLS 监听地址", "string"],
-        ["cert_file", "证书链路径", "string"],
-        ["key_file", "私钥路径", "string"],
-        ["keypair_manifest_file", "证书对清单路径", "string"],
-      ],
-    ],
-    [
       ["http3"],
       "HTTP/3 与 QUIC",
       [
@@ -116,7 +107,27 @@ const groups = {
 export function nestedFields(kind, values, capacity) {
   const node = element("div", "", "draft-nested");
   const rows = [];
-  for (const [prefix, title, definitions] of groups[kind] ?? []) {
+  if (["proxy", "stream"].includes(kind)) {
+    node.append(
+      element(
+        "p",
+        "切换 TLS 来源时请明确移除不再适用的声明；原目标预检会检查互斥条件。manifest 可保留文件种子，SNI 身份单独配置。",
+        "subtle",
+      ),
+    );
+  } else if (kind === "tls_identity") {
+    node.append(
+      element(
+        "p",
+        "SNI 身份使用自己的材料或外部签名引用，不继承默认 manifest、SPIRE 或 OCSP 响应。",
+        "subtle",
+      ),
+    );
+  }
+  for (const [prefix, title, definitions] of [
+    ...(groups[kind] ?? []),
+    ...tlsFieldGroups(kind),
+  ]) {
     const group = element("details");
     group.append(element("summary", title));
     let current = values;

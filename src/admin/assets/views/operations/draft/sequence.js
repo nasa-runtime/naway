@@ -3,6 +3,7 @@ import { draftFields } from "./schema.js";
 import { draftFieldPanel } from "./fields.js";
 import { fieldRow } from "./controls.js";
 import { fieldAction } from "./nested.js";
+import { tlsDraftLists } from "./tls.js";
 
 /**
  * 业务作用：列出常用列表与原文已声明的扩展数组，不把未知值转换成列表。
@@ -53,6 +54,7 @@ function lists(kind, values) {
       type: "string",
     });
   }
+  result.push(...tlsDraftLists(kind));
   return result.map((item) => {
     let current = values;
     let valid = true;
@@ -184,12 +186,12 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
       fields = draftFieldPanel(selected.type, current, capacity);
       body.append(fields.node);
     } else if (["insert", "set"].includes(operation.value)) {
-      if (selected.type === "instance") {
-        fields = draftFieldPanel("instance", {}, capacity);
+      if (["instance", "tls_identity"].includes(selected.type)) {
+        fields = draftFieldPanel(selected.type, {}, capacity);
         body.append(
           element(
             "p",
-            "新实例仅包含本次明确设置的字段；替换会移除旧元素的其它字段。",
+            "新对象仅包含本次明确设置的字段；替换会移除旧元素的其它字段。",
             "subtle",
           ),
           fields.node,
@@ -222,7 +224,10 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           ? entry
           : typeof entry?.uri === "string"
             ? entry.uri
-            : "元素";
+            : Array.isArray(entry?.server_names) &&
+                entry.server_names.every((name) => typeof name === "string")
+              ? entry.server_names.join(", ")
+              : "元素";
       const option = element("option", index + " · " + label.slice(0, 160));
       option.value = String(index);
       item.append(option);

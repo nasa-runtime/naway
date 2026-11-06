@@ -1,4 +1,8 @@
+import { tlsIdentityFields } from "./tls.js";
+
 const definitions = {
+  tls_identity: tlsIdentityFields,
+
   consumer_binding: [["plan", "消费者显式套餐", "string"]],
 
   usage_plan: [

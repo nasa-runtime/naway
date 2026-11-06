@@ -144,6 +144,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/schema.js"),
         ),
+        "/ui/views/operations/draft/tls.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/tls.js"),
+        ),
         "/ui/views/operations/draft/controls.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/controls.js"),
