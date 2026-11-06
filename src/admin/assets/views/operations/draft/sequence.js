@@ -5,6 +5,7 @@ import { fieldRow } from "./controls.js";
 import { fieldAction } from "./nested.js";
 import { tlsDraftLists } from "./tls.js";
 import { listenerDraftLists } from "./listener.js";
+import { mqttDraftLists } from "./mqtt.js";
 
 /**
  * 业务作用：列出常用列表与原文已声明的扩展数组，不把未知值转换成列表。
@@ -64,6 +65,7 @@ function lists(kind, values) {
   }
   result.push(...tlsDraftLists(kind));
   result.push(...listenerDraftLists(kind));
+  result.push(...mqttDraftLists(kind));
   return result.map((item) => {
     let current = values;
     let valid = true;

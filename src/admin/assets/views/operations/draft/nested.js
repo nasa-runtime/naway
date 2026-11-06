@@ -4,6 +4,7 @@ import { tlsFieldGroups } from "./tls.js";
 import { http3FieldGroups } from "./http3.js";
 import { listenerFieldGroups } from "./listener.js";
 import { streamTransportFieldGroups } from "./stream.js";
+import { mqttFieldGroups } from "./mqtt.js";
 
 const groups = {
   route: [
@@ -140,11 +141,19 @@ export function nestedFields(kind, values, capacity) {
         "subtle",
       ),
     );
+    node.append(
+      element(
+        "p",
+        "MQTT 治理需要目标具备 mqtt-governance 能力、TCP 和 CONNECT 预读，不能与 Kafka 治理同时启用。空发布或订阅名单拒绝对应操作；订阅过滤器必须整体落在授权边界内。双向包缓冲按连接数与包上限预留，不代表实际内存用量。",
+        "subtle",
+      ),
+    );
   }
   for (const [prefix, title, definitions] of [
     ...(groups[kind] ?? []),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
+    ...mqttFieldGroups(kind),
     ...http3FieldGroups(kind),
     ...tlsFieldGroups(kind),
   ]) {
