@@ -3,6 +3,7 @@ import { fieldRow } from "./controls.js";
 import { tlsFieldGroups } from "./tls.js";
 import { upstreamTlsFieldGroups } from "./upstream_tls.js";
 import { upstreamRetryFieldGroups } from "./upstream_retry.js";
+import { upstreamCapacityFieldGroups } from "./upstream_capacity.js";
 import { http3FieldGroups } from "./http3.js";
 import { listenerFieldGroups } from "./listener.js";
 import { streamTransportFieldGroups } from "./stream.js";
@@ -108,6 +109,11 @@ export function nestedFields(kind, values, capacity) {
         "预热整段缺省关闭，设置任一预热子字段即声明该策略；关闭须移除完整 prewarm。预热使用不带下游身份或正文的 HEAD 请求，不证明业务可用。h3 需要 HTTPS 实例及 http3 能力；h2 用于 TLS，明文 HTTP/2 使用 h2c。目标预检仍检查协议和配置组合。",
         "subtle",
       ),
+      element(
+        "p",
+        "自适应并发须显式 enabled，按服务限制等待上游响应头的在途尝试；达到上限后只有有限队列可等待，队列满或到期返回过载。窗口摘除没有 enabled，声明 outlier 即启用并替代 max_fails，移除整段才关闭；目标须具备 upstream-outlier 能力。失败与慢调用比例不能同时为 0，摘除上限按实例数向下取整，单实例不会被摘除。冷却到期仅开放一个真实恢复探测，成功前仍处于摘除状态。",
+        "subtle",
+      ),
     );
   }
   if (["service", "stream_route", "stream_route_new"].includes(kind)) {
@@ -192,6 +198,7 @@ export function nestedFields(kind, values, capacity) {
     ...tlsFieldGroups(kind),
     ...upstreamTlsFieldGroups(kind),
     ...upstreamRetryFieldGroups(kind),
+    ...upstreamCapacityFieldGroups(kind),
   ]) {
     const group = element("details");
     group.append(element("summary", title));
