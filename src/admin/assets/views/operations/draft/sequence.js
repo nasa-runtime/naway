@@ -6,6 +6,7 @@ import { fieldAction } from "./nested.js";
 import { tlsDraftLists } from "./tls.js";
 import { listenerDraftLists } from "./listener.js";
 import { mqttDraftLists } from "./mqtt.js";
+import { kafkaDraftLists } from "./kafka.js";
 
 /**
  * 业务作用：列出常用列表与原文已声明的扩展数组，不把未知值转换成列表。
@@ -66,6 +67,7 @@ function lists(kind, values) {
   result.push(...tlsDraftLists(kind));
   result.push(...listenerDraftLists(kind));
   result.push(...mqttDraftLists(kind));
+  result.push(...kafkaDraftLists(kind));
   return result.map((item) => {
     let current = values;
     let valid = true;
@@ -198,7 +200,9 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
       body.append(fields.node);
     } else if (["insert", "set"].includes(operation.value)) {
       if (
-        ["instance", "tls_identity", "stream_route"].includes(selected.type)
+        ["instance", "tls_identity", "stream_route", "kafka_broker"].includes(
+          selected.type,
+        )
       ) {
         // 原元素仍按稳定身份编辑；只有新建或整值替换才能明确提供新路由身份。
         const type =

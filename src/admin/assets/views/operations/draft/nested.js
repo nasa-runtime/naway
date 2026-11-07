@@ -5,6 +5,7 @@ import { http3FieldGroups } from "./http3.js";
 import { listenerFieldGroups } from "./listener.js";
 import { streamTransportFieldGroups } from "./stream.js";
 import { mqttFieldGroups } from "./mqtt.js";
+import { kafkaFieldGroups } from "./kafka.js";
 
 const groups = {
   route: [
@@ -148,12 +149,20 @@ export function nestedFields(kind, values, capacity) {
         "subtle",
       ),
     );
+    node.append(
+      element(
+        "p",
+        "Kafka 治理需要目标具备 kafka-governance 能力、TCP 且关闭 MQTT 与 TLS 预读。topic 和 group 按精确名称授权；空名单拒绝对应操作。broker 响应缺少任一地址映射会拒绝转发。帧期限不计纯空闲，总缓冲按连接数与帧上限预留；启用不代表支持全部 Kafka API。",
+        "subtle",
+      ),
+    );
   }
   for (const [prefix, title, definitions] of [
     ...(groups[kind] ?? []),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
+    ...kafkaFieldGroups(kind),
     ...http3FieldGroups(kind),
     ...tlsFieldGroups(kind),
   ]) {

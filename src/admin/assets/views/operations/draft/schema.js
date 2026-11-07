@@ -1,8 +1,10 @@
 import { tlsIdentityFields } from "./tls.js";
 import { streamRouteFields } from "./stream.js";
+import { kafkaBrokerFields } from "./kafka.js";
 
 const definitions = {
   tls_identity: tlsIdentityFields,
+  kafka_broker: kafkaBrokerFields,
   stream_route: streamRouteFields,
   stream_route_new: [
     ["id", "新流路由的稳定身份", "string"],

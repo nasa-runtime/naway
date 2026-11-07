@@ -148,6 +148,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/mqtt.js"),
         ),
+        "/ui/views/operations/draft/kafka.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/kafka.js"),
+        ),
         "/ui/views/operations/draft/stream.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/stream.js"),
