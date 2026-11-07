@@ -475,7 +475,7 @@ pub struct UpstreamTlsCfg {
     /// 发给上游的客户端私钥 PEM,等价 nginx `proxy_ssl_certificate_key`。
     #[serde(default, alias = "proxy_ssl_certificate_key")]
     pub client_key_file: Option<String>,
-    /// 内联客户端证书链；只允许受控发现源原子物化，必须与内联私钥成对出现。
+    /// 内联客户端证书链；必须与内联私钥成对出现，不能与文件身份或 SPIRE 混用。
     #[serde(default)]
     pub client_cert_pem: Option<String>,
     /// 内联客户端私钥；不进入日志或错误上下文，必须与内联证书链成对出现。

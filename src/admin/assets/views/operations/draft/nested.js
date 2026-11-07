@@ -1,6 +1,7 @@
 import { element } from "../../../core/dom.js";
 import { fieldRow } from "./controls.js";
 import { tlsFieldGroups } from "./tls.js";
+import { upstreamTlsFieldGroups } from "./upstream_tls.js";
 import { http3FieldGroups } from "./http3.js";
 import { listenerFieldGroups } from "./listener.js";
 import { streamTransportFieldGroups } from "./stream.js";
@@ -94,6 +95,15 @@ const groups = {
 export function nestedFields(kind, values, capacity) {
   const node = element("div", "", "draft-nested");
   const rows = [];
+  if (["service", "stream_route", "stream_route_new"].includes(kind)) {
+    node.append(
+      element(
+        "p",
+        "上游 CA 文件与内联 CA 互斥；客户端证书和私钥须成对，且不能与 SPIRE 混用。非空 SAN 列表使用 dns: 或 uri:，此时 server_name 只选择 SNI，证书链仍须验证。仅加密模式不能同时声明信任约束或客户端身份。服务实例须使用 HTTPS；lb:// 流上游在服务配置 TLS。SPIRE 需要目标具备 spire-workload 能力和可用的本地 Workload API。内联客户端材料请在完整声明中维护，常用字段不回填私钥。",
+        "subtle",
+      ),
+    );
+  }
   if (["proxy", "stream"].includes(kind)) {
     node.append(
       element(
@@ -165,6 +175,7 @@ export function nestedFields(kind, values, capacity) {
     ...kafkaFieldGroups(kind),
     ...http3FieldGroups(kind),
     ...tlsFieldGroups(kind),
+    ...upstreamTlsFieldGroups(kind),
   ]) {
     const group = element("details");
     group.append(element("summary", title));

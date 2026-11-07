@@ -7,6 +7,7 @@ import { tlsDraftLists } from "./tls.js";
 import { listenerDraftLists } from "./listener.js";
 import { mqttDraftLists } from "./mqtt.js";
 import { kafkaDraftLists } from "./kafka.js";
+import { upstreamTlsDraftLists } from "./upstream_tls.js";
 
 /**
  * 业务作用：列出常用列表与原文已声明的扩展数组，不把未知值转换成列表。
@@ -68,6 +69,7 @@ function lists(kind, values) {
   result.push(...listenerDraftLists(kind));
   result.push(...mqttDraftLists(kind));
   result.push(...kafkaDraftLists(kind));
+  result.push(...upstreamTlsDraftLists(kind));
   return result.map((item) => {
     let current = values;
     let valid = true;

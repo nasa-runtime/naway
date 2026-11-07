@@ -33,7 +33,7 @@ function exactValue(value) {
  * 参数说明：
  * - `name`：原始配置键。
  * - `title`：业务标签。
- * - `type`：常用控件类型或 JSON。
+ * - `type`：常用控件类型、保留换行的 multiline 字符串或 JSON。
  * - `value`：原始声明值，缺失时为 undefined。
  * - `capacity`：候选字节上限，用于输入控件容量。
  * - `removable`：该字段是否允许独立移除，必需的标量绑定须通过对象删除解除。
@@ -59,12 +59,13 @@ export function fieldRow(name, title, type, value, capacity, removable = true) {
     value === undefined ||
     (type === "lines"
       ? Array.isArray(value) && value.every((item) => typeof item === "string")
-      : typeof value === type);
+      : typeof value === (type === "multiline" ? "string" : type));
   const actual = compatible ? type : "json";
+  // PEM 等原文中的换行属于材料编码，必须用多行控件保持字节内容，不按名单拆分。
   const input = element(
     actual === "boolean"
       ? "select"
-      : ["lines", "json"].includes(actual)
+      : ["lines", "json", "multiline"].includes(actual)
         ? "textarea"
         : "input",
   );
@@ -81,7 +82,7 @@ export function fieldRow(name, title, type, value, capacity, removable = true) {
   } else if (actual === "number") {
     input.type = "number";
     input.step = "any";
-  } else if (["lines", "json"].includes(actual)) {
+  } else if (["lines", "json", "multiline"].includes(actual)) {
     input.rows = 4;
   }
   input.value =

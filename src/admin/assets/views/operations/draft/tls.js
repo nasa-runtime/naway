@@ -53,7 +53,7 @@ const tlsClientOcspFields = [
   ["allowed_responder_cidrs", "允许的私网响应者 CIDR（每行一项）", "lines"],
 ];
 
-const tlsSpireFields = [
+export const tlsSpireFields = [
   ["socket_path", "Workload API Unix socket 绝对路径", "string"],
   ["spiffe_id", "精确 SPIFFE ID", "string"],
   ["hint", "身份选择 hint", "string"],
