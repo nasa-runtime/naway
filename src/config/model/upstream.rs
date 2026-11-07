@@ -336,7 +336,7 @@ pub struct UpstreamLocalityCfg {
     /// 而不是把本区之外的流量一刀切。未列 zone 取默认权重 1。
     #[serde(default)]
     pub zone_weights: std::collections::HashMap<String, u32>,
-    /// 降级 zone:与本区同优先级参与,但份额按 `degraded_weight_percent` 打折。
+    /// 劣化 zone 保持原候选层，份额按 `degraded_weight_percent` 降低，不提升优先级。
     /// 用于「机房可用但已知劣化」这类既不该全量、也不该完全摘除的状态。
     #[serde(default)]
     pub degraded_zones: Vec<String>,

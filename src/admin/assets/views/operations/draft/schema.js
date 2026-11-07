@@ -2,8 +2,10 @@ import { tlsIdentityFields } from "./tls.js";
 import { streamRouteFields } from "./stream.js";
 import { kafkaBrokerFields } from "./kafka.js";
 import { upstreamRetryFields } from "./upstream_retry.js";
+import { localityTargetFields } from "./upstream_locality.js";
 
 const definitions = {
+  locality_target: localityTargetFields,
   tls_identity: tlsIdentityFields,
   kafka_broker: kafkaBrokerFields,
   stream_route: streamRouteFields,

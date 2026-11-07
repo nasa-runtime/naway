@@ -5,6 +5,7 @@ import { upstreamTlsFieldGroups } from "./upstream_tls.js";
 import { upstreamRetryFieldGroups } from "./upstream_retry.js";
 import { upstreamCapacityFieldGroups } from "./upstream_capacity.js";
 import { upstreamAffinityFieldGroups } from "./upstream_affinity.js";
+import { upstreamLocalityFieldGroups } from "./upstream_locality.js";
 import { http3FieldGroups } from "./http3.js";
 import { listenerFieldGroups } from "./listener.js";
 import { streamTransportFieldGroups } from "./stream.js";
@@ -120,6 +121,11 @@ export function nestedFields(kind, values, capacity) {
         "会话保持整段缺省关闭，声明 session_affinity 即启用，关闭须移除整段。亲和令牌只选择当前服务仍可用的实例，不是认证凭据，不能绕过健康、下线或地域边界。滚动 ttl_seconds 不能与绝对或空闲期限混用；持久 Cookie 的 Max-Age 随原绝对期限递减。Header 模式不接受 Cookie 有效期，切换载体时请明确处理旧字段。SameSite=None 须同时 Secure=true，省略 Path 与指定 path 互斥。",
         "subtle",
       ),
+      element(
+        "p",
+        "地域选择只使用静态实例或可信发现元数据。单层 failover 按本区及备用列表顺序选择；weighted 让已列可用区同层按份额分流，zone_weights 只用于此模式。声明 local_region 后须使用非空 targets，不混用单层备用、权重和劣化列表；分层先按 priority，failover 再按距离，weighted 在同 priority 内分流。劣化只降低同层份额，不提升优先级或代替健康摘除。未列实例仅在显式允许且已列层全不可用时兜底。移除整段 locality 才关闭地域约束。",
+        "subtle",
+      ),
     );
   }
   if (["service", "stream_route", "stream_route_new"].includes(kind)) {
@@ -206,6 +212,7 @@ export function nestedFields(kind, values, capacity) {
     ...upstreamRetryFieldGroups(kind),
     ...upstreamCapacityFieldGroups(kind),
     ...upstreamAffinityFieldGroups(kind),
+    ...upstreamLocalityFieldGroups(kind),
   ]) {
     const group = element("details");
     group.append(element("summary", title));

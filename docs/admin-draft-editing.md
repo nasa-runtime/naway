@@ -214,6 +214,16 @@ Header 模式不能配置 Cookie 有效期。Cookie 的 Secure、HttpOnly 缺省
 SameSite=None 必须同时 Secure=true；省略 Path 与声明 path 互斥。亲和 Cookie 追加到响应，
 不替换已有 Set-Cookie 头。编辑字段不求值令牌，合法组合仍由原目标预检确认。
 
+地域选择表单提供本地 region／zone／subzone、模式、未列实例兜底、单层备用顺序、权重映射
+和劣化份额。单层 `failover` 按本区及备用顺序选层；`weighted` 才允许 `zone_weights`，
+让已列可用区同层分流。声明 `local_region` 后须使用非空 `targets`，不混用单层备用、权重
+和劣化列表。分层目标可逐项编辑 region、zone、subzone、priority、weight、degraded，
+也可插入、替换、移动或删除；未编辑目标保留原文。分层先按 priority，`failover` 再按距离，
+`weighted` 在同 priority 内分配份额。同一可用区的整体目标与细分子区不得重叠。
+劣化只减少同层份额，不提升优先级或替代健康摘除；未列拓扑仅在显式允许且已列层全部不可用时
+兜底。策略只使用可信配置或发现元数据，不读取客户端位置声明；移除整段 `locality` 才关闭
+地域约束。目标预检仍验证拓扑、容量、数值边界及模型组合。
+
 已有对象另提供“逐项编辑有序列表”，覆盖路由断言、处理链、凭据引用、静态实例、接口请求
 方法、HTTP/3 扩展及已声明的其它数组。静态实例有 URI、权重、下线、备用、健康、慢启动及
 地域字段控件；对象元素也可单独设置扩展字段。每次列表操作单独生成候选，不带上普通字段
