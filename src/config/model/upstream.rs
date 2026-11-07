@@ -85,7 +85,7 @@ pub struct StaticServiceCfg {
     /// 可信 region/zone/subzone 分层与份额；未配置时保持全实例 LB 语义。
     #[serde(default)]
     pub locality: Option<UpstreamLocalityCfg>,
-    /// 后端负载反馈:让 `weighted_least_request` 按真实延迟或后端自报利用率择优。
+    /// 后端负载反馈：让 `least_conn` 与 `weighted_least_request` 按真实延迟或后端自报利用率择优。
     /// 未配置时保持纯在途请求数比较,不采集任何反馈、不产生额外状态。
     #[serde(default)]
     pub load_feedback: Option<LoadFeedbackCfg>,

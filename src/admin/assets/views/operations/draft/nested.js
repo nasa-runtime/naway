@@ -6,6 +6,7 @@ import { upstreamRetryFieldGroups } from "./upstream_retry.js";
 import { upstreamCapacityFieldGroups } from "./upstream_capacity.js";
 import { upstreamAffinityFieldGroups } from "./upstream_affinity.js";
 import { upstreamLocalityFieldGroups } from "./upstream_locality.js";
+import { upstreamFeedbackFieldGroups } from "./upstream_feedback.js";
 import { http3FieldGroups } from "./http3.js";
 import { listenerFieldGroups } from "./listener.js";
 import { streamTransportFieldGroups } from "./stream.js";
@@ -126,6 +127,11 @@ export function nestedFields(kind, values, capacity) {
         "地域选择只使用静态实例或可信发现元数据。单层 failover 按本区及备用列表顺序选择；weighted 让已列可用区同层按份额分流，zone_weights 只用于此模式。声明 local_region 后须使用非空 targets，不混用单层备用、权重和劣化列表；分层先按 priority，failover 再按距离，weighted 在同 priority 内分流。劣化只降低同层份额，不提升优先级或代替健康摘除。未列实例仅在显式允许且已列层全不可用时兜底。移除整段 locality 才关闭地域约束。",
         "subtle",
       ),
+      element(
+        "p",
+        "负载反馈供 least_conn 和 weighted_least_request（p2c）在当前候选层内比较；缺失、过期、非法或样本不足时回退基础算法，不改变实例健康。新鲜反馈覆盖不足时整体回退，覆盖下限为 0 仍须至少一份有效反馈。反馈只取真实上游响应或固定实例订阅，不信任客户端报告。带外订阅须 utilization、h2/h2c 和 upstream-orca 能力；默认要求 TLS 身份验证，明文须显式允许，不能使用 insecure_skip_verify。设置任一 out_of_band 子字段即声明订阅，关闭须移除整段；将反馈模式改为 none 时也须移除订阅。",
+        "subtle",
+      ),
     );
   }
   if (["service", "stream_route", "stream_route_new"].includes(kind)) {
@@ -213,6 +219,7 @@ export function nestedFields(kind, values, capacity) {
     ...upstreamCapacityFieldGroups(kind),
     ...upstreamAffinityFieldGroups(kind),
     ...upstreamLocalityFieldGroups(kind),
+    ...upstreamFeedbackFieldGroups(kind),
   ]) {
     const group = element("details");
     group.append(element("summary", title));
