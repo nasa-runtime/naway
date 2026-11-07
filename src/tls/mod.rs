@@ -220,7 +220,7 @@ impl ProducesTickets for SharedSessionTickets {
 /// 进程内共享的 TLS 服务端配置:启动期构建一次,证书文件变更时原子换新。
 pub type SharedServerConfig = Arc<ArcSwap<ServerConfig>>;
 
-/// HTTP 上游 TLS profile：已在配置构建期解析并校验证书材料。
+/// HTTP 与流上游 TLS profile：已在配置构建期解析并校验证书材料。
 ///
 /// `key` 只包含非敏感指纹,供常驻连接池按 profile 复用;`client_config` 不带 ALPN,创建 connector 时再由
 /// hyper-rustls 按 h1/h2 能力设置。
@@ -228,7 +228,7 @@ pub type SharedServerConfig = Arc<ArcSwap<ServerConfig>>;
 pub struct UpstreamTlsProfile {
     /// 不含密钥明文的稳定配置指纹，用作连接池身份。
     pub key: Arc<str>,
-    /// 可选显式 SNI/证书主机名；为空时使用上游 URI host。
+    /// 可选显式 SNI；未声明 SAN allowlist 时同时作为证书主机名，为空则使用上游 URI host。
     pub server_name: Option<Arc<str>>,
     /// 已加载 CA、客户端证书和校验策略的 rustls client 配置。
     pub client_config: Arc<ClientConfig>,
@@ -241,12 +241,12 @@ pub struct UpstreamTlsProfile {
 }
 
 impl UpstreamTlsProfile {
-    /// 业务作用：在使用远程 mTLS 身份创建新上游请求前复验 lease 与最大陈旧期。
+    /// 业务作用：在创建新上游请求或连接时复验动态身份授权与最大陈旧期，并维持 SPIRE 身份刷新。
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：本地身份，或仍获授权且未到期的远程身份返回 true；否则禁止创建新请求，既有连接可自然 drain。
-    pub(crate) fn allows_new_requests(&self) -> bool {
+    /// 返回：本地身份，或仍获授权且未到期的远程身份返回 true；否则禁止新请求或连接，既有会话可自然 drain。
+    pub fn allows_new_requests(&self) -> bool {
         if let Some(source) = &self.spire {
             source.ensure_upstream_watcher();
         }

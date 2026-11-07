@@ -22,6 +22,7 @@ pub mod scripts;
 mod sentinel;
 use sentinel::{load_sentinel_rules, SentinelRouteFilters};
 pub mod telemetry;
+pub(crate) mod upstream_tls;
 pub mod webdav;
 pub mod xds_server;
 
@@ -44,7 +45,7 @@ use crate::protocols::proxy_protocol::ProxyProtocolWriteVersion;
 use crate::routing::variable::VariablePlan;
 use crate::routing::Router;
 use crate::security::guard::InterfaceGuard;
-use crate::tls::{build_upstream_tls_profile, UpstreamTlsProfile};
+use crate::tls::UpstreamTlsProfile;
 use crate::upstream::{DynamicUpstreamStore, UpstreamDirectory};
 use model::{
     AcmeCfg, AdminAction, AdminApprovalCfg, AdminCfg, AdminResource, AdminRole, AdminRolloutCfg,
@@ -3500,6 +3501,13 @@ fn build_ocsp_stapling_runtime(
 
 /// 业务作用：构建 route 级 stream 上游 TLS/mTLS profile。`lb://` 由 service 配置持有 profile，
 /// 防止同一实例身份在 L7/L4 间使用两套证书策略却共享健康键。
+///
+/// 参数说明：
+/// - `cfg_path`：主配置路径，用于解析相对材料文件。
+/// - `listener`：所属流监听，提供拒绝配置时的定位信息。
+/// - `route`：包含上游目标与 TLS 声明的流路由。
+///
+/// 返回：未配置 TLS 时返回空；完整策略有效时返回 profile；来源冲突或非法材料拒绝候选。
 fn build_stream_upstream_tls(
     cfg_path: &Path,
     listener: &model::StreamListenerCfg,
@@ -3508,6 +3516,7 @@ fn build_stream_upstream_tls(
     let Some(tls) = &route.tls else {
         return Ok(None);
     };
+    // LB 实例的身份与连接池归属由服务统一持有，路由不能覆盖它的信任或客户端材料。
     if route.upstream.trim().starts_with("lb://") {
         anyhow::bail!(
             "stream `{}` route `{}` lb:// upstream TLS must be configured on upstreams.services",
@@ -3515,26 +3524,9 @@ fn build_stream_upstream_tls(
             route.id
         );
     }
-    let ca_file = tls
-        .ca_file
-        .as_deref()
-        .map(|path| resolve_relative(cfg_path, path));
-    let client_cert = tls
-        .client_cert_file
-        .as_deref()
-        .map(|path| resolve_relative(cfg_path, path));
-    let client_key = tls
-        .client_key_file
-        .as_deref()
-        .map(|path| resolve_relative(cfg_path, path));
-    build_upstream_tls_profile(
-        tls.server_name.as_deref(),
-        ca_file.as_deref(),
-        client_cert.as_deref(),
-        client_key.as_deref(),
-    )
-    .with_context(|| format!("stream `{}` route `{}` upstream TLS", listener.id, route.id))
-    .map(Some)
+    upstream_tls::build_profile(cfg_path, tls)
+        .with_context(|| format!("stream `{}` route `{}` upstream TLS", listener.id, route.id))
+        .map(Some)
 }
 
 /// 业务作用：编译 stream 发往上游的 PROXY protocol 配置。

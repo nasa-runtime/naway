@@ -27,10 +27,7 @@ use anyhow::{Context, Result};
 use crate::config::model::{
     DiscoveryCfg, StaticInstanceCfg, StaticServiceCfg, UpstreamPrewarmCfg, UpstreamsCfg,
 };
-use crate::config::resolve_relative;
-use crate::tls::{
-    build_upstream_tls_profile, build_upstream_tls_profile_with_material, UpstreamTlsProfile,
-};
+use crate::tls::{build_upstream_tls_profile, UpstreamTlsProfile};
 
 /// 服务发现快照提供者。
 pub trait ServiceRegistry: Send + Sync {
@@ -3162,68 +3159,9 @@ fn build_service_tls_profile(
     let Some(tls) = &svc.tls else {
         return Ok(None);
     };
-    if tls.insecure_skip_verify {
-        anyhow::ensure!(
-            tls.ca_file.is_none()
-                && tls.ca_pem.is_none()
-                && tls.subject_alt_names.is_empty()
-                && tls.client_cert_file.is_none()
-                && tls.client_key_file.is_none()
-                && tls.client_cert_pem.is_none()
-                && tls.client_key_pem.is_none()
-                && tls.spire.is_none(),
-            "service `{name}` insecure_skip_verify cannot be combined with trust or client identity material"
-        );
-        // 关闭证书认证只保留传输加密；配置构建期必须拒绝任何看似仍会生效的信任或身份材料。
-        return crate::tls::build_encryption_only_upstream_tls_profile(tls.server_name.as_deref())
-            .map(Some)
-            .with_context(|| {
-                format!("build encryption-only upstream tls profile for service `{name}`")
-            });
-    }
-    let ca_file = tls
-        .ca_file
-        .as_ref()
-        .map(|path| resolve_relative(cfg_path, path));
-    let client_cert_file = tls
-        .client_cert_file
-        .as_ref()
-        .map(|path| resolve_relative(cfg_path, path));
-    let client_key_file = tls
-        .client_key_file
-        .as_ref()
-        .map(|path| resolve_relative(cfg_path, path));
-    let mut profile = match &tls.spire {
-        Some(spire) => {
-            let source = crate::tls::spire::build_source(spire)
-                .with_context(|| format!("build upstream SPIRE identity for service `{name}`"))?;
-            crate::tls::build_upstream_tls_profile_with_spire(
-                tls.server_name.as_deref(),
-                ca_file.as_deref(),
-                tls.ca_pem.as_deref(),
-                &tls.subject_alt_names,
-                client_cert_file.as_deref(),
-                client_key_file.as_deref(),
-                tls.client_cert_pem.as_deref(),
-                tls.client_key_pem.as_deref(),
-                source,
-            )
-        }
-        None => build_upstream_tls_profile_with_material(
-            tls.server_name.as_deref(),
-            ca_file.as_deref(),
-            tls.ca_pem.as_deref(),
-            &tls.subject_alt_names,
-            client_cert_file.as_deref(),
-            client_key_file.as_deref(),
-            tls.client_cert_pem.as_deref(),
-            tls.client_key_pem.as_deref(),
-        ),
-    }
-    .with_context(|| format!("build upstream tls profile for service `{name}`"))?;
-    profile.client_identity_not_after = tls.client_identity_not_after;
-    profile.client_identity_policy_identity = tls.client_identity_policy_identity;
-    Ok(Some(profile))
+    crate::config::upstream_tls::build_profile(cfg_path, tls)
+        .with_context(|| format!("build upstream TLS profile for service `{name}`"))
+        .map(Some)
 }
 
 /// 业务作用：为 IPv6 authority 保留方括号边界，避免主机中的冒号被误当作端口分隔符。

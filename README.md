@@ -1072,6 +1072,14 @@ CA 混入同一信任池。完整响应删除 SVID、必需 federation bundle �
 服务端 SPIRE 身份禁止 session ticket，上游 SPIRE 客户端身份关闭 TLS resumption，确保恢复会话
 不能绕过身份轮换、bundle 换代或 selector 撤权。已建立连接按正常连接生命周期继续 drain。
 
+`upstreams.services.<name>.tls` 与直接 TCP 上游的 `stream.listeners[].routes[].tls`
+使用相同的信任和身份策略。`ca_file` 与 `ca_pem` 互斥，客户端证书和私钥必须使用成对文件或
+成对内联 PEM，且不能与 SPIRE 身份混用。非空 `subject_alt_names` 最多包含五项
+`dns:<name>` 或 `uri:<absolute-uri>`，证书须至少匹配一项；此时 `server_name` 仅用于 SNI，
+证书链与握手签名仍须通过校验。`insecure_skip_verify` 仅保留传输加密，不能同时声明信任约束或
+客户端身份，仅适用于身份已由受控发现边界约束的端点。`lb://service` 的 TLS 必须在服务声明，
+流路由不能覆盖。流上游在拨号前和握手后复验动态身份授权，失效时不放行业务数据。
+
 ```yaml
 server:
   tls:

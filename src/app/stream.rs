@@ -1894,9 +1894,22 @@ pub(super) fn default_stream_upstream_tls_profile() -> Result<gateway::tls::Upst
 
 /// 业务作用：建立明文或 TLS stream 上游。TLS 握手属于 connect deadline，避免 TCP 已连但 TLS
 /// dependency 卡住时绕过 `connect_timeout_ms`。Box 仅按连接分配一次，payload 不聚合。
+///
+/// 参数说明：
+/// - `reservation`：本次选择的目标地址、TLS 身份策略及默认认证名称。
+///
+/// 返回：拨号和握手成功且身份仍获授权时返回连接；超时、身份失效或握手失败时不放行业务字节。
 pub(super) async fn connect_stream_upstream(
     reservation: &StreamUpstreamReservation,
 ) -> Result<BoxStreamIo> {
+    // 选择实例后身份可能已到期；失去授权必须在产生新上游连接前拒绝。
+    anyhow::ensure!(
+        reservation
+            .tls_profile
+            .as_ref()
+            .is_none_or(|profile| profile.allows_new_requests()),
+        "stream upstream TLS identity is not authorized for a new connection"
+    );
     let tcp = TcpStream::connect(reservation.addr.as_str())
         .await
         .with_context(|| format!("connect stream upstream {}", reservation.addr))?;
@@ -1915,6 +1928,11 @@ pub(super) async fn connect_stream_upstream(
         .connect(server_name, tcp)
         .await
         .context("stream upstream TLS handshake")?;
+    // 握手期间授权也可能撤销或到期，必须在转发预读数据和业务负载前再次复验。
+    anyhow::ensure!(
+        profile.allows_new_requests(),
+        "stream upstream TLS identity expired or became unavailable during handshake"
+    );
     Ok(Box::new(tls))
 }
 

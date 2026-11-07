@@ -450,7 +450,7 @@ pub struct StaticInstanceCfg {
     pub subzone: Option<String>,
 }
 
-/// HTTP 上游 TLS 配置,对齐 nginx `proxy_ssl_*` 的高频子集。
+/// HTTP 与流上游共用的 TLS 信任、名称认证和客户端身份配置。
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct UpstreamTlsCfg {
     /// 覆盖发往上游的 TLS SNI 与证书校验名,等价 nginx `proxy_ssl_name`。
