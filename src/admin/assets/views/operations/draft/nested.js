@@ -4,6 +4,7 @@ import { tlsFieldGroups } from "./tls.js";
 import { upstreamTlsFieldGroups } from "./upstream_tls.js";
 import { upstreamRetryFieldGroups } from "./upstream_retry.js";
 import { upstreamCapacityFieldGroups } from "./upstream_capacity.js";
+import { upstreamAffinityFieldGroups } from "./upstream_affinity.js";
 import { http3FieldGroups } from "./http3.js";
 import { listenerFieldGroups } from "./listener.js";
 import { streamTransportFieldGroups } from "./stream.js";
@@ -114,6 +115,11 @@ export function nestedFields(kind, values, capacity) {
         "自适应并发须显式 enabled，按服务限制等待上游响应头的在途尝试；达到上限后只有有限队列可等待，队列满或到期返回过载。窗口摘除没有 enabled，声明 outlier 即启用并替代 max_fails，移除整段才关闭；目标须具备 upstream-outlier 能力。失败与慢调用比例不能同时为 0，摘除上限按实例数向下取整，单实例不会被摘除。冷却到期仅开放一个真实恢复探测，成功前仍处于摘除状态。",
         "subtle",
       ),
+      element(
+        "p",
+        "会话保持整段缺省关闭，声明 session_affinity 即启用，关闭须移除整段。亲和令牌只选择当前服务仍可用的实例，不是认证凭据，不能绕过健康、下线或地域边界。滚动 ttl_seconds 不能与绝对或空闲期限混用；持久 Cookie 的 Max-Age 随原绝对期限递减。Header 模式不接受 Cookie 有效期，切换载体时请明确处理旧字段。SameSite=None 须同时 Secure=true，省略 Path 与指定 path 互斥。",
+        "subtle",
+      ),
     );
   }
   if (["service", "stream_route", "stream_route_new"].includes(kind)) {
@@ -199,6 +205,7 @@ export function nestedFields(kind, values, capacity) {
     ...upstreamTlsFieldGroups(kind),
     ...upstreamRetryFieldGroups(kind),
     ...upstreamCapacityFieldGroups(kind),
+    ...upstreamAffinityFieldGroups(kind),
   ]) {
     const group = element("details");
     group.append(element("summary", title));

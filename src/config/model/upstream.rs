@@ -79,7 +79,7 @@ pub struct StaticServiceCfg {
     /// Maglev 查找表期望长度;构建期归一到不小于它的质数并受硬上限约束。
     #[serde(default)]
     pub hash_table_size: Option<usize>,
-    /// 服务级会话保持;route 级策略优先(Gateway API 语义)。
+    /// 服务级会话保持；路由使用该逻辑服务时应用其策略。
     #[serde(default)]
     pub session_affinity: Option<SessionAffinityCfg>,
     /// 可信 region/zone/subzone 分层与份额；未配置时保持全实例 LB 语义。
@@ -271,7 +271,7 @@ pub struct SessionAffinityCfg {
     /// cookie 名或请求头名;缺省 cookie 模式为 `naway_affinity`。
     #[serde(default)]
     pub name: Option<String>,
-    /// cookie 有效期(秒);0 或缺省表示会话 cookie(浏览器关闭即失效)。
+    /// 非持久模式的滚动 Cookie Max-Age（秒）；0 或缺省不设置该属性。
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
     /// 会话从首次建立起的绝对有效期（秒）；0 或缺省表示不由网关校验绝对期限。
