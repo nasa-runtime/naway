@@ -1,6 +1,7 @@
 import { tlsIdentityFields } from "./tls.js";
 import { streamRouteFields } from "./stream.js";
 import { kafkaBrokerFields } from "./kafka.js";
+import { upstreamRetryFields } from "./upstream_retry.js";
 
 const definitions = {
   tls_identity: tlsIdentityFields,
@@ -109,6 +110,7 @@ const definitions = {
     ["lb_policy", "负载均衡策略", "string"],
     ["hash_on", "一致性哈希来源", "string"],
     ["upstream_credentials", "上游凭据引用（每行一项）", "lines"],
+    ...upstreamRetryFields,
   ],
 
   stream: [

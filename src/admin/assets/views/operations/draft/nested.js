@@ -2,6 +2,7 @@ import { element } from "../../../core/dom.js";
 import { fieldRow } from "./controls.js";
 import { tlsFieldGroups } from "./tls.js";
 import { upstreamTlsFieldGroups } from "./upstream_tls.js";
+import { upstreamRetryFieldGroups } from "./upstream_retry.js";
 import { http3FieldGroups } from "./http3.js";
 import { listenerFieldGroups } from "./listener.js";
 import { streamTransportFieldGroups } from "./stream.js";
@@ -95,6 +96,20 @@ const groups = {
 export function nestedFields(kind, values, capacity) {
   const node = element("div", "", "draft-nested");
   const rows = [];
+  if (kind === "service") {
+    node.append(
+      element(
+        "p",
+        "换实例条件支持 error、timeout、http_502、http_503、http_504、non_idempotent；显式空列表禁用触发，移除字段恢复默认。GET/HEAD 以外的方法须有 Idempotency-Key 或显式 non_idempotent，且待转发正文必须为空；预算不会授予重放许可。总次数包含首次，每个候选最多尝试一次。预算比例与两项最低额度取较大值，同时限制窗口重试量和在途重试数；比例为 0 仍保留最低额度。窗口摘除 outlier 存在时替代 max_fails 策略。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "预热整段缺省关闭，设置任一预热子字段即声明该策略；关闭须移除完整 prewarm。预热使用不带下游身份或正文的 HEAD 请求，不证明业务可用。h3 需要 HTTPS 实例及 http3 能力；h2 用于 TLS，明文 HTTP/2 使用 h2c。目标预检仍检查协议和配置组合。",
+        "subtle",
+      ),
+    );
+  }
   if (["service", "stream_route", "stream_route_new"].includes(kind)) {
     node.append(
       element(
@@ -176,6 +191,7 @@ export function nestedFields(kind, values, capacity) {
     ...http3FieldGroups(kind),
     ...tlsFieldGroups(kind),
     ...upstreamTlsFieldGroups(kind),
+    ...upstreamRetryFieldGroups(kind),
   ]) {
     const group = element("details");
     group.append(element("summary", title));
