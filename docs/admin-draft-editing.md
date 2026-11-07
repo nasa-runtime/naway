@@ -214,6 +214,16 @@ Header 模式不能配置 Cookie 有效期。Cookie 的 Secure、HttpOnly 缺省
 SameSite=None 必须同时 Secure=true；省略 Path 与声明 path 互斥。亲和 Cookie 追加到响应，
 不替换已有 Set-Cookie 头。编辑字段不求值令牌，合法组合仍由原目标预检确认。
 
+服务来源字段包含注册服务名、命名空间、数字端口、Kubernetes 端口名称与 MCS ServiceImport、
+发现 URI scheme 和 Nacos cluster 过滤。动态来源须启用对应发现服务并移除静态实例；
+启用 Nacos 发现须编译 `nacos-sdk`，缺少时拒绝候选。发现总开关与 Nacos 连接身份属于启动配置。
+Kubernetes 数字端口与端口名称互斥，ServiceImport 使用 MCS EndpointSlice。Nacos cluster
+空列表允许全部 cluster，可在有序列表中逐项编辑；scheme 不改写静态实例已声明的 URI。
+`lb_policy` 优先于兼容字段 `lb`。`ring_hash`／`maglev` 须声明 `hash_on`，`ip_hash` 固定按
+`remote_addr`，不能同时声明 `hash_on`。哈希环虚拟节点数限1–1000，Maglev 期望槽位数限
+1–655373，并从预设质数表选择不小于期望值的首项，最小251；这些参数仅用于哈希策略。
+哈希与亲和只改变当前可用候选的选择顺序，不绕过健康、备用或地域边界。
+
 地域选择表单提供本地 region／zone／subzone、模式、未列实例兜底、单层备用顺序、权重映射
 和劣化份额。单层 `failover` 按本区及备用顺序选层；`weighted` 才允许 `zone_weights`，
 让已列可用区同层分流。声明 `local_region` 后须使用非空 `targets`，不混用单层备用、权重

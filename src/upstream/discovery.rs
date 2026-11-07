@@ -41,13 +41,22 @@ const MAX_REGISTRY_INSTANCES_HARD: usize = 4_096;
 
 /// 业务作用：解析 registry SecretSource 并 fail-fast 校验所有后台资源预算。
 ///
-/// 返回值进入不可变 snapshot；后台 worker 只使用已解析凭据，不在轮询路径
-/// 重复读 env/文件。
+/// 参数说明：
+/// - `cfg`：已应用发现总开关的后端声明，只验证实际启用的能力。
+/// - `config_dir`：文件型凭据的受控相对目录。
+///
+/// 返回：能力、预算与凭据均有效时生成不可变 snapshot 输入；缺少编译能力或声明非法时
+/// 拒绝候选。后台 worker 沿用已解析凭据，不在轮询路径重复读取环境或文件。
 pub(crate) fn build_runtime_config(
     mut cfg: DiscoveryCfg,
     config_dir: &std::path::Path,
 ) -> anyhow::Result<DiscoveryCfg> {
     if cfg.nacos.enabled {
+        // 制品缺少传输能力时必须在发布快照前拒绝，不能等后台订阅失败后留下无实例路由。
+        anyhow::ensure!(
+            cfg!(feature = "nacos-sdk"),
+            "discovery.nacos.enabled requires building gateway with feature `nacos-sdk`"
+        );
         anyhow::ensure!(
             !cfg.nacos.server_addr.trim().is_empty(),
             "discovery.nacos.server_addr cannot be empty"

@@ -104,6 +104,11 @@ export function nestedFields(kind, values, capacity) {
     node.append(
       element(
         "p",
+        "动态实例来源须启用对应发现服务，并移除静态 instances。Nacos 发现要求制品编译 nacos-sdk；发现总开关与 Nacos 连接身份属于启动配置。Kubernetes 数字端口与端口名称互斥，ServiceImport 使用 MCS EndpointSlice；Nacos clusters 空列表允许全部 cluster。scheme 用于拼接发现实例 URI，不改写已声明的静态 URI。lb_policy 优先于兼容字段 lb。ring_hash 和 maglev 须有 hash_on；ip_hash 固定按 remote_addr，不能再声明 hash_on。哈希参数仅用于哈希策略，Maglev 从预设质数表选择不小于期望值的槽位数；算法与亲和仍受健康、备用和地域候选层约束。",
+        "subtle",
+      ),
+      element(
+        "p",
         "换实例条件支持 error、timeout、http_502、http_503、http_504、non_idempotent；显式空列表禁用触发，移除字段恢复默认。GET/HEAD 以外的方法须有 Idempotency-Key 或显式 non_idempotent，且待转发正文必须为空；预算不会授予重放许可。总次数包含首次，每个候选最多尝试一次。预算比例与两项最低额度取较大值，同时限制窗口重试量和在途重试数；比例为 0 仍保留最低额度。窗口摘除 outlier 存在时替代 max_fails 策略。",
         "subtle",
       ),

@@ -104,7 +104,7 @@ fn weighted_member_order(weights: &[u64], slots: usize) -> Vec<usize> {
 /// 参数说明：
 /// - `requested`：是配置声明的期望表长。
 ///
-/// 返回：不小于 `requested` 的最小质数；超过硬上限时返回上限质数。
+/// 返回：预设表中不小于 `requested` 的首个质数，最小为251；超过硬上限时返回上限质数。
 pub fn maglev_table_size(requested: usize) -> usize {
     for prime in MAGLEV_PRIMES {
         if *prime >= requested {

@@ -3,6 +3,7 @@ import { streamRouteFields } from "./stream.js";
 import { kafkaBrokerFields } from "./kafka.js";
 import { upstreamRetryFields } from "./upstream_retry.js";
 import { localityTargetFields } from "./upstream_locality.js";
+import { upstreamCatalogFields } from "./upstream_catalog.js";
 
 const definitions = {
   locality_target: localityTargetFields,
@@ -111,6 +112,7 @@ const definitions = {
     ["nacos_service", "Nacos 服务名称", "string"],
     ["lb_policy", "负载均衡策略", "string"],
     ["hash_on", "一致性哈希来源", "string"],
+    ...upstreamCatalogFields,
     ["upstream_credentials", "上游凭据引用（每行一项）", "lines"],
     ...upstreamRetryFields,
   ],

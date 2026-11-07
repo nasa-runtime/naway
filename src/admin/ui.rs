@@ -180,6 +180,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/upstream_feedback.js"),
         ),
+        "/ui/views/operations/draft/upstream_catalog.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/upstream_catalog.js"),
+        ),
         "/ui/views/operations/draft/listener.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/listener.js"),

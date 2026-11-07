@@ -56,7 +56,7 @@ pub struct StaticServiceCfg {
     /// K8s Endpoints 端口名；空时要求响应仅有一个端口。
     #[serde(default)]
     pub registry_port_name: Option<String>,
-    /// Nacos 实例缺少 metadata URI 时拼接上游 URI 使用的 scheme,默认 `http`。
+    /// 发现实例缺少完整 URI 时拼接地址使用的 scheme，默认 `http`；不改写静态实例 URI。
     #[serde(default)]
     pub scheme: Option<String>,
     /// Nacos cluster 过滤;空 = 全部 cluster。
@@ -73,10 +73,10 @@ pub struct StaticServiceCfg {
     /// 只接受受控来源,拒绝任意高基数字段污染哈希环与跨节点共享状态。
     #[serde(default)]
     pub hash_on: Option<String>,
-    /// ring-hash 每单位权重生成的虚拟节点数;默认 100,构建期钳制到硬上限。
+    /// ring-hash 每单位权重生成的虚拟节点数；默认 100，哈希策略构建时要求在1..=1000内。
     #[serde(default)]
     pub hash_ring_replicas: Option<u32>,
-    /// Maglev 查找表期望长度;构建期归一到不小于它的质数并受硬上限约束。
+    /// Maglev 查找表期望长度；要求在1..=655373内，构建时选不小于它的预设质数。
     #[serde(default)]
     pub hash_table_size: Option<usize>,
     /// 服务级会话保持；路由使用该逻辑服务时应用其策略。
