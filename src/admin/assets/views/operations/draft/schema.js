@@ -5,8 +5,10 @@ import { upstreamRetryFields } from "./upstream_retry.js";
 import { localityTargetFields } from "./upstream_locality.js";
 import { upstreamCatalogFields } from "./upstream_catalog.js";
 import { routeDeadlineFields } from "./route_deadline.js";
+import { wafExclusionFields } from "./route_waf.js";
 
 const definitions = {
+  waf_exclusion: wafExclusionFields,
   locality_target: localityTargetFields,
   tls_identity: tlsIdentityFields,
   kafka_broker: kafkaBrokerFields,

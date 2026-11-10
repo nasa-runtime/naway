@@ -13,6 +13,7 @@ import { streamTransportFieldGroups } from "./stream.js";
 import { mqttFieldGroups } from "./mqtt.js";
 import { kafkaFieldGroups } from "./kafka.js";
 import { routeDeadlineFieldGroups } from "./route_deadline.js";
+import { routeWafFieldGroups } from "./route_waf.js";
 
 const groups = {
   route: [
@@ -111,6 +112,16 @@ export function nestedFields(kind, values, capacity) {
       element(
         "p",
         "并行副本须固定 lb:// 服务、明确 idempotent=true，并通过 proxy_pass_request_body off 关闭请求正文。运行时仅 GET / HEAD 可启动副本，总次数固定为 2；主请求在延迟内成功时不会发送副本，失败时可提前发送。胜出后取消另一尝试，4xx 作为业务结果；移除完整 hedge 声明才关闭策略。填写时间预算不会授予重复执行许可。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "声明 waf 即启用策略，缺省为 enforce；关闭须移除完整 waf。monitor 对规则命中只记录并继续转发，正文容量超限和读取失败仍会拒绝。仅明确开启 inspect_body 才聚合 JSON / XML 正文，不能与关闭转发正文或非零长流最长寿命同时声明。空 enabled_rules 启用全部内置规则；精确例外只能引用已启用规则及 path、query、body、header:framing 或 header:<小写名称>，不接受通配符。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "内置规则 id：sql_injection、xss、command_injection、template_injection、path_traversal、protocol_smuggling、abnormal_encoding、dangerous_header、json_threat、xml_threat。外部签名规则包沿用原声明及原目标预检，未编辑的包引用不随常用字段回传。",
         "subtle",
       ),
     );
@@ -229,6 +240,7 @@ export function nestedFields(kind, values, capacity) {
   for (const [prefix, title, definitions] of [
     ...(groups[kind] ?? []),
     ...routeDeadlineFieldGroups(kind),
+    ...routeWafFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

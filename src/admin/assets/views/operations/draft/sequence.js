@@ -9,6 +9,7 @@ import { mqttDraftLists } from "./mqtt.js";
 import { kafkaDraftLists } from "./kafka.js";
 import { upstreamTlsDraftLists } from "./upstream_tls.js";
 import { upstreamLocalityDraftLists } from "./upstream_locality.js";
+import { routeWafDraftLists } from "./route_waf.js";
 
 /**
  * 业务作用：列出常用列表与原文已声明的扩展数组，不把未知值转换成列表。
@@ -72,6 +73,7 @@ function lists(kind, values) {
   result.push(...kafkaDraftLists(kind));
   result.push(...upstreamTlsDraftLists(kind));
   result.push(...upstreamLocalityDraftLists(kind));
+  result.push(...routeWafDraftLists(kind));
   return result.map((item) => {
     let current = values;
     let valid = true;
@@ -210,6 +212,7 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "stream_route",
           "kafka_broker",
           "locality_target",
+          "waf_exclusion",
         ].includes(selected.type)
       ) {
         // 原元素仍按稳定身份编辑；只有新建或整值替换才能明确提供新路由身份。
