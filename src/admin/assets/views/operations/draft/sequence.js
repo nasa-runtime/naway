@@ -10,6 +10,7 @@ import { kafkaDraftLists } from "./kafka.js";
 import { upstreamTlsDraftLists } from "./upstream_tls.js";
 import { upstreamLocalityDraftLists } from "./upstream_locality.js";
 import { routeWafDraftLists } from "./route_waf.js";
+import { routeBotDraftLists } from "./route_bot.js";
 
 /**
  * 业务作用：列出常用列表与原文已声明的扩展数组，不把未知值转换成列表。
@@ -74,6 +75,7 @@ function lists(kind, values) {
   result.push(...upstreamTlsDraftLists(kind));
   result.push(...upstreamLocalityDraftLists(kind));
   result.push(...routeWafDraftLists(kind));
+  result.push(...routeBotDraftLists(kind));
   return result.map((item) => {
     let current = values;
     let valid = true;

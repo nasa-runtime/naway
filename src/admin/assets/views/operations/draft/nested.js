@@ -15,6 +15,7 @@ import { kafkaFieldGroups } from "./kafka.js";
 import { routeDeadlineFieldGroups } from "./route_deadline.js";
 import { routeWafFieldGroups } from "./route_waf.js";
 import { routeWafPackFieldGroups } from "./route_waf_pack.js";
+import { routeBotFieldGroups } from "./route_bot.js";
 
 const groups = {
   route: [
@@ -128,6 +129,11 @@ export function nestedFields(kind, values, capacity) {
       element(
         "p",
         "外部规则包使用本地 JSON 文件和 detached Ed25519 签名，来源、摘要、签名与公钥须同时有效；页面只编辑声明，不上传文件或读取 SecretSource。目标节点必须具备对应文件，候选预检与正式发布均会验证原始字节、签名及资源预算。包内容为有界 literal 规则；移除完整 rule_pack 保留内置 WAF，父段编辑与子字段编辑不能在同次动作中重叠。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "声明 bot 即启用，缺省为 enforce；关闭须移除完整 bot。非空允许名单要求 User-Agent 匹配，拒绝名单命中即挑战；glob 忽略大小写，名单间不能有相同 glob。必需头须是单个非空值。行为分数达到阈值时挑战，monitor 记录后继续；429 留给速率信号，普通挑战可选其它 4xx。指纹始终包含 User-Agent，再按声明顺序加入所选头值；这里的拒绝指纹不包含客户端 IP。未编辑的速率和可信机器人签名声明保持原值，声称可信仍须逐请求验签。",
         "subtle",
       ),
     );
@@ -248,6 +254,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeDeadlineFieldGroups(kind),
     ...routeWafFieldGroups(kind),
     ...routeWafPackFieldGroups(kind),
+    ...routeBotFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
