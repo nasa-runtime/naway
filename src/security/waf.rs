@@ -788,12 +788,15 @@ impl WafPolicy {
         None
     }
 
-    /// 业务作用：解析 XML 并拒绝 DTD、自定义 entity 与超预算结构，防止 XXE 和实体扩展攻击。
+    /// 业务作用：有界解析 XML，按有效规则识别 DTD、自定义 entity 与异常结构，提供模式处置所需的命中事实。
+    ///
+    /// 深度按元素层级计算，自闭合与成对元素使用同一预算；空元素不改变后续兄弟元素的父层级。
     ///
     /// 参数说明：
-    /// - `bytes`：是已通过请求体字节上限的完整 XML entity。
+    /// - `bytes`：已通过独立请求体容量门的完整 XML 数据。
     ///
-    /// 返回：非法或超预算返回 `xml_threat`；文本命中返回对应攻击规则；通过返回 `None`。
+    /// 返回：结构规则有效时，非法或超预算返回 `xml_threat`；文本命中返回对应规则，否则返回 `None`。
+    /// 是否拦截由 WAF 模式决定，已排除的规则不产生结构命中。
     fn inspect_xml(&self, bytes: &[u8]) -> Option<DetectedRule> {
         if !self.rule_applies(WafRule::XmlThreat, "body") && !self.has_body_signature_rules() {
             return None;
@@ -838,6 +841,12 @@ impl WafPolicy {
                 }
                 Event::Empty(element) => {
                     if (root_closed || (open_elements.is_empty() && root_seen))
+                        && self.rule_applies(WafRule::XmlThreat, "body")
+                    {
+                        return Some(DetectedRule::Builtin(WafRule::XmlThreat));
+                    }
+                    // 空元素自身也占一层；扫描属性前用父层数验证，不能让结束写法改变结构预算。
+                    if open_elements.len() >= self.max_xml_depth
                         && self.rule_applies(WafRule::XmlThreat, "body")
                     {
                         return Some(DetectedRule::Builtin(WafRule::XmlThreat));
