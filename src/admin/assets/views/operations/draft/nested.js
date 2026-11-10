@@ -14,6 +14,7 @@ import { mqttFieldGroups } from "./mqtt.js";
 import { kafkaFieldGroups } from "./kafka.js";
 import { routeDeadlineFieldGroups } from "./route_deadline.js";
 import { routeWafFieldGroups } from "./route_waf.js";
+import { routeWafPackFieldGroups } from "./route_waf_pack.js";
 
 const groups = {
   route: [
@@ -122,6 +123,11 @@ export function nestedFields(kind, values, capacity) {
       element(
         "p",
         "内置规则 id：sql_injection、xss、command_injection、template_injection、path_traversal、protocol_smuggling、abnormal_encoding、dangerous_header、json_threat、xml_threat。外部签名规则包沿用原声明及原目标预检，未编辑的包引用不随常用字段回传。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "外部规则包使用本地 JSON 文件和 detached Ed25519 签名，来源、摘要、签名与公钥须同时有效；页面只编辑声明，不上传文件或读取 SecretSource。目标节点必须具备对应文件，候选预检与正式发布均会验证原始字节、签名及资源预算。包内容为有界 literal 规则；移除完整 rule_pack 保留内置 WAF，父段编辑与子字段编辑不能在同次动作中重叠。",
         "subtle",
       ),
     );
@@ -241,6 +247,7 @@ export function nestedFields(kind, values, capacity) {
     ...(groups[kind] ?? []),
     ...routeDeadlineFieldGroups(kind),
     ...routeWafFieldGroups(kind),
+    ...routeWafPackFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
