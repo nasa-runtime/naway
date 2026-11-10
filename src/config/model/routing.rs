@@ -260,12 +260,13 @@ pub struct RouteCfg {
     /// `timeouts.stream_idle_timeout_ms`；显式 0 表示关闭。
     #[serde(default)]
     pub long_stream_idle_timeout_ms: Option<u64>,
-    /// 单次下游 HTTP 请求到完整响应结束的总时限(ms)。None 使用实现默认；Some(0)
-    /// 显式关闭。Gateway API HTTPRoute `timeouts.request` 物化到该字段。
+    /// 路由进入上游转发到完整响应结束的总时限(ms)，包含准入、重试与并行副本。
+    /// None或Some(0)不增加总截止点。Gateway API HTTPRoute `timeouts.request` 物化到该字段。
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
-    /// 单次上游 attempt 从开始发送到完整响应结束的时限(ms)。None 使用实现默认；
-    /// Some(0) 显式关闭。Gateway API HTTPRoute `timeouts.backendRequest` 物化到该字段。
+    /// 单次上游 attempt 从开始发送到完整响应结束的时限(ms)，每次重试或副本独立计时。
+    /// None或Some(0)不增加单次截止点；连接、TTFB与空闲预算仍生效。
+    /// Gateway API HTTPRoute `timeouts.backendRequest` 物化到该字段。
     #[serde(default)]
     pub backend_request_timeout_ms: Option<u64>,
     /// 该 route 的 SSE/gRPC 最长存活时间(ms)；0 表示不限制。超时时 gRPC 发

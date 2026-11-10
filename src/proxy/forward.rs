@@ -1103,6 +1103,8 @@ fn request_cookie_value<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
 
 /// 单次主上游发送的不可变执行参数；收拢参数以避免 retry 调用点发生位置错配。
 struct UpstreamSendContext<'a> {
+    /// 当前上游 attempt 从发送到完整响应的预算；未声明或0不增加绝对时限。
+    backend_request_timeout_ms: Option<u64>,
     /// response head/TTFB 超时，0 表示关闭。
     ttfb_timeout_ms: u64,
     /// response body frame idle 超时，0 表示关闭。
@@ -1124,6 +1126,10 @@ struct UpstreamSendContext<'a> {
     /// Connect unary request/response 聚合预算；streaming 模式不使用该值。
     browser_grpc_unary_limit: u64,
 }
+
+/// 仍待向下游交付的上游响应预算；选择重试或副本结果时不得恢复已过期的响应。
+#[derive(Clone, Copy)]
+struct UpstreamAttemptDeadline(TokioInstant);
 
 /// 在一次主请求的 retry attempts 间共享的 gRPC 长流登记参数。
 #[derive(Clone)]
@@ -1431,8 +1437,46 @@ fn map_client_error(context: &'static str, error: BoxError) -> ForwardError {
     ForwardError::BadGateway(anyhow::Error::from_boxed(error).context(context))
 }
 
+/// 业务作用：在原绝对时限内推进上游操作，到期先取消操作并保留本地整形与上游超时的归因。
+///
+/// 参数说明：
+/// - `deadline`：已固定的绝对截止时刻；未声明时不额外创建定时器。
+/// - `pacing`：本次请求的受信本地整形等待事实。
+/// - `operation`：仍持有本次上游资源、尚未向下游发布结果的操作。
+///
+/// 返回：期限内完成时沿用原结果；过期时丢弃操作及迟到结果并返回已分类超时。
+async fn with_absolute_deadline<F, T>(
+    deadline: Option<TokioInstant>,
+    pacing: Option<&crate::runtime::traffic_limit::pacing::RequestPacing>,
+    operation: F,
+) -> Result<T, ForwardError>
+where
+    F: Future<Output = Result<T, ForwardError>>,
+{
+    let Some(deadline) = deadline else {
+        return operation.await;
+    };
+    // 已失去时间预算的操作不得开始 I/O；响应头与正文转换复用同一截止时刻，不重新授权。
+    if TokioInstant::now() >= deadline {
+        return Err(ForwardError::timeout_for(pacing));
+    }
+    let result = tokio::time::timeout_at(deadline, operation)
+        .await
+        .map_err(|_| ForwardError::timeout_for(pacing))?;
+    // runtime 延迟轮询时，future 可能与 timer 同时就绪；迟到结果不能延长已声明期限。
+    if TokioInstant::now() >= deadline {
+        return Err(ForwardError::timeout_for(pacing));
+    }
+    result
+}
+
 impl super::GatewayProxy {
     /// 业务作用：执行单次路由的上游选择、转发和失败处理，统一约束重试、时限及流式资源生命周期。
+    ///
+    /// 参数说明：
+    /// - `ctx`：已完成路由与安全门判断的当前转发上下文。
+    ///
+    /// 返回：在总预算内取得响应头并将同一截止时刻移交正文；失败或到期取消当前转发。
     pub(super) async fn forward(
         &self,
         ctx: ForwardRequest<'_>,
@@ -1446,27 +1490,39 @@ impl super::GatewayProxy {
         {
             return Err(ForwardError::RequestDecompression(error));
         }
-        let timeout_ms = [
-            ctx.route.request_timeout_ms,
-            ctx.route.backend_request_timeout_ms,
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|timeout| *timeout > 0)
-        .min();
-        let Some(timeout_ms) = timeout_ms else {
+        // 总预算覆盖实例选择、准入等待、重试与并行副本；每个上游 attempt 另有独立预算。
+        let timeout_ms = ctx.route.request_timeout_ms.filter(|timeout| *timeout > 0);
+        if timeout_ms.is_none()
+            && ctx
+                .route
+                .backend_request_timeout_ms
+                .is_none_or(|timeout| timeout == 0)
+        {
             return self.forward_inner(ctx).await;
-        };
-        let deadline = TokioInstant::now() + Duration::from_millis(timeout_ms);
+        }
+        let deadline =
+            timeout_ms.map(|timeout| TokioInstant::now() + Duration::from_millis(timeout));
         let pacing = ctx
             .parts
             .extensions
             .get::<crate::runtime::traffic_limit::pacing::RequestPacing>()
             .cloned();
-        let response = tokio::time::timeout_at(deadline, self.forward_inner(ctx))
-            .await
-            .map_err(|_| ForwardError::timeout_for(pacing.as_ref()))??;
-        Ok(response.map(|body| AbsoluteDeadlineBody::new(body, deadline).boxed()))
+        let response =
+            with_absolute_deadline(deadline, pacing.as_ref(), self.forward_inner(ctx)).await?;
+        // 失败响应可能在等待其它尝试时耗尽自己的预算；发布响应头前拒绝，避免交付已失效正文。
+        if response
+            .extensions()
+            .get::<UpstreamAttemptDeadline>()
+            .is_some_and(|attempt| TokioInstant::now() >= attempt.0)
+        {
+            return Err(ForwardError::timeout_for(pacing.as_ref()));
+        }
+        Ok(match deadline {
+            Some(deadline) => {
+                response.map(|body| AbsoluteDeadlineBody::new(body, deadline).boxed())
+            }
+            None => response,
+        })
     }
 
     /// 业务作用：执行不含 route 总 deadline wrapper 的原始上游转发流程，供外层统一
@@ -1644,6 +1700,7 @@ impl super::GatewayProxy {
                 }
                 None => ctx.route.ws_frame.clone(),
             };
+            // HTTP 升级握手仍受单次上游预算约束；升级后的隧道继续使用自己的空闲和寿命策略。
             return self
                 .forward_websocket(
                     parts,
@@ -1661,6 +1718,7 @@ impl super::GatewayProxy {
                         .unwrap_or(ctx.proxy.timeouts.websocket_max_lifetime_ms),
                     client_trace,
                     frame_policy,
+                    ctx.route.backend_request_timeout_ms,
                 )
                 .await;
         }
@@ -1745,6 +1803,7 @@ impl super::GatewayProxy {
                     empty_body(),
                     primary,
                     UpstreamSendContext {
+                        backend_request_timeout_ms: ctx.route.backend_request_timeout_ms,
                         ttfb_timeout_ms: ctx.proxy.timeouts.upstream_ttfb_timeout_ms,
                         stream_idle_timeout_ms: response_stream_idle_timeout_ms,
                         downstream_version,
@@ -1790,6 +1849,7 @@ impl super::GatewayProxy {
                             empty_body(),
                             secondary,
                             UpstreamSendContext {
+                                backend_request_timeout_ms: ctx.route.backend_request_timeout_ms,
                                 ttfb_timeout_ms: ctx.proxy.timeouts.upstream_ttfb_timeout_ms,
                                 stream_idle_timeout_ms: response_stream_idle_timeout_ms,
                                 downstream_version,
@@ -1824,6 +1884,7 @@ impl super::GatewayProxy {
                     empty_body(),
                     secondary,
                     UpstreamSendContext {
+                        backend_request_timeout_ms: ctx.route.backend_request_timeout_ms,
                         ttfb_timeout_ms: ctx.proxy.timeouts.upstream_ttfb_timeout_ms,
                         stream_idle_timeout_ms: response_stream_idle_timeout_ms,
                         downstream_version,
@@ -2014,6 +2075,7 @@ impl super::GatewayProxy {
                         empty_body(),
                         reservation,
                         UpstreamSendContext {
+                            backend_request_timeout_ms: ctx.route.backend_request_timeout_ms,
                             ttfb_timeout_ms: ctx.proxy.timeouts.upstream_ttfb_timeout_ms,
                             stream_idle_timeout_ms: response_stream_idle_timeout_ms,
                             downstream_version,
@@ -2158,6 +2220,7 @@ impl super::GatewayProxy {
                 body,
                 reservation,
                 UpstreamSendContext {
+                    backend_request_timeout_ms: ctx.route.backend_request_timeout_ms,
                     ttfb_timeout_ms: ctx.proxy.timeouts.upstream_ttfb_timeout_ms,
                     stream_idle_timeout_ms: response_stream_idle_timeout_ms,
                     downstream_version,
@@ -2238,6 +2301,11 @@ impl super::GatewayProxy {
         mut reservation: UpstreamReservation,
         ctx: UpstreamSendContext<'_>,
     ) -> Result<Response<BoxBody>, ForwardError> {
+        // 每次真正发送都重新取得自己的时间预算；重试或延迟启动的副本不能沿用前一实例的截止点。
+        let backend_deadline = ctx
+            .backend_request_timeout_ms
+            .filter(|timeout| *timeout > 0)
+            .map(|timeout| TokioInstant::now() + Duration::from_millis(timeout));
         if reservation
             .tls_profile
             .as_ref()
@@ -2330,10 +2398,11 @@ impl super::GatewayProxy {
         };
         let result = super::health::observe_request(
             outlier,
-            async {
+            // 单次预算到期必须进入健康观察的错误分类，不能只取消外层等待而丢失真实上游超时。
+            with_absolute_deadline(backend_deadline, request_pacing.as_ref(), async {
                 fut.await
                     .map_err(|error| map_client_error("client request", error))
-            },
+            }),
             ctx.ttfb_timeout_ms,
             request_pacing.clone(),
         )
@@ -2386,16 +2455,27 @@ impl super::GatewayProxy {
         }
         let response =
             resp.map(|body| reservation.wrap_body(body, ctx.stream_idle_timeout_ms, grpc_drain));
-        if let Some(protocol) = ctx.browser_grpc.as_ref() {
+        let mut response = if let Some(protocol) = ctx.browser_grpc.as_ref() {
             // Connect unary 只有消费最终 grpc-status 后才能确定 HTTP 状态；转换必须留在
             // upstream attempt 内完成，不能先把 200 response head 发布给浏览器再尝试改写。
-            protocol
-                .translate_response(response, ctx.browser_grpc_unary_limit)
-                .await
-                .map_err(ForwardError::BrowserGrpc)
+            with_absolute_deadline(backend_deadline, request_pacing.as_ref(), async {
+                protocol
+                    .translate_response(response, ctx.browser_grpc_unary_limit)
+                    .await
+                    .map_err(ForwardError::BrowserGrpc)
+            })
+            .await?
         } else {
-            Ok(response)
+            response
+        };
+        if let Some(deadline) = backend_deadline {
+            // 转换与结果选择不能续期；正文沿用发送时的截止点，包含已聚合的Connect unary响应。
+            response
+                .extensions_mut()
+                .insert(UpstreamAttemptDeadline(deadline));
+            response = response.map(|body| AbsoluteDeadlineBody::new(body, deadline).boxed());
         }
+        Ok(response)
     }
 
     /// 业务作用：统一记录一个 hedge attempt 的健康结果并附着最终上游追踪信息，确保并发
@@ -3807,9 +3887,9 @@ impl super::GatewayProxy {
 
     /// 业务作用：完成 WebSocket 上游握手，并在 101 后启动持有连接与工作区名额的双向隧道。
     ///
-    /// 数据帧不解码、不重组；`ActivityIo` 只在成功搬运字节时更新一个原子时间戳，因此 idle/max-lifetime
-    /// 治理不会破坏 `copy_bidirectional` 的背压与少拷贝路径。注册表关闭会在取消 copy future 后串行写
-    /// Close 控制帧，避免控制帧和数据帧交错。
+    /// 透明隧道不解码、不重组；显式帧策略经受控消息管线处理。`ActivityIo` 只在成功搬运字节时
+    /// 更新活动时间，空闲与寿命治理保持背压。注册表关闭会在取消转发后串行写 Close 控制帧，
+    /// 避免控制帧和数据帧交错。
     ///
     /// 参数说明：
     /// - `parts`: 已完成 hop-by-hop/Host/转发头处理的上游握手 head。
@@ -3826,9 +3906,10 @@ impl super::GatewayProxy {
     /// - `max_lifetime_ms`: 升级后隧道最长寿命；0 表示关闭。
     /// - `client_trace`：下游握手携带的可信链路上下文。
     /// - `frame_policy`：该路由固定的 WebSocket frame 安全与资源策略。
+    /// - `backend_request_timeout_ms`：单次握手及非101响应的完整预算；不约束已升级隧道。
     ///
-    /// 返回：握手响应；上游握手失败映射为 `ForwardError::BadGateway`。101 后隧道错误只记日志，
-    /// 因为 HTTP 响应头已经发出，不能再改成普通错误响应。
+    /// 返回：握手响应，或按协议、资源与期限归类的转发错误。非101响应正文继续受本次截止约束；
+    /// 101后隧道失败只能关闭连接并记录日志，不能改写已经发出的HTTP状态。
     #[allow(clippy::too_many_arguments)]
     async fn forward_websocket(
         &self,
@@ -3846,7 +3927,11 @@ impl super::GatewayProxy {
         max_lifetime_ms: u64,
         client_trace: Option<crate::observability::telemetry::ClientTrace>,
         frame_policy: Option<Arc<crate::protocols::ws_frame::FramePolicy>>,
+        backend_request_timeout_ms: Option<u64>,
     ) -> Result<Response<BoxBody>, ForwardError> {
+        let backend_deadline = backend_request_timeout_ms
+            .filter(|timeout| *timeout > 0)
+            .map(|timeout| TokioInstant::now() + Duration::from_millis(timeout));
         let final_upstream = reservation.base.clone();
         let extension_offer = match frame_policy
             .as_ref()
@@ -3876,18 +3961,24 @@ impl super::GatewayProxy {
             .extensions
             .get::<crate::control::ownership::admission::Permit>()
             .cloned();
+        let pacing = parts
+            .extensions
+            .get::<crate::runtime::traffic_limit::pacing::RequestPacing>()
+            .cloned();
         let ureq = Request::from_parts(parts, body);
         // WebSocket upgrade 固定使用 HTTP/1.1，不得因 route protocol=auto 扩大成 h2 shard 池。
         let client = self.http_client_for(&reservation, false, None);
-        let result = super::health::observe(
+        let result = super::health::observe_request(
             reservation.outlier.take(),
-            async {
+            // 升级前仍是上游HTTP尝试，预算到期必须取消握手并进入同一健康分类。
+            with_absolute_deadline(backend_deadline, pacing.as_ref(), async {
                 client
                     .request(ureq)
                     .await
                     .map_err(|error| map_client_error("ws handshake", error))
-            },
+            }),
             0,
+            pacing.clone(),
         )
         .await;
         let mut resp = match result {
@@ -4005,6 +4096,16 @@ impl super::GatewayProxy {
             None,
             None,
         );
+        // 上游拒绝升级时仍是普通HTTP响应，正文不能逃离本次握手开始时的绝对预算。
+        let resp = match backend_deadline {
+            Some(deadline) => {
+                let mut resp = resp.map(|body| AbsoluteDeadlineBody::new(body, deadline).boxed());
+                resp.extensions_mut()
+                    .insert(UpstreamAttemptDeadline(deadline));
+                resp
+            }
+            None => resp,
+        };
         Ok(super::wrap_limit_conn_response(resp, limit_conn_guards))
     }
 }
@@ -5237,17 +5338,44 @@ fn hedge_attempt_succeeded(result: &Result<Response<BoxBody>, ForwardError>) -> 
         .is_ok_and(|response| !response.status().is_server_error())
 }
 
-/// 业务作用：两个 hedge attempt 都未成功时选出对下游最有解释力的失败结果。
+/// 业务作用：从已经完成的 hedge 尝试中选出仍可交付的业务响应，失败时保留可解释结果。
 ///
 /// 参数说明：
-/// - `first`：是先完成的失败
-/// - `second`：是后完成的失败。
+/// - `first`：先完成的响应或传输错误。
+/// - `second`：后完成的响应或传输错误。
 ///
-/// 返回：优先返回真实 5xx response；两者都是 transport 错误时保留先发生的错误。
+/// 返回：优先仍在预算内的非5xx响应，再选择未过期5xx；无可交付响应时保留原失败，
+/// 由转发出口将过期响应转为超时。两者都是传输错误时保留先发生的错误。
 fn choose_hedge_result(
     first: Result<Response<BoxBody>, ForwardError>,
     second: Result<Response<BoxBody>, ForwardError>,
 ) -> Result<Response<BoxBody>, ForwardError> {
+    let now = TokioInstant::now();
+    let first_current = first.as_ref().is_ok_and(|response| {
+        response
+            .extensions()
+            .get::<UpstreamAttemptDeadline>()
+            .is_none_or(|deadline| now < deadline.0)
+    });
+    let second_current = second.as_ref().is_ok_and(|response| {
+        response
+            .extensions()
+            .get::<UpstreamAttemptDeadline>()
+            .is_none_or(|deadline| now < deadline.0)
+    });
+    // 先到的5xx不是最终业务权威，不能遮蔽后到的成功或4xx；过期响应也不能重新取得交付资格。
+    if first_current && hedge_attempt_succeeded(&first) {
+        return first;
+    }
+    if second_current && hedge_attempt_succeeded(&second) {
+        return second;
+    }
+    if first_current {
+        return first;
+    }
+    if second_current {
+        return second;
+    }
     match (first, second) {
         (response @ Ok(_), _) => response,
         (_, response @ Ok(_)) => response,
