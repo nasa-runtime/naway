@@ -15,6 +15,7 @@ import { routeBotTrustedDraftLists } from "./route_bot_trusted.js";
 import { routeDlpDraftLists } from "./route_dlp.js";
 import { routeCsrfDraftLists } from "./route_csrf.js";
 import { routeGeoipDraftLists } from "./route_geoip.js";
+import { routeResponseContractDraftLists } from "./route_response_contract.js";
 
 /**
  * 业务作用：列出常用列表与原文已声明的扩展数组，不把未知值转换成列表。
@@ -84,6 +85,7 @@ function lists(kind, values) {
   result.push(...routeDlpDraftLists(kind));
   result.push(...routeCsrfDraftLists(kind));
   result.push(...routeGeoipDraftLists(kind));
+  result.push(...routeResponseContractDraftLists(kind));
   return result.map((item) => {
     let current = values;
     let valid = true;
@@ -225,6 +227,7 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "waf_exclusion",
           "bot_trusted",
           "dlp_exclusion",
+          "schema_registry_document",
         ].includes(selected.type)
       ) {
         // 路由的新建和整值替换需要显式 id；其它元素沿用各自字段约束。
@@ -267,14 +270,19 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           ? entry
           : selected?.type === "bot_trusted" && typeof entry?.name === "string"
             ? entry.name
-            : typeof entry?.id === "string"
-              ? entry.id
-              : typeof entry?.uri === "string"
-                ? entry.uri
-                : Array.isArray(entry?.server_names) &&
-                    entry.server_names.every((name) => typeof name === "string")
-                  ? entry.server_names.join(", ")
-                  : "元素";
+            : selected?.type === "schema_registry_document" &&
+                typeof entry?.url === "string"
+              ? entry.url
+              : typeof entry?.id === "string"
+                ? entry.id
+                : typeof entry?.uri === "string"
+                  ? entry.uri
+                  : Array.isArray(entry?.server_names) &&
+                      entry.server_names.every(
+                        (name) => typeof name === "string",
+                      )
+                    ? entry.server_names.join(", ")
+                    : "元素";
       const option = element("option", index + " · " + label.slice(0, 160));
       option.value = String(index);
       item.append(option);

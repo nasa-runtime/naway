@@ -8,8 +8,10 @@ import { routeDeadlineFields } from "./route_deadline.js";
 import { wafExclusionFields } from "./route_waf.js";
 import { trustedBotFields } from "./route_bot_trusted.js";
 import { dlpExclusionFields } from "./route_dlp.js";
+import { schemaRegistryDocumentFields } from "./route_response_contract.js";
 
 const definitions = {
+  schema_registry_document: schemaRegistryDocumentFields,
   dlp_exclusion: dlpExclusionFields,
   bot_trusted: trustedBotFields,
   waf_exclusion: wafExclusionFields,

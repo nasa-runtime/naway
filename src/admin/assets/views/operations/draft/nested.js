@@ -22,6 +22,7 @@ import { routeDlpFieldGroups } from "./route_dlp.js";
 import { routeCsrfFieldGroups } from "./route_csrf.js";
 import { routeGeoipFieldGroups } from "./route_geoip.js";
 import { routeRequestValidationFieldGroups } from "./route_request_validation.js";
+import { routeResponseContractFieldGroups } from "./route_response_contract.js";
 
 const groups = {
   route: [
@@ -192,6 +193,16 @@ export function nestedFields(kind, values, capacity) {
         "显式 head Schema 校验 method、path、query、headers、path_params；query 和小写 header 的每个值保持字符串数组，原始 path_params 为空。OpenAPI 操作另按声明解析基本类型的 query、header、path 和 cookie 参数，重复标量拒绝。正文只接受 JSON；有正文 Schema 必须显式设置 1–16777216 字节上限，head-only 上限为 0。未声明 body_required 时，显式正文 Schema 要求非空，OpenAPI 遵从 requestBody.required；false 仅允许空正文，不绕过 head、非空正文类型、结构或大小检查。合同不符及下游读取失败返回 400，正文超限返回 413；不能与长流生存期并用，正文校验不能与公共响应缓存并用。",
         "subtle",
       ),
+      element(
+        "p",
+        "响应合同必须从 OpenAPI 选择 operationId 或成对的路径与方法，所有模式都须设置 1–16777216 字节检查容量。observe 缺省透传原响应并以有界副本记录结论；block 在发送实体前校验，失败返回固定 502；replace_error 使用配置的非成功 HTTP 状态和固定文本。替代文本按多行字符串编辑，最多 4096 UTF-8 字节。压缩实体在 observe 中透传并记录不支持，在阻断模式中使用失败动作；响应合同不能与长流生存期并用。关闭须移除完整 response_contract。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "响应 Schema 的外部引用只能指向显式 catalog 或签名 HTTPS 文档；连同 OpenAPI 根最多 32 文档、原文总量最多 8 MiB，循环、过深引用及 $dynamicRef 拒绝。HTTPS 必须无凭据和 fragment，不跟随重定向，原始字节同时核对固定 SHA-256 与 Ed25519 签名；未声明 CA 时使用系统信任。单文档最多 4 MiB，总期限 100–30000 毫秒，字节缓存复用 1–86400000 毫秒，命中仍复验当前信任、签名和预算且不续期。所有文件和网络解析在候选构建时执行，页面只编辑声明，请求不访问这些来源。移除来源前须同时处理依赖它的引用。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -317,6 +328,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeCsrfFieldGroups(kind),
     ...routeGeoipFieldGroups(kind),
     ...routeRequestValidationFieldGroups(kind),
+    ...routeResponseContractFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
