@@ -319,9 +319,15 @@ impl BotPolicy {
     ///
     /// 返回：配置速率信号时返回向上取整且至少为一秒的窗口；未配置返回一秒。
     pub(crate) fn retry_after_secs(&self) -> u64 {
+        // HTTP 等待建议须覆盖完整窗口，毫秒尾数不能让客户端在该窗口结束前重试。
         self.rate
             .as_ref()
-            .map(|rate| rate.window.as_secs().max(1))
+            .map(|rate| {
+                rate.window
+                    .as_secs()
+                    .saturating_add(u64::from(rate.window.subsec_nanos() != 0))
+                    .max(1)
+            })
             .unwrap_or(1)
     }
 
