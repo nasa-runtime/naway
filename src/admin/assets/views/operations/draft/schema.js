@@ -4,6 +4,7 @@ import { kafkaBrokerFields } from "./kafka.js";
 import { upstreamRetryFields } from "./upstream_retry.js";
 import { localityTargetFields } from "./upstream_locality.js";
 import { upstreamCatalogFields } from "./upstream_catalog.js";
+import { routeDeadlineFields } from "./route_deadline.js";
 
 const definitions = {
   locality_target: localityTargetFields,
@@ -91,6 +92,7 @@ const definitions = {
     ["filters", "处理链（每行一项，顺序保留）", "lines"],
     ["preserve_host", "保留客户端 Host", "boolean"],
     ["upstream_credentials", "上游凭据引用（每行一项）", "lines"],
+    ...routeDeadlineFields,
   ],
 
   proxy: [

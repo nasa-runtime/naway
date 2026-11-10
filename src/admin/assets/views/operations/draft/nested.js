@@ -12,6 +12,7 @@ import { listenerFieldGroups } from "./listener.js";
 import { streamTransportFieldGroups } from "./stream.js";
 import { mqttFieldGroups } from "./mqtt.js";
 import { kafkaFieldGroups } from "./kafka.js";
+import { routeDeadlineFieldGroups } from "./route_deadline.js";
 
 const groups = {
   route: [
@@ -100,6 +101,20 @@ const groups = {
 export function nestedFields(kind, values, capacity) {
   const node = element("div", "", "draft-nested");
   const rows = [];
+  if (kind === "route") {
+    node.append(
+      element(
+        "p",
+        "请求总时限覆盖上游转发的准入等待、重试、副本和完整正文；单次时限从每次实际上游发送开始，各次独立计时。两项省略或设为 0 均不增加对应截止点，入口阶段期限仍生效；总时限非 0 时单次时限不能更大。响应头发出后的超时只能终止正文。帧间空闲期限省略时继承入口，0 关闭；最长寿命约束 SSE / gRPC 长流，原生边缘桥接也使用这两项长流参数；普通上游 WebSocket 升级后的隧道使用自身策略。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "并行副本须固定 lb:// 服务、明确 idempotent=true，并通过 proxy_pass_request_body off 关闭请求正文。运行时仅 GET / HEAD 可启动副本，总次数固定为 2；主请求在延迟内成功时不会发送副本，失败时可提前发送。胜出后取消另一尝试，4xx 作为业务结果；移除完整 hedge 声明才关闭策略。填写时间预算不会授予重复执行许可。",
+        "subtle",
+      ),
+    );
+  }
   if (kind === "service") {
     node.append(
       element(
@@ -213,6 +228,7 @@ export function nestedFields(kind, values, capacity) {
   }
   for (const [prefix, title, definitions] of [
     ...(groups[kind] ?? []),
+    ...routeDeadlineFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
