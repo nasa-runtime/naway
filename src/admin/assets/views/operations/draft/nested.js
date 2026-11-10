@@ -16,6 +16,7 @@ import { routeDeadlineFieldGroups } from "./route_deadline.js";
 import { routeWafFieldGroups } from "./route_waf.js";
 import { routeWafPackFieldGroups } from "./route_waf_pack.js";
 import { routeBotFieldGroups } from "./route_bot.js";
+import { routeBotRateFieldGroups } from "./route_bot_rate.js";
 
 const groups = {
   route: [
@@ -134,6 +135,11 @@ export function nestedFields(kind, values, capacity) {
       element(
         "p",
         "声明 bot 即启用，缺省为 enforce；关闭须移除完整 bot。非空允许名单要求 User-Agent 匹配，拒绝名单命中即挑战；glob 忽略大小写，名单间不能有相同 glob。必需头须是单个非空值。行为分数达到阈值时挑战，monitor 记录后继续；429 留给速率信号，普通挑战可选其它 4xx。指纹始终包含 User-Agent，再按声明顺序加入所选头值；这里的拒绝指纹不包含客户端 IP。未编辑的速率和可信机器人签名声明保持原值，声称可信仍须逐请求验签。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "声明 bot.rate 即启用速率信号，容量为基础令牌量加突发量，按补充窗口恢复基础量；速率指纹另含可信客户端地址。active_keys_fail_open 缺省为 false，只有明确开启才在指纹表满时放行未记账的新指纹，不创建新桶；已有指纹仍受额度限制，需要创建真实桶时仍须工作区状态名额。速率拒绝返回 429 和覆盖完整窗口的整秒等待建议，monitor 记录后继续。移除完整 rate 保留其它 Bot 信号；如果已无任何有效信号，候选仍会被拒绝，关闭全部策略须移除 bot。",
         "subtle",
       ),
     );
@@ -255,6 +261,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeWafFieldGroups(kind),
     ...routeWafPackFieldGroups(kind),
     ...routeBotFieldGroups(kind),
+    ...routeBotRateFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
