@@ -19,6 +19,7 @@ import { routeBotFieldGroups } from "./route_bot.js";
 import { routeBotRateFieldGroups } from "./route_bot_rate.js";
 import { routeBotTrustedFieldGroups } from "./route_bot_trusted.js";
 import { routeDlpFieldGroups } from "./route_dlp.js";
+import { routeCsrfFieldGroups } from "./route_csrf.js";
 
 const groups = {
   route: [
@@ -159,6 +160,16 @@ export function nestedFields(kind, values, capacity) {
         "只有明确开启正文方向才聚合检查 JSON、form 或 text；media type 支持 application/json、application/*+json、application/x-www-form-urlencoded、text/*、text/plain。正文超限、压缩或无法检查时仍拒绝，monitor 不豁免资源和结构门。请求命中 block 返回 403，容量超限 413，结构或读取失败 400；响应检查失败返回 502。正文遮蔽后更新长度并移除失效摘要、validator 和 range 元数据。请求正文检查不能关闭转发正文；任一正文检查不能配置非零长流最长寿命，响应正文检查不能与 proxy_cache 混用；internal 路由不能声明 DLP。",
         "subtle",
       ),
+      element(
+        "p",
+        "声明 csrf 即启用，关闭须移除完整策略。受保护方法先验证严格单值 Origin，再验证 Cookie 与头中的同一 Token；只有 Origin 缺失时才可用 Referer 兜底，错误来源不能被兜底或缺失放行开关覆盖。same-origin 使用监听协议与当前 authority，显式来源只接受 HTTP(S)。允许缺失来源不会跳过 Token 门；enforce 拒绝返回 403，monitor 记录固定原因后继续，不提供业务认证身份。internal 路由和 early_data 不能声明 CSRF。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "double_submit 使用 256-bit 随机 Token 且 token_secret 必须为空；signed 还要求至少 32 字节密钥、有效时限与路由绑定。切换到 double_submit 时请明确移除旧密钥声明，页面只编辑 SecretSource 文本。头名称不能复用 Cookie、Host、Authorization、Content-Length、Origin 或 Referer。只有开启签发且方法未受保护、响应成功或重定向时才生成 Token，固定 Cookie 的 Path=/、Secure、HttpOnly、SameSite=Strict，并设置 private, no-store；浏览器使用须 HTTPS。CSRF 只检查 head，不聚合正文。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -281,6 +292,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeBotRateFieldGroups(kind),
     ...routeBotTrustedFieldGroups(kind),
     ...routeDlpFieldGroups(kind),
+    ...routeCsrfFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

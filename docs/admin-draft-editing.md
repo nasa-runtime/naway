@@ -99,6 +99,20 @@ Bot 信任只影响 Bot 门禁，业务认证照常执行；正文由既有路�
 不进入内容放行。请求正文检查不能关闭转发正文，正文检查不能配置非零长流最长寿命；
 响应正文检查不能与 `proxy_cache` 混用，internal 路由不能声明 DLP。
 
+路由 CSRF 表单提供模式、受保护方法、允许来源、Referer 兜底与缺失来源开关、Token 模式、
+Cookie 与回传头名称、签名密钥引用、最大年龄及签发开关。方法与来源支持逐项编辑；
+方法为 1–16 个不重复的大写状态变更方法，不接受 GET / HEAD / OPTIONS / TRACE。
+允许来源为至多 64 项精确 HTTP(S) origin 或 `same-origin`，空列表须同时明确允许缺失来源。
+Origin 存在时必须严格验证；Referer 只在 Origin 缺失时兜底，允许缺失来源不会绕过 Token。
+声明 `csrf` 即启用，关闭须移除完整策略；internal 路由与 `early_data` 不接受该策略。
+
+`double_submit` 使用 256-bit 随机 Token 且密钥声明须为空；`signed` 使用至少 32 字节的
+HMAC SecretSource，并验证路由绑定及 1–604800 秒最大年龄。切换至 `double_submit` 时须明确
+移除旧密钥声明，未编辑的引用保持原值。只有启用签发、方法未受保护且最终响应成功或重定向
+时才生成头与 `__Host-` Cookie 中的同一 Token；Cookie 固定 `Path=/; Secure; HttpOnly; SameSite=Strict`，
+并通过 `private, no-store` 禁止共享缓存存储。浏览器使用须 HTTPS。CSRF 不聚合正文；
+`enforce` 拒绝返回 403，`monitor` 记录后继续，业务认证照常执行。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |
