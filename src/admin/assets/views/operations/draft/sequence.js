@@ -14,6 +14,7 @@ import { routeBotDraftLists } from "./route_bot.js";
 import { routeBotTrustedDraftLists } from "./route_bot_trusted.js";
 import { routeDlpDraftLists } from "./route_dlp.js";
 import { routeCsrfDraftLists } from "./route_csrf.js";
+import { routeGeoipDraftLists } from "./route_geoip.js";
 
 /**
  * 业务作用：列出常用列表与原文已声明的扩展数组，不把未知值转换成列表。
@@ -82,6 +83,7 @@ function lists(kind, values) {
   result.push(...routeBotTrustedDraftLists(kind));
   result.push(...routeDlpDraftLists(kind));
   result.push(...routeCsrfDraftLists(kind));
+  result.push(...routeGeoipDraftLists(kind));
   return result.map((item) => {
     let current = values;
     let valid = true;

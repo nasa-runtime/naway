@@ -20,6 +20,7 @@ import { routeBotRateFieldGroups } from "./route_bot_rate.js";
 import { routeBotTrustedFieldGroups } from "./route_bot_trusted.js";
 import { routeDlpFieldGroups } from "./route_dlp.js";
 import { routeCsrfFieldGroups } from "./route_csrf.js";
+import { routeGeoipFieldGroups } from "./route_geoip.js";
 
 const groups = {
   route: [
@@ -170,6 +171,16 @@ export function nestedFields(kind, values, capacity) {
         "double_submit 使用 256-bit 随机 Token 且 token_secret 必须为空；signed 还要求至少 32 字节密钥、有效时限与路由绑定。切换到 double_submit 时请明确移除旧密钥声明，页面只编辑 SecretSource 文本。头名称不能复用 Cookie、Host、Authorization、Content-Length、Origin 或 Referer。只有开启签发且方法未受保护、响应成功或重定向时才生成 Token，固定 Cookie 的 Path=/、Secure、HttpOnly、SameSite=Strict，并设置 private, no-store；浏览器使用须 HTTPS。CSRF 只检查 head，不聚合正文。",
         "subtle",
       ),
+      element(
+        "p",
+        "声明 geoip 即启用，至少保留一种国家、ASN 或匿名网络规则；关闭须移除完整策略。对应规则需要本地 MMDB，构建时有界读取并核对用途，单库最多 128 MiB；请求按可信客户端地址判断，不信任自报国家或地址头。国家代码转大写，单名单最多 256；ASN 为非零 u32，单名单最多 4096；名单内重复和允许/拒绝重叠均拒绝。匿名 trait：anonymous、anonymous_vpn、hosting_provider、public_proxy、residential_proxy、tor_exit_node。页面只编辑路径与规则，不获取数据库。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "每类数据库必须恰好对应非空规则；清空本类名单时须同时移除路径，留下无规则的数据库声明会拒绝候选。判断按国家、ASN、匿名网络的顺序进行；库内记录或字段缺失、解码错误会立即返回对应整体动作，选择 allow 不会继续后续库检查。数据库年龄在构建时复核，过期 reject 保留原快照，allow 显式放行整个 GeoIP 门，deny 关闭整个门；坏文件、错误用途及超过一天容差的未来时间仍拒绝候选。移除不再需要的路径或规则须明确操作，其它保护保持原值。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -293,6 +304,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeBotTrustedFieldGroups(kind),
     ...routeDlpFieldGroups(kind),
     ...routeCsrfFieldGroups(kind),
+    ...routeGeoipFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
