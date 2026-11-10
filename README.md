@@ -1216,6 +1216,9 @@ XML/SOAP 固定字段提取和输出。支持 rename、add、remove、default �
 与 processing instruction，并限制深度、节点、属性、文本和输出字节。转换会重建 Content-Type 与
 Content-Length，删除失效的编码、摘要、validator 和 range 元数据；partial entity 与 trailers 不参与
 转换。SOAP 可固定 `SOAPAction`，并把声明路径上的 Fault 映射为指定 HTTP status。
+SOAP 输入的固定映射须锚定标准 `Envelope` / `Body`；输出使用 `namespaces.soap` 选择标准
+SOAP 1.1/1.2 URI，未声明时输出 SOAP 1.2。静态路径或输出 URI 不合法时拒绝候选，热更保留当前
+快照。成功转换的完整实体会移除旧 `Transfer-Encoding` 和 `Trailer` 声明，使用新长度转发。
 响应转换和响应契约作用于最终响应，包含路由内产生的本地拒绝；例如请求校验返回的文本错误若
 不符合已配置的 JSON 响应转换，会以 `502` 结束。需要直接保留请求校验 `400`/`413` 的路由应避免
 组合这种不兼容的响应转换或阻断契约。

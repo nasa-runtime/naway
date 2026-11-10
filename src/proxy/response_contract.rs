@@ -11,7 +11,9 @@ use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
-use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE};
+use http::header::{
+    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, TRAILER, TRANSFER_ENCODING,
+};
 use http::request::Parts;
 use http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
 use http_body_util::BodyExt;
@@ -558,6 +560,14 @@ impl BodyTransformPlan {
         let operations = compile_json_operations(&cfg.operations)?;
         let xml = XmlTransformPlan::build(cfg, direction)?;
         validate_format_plan(cfg, &xml, direction)?;
+        // 固定 SOAP 映射必须在发布前可用，不能让无法匹配标准 Envelope/Body 的计划替换健康快照。
+        if cfg.input == BodyFormatCfg::Soap {
+            validate_soap_envelope_path(&xml.extract, xml.fault.as_ref())?;
+        }
+        // 输出 Envelope 的 URI 只取决于配置；提前拒绝未知协议，实际消息仍经过完整序列化检查。
+        if cfg.output == BodyFormatCfg::Soap {
+            xml.soap_output_namespace()?;
+        }
         let soap_action = cfg
             .soap_action
             .as_deref()
@@ -610,6 +620,9 @@ impl BodyTransformPlan {
         {
             strip_body_integrity_headers(&mut parts.headers);
             parts.headers.remove(CONTENT_ENCODING);
+            // 新实体已经拒绝实际 trailers；旧分块与 Trailer 声明不能和重建的长度一起进入 HTTP 编码器。
+            parts.headers.remove(TRANSFER_ENCODING);
+            parts.headers.remove(TRAILER);
             parts
                 .headers
                 .insert(CONTENT_TYPE, HeaderValue::from_static(media_type));
@@ -661,6 +674,9 @@ impl BodyTransformPlan {
             } => {
                 strip_body_integrity_headers(&mut parts.headers);
                 parts.headers.remove(CONTENT_ENCODING);
+                // 完整新实体使用自己的消息边界，避免旧分块声明与新 Content-Length 导致下游拒绝响应。
+                parts.headers.remove(TRANSFER_ENCODING);
+                parts.headers.remove(TRAILER);
                 parts
                     .headers
                     .insert(CONTENT_TYPE, HeaderValue::from_static(media_type));
@@ -995,18 +1011,7 @@ impl XmlTransformPlan {
         }
         let mut writer = Writer::new(Vec::new());
         if soap {
-            let soap_namespace = self
-                .namespaces
-                .get("soap")
-                .map(String::as_str)
-                .unwrap_or("http://www.w3.org/2003/05/soap-envelope");
-            if !matches!(
-                soap_namespace,
-                "http://schemas.xmlsoap.org/soap/envelope/"
-                    | "http://www.w3.org/2003/05/soap-envelope"
-            ) {
-                bail!("SOAP namespace is not a supported envelope URI");
-            }
+            let soap_namespace = self.soap_output_namespace()?;
             let mut envelope = BytesStart::new("soap:Envelope");
             envelope.push_attribute(("xmlns:soap", soap_namespace));
             for (prefix, uri) in &self.namespaces {
@@ -1028,6 +1033,26 @@ impl XmlTransformPlan {
             root.write(&mut writer, true, &self.namespaces)?;
         }
         Ok(writer.into_inner())
+    }
+
+    /// 业务作用：统一构建和序列化使用的 SOAP Envelope URI，使已批准的输出声明与实际协议一致。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：标准 SOAP 1.1/1.2 URI；未声明时选择 SOAP 1.2，未知 URI 返回错误。
+    fn soap_output_namespace(&self) -> Result<&str> {
+        let namespace = self
+            .namespaces
+            .get("soap")
+            .map(String::as_str)
+            .unwrap_or("http://www.w3.org/2003/05/soap-envelope");
+        if !matches!(
+            namespace,
+            "http://schemas.xmlsoap.org/soap/envelope/" | "http://www.w3.org/2003/05/soap-envelope"
+        ) {
+            bail!("SOAP namespace is not a supported envelope URI");
+        }
+        Ok(namespace)
     }
 
     /// 业务作用：使 SOAP 输出的 Content-Type 与实际 Envelope namespace 版本保持一致。
