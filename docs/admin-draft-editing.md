@@ -128,6 +128,23 @@ ASN 元素保持非零 `u32` 数值；国家为两位 ASCII 字母并转大写�
 仍会拒绝候选。请求使用可信客户端地址，数据面不读取文件或发起远程地理查询；
 未编辑的其它安全声明保持原值。
 
+路由请求校验表单提供十项 `request_validation` 字段：内联或本地文件形式的 head / body
+JSON Schema、OpenAPI 文件和操作选择器、正文字节上限及空正文语义。每种 Schema 的内联与
+文件来源互斥，OpenAPI 与显式 Schema 互斥。OpenAPI 必须恰选 `operation_id` 或成对的
+`operation_path` / `operation_method`；切换时须明确移除旧来源或选择器。
+文件路径相对主配置目录解析，页面不读取、上传或下载文件。Schema 在候选构建时读取并编译，
+只接受文档内部引用，请求不执行文件或网络解析。关闭校验须移除完整策略。
+
+显式 head Schema 使用 `method`、`path`、`query`、`headers` 和空 `path_params` 的稳定
+envelope；query 和小写 header 的值保留为字符串数组。OpenAPI 操作另按声明解析基本类型的
+query、header、path 与 cookie 参数，并拒绝重复标量。正文为 JSON，有正文 Schema 时必须
+显式设置 `max_body_bytes` 为 1–16777216，head-only 必须为 0。未声明 `body_required` 时，
+显式正文 Schema 要求非空，OpenAPI 遵从 `requestBody.required`；显式 `false` 只允许空正文，
+非空正文仍需符合媒体类型、JSON 语法、Schema 和大小上限，head 也仍须通过。
+通过校验的原始正文字节与 trailers 继续转发；不符合同或下游读取失败返回 400，超限返回 413，
+拒绝请求不进入上游。请求校验不能与长流生存期并用，正文 Schema 不能与公共响应缓存并用；
+其它能力组合由目标构建器校验。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |

@@ -23,10 +23,10 @@ pub struct RequestValidationCfg {
     /// body JSON/YAML Schema 文件；相对路径按 `gateway.yml` 所在目录解析。
     #[serde(default)]
     pub body_schema_file: Option<String>,
-    /// OpenAPI 3 JSON/YAML 文件。设置时由 `operation_id` 定位 operation，并与显式 schema 互斥。
+    /// OpenAPI 3 JSON/YAML 文件。以 operationId 或路径与方法定位操作，与显式 Schema 互斥。
     #[serde(default)]
     pub openapi_file: Option<String>,
-    /// OpenAPI operationId；使用 `openapi_file` 时必填。
+    /// OpenAPI operationId；与 `operation_path` + `operation_method` 二选一。
     #[serde(default)]
     pub operation_id: Option<String>,
     /// OpenAPI path template；与 `operation_method` 成对，用于没有 operationId 的门户导入。

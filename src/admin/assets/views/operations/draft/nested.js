@@ -21,6 +21,7 @@ import { routeBotTrustedFieldGroups } from "./route_bot_trusted.js";
 import { routeDlpFieldGroups } from "./route_dlp.js";
 import { routeCsrfFieldGroups } from "./route_csrf.js";
 import { routeGeoipFieldGroups } from "./route_geoip.js";
+import { routeRequestValidationFieldGroups } from "./route_request_validation.js";
 
 const groups = {
   route: [
@@ -181,6 +182,16 @@ export function nestedFields(kind, values, capacity) {
         "每类数据库必须恰好对应非空规则；清空本类名单时须同时移除路径，留下无规则的数据库声明会拒绝候选。判断按国家、ASN、匿名网络的顺序进行；库内记录或字段缺失、解码错误会立即返回对应整体动作，选择 allow 不会继续后续库检查。数据库年龄在构建时复核，过期 reject 保留原快照，allow 显式放行整个 GeoIP 门，deny 关闭整个门；坏文件、错误用途及超过一天容差的未来时间仍拒绝候选。移除不再需要的路径或规则须明确操作，其它保护保持原值。",
         "subtle",
       ),
+      element(
+        "p",
+        "请求校验至少需要 head Schema、正文 Schema 或 OpenAPI 操作；关闭须移除完整 request_validation。每种 Schema 的内联与文件来源互斥，OpenAPI 与所有显式 Schema 互斥。OpenAPI 必须恰选 operationId 或路径模板加 HTTP 方法；切换来源或选择器时须明确移除旧字段。路径相对主配置目录解析，页面不读取或上传文件；Schema 在候选构建时编译，引用只允许当前文档内部，不在请求时访问文件或网络。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "显式 head Schema 校验 method、path、query、headers、path_params；query 和小写 header 的每个值保持字符串数组，原始 path_params 为空。OpenAPI 操作另按声明解析基本类型的 query、header、path 和 cookie 参数，重复标量拒绝。正文只接受 JSON；有正文 Schema 必须显式设置 1–16777216 字节上限，head-only 上限为 0。未声明 body_required 时，显式正文 Schema 要求非空，OpenAPI 遵从 requestBody.required；false 仅允许空正文，不绕过 head、非空正文类型、结构或大小检查。合同不符及下游读取失败返回 400，正文超限返回 413；不能与长流生存期并用，正文校验不能与公共响应缓存并用。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -305,6 +316,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeDlpFieldGroups(kind),
     ...routeCsrfFieldGroups(kind),
     ...routeGeoipFieldGroups(kind),
+    ...routeRequestValidationFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

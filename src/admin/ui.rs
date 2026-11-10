@@ -220,6 +220,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/route_geoip.js"),
         ),
+        "/ui/views/operations/draft/route_request_validation.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/route_request_validation.js"),
+        ),
         "/ui/views/operations/draft/listener.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/listener.js"),
