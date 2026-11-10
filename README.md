@@ -1210,6 +1210,10 @@ route 可按 OpenAPI operation、HTTP status 与 media type 校验最终响应�
 HTTPS 文档必须固定 SHA-256，并通过 detached Ed25519 signature 复验；redirect、未登记引用、引用
 循环、资源超限或候选编译失败都不会替换当前 route 快照。
 
+普通请求的 `Trailer` 声明经过逐跳字段清理后仍保留时，向 HTTP/1.1 上游显式使用 chunked，
+并移除 `Content-Length`，使有界聚合后的实体也能重放声明允许的合法 trailers。HTTP/2 与
+Upgrade 继续按各自协议编码；实体数据的准确长度语义保持不变。
+
 `request_transform` 与 `response_transform` 提供有界 JSON Pointer 操作，以及 namespace-aware 的
 XML/SOAP 固定字段提取和输出。支持 rename、add、remove、default 与 type check，不执行脚本、通配
 遍历或动态元素名；冲突写、父子覆盖和 rename 循环在候选构建阶段拒绝。XML 禁用 DTD、自定义实体

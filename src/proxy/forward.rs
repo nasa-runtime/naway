@@ -7525,14 +7525,15 @@ fn sanitize_hop_headers(parts: &mut Parts, keep_upgrade: bool) {
 /// token、`Keep-Alive`、`Proxy-Connection`、`Transfer-Encoding`、`Upgrade`，并只允许
 /// `TE: trailers`。那一步无法绕过，也最接近 wire；Naway 不在前一层重复扫描这些字段，只补
 /// Hyper 不负责、但不能泄漏给 origin 的代理认证头。整个过程原地修改 HeaderMap，不复制
-/// header value，更不读取 body。HTTP/1.1 则继续由 Naway 完整清洗。
+/// header value，更不读取 body。HTTP/1.1 则由 Naway 完整清洗，并为保留 Trailer 声明的
+/// 普通请求选择分块编码，防止已聚合实体的精确长度使终止元数据被省略。
 ///
 /// 参数说明：
 /// - `parts`：是待转发请求头
 /// - `keep_upgrade`：表示保留 WebSocket upgrade
 /// - `upstream_version`：是已经冻结的最终上游 HTTP 版本。
 ///
-/// 返回：无；函数原地清理请求头，HTTP/2 只补充移除 Hyper 不负责的代理认证字段。
+/// 返回：原地清理请求头并确定普通 HTTP/1.1 trailers 的分帧；HTTP/2 仅补充代理认证清理。
 #[inline]
 fn sanitize_hop_headers_for_upstream(
     parts: &mut Parts,
@@ -7545,6 +7546,16 @@ fn sanitize_hop_headers_for_upstream(
         return;
     }
     sanitize_hop_headers(parts, keep_upgrade);
+    // 只有逐跳清理后仍保留的声明才能决定下一跳分帧；定长编码不会发送待重放的 trailers。
+    if !keep_upgrade
+        && upstream_version == http::Version::HTTP_11
+        && parts.headers.contains_key(http::header::TRAILER)
+    {
+        parts.headers.remove(CONTENT_LENGTH);
+        parts
+            .headers
+            .insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+    }
 }
 
 /// 业务作用：只保留允许传播的 TE 语义，避免请求头改变下一跳实体分帧。
