@@ -12,6 +12,7 @@ import { upstreamLocalityDraftLists } from "./upstream_locality.js";
 import { routeWafDraftLists } from "./route_waf.js";
 import { routeBotDraftLists } from "./route_bot.js";
 import { routeBotTrustedDraftLists } from "./route_bot_trusted.js";
+import { routeDlpDraftLists } from "./route_dlp.js";
 
 /**
  * 业务作用：列出常用列表与原文已声明的扩展数组，不把未知值转换成列表。
@@ -78,6 +79,7 @@ function lists(kind, values) {
   result.push(...routeWafDraftLists(kind));
   result.push(...routeBotDraftLists(kind));
   result.push(...routeBotTrustedDraftLists(kind));
+  result.push(...routeDlpDraftLists(kind));
   return result.map((item) => {
     let current = values;
     let valid = true;
@@ -218,6 +220,7 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "locality_target",
           "waf_exclusion",
           "bot_trusted",
+          "dlp_exclusion",
         ].includes(selected.type)
       ) {
         // 路由的新建和整值替换需要显式 id；其它元素沿用各自字段约束。

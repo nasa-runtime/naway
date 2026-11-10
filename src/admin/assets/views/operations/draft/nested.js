@@ -18,6 +18,7 @@ import { routeWafPackFieldGroups } from "./route_waf_pack.js";
 import { routeBotFieldGroups } from "./route_bot.js";
 import { routeBotRateFieldGroups } from "./route_bot_rate.js";
 import { routeBotTrustedFieldGroups } from "./route_bot_trusted.js";
+import { routeDlpFieldGroups } from "./route_dlp.js";
 
 const groups = {
   route: [
@@ -148,6 +149,16 @@ export function nestedFields(kind, values, capacity) {
         "可信搜索机器人最多声明 32 条，名称须唯一，签名与时间戳头须不同，密钥引用解析后至少 32 字节。只有 User-Agent 匹配且逐请求 HMAC-SHA256 验签通过才豁免 Bot 信号和速率，后续业务认证照常执行。签名绑定时间戳、可信客户端地址、方法、authority、原始 path/query 与 User-Agent。无效声明在 enforce 下挑战，在 monitor 下保持非可信并记录后继续；页面只编辑 SecretSource 文本，不读取密钥。清空或移除完整列表撤销豁免，保留其它 Bot 规则。",
         "subtle",
       ),
+      element(
+        "p",
+        "声明 dlp 即启用，关闭须移除完整策略；至少启用一处检查。空 enabled_rules 启用全部固定规则：email、phone、credit_card、national_id、jwt、api_key、private_key、secret。header 目标名称须合法且唯一；精确例外绑定已启用规则和原 target，不接受通配符，header target 使用小写名称。monitor 保留命中字节，redact 替换命中字段；日志路径命中时使用固定 /redacted，不记录原值。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "只有明确开启正文方向才聚合检查 JSON、form 或 text；media type 支持 application/json、application/*+json、application/x-www-form-urlencoded、text/*、text/plain。正文超限、压缩或无法检查时仍拒绝，monitor 不豁免资源和结构门。请求命中 block 返回 403，容量超限 413，结构或读取失败 400；响应检查失败返回 502。正文遮蔽后更新长度并移除失效摘要、validator 和 range 元数据。请求正文检查不能关闭转发正文；任一正文检查不能配置非零长流最长寿命，响应正文检查不能与 proxy_cache 混用；internal 路由不能声明 DLP。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -269,6 +280,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeBotFieldGroups(kind),
     ...routeBotRateFieldGroups(kind),
     ...routeBotTrustedFieldGroups(kind),
+    ...routeDlpFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

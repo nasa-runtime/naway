@@ -7,8 +7,10 @@ import { upstreamCatalogFields } from "./upstream_catalog.js";
 import { routeDeadlineFields } from "./route_deadline.js";
 import { wafExclusionFields } from "./route_waf.js";
 import { trustedBotFields } from "./route_bot_trusted.js";
+import { dlpExclusionFields } from "./route_dlp.js";
 
 const definitions = {
+  dlp_exclusion: dlpExclusionFields,
   bot_trusted: trustedBotFields,
   waf_exclusion: wafExclusionFields,
   locality_target: localityTargetFields,
