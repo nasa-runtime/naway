@@ -25,6 +25,7 @@ import { routeRequestValidationFieldGroups } from "./route_request_validation.js
 import { routeResponseContractFieldGroups } from "./route_response_contract.js";
 import { routeBodyTransformFieldGroups } from "./route_body_transform.js";
 import { routeGraphqlGuardFieldGroups } from "./route_graphql_guard.js";
+import { routeDegraphqlFieldGroups } from "./route_degraphql.js";
 
 const groups = {
   route: [
@@ -230,6 +231,16 @@ export function nestedFields(kind, values, capacity) {
         "fragment 每次展开重新计费，alias 不能隐藏 __* introspection 字段，默认也拒绝 __typename。body/query/token 超限返回 413，结构、深度或复杂度失败返回 400，禁止 introspection 或关闭的 GraphQL WebSocket 握手返回 403，错误方法返回 405，不支持的 POST 媒体类型返回 415。显式允许 graphql-transport-ws / graphql-ws 后只透明转发，消息级查询门由上游负责，握手前认证和连接治理仍生效。该策略需要 HTTP 上游，最终组合由原目标构建器校验。",
         "subtle",
       ),
+      element(
+        "p",
+        "degraphql 将精确 Method=GET 路由的已知空请求转换为固定 GraphQL POST。query 与 operation_name 由配置冻结，客户端 query 参数不能替换文档；固定文档在构建时按显式或缺省 GraphQL 预算检查。上游 path 不带 query/fragment，path 变量模板须匹配路由 PathTemplate 签名，最多64个命名变量。非空、未知 chunked 或 Upgrade 输入拒绝，生成 JSON 超限返回413。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "path/query/header 来源只读取明确名称，重复 query/header、必需值缺失、坏类型或文本单值超限返回400；required=false 时缺失变量省略。integer 为 i64，number 必须有限，boolean 只接受 true/false。literal 使用固定非 null JSON 值且 name 须为空，不按 kind 转换；固定值受生成正文总预算。切换来源须显式移除旧 name/value，不自动丢弃原声明；请求校验/转换、缓存、终端后端、镜像及路径改写等组合由原目标构建器拒绝。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -358,6 +369,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeResponseContractFieldGroups(kind),
     ...routeBodyTransformFieldGroups(kind),
     ...routeGraphqlGuardFieldGroups(kind),
+    ...routeDegraphqlFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

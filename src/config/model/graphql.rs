@@ -88,7 +88,7 @@ pub struct DegraphqlVariableCfg {
 pub enum DegraphqlVariableSourceCfg {
     /// 从已匹配 REST path template 的参数取值。
     Path,
-    /// 从 query 参数取第一个值。
+    /// 从唯一的同名 query 参数取值；重复声明拒绝请求。
     Query,
     /// 从显式命名的 HTTP header 取值。
     Header,

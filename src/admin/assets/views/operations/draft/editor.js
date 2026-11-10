@@ -4,6 +4,7 @@ import { objectKinds, objectLabel, namedObject } from "./schema.js";
 import { fieldAction } from "./nested.js";
 import { sequenceEditor } from "./sequence.js";
 import { keyEditor, keySecret } from "./keys.js";
+import { degraphqlVariableEditor } from "./route_degraphql.js";
 
 /**
  * 业务作用：围绕当前候选提供显式对象编辑，所有结果仍须进入共享提案和原目标执行。
@@ -192,6 +193,22 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
         ),
       );
       if (object.kind === "route") {
+        body.append(
+          degraphqlVariableEditor(
+            object,
+            values,
+            capacity,
+            (action) => {
+              // 变量动作只能引用仍存活的原路由选择，旧面板不能向新候选提交。
+              if (selected === object && fields && !creating) {
+                perform(action, publish);
+              }
+            },
+            () => {
+              generation += 1;
+            },
+          ),
+        );
         body.append(
           keyEditor(
             object,

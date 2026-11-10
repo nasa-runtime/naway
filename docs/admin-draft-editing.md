@@ -207,6 +207,23 @@ POST 支持 JSON 单操作或 batch、`application/graphql` 原文及 multipart 
 返回 403。该策略需要 HTTP 上游，不与终端静态、固定响应、BFF 或 LLM 后端组合；
 其它组合及 `graphql_cost` 的原正文和订阅约束由原目标构建器校验。
 
+`degraphql` 表单提供固定 `query`、可选 `operation_name`、`upstream_path`、
+`rest_path_template`、完整 `variables` 映射与 `max_body_bytes`。仅用于精确
+`Method=GET` 的 HTTP 路由；原请求须已知空正文，未知 chunked 与 Upgrade 也拒绝。
+网关生成固定文档的 POST JSON envelope，客户端 query 参数不能替换文档；固定文档
+在构建时按显式 `graphql_guard` 或原生缺省预算检查。生成正文上限为 1024–1048576
+字节，超限返回 413；上游 path 不得带 query、fragment 或控制字符，最多2048字节。
+
+变量可按 GraphQL 名称逐项新增、编辑六字段、整值替换或确认删除，最多64项；未编辑
+子树和缺省值保持原声明。来源为 `path`、`query`、`header` 或 `literal`。文本来源
+明确命名字段，单值上限为1–65536 UTF-8字节；重复 query/header、必需值缺失、坏类型
+或超限返回400。`required=false` 时缺失变量省略；integer 使用 i64，number 必须有限，
+boolean 只接受 `true`/`false`。path 变量模板须与路由 `PathTemplate` 签名一致；path
+逐段百分号解码，query 使用表单解码语义。literal 的 name 须空且 value 必须是非 null
+JSON，不按 kind 转换，固定值受生成正文总预算。切换来源须显式移除不再合法的旧字段。
+请求校验/请求转换、缓存、internal、终端后端、镜像及路径改写组合由原目标构建器拒绝；
+其它未编辑治理继续保持。命名变量动作独立生成候选，不连带提交普通字段的待写修改。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |
