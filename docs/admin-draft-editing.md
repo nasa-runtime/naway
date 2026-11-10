@@ -189,6 +189,24 @@ range、分块及 Trailer 声明。压缩实体、partial entity、实际 traile
 响应转换也覆盖路由内产生的拒绝，组合策略时须保证对应格式兼容。未编辑的其它治理声明
 保持原值，最终组合与合法性由原目标候选构建器校验。
 
+GraphQL 查询预算表单提供 `graphql_guard` 七项原生字段。声明即启用，关闭须移除整段；
+未编辑的缺省预算和两个放行开关保持原声明。POST 实体为 1–4194304 字节；解码后的完整
+query 文档为 1–1048576 UTF-8 字节，token 为 1–262144 且不超过 query 字节上限，
+深度为 1–128，选定 operation 的字段复杂度为 1–10000000。根字段深度为 1，每字段成本
+为 1，fragment 每次展开重新计费。batch 逐 envelope 复验文档和选定操作的预算，累计成本
+交给计量与成本准入；这些字段
+不声明额外的 HTTP batch 总复杂度上限。
+
+GET 使用唯一 `query` 和可选唯一 `operationName`，只允许 query 操作且不聚合实体；
+POST 支持 JSON 单操作或 batch、`application/graphql` 原文及 multipart 中唯一的
+`operations` 部分，通过后原始实体和 trailers 继续转发。body/query/token 超限返回 413，
+结构、深度或复杂度不符返回 400，不支持的 POST 媒体类型返回 415，错误方法返回 405。
+默认拒绝实际字段名以 `__` 开头的 introspection（包含 `__typename`），alias 不绕过该门。
+显式允许标准或 legacy GraphQL WebSocket 订阅后只执行透明转发，消息级查询解析与预算
+由上游承担，握手前认证和连接治理仍生效；关闭的 GraphQL 握手和禁止的 introspection
+返回 403。该策略需要 HTTP 上游，不与终端静态、固定响应、BFF 或 LLM 后端组合；
+其它组合及 `graphql_cost` 的原正文和订阅约束由原目标构建器校验。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |

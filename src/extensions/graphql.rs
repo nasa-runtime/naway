@@ -25,7 +25,7 @@ const HARD_MAX_QUERY_BYTES: usize = 1024 * 1024;
 const HARD_MAX_TOKENS: usize = 262_144;
 /// 所有递归入口都受这个 build-time 上限约束，防止 Rust 调用栈耗尽。
 const HARD_MAX_DEPTH: usize = 128;
-/// 单请求字段成本绝对上限；计算使用饱和加法，不会发生 usize wraparound。
+/// 单 operation 字段成本绝对上限；batch 逐项检查后累计计量成本，计算不会发生 usize wraparound。
 const HARD_MAX_COMPLEXITY: usize = 10_000_000;
 
 /// 构建期验证后的 GraphQL route 策略。

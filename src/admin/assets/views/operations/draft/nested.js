@@ -24,6 +24,7 @@ import { routeGeoipFieldGroups } from "./route_geoip.js";
 import { routeRequestValidationFieldGroups } from "./route_request_validation.js";
 import { routeResponseContractFieldGroups } from "./route_response_contract.js";
 import { routeBodyTransformFieldGroups } from "./route_body_transform.js";
+import { routeGraphqlGuardFieldGroups } from "./route_graphql_guard.js";
 
 const groups = {
   route: [
@@ -219,6 +220,16 @@ export function nestedFields(kind, values, capacity) {
         "XML 路径按 namespace URI 与本地名匹配，不要求发送方使用相同 prefix；DTD 与外部实体拒绝，深度、节点、属性和文本预算也须合法。SOAP 输入映射须锚定标准 Envelope / Body，输出用 namespaces.soap 选择 SOAP 1.1 或 1.2 URI，未声明时输出 SOAP 1.2。SOAPAction 在请求侧校验输入或设置输出，响应侧仅校验声明合法性，不检查或写入响应头；SOAP Fault 状态映射只在响应侧提供。切换格式时请明确处理旧映射，页面不会自动删除或填充其它声明。",
         "subtle",
       ),
+      element(
+        "p",
+        "声明 graphql_guard 即启用，关闭须移除完整策略。GET 要求唯一 query 和可选唯一 operationName，且只允许 query；POST 支持 JSON 单操作或 batch、application/graphql 原文及 multipart 的唯一 operations 部分。POST 有界读取，通过后原字节和 trailers 继续转发。每个 envelope 检查完整查询文档的字节、token 与深度，再检查选定 operation 的字段复杂度；batch 成本累加用于计量，不把单 operation 预算当作整个 HTTP batch 的总预算。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "fragment 每次展开重新计费，alias 不能隐藏 __* introspection 字段，默认也拒绝 __typename。body/query/token 超限返回 413，结构、深度或复杂度失败返回 400，禁止 introspection 或关闭的 GraphQL WebSocket 握手返回 403，错误方法返回 405，不支持的 POST 媒体类型返回 415。显式允许 graphql-transport-ws / graphql-ws 后只透明转发，消息级查询门由上游负责，握手前认证和连接治理仍生效。该策略需要 HTTP 上游，最终组合由原目标构建器校验。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -346,6 +357,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeRequestValidationFieldGroups(kind),
     ...routeResponseContractFieldGroups(kind),
     ...routeBodyTransformFieldGroups(kind),
+    ...routeGraphqlGuardFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

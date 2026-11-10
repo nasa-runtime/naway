@@ -21,7 +21,7 @@ pub struct GraphqlGuardCfg {
     /// 根字段深度计为 1；任一可达选择路径超过该值即在上游前拒绝。
     #[serde(default = "default_graphql_max_depth")]
     pub max_depth: usize,
-    /// 每个字段成本为 1，fragment 每次 spread 都重新计费；超过即拒绝。
+    /// 每 operation 的字段成本上限；每字段为 1，fragment 每次 spread 重新计费，batch 成本另作累加。
     #[serde(default = "default_graphql_max_complexity")]
     pub max_complexity: usize,
     /// 是否允许 `__schema`/`__type`/`__typename` 等 introspection 字段。
