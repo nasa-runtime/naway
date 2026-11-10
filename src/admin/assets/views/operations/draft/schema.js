@@ -9,8 +9,16 @@ import { wafExclusionFields } from "./route_waf.js";
 import { trustedBotFields } from "./route_bot_trusted.js";
 import { dlpExclusionFields } from "./route_dlp.js";
 import { schemaRegistryDocumentFields } from "./route_response_contract.js";
+import {
+  bodyTransformOperationFields,
+  bodyTransformExtractFields,
+  bodyTransformEmitFields,
+} from "./route_body_transform.js";
 
 const definitions = {
+  body_transform_operation: bodyTransformOperationFields,
+  body_transform_extract: bodyTransformExtractFields,
+  body_transform_emit: bodyTransformEmitFields,
   schema_registry_document: schemaRegistryDocumentFields,
   dlp_exclusion: dlpExclusionFields,
   bot_trusted: trustedBotFields,

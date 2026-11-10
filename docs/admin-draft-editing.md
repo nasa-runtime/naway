@@ -162,6 +162,33 @@ Schema 的外部引用只可指向显式 `catalog_files` 或 `registry_documents
 这些解析只发生在候选构建阶段，数据面不访问来源，页面也不求值 SecretSource。
 删除来源时须明确处理依赖它的引用，未编辑的其它合同与安全声明保持原值。
 
+路由实体转换表单分别提供 `request_transform` 的十三个合法字段和 `response_transform` 的
+十四个字段；SOAP Fault 状态映射仅供响应侧使用。两方向各有 JSON 操作、XML 提取和 XML
+输出字段的逐项编辑，以及输出根、namespace 映射、SOAPAction 和独立资源预算。
+声明策略即启用对应方向，关闭须移除完整策略，不生成另一方向或物化未编辑的默认值。
+输入与输出容量各为 1–16777216 字节，XML 深度为 1–256、节点事件为 1–1000000、
+单元素属性为 1–4096、文本总量为 1–16777216 字节；JSON 方向的这些声明也须合法。
+转换不能与非零 `long_stream_max_lifetime_ms` 组合，缓冲及重建的实体有明确终态。
+
+JSON 操作依序执行：`rename` 移动已有值，`add` 要求位置尚不存在，`remove` 缺失时幂等，
+`default` 只补缺失，`type_check` 要求类型而不转换值。切换 `action` 时须明确移除旧类型的
+多余字段；固定 `value` 接受任意 JSON，`null` 是实际值，不能代替移除动作。
+路径使用非根 RFC 6901 JSON Pointer，`*` 按字面键处理，不执行 JSONPath、通配展开或脚本。
+JSON 到 JSON 至少需要一项操作；XML/SOAP 输入须有提取，输出须有固定输出结构。
+操作及每类 XML 映射最多 256 项，add/default 常量累计最多 1 MiB；namespace 映射最多
+64 项且 URI 不重复。冲突的 JSON 写目标、rename 环、重复的提取来源或目标、重复的
+输出来源及重叠的输出元素路径拒绝候选。
+XML 路径按 namespace URI 和本地名匹配，输出路径相对业务根，提取和输出的 `required`
+只在明确编辑时写入。SOAP 输入映射锚定标准 `Envelope` / `Body`；输出通过 `namespaces.soap`
+选择标准 SOAP 1.1/1.2 URI，缺省 SOAP 1.2。SOAPAction 在请求侧校验输入或设置输出；
+响应侧只校验声明合法性，不检查或写入响应头。
+
+转换有界聚合完整实体并重新序列化，成功后重建类型与长度，移除失效的编码、完整性、
+range、分块及 Trailer 声明。压缩实体、partial entity、实际 trailers、DTD 和外部实体拒绝。
+请求结构或格式失败返回 400，容量超限返回 413；响应转换失败返回 502。
+响应转换也覆盖路由内产生的拒绝，组合策略时须保证对应格式兼容。未编辑的其它治理声明
+保持原值，最终组合与合法性由原目标候选构建器校验。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |

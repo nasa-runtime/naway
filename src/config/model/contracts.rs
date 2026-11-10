@@ -148,7 +148,7 @@ pub struct BodyTransformCfg {
     /// 中间 JSON 到 XML/SOAP 输出的固定结构。
     #[serde(default)]
     pub xml_emit: Option<XmlEmitCfg>,
-    /// SOAP 输入必须匹配或 SOAP 输出需要设置的固定 SOAPAction。
+    /// 请求侧 SOAP 输入须匹配或输出须设置的 SOAPAction；响应侧仅校验声明，不操作响应头。
     #[serde(default)]
     pub soap_action: Option<String>,
     /// SOAP Fault 命中时修改 HTTP status 的固定映射，仅响应转换可用。

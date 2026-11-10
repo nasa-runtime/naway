@@ -228,6 +228,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/route_response_contract.js"),
         ),
+        "/ui/views/operations/draft/route_body_transform.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/route_body_transform.js"),
+        ),
         "/ui/views/operations/draft/listener.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/listener.js"),

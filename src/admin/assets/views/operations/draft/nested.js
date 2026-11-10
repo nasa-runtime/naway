@@ -23,6 +23,7 @@ import { routeCsrfFieldGroups } from "./route_csrf.js";
 import { routeGeoipFieldGroups } from "./route_geoip.js";
 import { routeRequestValidationFieldGroups } from "./route_request_validation.js";
 import { routeResponseContractFieldGroups } from "./route_response_contract.js";
+import { routeBodyTransformFieldGroups } from "./route_body_transform.js";
 
 const groups = {
   route: [
@@ -203,6 +204,21 @@ export function nestedFields(kind, values, capacity) {
         "响应 Schema 的外部引用只能指向显式 catalog 或签名 HTTPS 文档；连同 OpenAPI 根最多 32 文档、原文总量最多 8 MiB，循环、过深引用及 $dynamicRef 拒绝。HTTPS 必须无凭据和 fragment，不跟随重定向，原始字节同时核对固定 SHA-256 与 Ed25519 签名；未声明 CA 时使用系统信任。单文档最多 4 MiB，总期限 100–30000 毫秒，字节缓存复用 1–86400000 毫秒，命中仍复验当前信任、签名和预算且不续期。所有文件和网络解析在候选构建时执行，页面只编辑声明，请求不访问这些来源。移除来源前须同时处理依赖它的引用。",
         "subtle",
       ),
+      element(
+        "p",
+        "request_transform 与 response_transform 分别启用对应方向，关闭须移除完整策略。输入与输出容量均须为 1–16777216 字节；转换有界聚合并重新序列化完整实体，重建类型、长度及必要 SOAPAction，移除失效的完整性、编码、分块和 Trailer 元数据。压缩实体、partial entity 和实际 trailers 拒绝；请求结构或类型失败返回 400，超限返回 413，响应转换失败返回 502。响应转换也作用于路由内产生的拒绝响应，需避免不兼容的格式组合。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "JSON 操作按顺序执行，rename 移动已有值，add 仅写不存在的位置，remove 缺失时幂等，default 仅补缺失，type_check 不转换类型。切换 action 须明确移除旧操作不再接受的字段；value 的 JSON null 是实际值，删除字段请选择移除。路径使用非根 JSON Pointer，* 为字面键，不执行 JSONPath 或通配展开。JSON 到 JSON 至少需要一个操作；XML / SOAP 输入须有 xml_extract，输出须有 xml_emit。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "XML 路径按 namespace URI 与本地名匹配，不要求发送方使用相同 prefix；DTD 与外部实体拒绝，深度、节点、属性和文本预算也须合法。SOAP 输入映射须锚定标准 Envelope / Body，输出用 namespaces.soap 选择 SOAP 1.1 或 1.2 URI，未声明时输出 SOAP 1.2。SOAPAction 在请求侧校验输入或设置输出，响应侧仅校验声明合法性，不检查或写入响应头；SOAP Fault 状态映射只在响应侧提供。切换格式时请明确处理旧映射，页面不会自动删除或填充其它声明。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -329,6 +345,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeGeoipFieldGroups(kind),
     ...routeRequestValidationFieldGroups(kind),
     ...routeResponseContractFieldGroups(kind),
+    ...routeBodyTransformFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

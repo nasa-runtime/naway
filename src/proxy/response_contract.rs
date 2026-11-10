@@ -1802,7 +1802,7 @@ impl JsonPointer {
     /// 参数说明：
     /// - `raw`：是配置 pointer。
     ///
-    /// 返回：合法非根 pointer 返回 token 计划；通配、非法转义、过深或空根写返回错误。
+    /// 返回：合法非根 pointer 返回 token 计划，`*` 保持字面键；非法转义、数组追加标记、过深或空根写返回错误。
     fn parse(raw: &str) -> Result<Self> {
         if raw.is_empty() || !raw.starts_with('/') {
             bail!("JSON transform pointer must be a non-root RFC 6901 path");
