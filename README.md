@@ -766,8 +766,14 @@ Bot 策略可组合大小写不敏感的 User-Agent glob、必需 header、自�
 共享 RateLimiter。命中可选择 `enforce` 或 `monitor`；enforce 返回带固定
 `WWW-Authenticate: NawayBot` 的挑战响应，速率拒绝返回 429 与 `Retry-After`。可信搜索机器人
 不会仅凭 User-Agent 获得豁免：每个请求都必须用构建期 SecretSource 对时间戳、权威客户端 IP、
-方法、authority、path/query 和 User-Agent 做 HMAC-SHA256 签名复验。原始输入与指纹不进入日志、
-指标或限流 key。
+方法、authority、path/query 和 User-Agent 做 HMAC-SHA256 签名复验。Bot 诊断只记录固定原因，
+速率键使用包含可信客户端地址的摘要维度，不保存原始输入或完整拒绝指纹。
+
+可信机器人签名的消息为六项 UTF-8 字节，依次是解析后的十进制 Unix 秒时间戳、可信客户端 IP、
+方法、URI authority（缺失时使用严格单值 Host）、原始 path/query 和原始 User-Agent；项间使用
+单个 LF，末尾不追加换行。HMAC-SHA256 摘要使用无填充 Base64URL。只有 UA 匹配且验签通过
+才豁免 Bot 信号与速率，后续业务认证照常执行；正文由既有路由策略处理，不属于此 Bot 身份签名输入。
+无效声明在 `enforce` 下挑战，在 `monitor` 下仍为非可信请求，按监控模式记录后继续。
 
 ```yaml
 routes:

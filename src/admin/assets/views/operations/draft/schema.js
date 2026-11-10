@@ -6,8 +6,10 @@ import { localityTargetFields } from "./upstream_locality.js";
 import { upstreamCatalogFields } from "./upstream_catalog.js";
 import { routeDeadlineFields } from "./route_deadline.js";
 import { wafExclusionFields } from "./route_waf.js";
+import { trustedBotFields } from "./route_bot_trusted.js";
 
 const definitions = {
+  bot_trusted: trustedBotFields,
   waf_exclusion: wafExclusionFields,
   locality_target: localityTargetFields,
   tls_identity: tlsIdentityFields,

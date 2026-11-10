@@ -139,7 +139,7 @@ pub struct BotCfg {
 pub struct TrustedSearchBotCfg {
     /// 稳定、低基数的声明名称，仅用于配置错误定位。
     pub name: String,
-    /// 声称该身份的 User-Agent glob；匹配后签名失败会故障关闭。
+    /// 声称该身份的 User-Agent glob；匹配后只有验签通过才可信，失败按 enforce/monitor 处置。
     pub user_agents: Vec<String>,
     /// HMAC-SHA256 SecretSource，构建期解析且至少 32 bytes。
     pub signature_secret: String,

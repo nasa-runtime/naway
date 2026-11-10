@@ -17,6 +17,7 @@ import { routeWafFieldGroups } from "./route_waf.js";
 import { routeWafPackFieldGroups } from "./route_waf_pack.js";
 import { routeBotFieldGroups } from "./route_bot.js";
 import { routeBotRateFieldGroups } from "./route_bot_rate.js";
+import { routeBotTrustedFieldGroups } from "./route_bot_trusted.js";
 
 const groups = {
   route: [
@@ -142,6 +143,11 @@ export function nestedFields(kind, values, capacity) {
         "声明 bot.rate 即启用速率信号，容量为基础令牌量加突发量，按补充窗口恢复基础量；速率指纹另含可信客户端地址。active_keys_fail_open 缺省为 false，只有明确开启才在指纹表满时放行未记账的新指纹，不创建新桶；已有指纹仍受额度限制，需要创建真实桶时仍须工作区状态名额。速率拒绝返回 429 和覆盖完整窗口的整秒等待建议，monitor 记录后继续。移除完整 rate 保留其它 Bot 信号；如果已无任何有效信号，候选仍会被拒绝，关闭全部策略须移除 bot。",
         "subtle",
       ),
+      element(
+        "p",
+        "可信搜索机器人最多声明 32 条，名称须唯一，签名与时间戳头须不同，密钥引用解析后至少 32 字节。只有 User-Agent 匹配且逐请求 HMAC-SHA256 验签通过才豁免 Bot 信号和速率，后续业务认证照常执行。签名绑定时间戳、可信客户端地址、方法、authority、原始 path/query 与 User-Agent。无效声明在 enforce 下挑战，在 monitor 下保持非可信并记录后继续；页面只编辑 SecretSource 文本，不读取密钥。清空或移除完整列表撤销豁免，保留其它 Bot 规则。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -262,6 +268,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeWafPackFieldGroups(kind),
     ...routeBotFieldGroups(kind),
     ...routeBotRateFieldGroups(kind),
+    ...routeBotTrustedFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
