@@ -17,6 +17,7 @@ import { routeCsrfDraftLists } from "./route_csrf.js";
 import { routeGeoipDraftLists } from "./route_geoip.js";
 import { routeCasbinDraftLists } from "./route_casbin.js";
 import { routeOpaDraftLists } from "./route_opa.js";
+import { routeExternalPluginDraftLists } from "./route_external_plugin.js";
 import { routeResponseContractDraftLists } from "./route_response_contract.js";
 import {
   routeBodyTransformDraftLists,
@@ -52,6 +53,7 @@ function lists(kind, values) {
       type: "stream_route",
     });
   }
+  result.push(...routeExternalPluginDraftLists(kind));
   for (const [key, value] of Object.entries(values)) {
     if (
       key !== "id" &&
@@ -240,11 +242,16 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "body_transform_operation",
           "body_transform_extract",
           "body_transform_emit",
+          "external_plugin",
         ].includes(selected.type)
       ) {
-        // 路由的新建和整值替换需要显式 id；其它元素沿用各自字段约束。
+        // 流路由和外部插件的新增或整值替换须显式声明 id，字段编辑不开放原元素的身份变更。
         const type =
-          selected.type === "stream_route" ? "stream_route_new" : selected.type;
+          selected.type === "stream_route"
+            ? "stream_route_new"
+            : selected.type === "external_plugin"
+              ? "external_plugin_new"
+              : selected.type;
         fields = draftFieldPanel(type, {}, capacity);
         body.append(
           element(
@@ -375,6 +382,12 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           (typeof action.fields?.id !== "string" || !action.fields.id.trim())
         ) {
           throw new Error("新流路由必须明确填写非空的稳定身份 id。");
+        }
+        if (
+          selected.type === "external_plugin" &&
+          (typeof action.fields?.id !== "string" || !action.fields.id.trim())
+        ) {
+          throw new Error("新增或替换外部插件必须明确填写非空的稳定身份 id。");
         }
         edit = {
           op,

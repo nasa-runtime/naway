@@ -9,6 +9,7 @@ import { wafExclusionFields } from "./route_waf.js";
 import { trustedBotFields } from "./route_bot_trusted.js";
 import { dlpExclusionFields } from "./route_dlp.js";
 import { schemaRegistryDocumentFields } from "./route_response_contract.js";
+import { externalPluginFields } from "./route_external_plugin.js";
 import {
   bodyTransformOperationFields,
   bodyTransformExtractFields,
@@ -16,6 +17,8 @@ import {
 } from "./route_body_transform.js";
 
 const definitions = {
+  external_plugin: externalPluginFields.filter(([name]) => name !== "id"),
+  external_plugin_new: externalPluginFields,
   body_transform_operation: bodyTransformOperationFields,
   body_transform_extract: bodyTransformExtractFields,
   body_transform_emit: bodyTransformEmitFields,

@@ -273,6 +273,21 @@ export function nestedFields(kind, values, capacity) {
         "OPA cache 存在即启用，只缓存明确 allow/deny，不缓存错误；external 缓存须有策略修订，embedded 使用 bundle revision 或摘要。singleflight 仅合并本节点同键 miss，follower 有期限；distributed 通过 DynamicStore 复验修订、过期与义务，退避独立于缓存。移除 cache 只关闭缓存，关闭授权须移除整个 opa_authorization；输入与义务子组移除恢复原生默认，不物化缺省值，父段和子项不能在同次动作中重叠。",
         "subtle",
       ),
+      element(
+        "p",
+        "external_plugins 最多16项，按 request_headers 和 response_headers 分组，各相位内保持原数组顺序。处理器仅接收固定请求元数据和头名单，不发送业务正文，也不提供 consumer 或 JWT claims 字段；服务 Authorization 使用独立 SecretSource。响应相位只保存所需请求头的并集，且在完整请求插件链成功后快照。正常继续时原 body 与 trailers 按流转发，continue 不能改写正文。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "外部 HTTP 插件的 continue 先整组验证再提交本插件头变更，local_response 返回有界正文与非1xx状态并短路。依赖、响应协议或越权输出失败默认500，fail_open 只丢弃本插件结果后继续；前面插件已提交的合法变更保持。请求输入坏UTF-8或超限431、响应输入错误500，均不受失败开放。明确本地响应也不会被失败开放覆盖。名单禁止敏感凭据、Forwarded、X-Forwarded-For、X-Forwarded-Host、X-Forwarded-Proto 和连接分帧头，构建时规范化去重。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "插件 id 在整条链中唯一，字段编辑保持原 id；新增和整值替换须显式填写，替换会移除旧元素其它字段。请求相位不能声明可见响应头；目标必须是 HTTP(S) origin 或 lb://service，路径独立且无 query。列表支持插入、字段编辑、替换、移动和确认删除；空数组或移除完整 external_plugins 停用链，原认证与其它治理保持。internal 和公共 proxy_cache 组合由原目标构建器拒绝。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
