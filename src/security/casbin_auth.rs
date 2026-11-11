@@ -3,7 +3,8 @@
 //! model 与 policy 文件只在 `GatewaySnapshot` 构建期读取，并被编译成只读
 //! `Enforcer`。请求期不读文件、不动态解析 matcher；只按构建期已编译的参数计划
 //! 组装一个有界 `Vec<String>` 交给 Casbin。Casbin/Rhai 需要拥有的动态值，因此这些小字符串
-//! 拷贝是显式授权慢路径的必要成本；业务 body/凭据原文从不进入策略引擎。
+//! 拷贝是显式授权慢路径的必要成本；业务 body 不进入策略引擎。显式 header 参数保留原始值，
+//! 不会自动成为已认证身份；consumer 只来自已通过的认证链。
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};

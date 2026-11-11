@@ -224,6 +224,20 @@ JSON，不按 kind 转换，固定值受生成正文总预算。切换来源须�
 请求校验/请求转换、缓存、internal、终端后端、镜像及路径改写组合由原目标构建器拒绝；
 其它未编辑治理继续保持。命名变量动作独立生成候选，不连带提交普通字段的待写修改。
 
+Casbin 授权表单提供 `model_file`、`policy_file`、有序 `arguments`、
+`require_identity`、`max_argument_bytes`、`max_input_bytes` 与 `fail_open`。
+两份受信本地文件在候选构建时按单文件4 MiB上限读取 UTF-8 并编译；相对路径以主配置
+目录解析，请求期不读文件或业务正文。参数按 model 的 `r` 顺序指定，支持 consumer、
+path、method、route_id、client_ip、scheme 和显式 `header:Name`，必须为1–16项。
+header 提供未可信原始值，不能代替已通过认证链的 consumer；缺省参数不在页面物化。
+
+单参数预算为1–65536 UTF-8字节，合计预算不得低于单参数预算且不超过262144字节。
+明确拒绝和缺主体返回403，无效UTF-8或输入超限返回431；内部求值异常默认500，仅此
+异常可由 `fail_open=true` 放行。`require_identity=false` 时缺 consumer 使用 anonymous，
+已有已认证 consumer 仍保持；开启身份要求须具备原生认证链或父层身份来源。internal 和
+公共 proxy_cache 组合拒绝。参数列表支持按位置插入、替换、移动和确认删除；整段移除
+Casbin 声明不移除原认证、WAF 或其它独立策略。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |

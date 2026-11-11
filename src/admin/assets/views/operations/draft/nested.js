@@ -26,6 +26,7 @@ import { routeResponseContractFieldGroups } from "./route_response_contract.js";
 import { routeBodyTransformFieldGroups } from "./route_body_transform.js";
 import { routeGraphqlGuardFieldGroups } from "./route_graphql_guard.js";
 import { routeDegraphqlFieldGroups } from "./route_degraphql.js";
+import { routeCasbinFieldGroups } from "./route_casbin.js";
 
 const groups = {
   route: [
@@ -241,6 +242,16 @@ export function nestedFields(kind, values, capacity) {
         "path/query/header 来源只读取明确名称，重复 query/header、必需值缺失、坏类型或文本单值超限返回400；required=false 时缺失变量省略。integer 为 i64，number 必须有限，boolean 只接受 true/false。literal 使用固定非 null JSON 值且 name 须为空，不按 kind 转换；固定值受生成正文总预算。切换来源须显式移除旧 name/value，不自动丢弃原声明；请求校验/转换、缓存、终端后端、镜像及路径改写等组合由原目标构建器拒绝。",
         "subtle",
       ),
+      element(
+        "p",
+        "Casbin model 与 policy 在候选构建时有界读取并编译，请求期只组装固定参数，不读取业务正文。arguments 按 model r 顺序指定 consumer、path、method、route_id、client_ip、scheme 和 header:Name；header 是未可信原始值，不能代替已通过认证的 consumer。相对文件以主配置目录解析。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "require_identity=false 时无主体使用 anonymous；开启身份要求须有原生认证链或父层身份来源。明确拒绝与缺主体返回403，参数过大或无效UTF-8返回431，内部求值异常默认500，只有该异常受 fail_open 控制。该策略不能与 internal 或公共 proxy_cache 组合；关闭须移除完整声明，原认证和其它治理保持。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -370,6 +381,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeBodyTransformFieldGroups(kind),
     ...routeGraphqlGuardFieldGroups(kind),
     ...routeDegraphqlFieldGroups(kind),
+    ...routeCasbinFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
