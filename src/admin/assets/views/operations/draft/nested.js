@@ -27,6 +27,7 @@ import { routeBodyTransformFieldGroups } from "./route_body_transform.js";
 import { routeGraphqlGuardFieldGroups } from "./route_graphql_guard.js";
 import { routeDegraphqlFieldGroups } from "./route_degraphql.js";
 import { routeCasbinFieldGroups } from "./route_casbin.js";
+import { routeOpaFieldGroups } from "./route_opa.js";
 
 const groups = {
   route: [
@@ -252,6 +253,26 @@ export function nestedFields(kind, values, capacity) {
         "require_identity=false 时无主体使用 anonymous；开启身份要求须有原生认证链或父层身份来源。明确拒绝与缺主体返回403，参数过大或无效UTF-8返回431，内部求值异常默认500，只有该异常受 fail_open 控制。该策略不能与 internal 或公共 proxy_cache 组合；关闭须移除完整声明，原认证和其它治理保持。",
         "subtle",
       ),
+      element(
+        "p",
+        "OPA external 使用 HTTP(S) origin 或 lb://service 与独立绝对路径，不能同时声明 bundle；embedded 需要 opa-embedded 能力和受信本地签名 bundle，须明确移除旧 target、path 与 authorization。页面只编辑路径与 SecretSource，不读取或上传材料；bundle 的 detached Ed25519 签名覆盖原始压缩字节，候选构建先验签再有界解包和编译静态 Rego 规则。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "OPA 默认只读请求 head；正文与已验证 JWT claims 分别显式开启。正文须精确匹配去参数 media type 且为合法 JSON，通过后原字节与 trailers 继续转发；类型不支持415、正文超限413、读取或JSON失败400。输入头为未可信属性，敏感凭据、实体和连接头不能加入；缺主体403，头值或编码输入超限431，均不受 fail_open。客户端身份头不能替代已认证 consumer。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "OPA 明确 deny 返回403；依赖传输、期限、求值或响应协议失败默认503，仅此类失败受 fail_open 控制。返回义务须先整组通过名单、重复/冲突和预算检查，再应用请求头、延迟响应头及审计元数据；非法义务不部分执行，失败开放也不执行失败义务。义务名单禁止 Authorization、Cookie、Host 及连接和分帧控制头；审计 key 为1–64字节ASCII字母、数字、下划线、连字符或点。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "OPA cache 存在即启用，只缓存明确 allow/deny，不缓存错误；external 缓存须有策略修订，embedded 使用 bundle revision 或摘要。singleflight 仅合并本节点同键 miss，follower 有期限；distributed 通过 DynamicStore 复验修订、过期与义务，退避独立于缓存。移除 cache 只关闭缓存，关闭授权须移除整个 opa_authorization；输入与义务子组移除恢复原生默认，不物化缺省值，父段和子项不能在同次动作中重叠。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -382,6 +403,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeGraphqlGuardFieldGroups(kind),
     ...routeDegraphqlFieldGroups(kind),
     ...routeCasbinFieldGroups(kind),
+    ...routeOpaFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

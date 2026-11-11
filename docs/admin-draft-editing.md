@@ -238,6 +238,43 @@ header 提供未可信原始值，不能代替已通过认证链的 consumer；�
 公共 proxy_cache 组合拒绝。参数列表支持按位置插入、替换、移动和确认删除；整段移除
 Casbin 声明不移除原认证、WAF 或其它独立策略。
 
+OPA 授权表单提供全部十七主声明、bundle 七字段、input 四字段、obligations 六字段和
+cache 十字段。四个完整子组可显式设置或移除，子字段操作保持未编辑的秘密引用、开关
+和未知声明；父子路径不能在同次动作中重叠。五个字符串名单支持按位置插入、替换、
+移动和确认删除，不自行去重或扩大权限。关闭 OPA 须移除完整 `opa_authorization`；移除
+cache 只关闭缓存，移除 input 或 obligations 恢复对应原生默认。
+
+external 使用 HTTP(S) origin 或 `lb://service` 和独立绝对路径，路径最多2048字节且不能
+带 scheme、authority 或 query，不能同时声明 bundle。完整服务 Authorization 值支持
+SecretSource。embedded 需要 `opa-embedded` 能力、非空签名 bundle，并禁止非空
+target、path 和 authorization；切换模式须显式处理旧声明，页面不自动删除。bundle
+为本地 tar.gz，相对主配置目录解析；detached Ed25519 签名覆盖压缩原始字节，签名和
+公钥为64与32字节的标准Base64 SecretSource。压缩、regular file 展开总量和文件数分别
+最多64 MiB、256 MiB与4096；链接与特殊条目拒绝，至少有一个Rego模块。静态查询为
+`data.<package>.<rule>`，manifest 未提供或 revision 为空时使用材料摘要；候选构建期验签、
+有界解包并编译，请求不重新读取来源。页面不读取秘密或上传文件。
+
+输入头名单最多32个原声明，构建时规范化去重；敏感凭据、实体和连接头拒绝，值仍是不可信
+属性。单值1–65536字节、完整编码输入256–1048576字节、响应16–1048576字节，决策总
+期限1–60000毫秒含响应正文。body 与已验证JWT claims 均单独显式开启；正文上限1–1048576
+字节，1–32项去参数精确media type须唯一、无通配符或参数，并且正文必须为合法JSON。
+通过后原字节和trailers重放；类型不支持415、正文超限413、读取或JSON失败400，缺主体403，
+头值无效或输入过大431。consumer 只来自认证链，客户端身份头不能提供身份。
+
+明确deny返回403；依赖传输、期限、求值、响应协议及非法obligation默认503，仅这些依赖
+失败可由 `fail_open=true` 放行，本地输入和身份门仍拒绝。义务先整组验证再应用，失败义务
+从不部分执行，失败开放也不执行它。请求/响应头及审计key名单各最多256项；义务头禁止
+Authorization、Cookie、Host和连接/分帧控制字段，审计key为1–64字节ASCII字母、数字、
+下划线、连字符或点。单次条目1–256、单值1–65536字节、名称和值总量1–1048576字节。
+
+cache 只保存明确allow/deny，分别使用1–300000毫秒TTL，本节点容量1–1000000；外部策略
+须声明1–128可见ASCII字节的policy_revision，embedded使用bundle revision或摘要。相同
+输入及策略域共享决策，域包含可信身份、策略修订和实际服务凭据摘要。singleflight仅合并
+本节点同键并发miss，follower等待1–30000毫秒、活跃key上限1–65536；表满有界绕过。
+distributed经DynamicStore复验修订、过期与义务，启用时共享容量1–1000000且collection
+须合法。依赖错误不缓存；首次退避1–60000毫秒，上限不低于首次且最多300000毫秒，
+不能把退避期间不外呼当成缓存错误结果。原认证、WAF和其它独立治理保持原声明。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |

@@ -16,6 +16,7 @@ import { routeDlpDraftLists } from "./route_dlp.js";
 import { routeCsrfDraftLists } from "./route_csrf.js";
 import { routeGeoipDraftLists } from "./route_geoip.js";
 import { routeCasbinDraftLists } from "./route_casbin.js";
+import { routeOpaDraftLists } from "./route_opa.js";
 import { routeResponseContractDraftLists } from "./route_response_contract.js";
 import {
   routeBodyTransformDraftLists,
@@ -91,6 +92,7 @@ function lists(kind, values) {
   result.push(...routeCsrfDraftLists(kind));
   result.push(...routeGeoipDraftLists(kind));
   result.push(...routeCasbinDraftLists(kind));
+  result.push(...routeOpaDraftLists(kind));
   result.push(...routeResponseContractDraftLists(kind));
   result.push(...routeBodyTransformDraftLists(kind));
   return result.map((item) => {
