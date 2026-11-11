@@ -29,6 +29,7 @@ import { routeDegraphqlFieldGroups } from "./route_degraphql.js";
 import { routeCasbinFieldGroups } from "./route_casbin.js";
 import { routeOpaFieldGroups } from "./route_opa.js";
 import { routeExtProcFieldGroups } from "./route_ext_proc.js";
+import { routeGrpcTranscodingFieldGroups } from "./route_grpc_transcoding.js";
 
 const groups = {
   route: [
@@ -304,6 +305,21 @@ export function nestedFields(kind, values, capacity) {
         "ext_proc 的 fail_open 只覆盖连接、期限、服务不可用、容量和 circuit 等已分类依赖错误；错序、重复、畸形 protobuf、越权 mutation、未授权 metadata、gRPC 明确拒绝及本地输入资源门始终关闭。依赖开放后本请求永久 bypass，后续相位不再访问处理器；先前合法变更保持。buffered 请求体超限413、读取失败400，响应体与协议失败500；入流依赖失败默认503，流已发 head 后的失败只能终止正文。",
         "subtle",
       ),
+      element(
+        "p",
+        "grpc_transcoding 需要目标制品启用 grpc-descriptor 能力。FileDescriptorSet 来自受信本地文件，相对路径以主配置目录解析；文件内容在有界读取后编译为当前快照的 RPC 计划。google_http 和 connect_json 至少启用一个，移除完整声明才停用 descriptor JSON 转码。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "service 和 method 使用 protobuf full name，不接受斜杠、空白或重复项；services 必须非空，methods 空名单表示允许所选 service 的全部方法，descriptor 扩展时暴露范围可能随之变化。名单仅约束 JSON 转码入口，原生 gRPC 透传仍由路由和鉴权策略控制。未知 Connect JSON schema 返回404，错误 unary 或 streaming Content-Type 返回415；未命中的普通 JSON HTTP 请求保持普通路由语义。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "JSON 文档预算不能超过输入或输出消息预算，未完成 stream 缓冲不能超过输入输出消息预算的较大值。reject_unknown_fields 显式关闭时允许忽略 descriptor 未声明的 JSON 字段；不改变原生 protobuf 的未知字段语义。展示和逐项编辑不填入协议默认值，不改未编辑的 descriptor 引用、名单、开关和其它治理。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -436,6 +452,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeCasbinFieldGroups(kind),
     ...routeOpaFieldGroups(kind),
     ...routeExtProcFieldGroups(kind),
+    ...routeGrpcTranscodingFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

@@ -331,6 +331,28 @@ gRPC明确拒绝及本地预算。依赖开放后当前请求永久bypass，后�
 413、读取400，响应body失败500，均不受失败开放。流式head发出后的失败只能终止body。
 每次变更先整组验证再提交，未编辑的原预算、开关、秘密引用与其它治理保持。
 
+Descriptor 驱动 gRPC JSON 表单提供 `grpc_transcoding` 的十二项原生声明与 service、method
+两个逐项名单。节点必须启用 `grpc-descriptor`；FileDescriptorSet 为受信本地文件，相对路径
+以主配置目录解析，快照绑定同一份有界文件字节和 RPC 计划。`google_http` 与 `connect_json`
+至少开启一个；移除完整声明停止 descriptor JSON 转码。
+
+service full name 必须显式列出1–128项，method full name 子集最多2048项；名称不得含斜杠、
+空白或重复项。methods 空名单允许所选 service 的全部方法，descriptor 新增方法时暴露范围
+可能随之变化；固定范围应逐项列出。名单只约束 JSON 转码入口，原生 gRPC 透传另由路由与
+鉴权策略控制。未知 Connect JSON schema 返回404，unary/streaming 媒体类型不匹配返回415；
+未匹配 google.api.http 的普通 JSON HTTP 请求保持原路由语义。
+
+descriptor 文件预算1024–33554432字节，输入/输出消息、JSON 文档与未完成流缓冲分别为
+1–67108864字节；JSON 上限不能超过输入和输出预算，缓冲不能超过两者的较大值。每 stream
+消息上限1–10000000。`reject_unknown_fields` 显式关闭时忽略 descriptor 未声明的 JSON
+字段，不改变原生 protobuf 的未知字段语义。逐项编辑和整段移除保持未编辑的引用、宽整数、
+名单、开关与其它治理，不物化运行时默认值。
+
+完整 descriptor pool 还独立限制为最多256个文件、1024个 service 和8192个 method，不能
+通过缩小白名单绕过。转码独占 request/response body 和 RPC path，不能叠加请求/响应校验、
+实体转换、GraphQL、缓存、hedge、镜像、内部路由、直接响应及路径改写，也不能与 grpc_edge
+或静态服务、聚合、Dubbo 等专用终端后端组合；候选须由原目标构建器完整复验。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |

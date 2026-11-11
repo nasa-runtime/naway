@@ -19,6 +19,7 @@ import { routeCasbinDraftLists } from "./route_casbin.js";
 import { routeOpaDraftLists } from "./route_opa.js";
 import { routeExternalPluginDraftLists } from "./route_external_plugin.js";
 import { routeExtProcDraftLists } from "./route_ext_proc.js";
+import { routeGrpcTranscodingDraftLists } from "./route_grpc_transcoding.js";
 import { routeResponseContractDraftLists } from "./route_response_contract.js";
 import {
   routeBodyTransformDraftLists,
@@ -97,6 +98,7 @@ function lists(kind, values) {
   result.push(...routeCasbinDraftLists(kind));
   result.push(...routeOpaDraftLists(kind));
   result.push(...routeExtProcDraftLists(kind));
+  result.push(...routeGrpcTranscodingDraftLists(kind));
   result.push(...routeResponseContractDraftLists(kind));
   result.push(...routeBodyTransformDraftLists(kind));
   return result.map((item) => {
