@@ -353,6 +353,26 @@ descriptor 文件预算1024–33554432字节，输入/输出消息、JSON 文档
 实体转换、GraphQL、缓存、hedge、镜像、内部路由、直接响应及路径改写，也不能与 grpc_edge
 或静态服务、聚合、Dubbo 等专用终端后端组合；候选须由原目标构建器完整复验。
 
+路由级 `grpc_edge` 表单提供三十五项原生叶字段与四个逐项名单，包括动作、精确方法、身份、
+授权、发送队列、PublishStream 和节点预算。仅 `enabled=true` 且节点启用 `grpc-edge` 能力时
+接管精确 RPC；关闭或移除后保持普通 L7 透传。关闭时可预置声明，类型与未知字段仍须合法。
+subscribe 与 publish/push 必须使用不同路由和认证配置，分别声明 `required` 与 `service`；
+动作 header 只确认已匹配的方法，不能把普通业务 RPC 改成边缘动作。
+
+user 来自已验证主体的 claim 或已认证 consumer，客户端自报 header 不产生身份。
+`tenant_claim` 省略时使用 default tenant，声明时必须从已验证主体取得，不能与 `user_claim`
+相同。启用时必须显式声明 `authz`，空名单拒绝对应动作；未允许的动作不得声明 RPC 或非空
+授权名单。模式支持字面量、末尾 `*`、`%{user}` 和 `%{tenant}`，单项最多512字节。
+WS 桥接只适用于 subscribe，沿用同一身份、授权和预算，路径不能与边缘 RPC 相同。
+
+消息 body 最多16777216字节，另计5字节 gRPC 前缀；队列字节、节点 payload 驻留字节和
+PublishStream 累计字节各须能容纳一条最大完整帧。旧顶层 `max_msg_bytes` 与权威位置
+`limits.max_msg_bytes` 同时声明时须相等，逐项移除旧别名不会改写权威预算。
+队满按 `drop_oldest`、`drop_new`、`latest_by_key` 或 `close_slow` 处理，`at_most_once`
+不承诺离线补发。PublishStream 速率门通过背压节流，其余寿命、消息数、累计字节门到界返回
+已处理 summary 供发布方轮转。表单不自动启用能力，不物化默认预算，不重写其它策略或引用。
+全局 `grpc_edge_cluster` 独立决定跨节点传输与目录，不由路由表单隐式创建或更改。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |

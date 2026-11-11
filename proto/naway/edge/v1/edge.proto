@@ -27,8 +27,8 @@ option java_multiple_files = true;
 // **租户与用户身份不接受客户端自报**:tenant/user 一律取自已验证 principal 的 claim
 // (JWT claim,或非 JWT 认证下的已认证 consumer)。客户端放在 metadata 或消息体里的
 // 任何身份字段都不会被采信。能碰哪个 group 由 route 的 `grpc_edge.authz` 策略决定,
-// 越权返回 PERMISSION_DENIED(7)。兼容旧配置时 authz 整段缺省仍表示不限制 scope;
-// 生产 route 必须显式配置 authz,配置块存在后才是 deny-by-default。
+// 越权返回 PERMISSION_DENIED(7)。启用边缘模式的 route 必须显式声明 authz，缺失时
+// 构建期拒绝；各动作名单为空即拒绝对应 scope，公开放行也须显式声明 "*"。
 //
 // 每个方法的 `:path` 由 route 配置,下面的注释给出默认形态。
 

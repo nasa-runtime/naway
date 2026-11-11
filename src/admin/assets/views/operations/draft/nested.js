@@ -30,6 +30,7 @@ import { routeCasbinFieldGroups } from "./route_casbin.js";
 import { routeOpaFieldGroups } from "./route_opa.js";
 import { routeExtProcFieldGroups } from "./route_ext_proc.js";
 import { routeGrpcTranscodingFieldGroups } from "./route_grpc_transcoding.js";
+import { routeGrpcEdgeFieldGroups } from "./route_grpc_edge.js";
 
 const groups = {
   route: [
@@ -320,6 +321,21 @@ export function nestedFields(kind, values, capacity) {
         "JSON 文档预算不能超过输入或输出消息预算，未完成 stream 缓冲不能超过输入输出消息预算的较大值。reject_unknown_fields 显式关闭时允许忽略 descriptor 未声明的 JSON 字段；不改变原生 protobuf 的未知字段语义。展示和逐项编辑不填入协议默认值，不改未编辑的 descriptor 引用、名单、开关和其它治理。",
         "subtle",
       ),
+      element(
+        "p",
+        "grpc_edge 仅在 enabled=true 且原目标具备 grpc-edge 能力时接管精确动作 RPC；关闭或移除后保持普通 L7 透传。subscribe 与 publish/push 必须分路由及认证配置，分别使用 required 和 service。动作 header 只是二次确认，不能覆盖精确 RPC 路径。客户端 header 不产生可信身份；user 取已验证 claim 或已认证 consumer，显式 tenant_claim 必须在已验证主体中存在，且与 user_claim 不同。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "启用边缘模式必须显式声明 authz；对应名单为空即拒绝，未允许的 action 不能声明 RPC 或非空授权名单。模式只支持字面量、末尾 * 和 %{user} / %{tenant}，不使用会被配置环境展开的变量语法。WS 桥接只提供订阅传输，复用同一身份、授权及预算，不提供另一套权限。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "边缘消息上限不含5字节前缀；发送队列字节、节点 payload 驻留和 PublishStream 累计字节须各能容纳最大完整帧。旧 max_msg_bytes 与 limits.max_msg_bytes 同时声明必须相等。队满按声明丢弃、合并或关闭慢客户端，at_most_once 不提供离线补发；PublishStream 速率通过背压节流，寿命/消息数/累计字节到界返回已处理 summary 供发布方轮转。逐项编辑不填入默认值，不改未编辑的身份映射、名单或其它路由策略。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -453,6 +469,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeOpaFieldGroups(kind),
     ...routeExtProcFieldGroups(kind),
     ...routeGrpcTranscodingFieldGroups(kind),
+    ...routeGrpcEdgeFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
