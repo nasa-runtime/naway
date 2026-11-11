@@ -105,7 +105,7 @@ pub(crate) struct ExtProcMetadata {
     namespaces: std::collections::HashMap<String, prost_types::Struct>,
 }
 
-#[cfg(feature = "ext-proc")]
+#[cfg(feature = "inference-gateway")]
 impl ExtProcMetadata {
     /// 业务作用：读取 EPP 等处理器写入的单个字符串决策，不把完整 protobuf 结构暴露给数据面。
     ///

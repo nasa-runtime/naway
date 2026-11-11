@@ -5889,7 +5889,16 @@ impl GatewayProxy {
                     changes.apply_headers(response.headers_mut());
                     if changes.replaces_body() {
                         let bytes = changes.apply_body(Bytes::new());
-                        normalize_content_length(response.headers_mut(), bytes.len());
+                        // 新实体不能沿用上游分块和尾部声明；声明无法编码时拒绝交付，避免混合两份消息边界。
+                        if normalize_ext_proc_response_framing(
+                            response.headers_mut(),
+                            bytes.len(),
+                            None,
+                        )
+                        .is_err()
+                        {
+                            return text_status(500, "external processor response framing failed");
+                        }
                         *response.body_mut() = full_body(bytes);
                         replaced_tail = true;
                     }
@@ -6001,7 +6010,16 @@ impl GatewayProxy {
                         }
                     }
                 }
-                normalize_content_length(&mut parts.headers, bytes.len());
+                // 原 body 已被消费，必须按实际保留的尾部重建边界，不能带着半更新的 head 返回。
+                if normalize_ext_proc_response_framing(
+                    &mut parts.headers,
+                    bytes.len(),
+                    trailers.as_ref(),
+                )
+                .is_err()
+                {
+                    return text_status(500, "external processor response framing failed");
+                }
                 let metadata = shared.lock().await.metadata();
                 parts.extensions.insert(metadata);
                 shared.lock().await.finish();
@@ -12689,6 +12707,43 @@ fn normalize_content_length(headers: &mut http::HeaderMap, length: usize) {
     } else {
         headers.remove(http::header::CONTENT_LENGTH);
     }
+}
+
+#[cfg(feature = "ext-proc")]
+/// 业务作用：为处理器重建的响应选择唯一实体边界，使保留的尾部字段能够由下游协议完整编码。
+///
+/// 参数说明：
+/// - `headers`：是上游响应及处理器变更后的头部，不再拥有原传输分块边界。
+/// - `length`：是最终 DATA 字节数，不包含尾部字段。
+/// - `trailers`：是仍将重放的实际尾部帧；缺失表示原尾部已经被替换或不存在。
+///
+/// 返回：成功时移除旧 Transfer-Encoding，有尾部时撤去 Content-Length 并声明实际字段，
+/// 无尾部时使用精确长度；字段声明不能编码时失败，调用方必须停止交付该响应。
+fn normalize_ext_proc_response_framing(
+    headers: &mut HeaderMap,
+    length: usize,
+    trailers: Option<&HeaderMap>,
+) -> Result<(), http::header::InvalidHeaderValue> {
+    // 旧分块编码属于已消费的上游传输，不能与新长度并存；有尾部时由下游编码器选择分块或 H2 帧。
+    headers.remove(http::header::TRANSFER_ENCODING);
+    headers.remove(http::header::TRAILER);
+    if let Some(trailers) = trailers {
+        // 精确 DATA 长度不代表实体帧已经结束，保留 Content-Length 会让 HTTP/1 跳过后续尾部。
+        headers.remove(http::header::CONTENT_LENGTH);
+        let mut names = String::new();
+        for name in trailers.keys() {
+            if !names.is_empty() {
+                names.push_str(", ");
+            }
+            names.push_str(name.as_str());
+        }
+        if !names.is_empty() {
+            headers.insert(http::header::TRAILER, HeaderValue::from_str(&names)?);
+        }
+    } else {
+        normalize_content_length(headers, length);
+    }
+    Ok(())
 }
 
 /// 业务作用：body 被遮蔽后删除已不再对应最终实体的摘要、validator 与 range header。

@@ -3645,6 +3645,20 @@ end
 脚本标识、阶段、预算、失败策略与内容指纹。`gw_script_invocations_total{phase,outcome}` 提供固定
 相位和结果计数，Prometheus 与 OTLP 共享同一事实源。关闭 feature 后不编译 Lua，也不增加数据面分支。
 
+## Envoy External Processing
+
+启用 `ext-proc` feature 后，路由可通过 `ext_proc` 选择标准 ExternalProcessor.Process
+双向 gRPC 处理器、相位、资源预算和可写权限。所选 head 和 trailer 包含全部原始头字节，
+其中业务凭据也对处理器可见，只应接入受信服务；服务 Authorization metadata 使用独立秘密源。
+依赖故障可按 `fail_open` 放行，协议拒绝、非法变更与本地输入预算始终关闭。
+
+正文支持 none、buffered 和 streamed。none 不发送正文相位，但头阶段明确
+`CONTINUE_AND_REPLACE` 仍可有界替换或清空实体。聚合或替换响应后，原上游分块声明
+不再参与下游编码：保留实际 trailers 时声明其当前字段且不发送 Content-Length，HTTP/1.1
+使用分块、HTTP/2 使用 DATA 与尾部 HEADERS；没有 trailers 时使用新实体的精确长度，
+不保留已失效的 Trailer 声明。同名尾部字段的多个值保持原顺序，不折叠成最后一个值。
+空 DATA 与尾部帧仍分别结束，不以正文长度代替尾部完成。
+
 ## Spring Cloud Gateway 配置兼容
 
 `scg-compat` 仅在构建期将 Spring Cloud Gateway Server WebFlux 声明翻译为普通 Naway 路由。

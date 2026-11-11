@@ -125,7 +125,7 @@ http = "1"
 http-body-util = { version = "0.1", features = ["channel"] }
 httpdate = "1"                           # cache 条件请求解析 RFC HTTP-date，不自造不完整日期语法
 hmac = "0.12"                           # RFC2136 DNS-01 的 HMAC-SHA256 TSIG 签名与响应认证
-hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper = { version = "1.11", features = ["http1", "http2", "server", "client"] }
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio", "webpki-roots"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "tokio", "http1", "http2"] }
 h3 = { version = "0.0.8", optional = true, features = ["tracing"] } # HTTP/3 frame/QPACK 状态机；只由 http3 feature 引入

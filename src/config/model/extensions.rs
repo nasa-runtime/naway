@@ -402,7 +402,7 @@ pub struct ExtProcCfg {
 #[derive(Debug, Deserialize, Clone, Copy, Default, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtProcBodyModeCfg {
-    /// 不发送 body，也不允许 body mutation。
+    /// 不发送 body 相位；头部明确 CONTINUE_AND_REPLACE 时仍可有界替换或清空原实体。
     #[default]
     None,
     /// 聚合到显式上限后发送单条完整 body。
