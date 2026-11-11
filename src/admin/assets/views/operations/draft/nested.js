@@ -28,6 +28,7 @@ import { routeGraphqlGuardFieldGroups } from "./route_graphql_guard.js";
 import { routeDegraphqlFieldGroups } from "./route_degraphql.js";
 import { routeCasbinFieldGroups } from "./route_casbin.js";
 import { routeOpaFieldGroups } from "./route_opa.js";
+import { routeExtProcFieldGroups } from "./route_ext_proc.js";
 
 const groups = {
   route: [
@@ -288,6 +289,21 @@ export function nestedFields(kind, values, capacity) {
         "插件 id 在整条链中唯一，字段编辑保持原 id；新增和整值替换须显式填写，替换会移除旧元素其它字段。请求相位不能声明可见响应头；目标必须是 HTTP(S) origin 或 lb://service，路径独立且无 query。列表支持插入、字段编辑、替换、移动和确认删除；空数组或移除完整 external_plugins 停用链，原认证与其它治理保持。internal 和公共 proxy_cache 组合由原目标构建器拒绝。",
         "subtle",
       ),
+      element(
+        "p",
+        "ext_proc 需要目标制品启用 ext-proc 能力，至少选择一个 head、body 或 trailer 相位。启用 head 或 trailer 会发送其全部原始头字节，请求中包含的业务凭据也对处理器可见，只应配置受信 gRPC 服务。服务 Authorization 使用独立 SecretSource；可写头名单不限制输入可见范围，认证拥有的身份头、凭据、伪头、目标及连接分帧字段始终禁止改写。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "none 不发送 body 相位，但头部明确 CONTINUE_AND_REPLACE 仍可在正文预算内替换或清空原实体。buffered 有界聚合，streamed 每个 DATA 等待唯一匹配响应形成背压；开启 trailer 且非 streamed 时也会先有界读取正文。streamed body 阶段不能改写 head；请求相位允许有界 ImmediateResponse，响应相位不接受即时响应。处理器不能动态扩大相位或修改既定期限。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "ext_proc 的 fail_open 只覆盖连接、期限、服务不可用、容量和 circuit 等已分类依赖错误；错序、重复、畸形 protobuf、越权 mutation、未授权 metadata、gRPC 明确拒绝及本地输入资源门始终关闭。依赖开放后本请求永久 bypass，后续相位不再访问处理器；先前合法变更保持。buffered 请求体超限413、读取失败400，响应体与协议失败500；入流依赖失败默认503，流已发 head 后的失败只能终止正文。",
+        "subtle",
+      ),
     );
   }
   if (kind === "service") {
@@ -419,6 +435,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeDegraphqlFieldGroups(kind),
     ...routeCasbinFieldGroups(kind),
     ...routeOpaFieldGroups(kind),
+    ...routeExtProcFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

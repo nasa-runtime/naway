@@ -303,6 +303,34 @@ UTF-8字节、编码输入256–1048576字节、处理器响应16–1048576字�
 或编码输入超限返回431，编码错误500；响应输入错误500，均不受失败开放。列表操作
 只提交本次元素动作，未修改秘密引用、宽整数和开关保持原声明，不物化运行时默认值。
 
+Envoy External Processing 表单提供 `ext_proc` 的十九项原生声明与两个逐项字符串名单。
+节点制品必须启用 `ext-proc` 能力；至少选择一个head、body或trailer相位，关闭须移除
+完整声明。开启head或trailer会发送其全部原始头字节，请求里的业务凭据也对受信处理器
+可见；mutation名单仅限制写权限。服务Authorization metadata使用独立SecretSource，
+解析后最多16384字节。目标为无userinfo、path或query的HTTP(S)origin，或≤253字节
+安全ASCII服务名的 `lb://service`，使用固定标准ExternalProcessor.Process双向流。
+
+body模式为none、buffered或streamed。none不发送body相位，但头部明确
+`CONTINUE_AND_REPLACE` 仍可有界替换或清空原实体；buffered收集完整有界实体，
+streamed逐DATA等待唯一同相位响应并施加背压。trailer开启且非streamed时也会先有界
+读取正文。streamed body相位禁止head变更；即时响应仅允许请求相位，响应相位收到
+ImmediateResponse须拒绝。处理器不能用mode_override或期限覆盖扩大原声明权限。
+
+每相位期限1–60000毫秒，整流期限不得更小且最多900000毫秒。单条protobuf payload
+为256–16777216字节；双向累计含每条5字节gRPC envelope，不得低于单条预算且最多
+134217728字节。每方向body上限1–67108864字节且不得超过总量；每路由同时处理流
+1–65536，连续依赖失败阈值1–10000，circuit冷却1–60000毫秒。可写头最多128项，
+修剪并规范化后须唯一；凭据、伪头、连接分帧/目标字段、全部x-forwarded-/x-naway-
+及本地认证拥有的身份头冻结。metadata namespace最多32项，每项1–128字节安全ASCII
+字母、数字、点、连字符或下划线且唯一，仅在当前请求和后续相位间保存。
+
+`fail_open` 只覆盖已分类的连接、期限、服务不可用、入流容量与circuit等Dependency；
+Protocol和Input始终关闭，包括错序、重复、畸形protobuf、越权mutation、错误namespace、
+gRPC明确拒绝及本地预算。依赖开放后当前请求永久bypass，后续相位不再外呼，之前已
+通过的合法变更保持。入流依赖失败默认503，头部协议失败500；buffered请求body超限
+413、读取400，响应body失败500，均不受失败开放。流式head发出后的失败只能终止body。
+每次变更先整组验证再提交，未编辑的原预算、开关、秘密引用与其它治理保持。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |
