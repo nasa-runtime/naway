@@ -1488,6 +1488,13 @@ dubbo:
   max_hessian_depth: 32
 ```
 
+路由 `gateway_redirect` 是独立终端后端，支持301、302、303、307、308及目标 scheme、hostname、
+port、完整路径或成对前缀替换。路径遵循入口安全规范化，原 query 保留；路径替换互斥，前缀
+不匹配或 authority 无效返回400，危险编码路径仍在入口拒绝。
+省略 scheme 保留监听协议；省略 hostname 保留入站主机。省略 port 时，仅在 scheme 未覆盖时保留
+入站端口，否则使用目标协议默认端口。管理草稿提供七字段独立编辑，不补默认值；后端切换须显式
+移除旧终端并声明新终端，不能同时保留普通 `uri`。
+
 MQTT stream listener 可通过独立 `mqtt-governance` feature 启用 MQTT 3.1.1/5.0 协议治理；
 关闭时仍是原有透明 TCP 转发，可选地只 preread CONNECT client id 做路由。治理 profile 在拨号
 broker 前校验 client id，并对 PUBLISH topic、SUBSCRIBE/UNSUBSCRIBE filter、QoS1/2 packet-id
