@@ -711,6 +711,17 @@ Kubernetes 数字端口与端口名称互斥，ServiceImport 使用 MCS Endpoint
 `allow_plaintext=true` 时允许，部署方须保证该网络的身份边界。移除整段 `out_of_band`
 才停止订阅；关闭全部反馈时同时移除订阅，并将模式改为 `none` 或移除整段 `load_feedback`。
 
+路由的 LLM 入口表单独立提供 `api_type`、`max_body_bytes`、`max_prompt_tokens`、
+`max_completion_tokens`、`max_response_bytes`、`max_stream_frame_bytes`、`max_duration_ms`
+和 `max_cost_microusd`。API 类型必须与原模型兼容；请求实体、提示词、补全、响应累计量、流记录、
+单次模型调用期限及估算费用各自受原目标的完整策略约束。SSE 事件与 NDJSON 行跨 HTTP DATA 块计量；
+流已建立后超额会中止正文，不能再改成另一个 HTTP 状态。预算与编码语义见[模型入口说明](../README.md)。
+
+这些字段缺省保持原声明，不补模型、价格、凭据或默认授权，也不重建未编辑的模型目录、配额、
+护栏、moderation、缓存与治理声明。费用的 `u64::MAX` 仅观测声明可在保持状态下保留原文；
+显式宽整数须通过原始 YAML 输入，字段控件不会以浮点近似值重建它。单项移除恢复该字段原生缺省，
+移除完整 `llm` 才解除模型后端；切换普通 HTTP 等终端须显式设置对应 URI，并满足原有认证和路由约束。
+
 已有对象另提供“逐项编辑有序列表”，覆盖路由断言、处理链、凭据引用、静态实例、接口请求
 方法、HTTP/3 扩展及已声明的其它数组。静态实例有 URI、权重、下线、备用、健康、慢启动及
 地域字段控件；对象元素也可单独设置扩展字段。每次列表操作单独生成候选，不带上普通字段
