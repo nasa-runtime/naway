@@ -1173,6 +1173,10 @@ signature 或签名的 in-toto Statement；两者同时声明时全部验证。O
 证明失效时直接拒绝候选；重新下载相同内容不能恢复失去的信任。获取、验签、编译或实例化失败时，
 当前路由快照保持不变。
 
+内容缓存命中不访问 registry，也不证明 tag 当前状态；OCI manifest、layer descriptor 与模块摘要的
+对应关系在 registry 获取路径校验。来源引用与 manifest 摘要声明的变化仍参与配置比较，缓存命中
+只证明固定模块内容及当前供应链证明，不代替 registry 的在线观察。
+
 ```yaml
 routes:
   - id: verified-wasm

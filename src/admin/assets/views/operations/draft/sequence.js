@@ -21,6 +21,7 @@ import { routeExternalPluginDraftLists } from "./route_external_plugin.js";
 import { routeExtProcDraftLists } from "./route_ext_proc.js";
 import { routeGrpcTranscodingDraftLists } from "./route_grpc_transcoding.js";
 import { routeGrpcEdgeDraftLists } from "./route_grpc_edge.js";
+import { routeWasmDraftLists } from "./route_wasm.js";
 import { routeResponseContractDraftLists } from "./route_response_contract.js";
 import {
   routeBodyTransformDraftLists,
@@ -57,6 +58,7 @@ function lists(kind, values) {
     });
   }
   result.push(...routeExternalPluginDraftLists(kind));
+  result.push(...routeWasmDraftLists(kind));
   for (const [key, value] of Object.entries(values)) {
     if (
       key !== "id" &&
@@ -249,15 +251,18 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "body_transform_extract",
           "body_transform_emit",
           "external_plugin",
+          "wasm_plugin",
         ].includes(selected.type)
       ) {
-        // 流路由和外部插件的新增或整值替换须显式声明 id，字段编辑不开放原元素的身份变更。
+        // 流路由和插件的新增或整值替换须显式声明 id，字段编辑不开放原元素的身份变更。
         const type =
           selected.type === "stream_route"
             ? "stream_route_new"
             : selected.type === "external_plugin"
               ? "external_plugin_new"
-              : selected.type;
+              : selected.type === "wasm_plugin"
+                ? "wasm_plugin_new"
+                : selected.type;
         fields = draftFieldPanel(type, {}, capacity);
         body.append(
           element(
@@ -394,6 +399,15 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           (typeof action.fields?.id !== "string" || !action.fields.id.trim())
         ) {
           throw new Error("新增或替换外部插件必须明确填写非空的稳定身份 id。");
+        }
+        if (
+          selected.type === "wasm_plugin" &&
+          (typeof action.fields?.id !== "string" ||
+            action.fields.id.length === 0)
+        ) {
+          throw new Error(
+            "新增或替换 Proxy-Wasm 插件必须明确填写非空的稳定身份 id。",
+          );
         }
         edit = {
           op,

@@ -373,6 +373,29 @@ PublishStream 累计字节各须能容纳一条最大完整帧。旧顶层 `max_
 已处理 summary 供发布方轮转。表单不自动启用能力，不物化默认预算，不重写其它策略或引用。
 全局 `grpc_edge_cluster` 独立决定跨节点传输与目录，不由路由表单隐式创建或更改。
 
+Proxy-Wasm 插件链按原始位置提供二十三项原生声明。新增或整值替换必须明确填写稳定 id；
+已有元素字段编辑不开放 id 变更，移动和确认删除只作用于选中元素。`module_file` 与
+`module_source` 二选一；切换来源须显式移除旧声明。远程来源的十项声明与 attestation
+六项约束可逐项编辑，未编辑的材料引用、未知字段与宽整数继续保留在服务端原始候选中。
+
+远程模块固定最终字节 SHA-256，并验证 detached Ed25519 signature/public_key 或签名
+in-toto statement；同时声明时两者都须有效，OCI tag 还须绑定 manifest 摘要。候选构建时
+获取或读取内容缓存，再验证和编译模块；缓存命中仍复验当前字节上限、模块摘要、凭据格式、
+附加 CA、签名及 provenance。内容缓存不访问 registry，不证明 tag 当前状态，manifest 与
+layer 的对应关系在下载路径校验。来源引用和 manifest 声明的变化仍属于独立的配置比较身份。
+页面只编辑 SecretSource 文本，不获取模块或信任材料。
+
+`config` 为最多65536字节的编码 JSON。`callout_clusters` 使用明确完整的 JSON 列表，
+每项字段为 `name`、`origin`、`ca_certificate`、`allow_cleartext`、`http2_prior_knowledge`；
+最多32项、名称唯一，origin 只接受不带 userinfo、业务 path、query 或 fragment 的 HTTP(S)
+origin。明文 HTTP 须显式允许，HTTP/2 prior knowledge 仅用于已允许的明文 origin。
+客体只能引用固定名称；运行时不提供 WASI、文件、socket 或环境访问。
+
+六种相位分别处理请求或响应的 head、聚合 body、逐帧 body；同一方向不能混用聚合与流式
+body，相位选择不会自动授予 callout。每 route 的 Wasm 与脚本总数最多16项。
+显式 fail_open 只跳过可开放的客体执行错误并丢弃本插件部分输出，保留前一插件已提交结果；
+共享资源准入拒绝仍关闭。未编辑的预算不会因控件展示而物化为运行默认值。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |

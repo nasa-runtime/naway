@@ -31,6 +31,7 @@ import { routeOpaFieldGroups } from "./route_opa.js";
 import { routeExtProcFieldGroups } from "./route_ext_proc.js";
 import { routeGrpcTranscodingFieldGroups } from "./route_grpc_transcoding.js";
 import { routeGrpcEdgeFieldGroups } from "./route_grpc_edge.js";
+import { wasmSourceFieldGroups } from "./route_wasm.js";
 
 const groups = {
   route: [
@@ -119,6 +120,25 @@ const groups = {
 export function nestedFields(kind, values, capacity) {
   const node = element("div", "", "draft-nested");
   const rows = [];
+  if (["wasm_plugin", "wasm_plugin_new"].includes(kind)) {
+    node.append(
+      element(
+        "p",
+        "本地 module_file 与远程 module_source 必须二选一，切换时须显式移除旧来源。模块在候选构建期验证并编译；不提供 WASI、文件、socket 或环境访问。只有显式 body 相位才检查对应正文预算，聚合与流式 body 相位不能在同一方向混用。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "远程模块必须固定最终字节 SHA-256，并声明成对 detached signature/public_key 或签名 attestation；两者同时声明时都须通过。OCI tag 还须固定 manifest 摘要。页面只编辑 SecretSource，不获取材料。内容缓存命中仍复验当前字节上限、模块摘要、凭据格式、CA、签名和 provenance；命中时不访问 registry，不证明 tag 当前状态。manifest 与 layer 对应关系在 registry 下载路径校验。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "callout_clusters 以明确的完整 JSON 列表编辑，每项只声明 name、固定 HTTP(S) origin、可选 ca_certificate、allow_cleartext 和 http2_prior_knowledge；名称须唯一，origin 不得带业务 path、query、fragment 或 userinfo。HTTP 必须显式允许明文，prior knowledge 仅适用于已允许的明文 HTTP；客体只能引用名称，不能自行选择网络目标。fail_open 不开放共享资源准入拒绝，前一插件已提交输出保持，本插件部分输出丢弃。",
+        "subtle",
+      ),
+    );
+  }
   if (kind === "route") {
     node.append(
       element(
@@ -470,6 +490,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeExtProcFieldGroups(kind),
     ...routeGrpcTranscodingFieldGroups(kind),
     ...routeGrpcEdgeFieldGroups(kind),
+    ...wasmSourceFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
