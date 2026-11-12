@@ -1,8 +1,8 @@
 /**
- * 业务作用：显式维护 LLM 入口预算与模型选择声明，避免重建模型凭据或其它治理配置。
+ * 业务作用：显式维护 LLM 入口预算、选择和 Token 配额声明，避免重建模型凭据或其它治理配置。
  * 参数说明：
  * - `kind`：当前草稿对象类别。
- * 返回：仅路由提供独立的入口预算与选择字段，不自动添加模型、注入凭据或授予副本发送权。
+ * 返回：仅路由提供独立字段，不自动添加模型、注入凭据、授予副本发送权或放宽额度。
  */
 export function routeLlmFieldGroups(kind) {
   if (kind !== "route") {
@@ -44,6 +44,33 @@ export function routeLlmFieldGroups(kind) {
           "max_cost_microusd",
           "估算费用上限（正数，微美元；保留原声明的仅观测模式）",
           "number",
+        ],
+      ],
+    ],
+    [
+      ["llm"],
+      "LLM Token 配额完整声明",
+      [
+        [
+          "token_quota",
+          "完整 Token 配额（移除关闭配额，保留模型与认证）",
+          "json",
+        ],
+      ],
+    ],
+    [
+      ["llm", "token_quota"],
+      "LLM Token 预留与结算配额",
+      [
+        ["tokens", "每窗口补充 Token 数（正数）", "number"],
+        ["window_ms", "配额补充窗口（毫秒；1–86400000）", "number"],
+        ["burst", "额外突发 Token 容量（0表示无额外容量）", "number"],
+        ["dimension", "已验证额度身份（route、consumer、api_key）", "string"],
+        ["max_active_keys", "同规则真实活跃维度上限（1–1000000）", "number"],
+        [
+          "active_keys_fail_open",
+          "维度表满时允许未记账的新维度（不放开已有桶）",
+          "boolean",
         ],
       ],
     ],
