@@ -2239,8 +2239,8 @@ impl GatewayProxy {
                     text_status(503, "Agent protocol is not compiled")
                 }
             } else if route.llm.is_some() {
-                // LLM 分支的 future 约 8KiB，且只有显式 LLM route 会执行；在冷分支装箱可避免
-                // 它把所有普通 HTTP/gRPC 请求的统一 service future 撑大，普通转发不新增分配。
+                // 模型交付拥有独立的异步状态，只有显式 LLM 路由才为其分配存储，避免把多协议
+                // 状态叠加到普通 HTTP/gRPC 请求的入口栈帧。
                 let circuit_started = (!circuit_permits.is_empty()).then(Instant::now);
                 match Box::pin(
                     self.forward_llm(LlmForwardRequest {
@@ -3171,7 +3171,7 @@ impl GatewayProxy {
         }
     }
 
-    /// 业务作用：执行统一 Chat 请求的身份、内容、检索、预算和模型交付管线。
+    /// 业务作用：隔离模型入口的协议执行状态，并执行 Chat 请求的身份、内容、检索、预算与交付管线。
     ///
     /// 参数说明：
     /// - `ctx`：持有同代快照、冻结认证事实和唯一请求实体。
@@ -3186,7 +3186,9 @@ impl GatewayProxy {
         #[cfg(feature = "ai-governance")]
         let governance_deadline = tokio::time::Instant::now() + policy.max_duration;
         if policy.api_type != crate::ai::llm::LlmApiType::ChatCompletions {
-            return self.forward_native_ai(ctx, policy).await;
+            // 原生 API 包含与 Chat 不同的实体和长连接状态；分开保存，避免未执行的协议分支
+            // 也扩大当前模型请求的栈帧。
+            return Box::pin(self.forward_native_ai(ctx, policy)).await;
         }
         if content_length_exceeds(&ctx.parts, policy.max_body_bytes) {
             return LlmForwardOutcome::Local(text_status(413, "LLM request body too large"));
@@ -3733,7 +3735,8 @@ impl GatewayProxy {
                 "chat.completions",
                 &model.id,
             );
-            let response = self.forward(forward::ForwardRequest {
+            // 统一上游转发跨越连接、认证与响应多个阶段，独立保存其状态，限制模型交付的嵌套栈占用。
+            let response = Box::pin(self.forward(forward::ForwardRequest {
                 snap: ctx.snap,
                 proxy: ctx.proxy,
                 route: ctx.route,
@@ -3754,7 +3757,7 @@ impl GatewayProxy {
                 websocket_max_lifetime_ms: None,
                 websocket_frame_limits: None,
                 trace: Some(ctx.trace),
-            });
+            }));
             #[cfg(feature = "ai-governance")]
             let response = if let Some(execution) = &governance {
                 match execution.wait(response).await {
@@ -4166,7 +4169,8 @@ impl GatewayProxy {
         policy: &crate::ai::llm::LlmRoutePolicy,
     ) -> LlmForwardOutcome {
         if policy.api_type == crate::ai::llm::LlmApiType::Realtime {
-            return self.forward_realtime_ai(ctx, policy).await;
+            // 长连接升级状态独立于普通原生 JSON 请求，避免冷分支扩大每个原生 API 的栈帧。
+            return Box::pin(self.forward_realtime_ai(ctx, policy)).await;
         }
         if ctx.downstream_upgrade.is_some() {
             return LlmForwardOutcome::Local(text_status(
@@ -4361,7 +4365,8 @@ impl GatewayProxy {
                 ));
             }
             let started = Instant::now();
-            let future = self.forward(forward::ForwardRequest {
+            // 原生 API 的连接和响应状态跨 await 保留，由独立存储承载，避免与协议实体状态嵌套。
+            let future = Box::pin(self.forward(forward::ForwardRequest {
                 snap: ctx.snap,
                 proxy: ctx.proxy,
                 route: ctx.route,
@@ -4382,7 +4387,7 @@ impl GatewayProxy {
                 websocket_max_lifetime_ms: None,
                 websocket_frame_limits: None,
                 trace: Some(ctx.trace),
-            });
+            }));
             let mut response = match tokio::time::timeout(policy.max_duration, future).await {
                 Err(_) if attempt + 1 < model_count => continue,
                 Err(_) => {
@@ -4504,7 +4509,8 @@ impl GatewayProxy {
         let mut parts = ctx.parts;
         model.prepare_headers(&mut parts, true);
         let consumer = ctx.route.authenticated_consumer(&parts);
-        let future = self.forward(forward::ForwardRequest {
+        // Realtime 已持有升级和连接治理句柄，上游握手状态独立保存，限制单次升级的嵌套栈占用。
+        let future = Box::pin(self.forward(forward::ForwardRequest {
             snap: ctx.snap,
             proxy: ctx.proxy,
             route: ctx.route,
@@ -4530,7 +4536,7 @@ impl GatewayProxy {
                 policy.max_response_bytes as u64,
             )),
             trace: Some(ctx.trace),
-        });
+        }));
         match tokio::time::timeout(policy.max_duration, future).await {
             Ok(Ok(mut response)) => {
                 response.headers_mut().insert(
@@ -4567,7 +4573,8 @@ impl GatewayProxy {
         let deadline = tokio::time::Instant::now() + policy.timeout;
         let mut parts = ctx.parts.clone();
         policy.prepare_headers(&mut parts);
-        let future = self.forward(forward::ForwardRequest {
+        // Moderation 与模型交付共享请求执行链，外部调用状态独立保存，避免叠加到模型请求栈帧。
+        let future = Box::pin(self.forward(forward::ForwardRequest {
             snap: ctx.snap,
             proxy: ctx.proxy,
             route: ctx.route,
@@ -4588,7 +4595,7 @@ impl GatewayProxy {
             websocket_max_lifetime_ms: None,
             websocket_frame_limits: None,
             trace: Some(ctx.trace),
-        });
+        }));
         let response = tokio::time::timeout_at(deadline, future)
             .await
             .context("LLM moderation timeout")?
