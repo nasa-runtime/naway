@@ -1,5 +1,5 @@
 /**
- * 业务作用：显式维护 LLM 入口预算、选择、配额和内容策略，避免重建模型凭据或其它治理配置。
+ * 业务作用：显式维护 LLM 入口预算、选择、配额、缓存和内容策略，避免重建模型凭据或其它治理配置。
  * 参数说明：
  * - `kind`：当前草稿对象类别。
  * 返回：仅路由提供独立字段，不自动添加模型、注入凭据、授予副本发送权或放宽额度。
@@ -56,6 +56,50 @@ export function routeLlmFieldGroups(kind) {
           "完整本地护栏（移除关闭本地规则与可信提示，保留外部判定）",
           "json",
         ],
+      ],
+    ],
+    [
+      ["llm"],
+      "LLM 语义缓存完整声明",
+      [
+        [
+          "semantic_cache",
+          "完整语义缓存（移除关闭缓存，保留模型和认证）",
+          "json",
+        ],
+      ],
+    ],
+    [
+      ["llm", "semantic_cache"],
+      "LLM 缓存容量与隔离",
+      [
+        ["ttl_ms", "条目存活时间（1–604800000毫秒）", "number"],
+        ["max_entries", "每路由与隔离范围条目上限（1–1000000）", "number"],
+        ["max_response_bytes", "可回填响应字节上限（1–16777216）", "number"],
+        ["similarity_threshold", "余弦相似度阈值（0–1）", "number"],
+        [
+          "max_candidates",
+          "单次最近候选上限（1–1024；与维度乘积不超过1048576）",
+          "number",
+        ],
+        ["l2", "使用共享 Redis L2（须已配置 Redis 后端）", "bool"],
+        [
+          "scope",
+          "可信身份隔离（consumer、api_key；route 须允许公共复用）",
+          "string",
+        ],
+        ["embedding", "完整 embedding 服务（设置会替换整个子声明）", "json"],
+      ],
+    ],
+    [
+      ["llm", "semantic_cache", "embedding"],
+      "LLM Embedding 服务",
+      [
+        ["uri", "固定 embedding 服务 URI（http、https 或 lb）", "string"],
+        ["model", "固定 embedding 模型名", "string"],
+        ["path", "API 路径（空使用 /v1/embeddings）", "string"],
+        ["api_key", "凭据 SecretSource（空表示不注入）", "string"],
+        ["max_dimensions", "接受的向量维度上限（1–65536）", "number"],
       ],
     ],
     [

@@ -1414,6 +1414,8 @@ Token 配额的补充量、窗口、突发、验证身份维度和容量策略�
 只有显式依赖故障放行才继续模型，完整正文与响应头共用一次判定期限。
 本地内容护栏支持多行可信提示、输入与输出短语和类型化分类规则；规则来源须明确三选一，
 流式输出保留足够文本窗口，命中时终止交付；移除本地护栏保留外部判定与认证。
+语义缓存可独立编辑容量、存活时间、可信身份隔离和 embedding 服务；明确公共路由共享才跨身份
+复用，响应超出回填预算仍正常返回，移除缓存保留模型与认证。
 
 provider 计划支持 OpenAI、Anthropic、Google Gemini Developer API、Azure OpenAI、AWS Bedrock、
 Vertex AI、Cohere、Mistral、Hugging Face、xAI、DashScope、DeepSeek、Ollama 和 vLLM。Azure API 版本、
