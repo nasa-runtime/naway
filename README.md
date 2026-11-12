@@ -1417,6 +1417,9 @@ Token 配额的补充量、窗口、突发、验证身份维度和容量策略�
 语义缓存可独立编辑容量、存活时间、可信身份隔离和 embedding 服务；明确公共路由共享才跨身份
 复用，响应超出回填预算仍正常返回，移除缓存保留模型与认证。
 
+固定提示模板也可独立编辑名称、业务修订、文件与固定变量；变量不读取请求或执行表达式，
+移除模板保留其余治理和认证。
+
 provider 计划支持 OpenAI、Anthropic、Google Gemini Developer API、Azure OpenAI、AWS Bedrock、
 Vertex AI、Cohere、Mistral、Hugging Face、xAI、DashScope、DeepSeek、Ollama 和 vLLM。Azure API 版本、
 Bedrock region/SigV4、Vertex project/region 与所有 endpoint 都在候选快照中冻结；API key、AWS access

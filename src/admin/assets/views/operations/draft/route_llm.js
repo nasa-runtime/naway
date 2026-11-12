@@ -59,6 +59,21 @@ export function routeLlmFieldGroups(kind) {
       ],
     ],
     [
+      ["llm", "governance"],
+      "LLM 固定提示完整声明",
+      [["prompt", "完整固定模板（移除只关闭模板注入，保留治理身份）", "json"]],
+    ],
+    [
+      ["llm", "governance", "prompt"],
+      "LLM 固定提示模板（需 ai-governance）",
+      [
+        ["name", "模板名称（固定业务身份）", "string"],
+        ["revision", "模板修订标识（配置固定，客户端不能覆盖）", "string"],
+        ["file", "UTF-8 模板文件（相对配置目录，最多64KiB）", "string"],
+        ["variables", "完整固定字符串变量映射（设置会替换整份映射）", "json"],
+      ],
+    ],
+    [
       ["llm"],
       "LLM 语义缓存完整声明",
       [
