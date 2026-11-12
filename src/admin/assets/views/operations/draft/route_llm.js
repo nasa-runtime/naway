@@ -1,5 +1,5 @@
 /**
- * 业务作用：显式维护 LLM 入口预算、选择、配额和外部内容判定声明，避免重建模型凭据或其它治理配置。
+ * 业务作用：显式维护 LLM 入口预算、选择、配额和内容策略，避免重建模型凭据或其它治理配置。
  * 参数说明：
  * - `kind`：当前草稿对象类别。
  * 返回：仅路由提供独立字段，不自动添加模型、注入凭据、授予副本发送权或放宽额度。
@@ -44,6 +44,44 @@ export function routeLlmFieldGroups(kind) {
           "max_cost_microusd",
           "估算费用上限（正数，微美元；保留原声明的仅观测模式）",
           "number",
+        ],
+      ],
+    ],
+    [
+      ["llm"],
+      "LLM 本地内容护栏完整声明",
+      [
+        [
+          "guardrails",
+          "完整本地护栏（移除关闭本地规则与可信提示，保留外部判定）",
+          "json",
+        ],
+      ],
+    ],
+    [
+      ["llm", "guardrails"],
+      "LLM 本地内容规则与可信提示",
+      [
+        ["rules", "完整结构化规则列表（设置值会替换整个名单）", "json"],
+        [
+          "stream_window_bytes",
+          "解码文本保留窗口（有规则时64–65536；须覆盖最长响应匹配）",
+          "number",
+        ],
+        [
+          "system_prompt",
+          "前置可信 system 提示（保留换行；空表示不注入）",
+          "multiline",
+        ],
+        [
+          "blocked_substrings",
+          "输入阻断完整短语名单（每行一项，最多64条）",
+          "lines",
+        ],
+        [
+          "blocked_response_substrings",
+          "输出阻断完整短语名单（每行一项，最多64条）",
+          "lines",
         ],
       ],
     ],
@@ -228,11 +266,40 @@ export const llmModelFields = [
   ["weight", "weighted 相对权重（0–1000000；0保留回退资格）", "number"],
 ];
 
+export const llmGuardrailFields = [
+  ["id", "规则稳定 id（1–64字节，仅字母、数字、.、_、-）", "string"],
+  [
+    "category",
+    "固定分类（prompt_injection、jailbreak、pii、secret、content）",
+    "string",
+  ],
+  [
+    "directions",
+    "完整方向名单（每行 request 或 response，不空且不重复）",
+    "lines",
+  ],
+  [
+    "contains",
+    "固定包含文本（保留换行；与 regex、detector 三选一）",
+    "multiline",
+  ],
+  [
+    "regex",
+    "有界正则（不能空匹配；与 contains、detector 三选一）",
+    "multiline",
+  ],
+  [
+    "detector",
+    "固定检测器（email、phone、national_id、api_key、private_key、bearer）",
+    "string",
+  ],
+];
+
 /**
- * 业务作用：按原始位置编辑模型目录和选择能力名单，避免重建其它模型或默认授予端点、凭据和能力。
+ * 业务作用：按原始位置编辑模型、能力和内容规则名单，避免重建其它声明或默认授予端点、凭据和能力。
  * 参数说明：
  * - `kind`：当前草稿对象类别。
- * 返回：仅路由提供模型列表与两项能力名单；新增模型须显式提供身份及真实后端，已有身份不由字段补丁改写。
+ * 返回：仅路由提供明确类型的名单；新增模型与规则须声明身份，已有身份不由字段补丁改写。
  */
 export function routeLlmDraftLists(kind) {
   if (kind !== "route") {
@@ -253,6 +320,21 @@ export function routeLlmDraftLists(kind) {
       path: ["llm", "selection", "preferred_capabilities"],
       title: "LLM 软偏好能力",
       type: "string",
+    },
+    {
+      path: ["llm", "guardrails", "blocked_substrings"],
+      title: "LLM 输入阻断短语",
+      type: "string",
+    },
+    {
+      path: ["llm", "guardrails", "blocked_response_substrings"],
+      title: "LLM 输出阻断短语",
+      type: "string",
+    },
+    {
+      path: ["llm", "guardrails", "rules"],
+      title: "LLM 内容分类规则",
+      type: "llm_guardrail",
     },
   ];
 }

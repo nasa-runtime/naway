@@ -269,10 +269,11 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "script_plugin",
           "bff_target",
           "llm_model",
+          "llm_guardrail",
           "ws_message_plugin",
         ].includes(selected.type)
       ) {
-        // 稳定 id 绑定路由、插件、聚合目标和模型目录中的引用，只在新增或整值替换时开放身份声明。
+        // 稳定 id 绑定路由、插件、聚合目标、模型与内容规则身份，只在新增或整值替换时开放声明。
         const type =
           selected.type === "stream_route"
             ? "stream_route_new"
@@ -286,7 +287,9 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
                     ? "bff_target_new"
                     : selected.type === "llm_model"
                       ? "llm_model_new"
-                      : selected.type;
+                      : selected.type === "llm_guardrail"
+                        ? "llm_guardrail_new"
+                        : selected.type;
         fields = draftFieldPanel(type, {}, capacity);
         body.append(
           element(
@@ -480,6 +483,34 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
             ) {
               throw new Error(`新增或替换模型必须明确填写非空的 ${key}。`);
             }
+          }
+        }
+        // 分类、方向与唯一匹配来源必须由操作者明确选择，不能从旧规则猜测新增的阻断范围。
+        if (selected.type === "llm_guardrail") {
+          if (
+            typeof action.fields?.id !== "string" ||
+            !/^[A-Za-z0-9_.-]{1,64}$/.test(action.fields.id)
+          ) {
+            throw new Error(
+              "新增或替换内容规则必须明确填写1–64字节的稳定 id，仅允许字母、数字、.、_、-。",
+            );
+          }
+          if (
+            typeof action.fields.category !== "string" ||
+            !action.fields.category.trim() ||
+            !Array.isArray(action.fields.directions) ||
+            !action.fields.directions.length
+          ) {
+            throw new Error(
+              "新增或替换内容规则必须明确填写分类与非空方向名单。",
+            );
+          }
+          if (
+            ["contains", "regex", "detector"].filter((key) =>
+              Object.hasOwn(action.fields, key),
+            ).length !== 1
+          ) {
+            throw new Error("新增或替换内容规则必须明确选择恰好一种匹配来源。");
           }
         }
         edit = {
