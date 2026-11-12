@@ -7615,70 +7615,83 @@ impl<T> BudgetIo<T> {
         }
     }
 
-    /// 业务作用：为隧道实际搬运字节记账，并在总预算耗尽时终止继续传输。
+    /// 业务作用：在任一方向写入前共同预留剩余交付额度，阻止超额字节先到达对端。
     ///
     /// 参数说明：
-    /// - `bytes`：是本次底层 IO 已实际完成的字节数。
+    /// - `maximum`：本次调用最多希望交付的字节数。
     ///
-    /// 返回：预算内返回成功；累计值超过上限时返回 IO 错误。
-    fn charge(&self, bytes: usize) -> std::io::Result<()> {
-        if self.limit == 0 || bytes == 0 {
-            return Ok(());
+    /// 返回：返回本次独占的可写前缀长度；额度耗尽且仍需写入时拒绝，空写不占用额度。
+    fn reserve(&self, maximum: usize) -> std::io::Result<usize> {
+        if self.limit == 0 || maximum == 0 {
+            return Ok(maximum);
         }
-        let used = self
-            .counter
-            .fetch_add(bytes as u64, Ordering::Relaxed)
-            .saturating_add(bytes as u64);
-        if used > self.limit {
-            return Err(std::io::Error::other("tunnel byte budget exhausted"));
+        let mut used = self.counter.load(Ordering::Relaxed);
+        loop {
+            let available = self.limit.saturating_sub(used);
+            if available == 0 {
+                return Err(std::io::Error::other("tunnel byte budget exhausted"));
+            }
+            let reserved = available.min(maximum as u64);
+            // 两个方向在外部写入前取得互不重叠的额度，不能先写出再发现另一方向已用完预算。
+            match self.counter.compare_exchange_weak(
+                used,
+                used + reserved,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(reserved as usize),
+                Err(current) => used = current,
+            }
         }
-        Ok(())
     }
 }
 
 impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for BudgetIo<T> {
-    /// 业务作用：透明读取隧道字节，并按真实读取量执行共享总预算门禁。
+    /// 业务作用：透明读取待转发数据，把共享额度留给实际向对端交付的写入。
     ///
     /// 参数说明：
     /// - `cx`：是异步任务上下文
     /// - `buf`：是下游提供的读取缓冲。
     ///
-    /// 返回：返回底层读取结果；读后超预算时返回错误终止隧道。
+    /// 返回：返回底层读取结果；读取不代表已完成转发，不重复扣减写入额度。
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &result {
-            let read = buf.filled().len().saturating_sub(before);
-            if let Err(error) = self.charge(read) {
-                return Poll::Ready(Err(error));
-            }
-        }
-        result
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
 impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for BudgetIo<T> {
-    /// 业务作用：透明写入隧道字节，并按真实写入量执行共享总预算门禁。
+    /// 业务作用：只向底层交付本次已预留的前缀，并按实际写出量保留共享预算占用。
     ///
     /// 参数说明：
     /// - `cx`：是异步任务上下文
     /// - `buf`：是待写字节。
     ///
-    /// 返回：返回底层写入结果；写后超预算时返回错误终止隧道。
+    /// 返回：返回底层实际写入结果；余额不足时可短写，耗尽后拒绝新的非空写入，0预算保持不限。
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(written)) = &result {
-            if let Err(error) = self.charge(*written) {
-                return Poll::Ready(Err(error));
-            }
+        if self.limit == 0 || buf.is_empty() {
+            return Pin::new(&mut self.inner).poll_write(cx, buf);
+        }
+        let reserved = match self.reserve(buf.len()) {
+            Ok(reserved) => reserved,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let result = Pin::new(&mut self.inner).poll_write(cx, &buf[..reserved]);
+        let written = match &result {
+            Poll::Ready(Ok(written)) => *written,
+            _ => 0,
+        };
+        // 未完成、失败或短写都不能永久消耗尚未交付的额度，否则另一方向会被虚假的用量拒绝。
+        let unused = reserved.saturating_sub(written);
+        if unused > 0 {
+            self.counter.fetch_sub(unused as u64, Ordering::Relaxed);
         }
         result
     }
