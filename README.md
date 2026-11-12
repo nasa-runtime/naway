@@ -1406,6 +1406,8 @@ DATA 块中不会合并其单记录额度；未知媒体类型继续限制单个
 独立审批和持久执行。移除完整 `llm` 后切换其它后端，需要显式填写对应的后端声明。
 模型目录可按原位置新增、替换、编辑、移动和删除；已有模型的稳定 `id` 不通过字段补丁改写。
 新增或替换须明确提供 `id`、provider、URI 和模型名，未编辑的凭据、价格与能力保持原声明。
+选择策略、两项能力名单、首 token 排序边界、shadow 和 rollout 也可独立编辑；后台副本与灰度
+引用均须显式成对声明，后台结果不能成为主响应或回退。边界见[管理草稿](docs/admin-draft-editing.md#管理页面)。
 
 provider 计划支持 OpenAI、Anthropic、Google Gemini Developer API、Azure OpenAI、AWS Bedrock、
 Vertex AI、Cohere、Mistral、Hugging Face、xAI、DashScope、DeepSeek、Ollama 和 vLLM。Azure API 版本、

@@ -1,8 +1,8 @@
 /**
- * 业务作用：显式维护 LLM 入口协议与请求资源预算，避免编辑预算时重建模型凭据或其它治理声明。
+ * 业务作用：显式维护 LLM 入口预算与模型选择声明，避免重建模型凭据或其它治理配置。
  * 参数说明：
  * - `kind`：当前草稿对象类别。
- * 返回：仅路由提供八项原生声明，不自动选择模型、注入凭据或修改其它终端后端。
+ * 返回：仅路由提供独立的入口预算与选择字段，不自动添加模型、注入凭据或授予副本发送权。
  */
 export function routeLlmFieldGroups(kind) {
   if (kind !== "route") {
@@ -43,6 +43,57 @@ export function routeLlmFieldGroups(kind) {
         [
           "max_cost_microusd",
           "估算费用上限（正数，微美元；保留原声明的仅观测模式）",
+          "number",
+        ],
+      ],
+    ],
+    [
+      ["llm"],
+      "LLM 选择策略完整声明",
+      [["selection", "完整选择声明（移除恢复原生缺省，保留模型目录）", "json"]],
+    ],
+    [
+      ["llm", "selection"],
+      "LLM 模型选择与独立副本",
+      [
+        [
+          "strategy",
+          "首选策略（ordered、cost、latency、weighted、joint）",
+          "string",
+        ],
+        [
+          "required_capabilities",
+          "必需能力完整名单（每行一项，最多16项，全部满足才保留模型）",
+          "lines",
+        ],
+        [
+          "preferred_capabilities",
+          "joint 软偏好完整名单（每行一项，最多16项）",
+          "lines",
+        ],
+        [
+          "max_first_token_latency_ms",
+          "joint 首 token 排序边界（毫秒；0不声明，不替代请求期限）",
+          "number",
+        ],
+        [
+          "shadow_model",
+          "独立后台副本的固定模型 id（须与正数采样份额同时声明）",
+          "string",
+        ],
+        [
+          "shadow_basis_points",
+          "shadow 采样份额（0–10000；0须同时解除模型引用）",
+          "number",
+        ],
+        [
+          "rollout_model",
+          "灰度首选固定模型 id（失败仍回退，不能与 shadow 相同）",
+          "string",
+        ],
+        [
+          "rollout_basis_points",
+          "rollout 采样份额（0–10000；0须同时解除模型引用）",
           "number",
         ],
       ],
@@ -118,10 +169,10 @@ export const llmModelFields = [
 ];
 
 /**
- * 业务作用：按原始位置编辑固定模型目录，避免重建其它模型或默认授予端点、凭据和能力。
+ * 业务作用：按原始位置编辑模型目录和选择能力名单，避免重建其它模型或默认授予端点、凭据和能力。
  * 参数说明：
  * - `kind`：当前草稿对象类别。
- * 返回：仅路由提供模型列表；新增与整值替换须显式提供身份及真实后端，已有身份不由字段补丁改写。
+ * 返回：仅路由提供模型列表与两项能力名单；新增模型须显式提供身份及真实后端，已有身份不由字段补丁改写。
  */
 export function routeLlmDraftLists(kind) {
   if (kind !== "route") {
@@ -132,6 +183,16 @@ export function routeLlmDraftLists(kind) {
       path: ["llm", "models"],
       title: "LLM 固定模型目录",
       type: "llm_model",
+    },
+    {
+      path: ["llm", "selection", "required_capabilities"],
+      title: "LLM 必需能力",
+      type: "string",
+    },
+    {
+      path: ["llm", "selection", "preferred_capabilities"],
+      title: "LLM 软偏好能力",
+      type: "string",
     },
   ];
 }

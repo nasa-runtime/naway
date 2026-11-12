@@ -627,7 +627,7 @@ export function nestedFields(kind, values, capacity) {
   /**
    * 业务作用：只提交显式子字段动作，未知子字段继续由服务端原始树持有。
    * 参数说明: 无。
-   * 返回：有限设置和移除序列，不包含读取到的完整原始父对象。
+   * 返回：有限设置和移除序列，不包含完整原始父对象；同次动作的祖先与子项重叠时拒绝。
    */
   function read() {
     const edits = [];
@@ -647,6 +647,21 @@ export function nestedFields(kind, values, capacity) {
 
           value: action.value,
         });
+      }
+    }
+    // 整段声明和子项不能争用同一原始子树，避免候选含有依赖动作顺序的半完成策略。
+    for (let index = 0; index < edits.length; index++) {
+      for (const other of edits.slice(index + 1)) {
+        const left = edits[index].path;
+        const right = other.path;
+        const shared = Math.min(left.length, right.length);
+        if (
+          left.slice(0, shared).every((key, offset) => key === right[offset])
+        ) {
+          throw new Error(
+            "同一字段不能同时整值修改和编辑子项，请只选择一种方式。",
+          );
+        }
       }
     }
     return edits;

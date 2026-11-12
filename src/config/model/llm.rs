@@ -282,7 +282,7 @@ pub struct LlmSelectionCfg {
     /// joint 策略的软偏好能力；命中项越多，语义得分越高。
     #[serde(default)]
     pub preferred_capabilities: Vec<String>,
-    /// joint 策略允许的首 token 延迟上界；模型声明值或运行 EWMA 超过时不作为首选。
+    /// joint 首 token 排序边界；声明值或运行 EWMA 超出时排在边界内模型之后，不替代请求期限。
     #[serde(default)]
     pub max_first_token_latency_ms: u64,
     /// 可选 shadow 模型 id；只接收按比例采样的副本，结果永不进入主响应或 fallback。
@@ -308,11 +308,11 @@ pub enum LlmSelectionStrategyCfg {
     Ordered,
     /// 按 input+output 配置单价从低到高。
     Cost,
-    /// 按本进程成功响应头延迟 EWMA 从低到高；无样本时保持配置顺序。
+    /// 未采样模型优先探索；已有样本按本进程响应头延迟 EWMA 升序，同值保持配置顺序。
     Latency,
     /// 按配置权重为请求稳定选择首模型，其余保持 fallback 顺序。
     Weighted,
-    /// 同时按能力、SLO、估算费用和本进程语义亲和度计算首选顺序。
+    /// 联合能力偏好、首 token 排序边界、单价与可用延迟事实确定首选顺序。
     Joint,
 }
 
