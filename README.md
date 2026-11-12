@@ -1619,6 +1619,10 @@ Origin 仅接受精确 HTTP(S) 来源，不能包含通配符或业务路径；�
 `early_data_shared_replay_cache: true`；配置与实际后端不一致时 listener 不会发布。证书或 listener
 generation 切换会使旧的本地恢复状态失效，客户端自动回到 1-RTT。
 
+管理草稿提供路由 `early_data.enabled` 与 `early_data.replay_window_ms` 两个独立字段。
+关闭时保留窗口声明但不生成执行计划；页面不自动改变安全方法、请求体转发、认证或监听恢复
+能力，候选须同时满足路由与监听器的安全合同才可发布。
+
 ```yaml
 runtime_state:
   replay_guard:
