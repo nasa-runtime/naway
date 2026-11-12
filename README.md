@@ -3558,6 +3558,37 @@ FLV route 将 `format` 改为 `flv`。`start` 是**原文件字节偏移**，不
 管理路由摘要包含容器、预算和资源域指纹，不公开本地根。`gw_media_operations_total` 只按固定
 `format/outcome` 计数；`prepared` 表示响应已准备，不代表客户端已经播放或完整下载。
 
+## 固定 API mock 响应
+
+`mock_response` 在候选构建时冻结状态码、响应头与 UTF-8 正文，命中路由后直接返回共享正文，
+不访问上游，也不展开动态模板。适合提供固定接口响应；启用时须明确移除普通 `uri` 等其它
+终端后端声明，原有下游认证和 WAF 仍执行。
+
+```yaml
+schema_version: 1
+proxies:
+  - id: public
+    listen: "127.0.0.1:8080"
+    routes:
+      - id: mock-order
+        predicates: ["Path=/mock/order"]
+        mock_response:
+          status: 200
+          headers:
+            Content-Type: application/json
+            X-Response-Source: fixed
+          body: '{"state":"accepted"}'
+```
+
+状态码接受 HTTP 解析器支持的200–999，拒绝所有信息响应；204/304 必须使用空正文。
+正文最多1MiB，原始响应头声明最多64项。头名按大小写不敏感语义编译，同值别名合并，冲突值
+拒绝整个候选；每个头名只有一个固定值，不提供多条 Set-Cookie 语义。Connection、
+Transfer-Encoding 与 Content-Length 不允许声明，非法头名或头值也拒绝候选。
+mock 不与请求/响应校验、共享缓存、镜像或内部响应重路由组合，已发布配置在候选无效时继续服务。
+
+管理草稿提供状态、完整头映射与多行正文的独立编辑，保留显式空值、换行和未编辑声明；
+后端切换由用户明确选择。
+
 ## 只读 BFF 聚合
 
 `bff_aggregation` 把1–16个固定 HTTP GET 子请求合并为一个 JSON 响应，每个稳定 target id
