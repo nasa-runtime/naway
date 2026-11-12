@@ -3176,7 +3176,8 @@ impl GatewayProxy {
     /// 参数说明：
     /// - `ctx`：持有同代快照、冻结认证事实和唯一请求实体。
     ///
-    /// 返回：本地拒绝或经过当前路由策略裁决的模型响应。
+    /// 返回：本地拒绝或经过当前路由策略裁决的模型响应；Chat 上游响应头与完整 JSON 正文
+    /// 共用单次调用期限，正文超时返回 504 并保留用量未知的保守配额预留。
     async fn forward_llm(self: &Arc<Self>, mut ctx: LlmForwardRequest<'_>) -> LlmForwardOutcome {
         let policy = ctx
             .route
@@ -3735,6 +3736,8 @@ impl GatewayProxy {
                 "chat.completions",
                 &model.id,
             );
+            // 同一模型的响应头与完整 JSON 正文共享截止时间，避免对端通过逐阶段等待扩大资源预算。
+            let provider_deadline = tokio::time::Instant::now() + policy.max_duration;
             // 统一上游转发跨越连接、认证与响应多个阶段，独立保存其状态，限制模型交付的嵌套栈占用。
             let response = Box::pin(self.forward(forward::ForwardRequest {
                 snap: ctx.snap,
@@ -3758,6 +3761,7 @@ impl GatewayProxy {
                 websocket_frame_limits: None,
                 trace: Some(ctx.trace),
             }));
+            let response = tokio::time::timeout_at(provider_deadline, response);
             #[cfg(feature = "ai-governance")]
             let response = if let Some(execution) = &governance {
                 match execution.wait(response).await {
@@ -3774,6 +3778,8 @@ impl GatewayProxy {
             };
             #[cfg(not(feature = "ai-governance"))]
             let response = response.await;
+            // 响应头超时沿用上游传输超时的模型回退、观测与最终配额退回规则。
+            let response = response.unwrap_or(Err(forward::ForwardError::Timeout));
             let mut response = match response {
                 Ok(response) => response,
                 Err(error) => {
@@ -3807,7 +3813,11 @@ impl GatewayProxy {
                 operation.outcome("fallback");
                 // 有界排空小错误体可复用 h1 连接；超过预算立即 drop，不能为了 fallback collect
                 // 一个不可信 5xx body。h2 Drop 会按协议取消当前 stream，不影响连接其它 stream。
-                drain_llm_fallback_response(response).await;
+                let _ = tokio::time::timeout_at(
+                    provider_deadline,
+                    drain_llm_fallback_response(response),
+                )
+                .await;
                 continue;
             }
             if !response.status().is_success() {
@@ -3860,6 +3870,7 @@ impl GatewayProxy {
                         }
                     }
                 };
+                let conversion = tokio::time::timeout_at(provider_deadline, conversion);
                 #[cfg(feature = "ai-governance")]
                 let converted = if let Some(execution) = &governance {
                     // 头部到达不代表本次调用完成，整个正文等待仍受同代授权与总 deadline 限制。
@@ -3877,6 +3888,18 @@ impl GatewayProxy {
                 };
                 #[cfg(not(feature = "ai-governance"))]
                 let converted = conversion.await;
+                let converted = match converted {
+                    Ok(converted) => converted,
+                    Err(_) => {
+                        // 成功响应头之后仍可能已产生计费用量；正文期限耗尽不能被当作确定失败而退款。
+                        operation.outcome("failed");
+                        self.metrics.inc_upstream_error();
+                        return LlmForwardOutcome::Upstream(text_status(
+                            504,
+                            "LLM provider response deadline exceeded",
+                        ));
+                    }
+                };
                 match converted {
                     Ok((converted, usage, body)) => {
                         response = converted;
