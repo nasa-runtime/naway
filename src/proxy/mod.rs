@@ -14,6 +14,7 @@ mod http3_upstream;
 mod sentinel;
 use circuit::{CircuitStates, Outcome as CircuitOutcome};
 mod layers;
+mod llm_stream;
 mod observation;
 pub(crate) mod request_validation;
 pub(crate) mod response_contract;
@@ -3177,7 +3178,8 @@ impl GatewayProxy {
     /// - `ctx`：持有同代快照、冻结认证事实和唯一请求实体。
     ///
     /// 返回：本地拒绝或经过当前路由策略裁决的模型响应；Chat 上游响应头与完整 JSON 正文
-    /// 共用单次调用期限，正文超时返回 504 并保留用量未知的保守配额预留。
+    /// 共用单次调用期限，正文超时返回 504 并保留用量未知的保守配额预留；转换的 Chat SSE
+    /// 在同一调用截止及原始、转换后两阶段字节门内交付，流已建立时越界直接终止正文。
     async fn forward_llm(self: &Arc<Self>, mut ctx: LlmForwardRequest<'_>) -> LlmForwardOutcome {
         let policy = ctx
             .route
@@ -3996,6 +3998,15 @@ impl GatewayProxy {
                     .expect("LLM model id was validated as an HTTP-safe ASCII token"),
             );
             if request.stream && response.status().is_success() {
+                if !model.native_passthrough {
+                    // 先约束提供商原始事件，避免协议解析和用量结算消费预算外的上游字节。
+                    response = llm_stream::wrap_response(
+                        response,
+                        policy.max_response_bytes,
+                        policy.max_stream_frame_bytes,
+                        provider_deadline,
+                    );
+                }
                 let accounting = LlmStreamAccounting {
                     usage: ctx
                         .parts
@@ -4049,6 +4060,15 @@ impl GatewayProxy {
                         }
                     }
                 };
+                if !model.native_passthrough {
+                    // 协议转换可能增加事件长度；下游交付也必须受同一冻结额度和绝对截止约束。
+                    response = llm_stream::wrap_response(
+                        response,
+                        policy.max_response_bytes,
+                        policy.max_stream_frame_bytes,
+                        provider_deadline,
+                    );
+                }
             }
             if request.stream && response.status().is_success() {
                 let gate: Option<Arc<dyn crate::ai::guardrail::StreamGate>> = None;
