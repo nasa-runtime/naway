@@ -1,5 +1,5 @@
 /**
- * 业务作用：显式维护 LLM 入口预算、选择和 Token 配额声明，避免重建模型凭据或其它治理配置。
+ * 业务作用：显式维护 LLM 入口预算、选择、配额和外部内容判定声明，避免重建模型凭据或其它治理配置。
  * 参数说明：
  * - `kind`：当前草稿对象类别。
  * 返回：仅路由提供独立字段，不自动添加模型、注入凭据、授予副本发送权或放宽额度。
@@ -44,6 +44,39 @@ export function routeLlmFieldGroups(kind) {
           "max_cost_microusd",
           "估算费用上限（正数，微美元；保留原声明的仅观测模式）",
           "number",
+        ],
+      ],
+    ],
+    [
+      ["llm"],
+      "LLM 外部内容判定完整声明",
+      [
+        [
+          "moderation",
+          "完整 Moderation 声明（移除关闭该判定，保留模型与认证）",
+          "json",
+        ],
+      ],
+    ],
+    [
+      ["llm", "moderation"],
+      "LLM 外部 Moderation 判定",
+      [
+        ["uri", "固定判定服务（http(s):// 或 lb://service）", "string"],
+        ["model", "固定 Moderation 模型名（显式非空，最多256字节）", "string"],
+        ["path", "固定 API path（空使用 /v1/moderations）", "string"],
+        [
+          "api_key",
+          "判定服务 API key 的 SecretSource 引用（不读取秘密）",
+          "string",
+        ],
+        ["timeout_ms", "单次判定含完整正文期限（毫秒；1–60000）", "number"],
+        ["max_request_bytes", "序列化判定请求字节上限（1–16777216）", "number"],
+        ["max_response_bytes", "判定响应聚合字节上限（1–4194304）", "number"],
+        [
+          "fail_mode",
+          "依赖故障策略（closed、open；明确 flagged 始终拒绝）",
+          "string",
         ],
       ],
     ],

@@ -1410,6 +1410,8 @@ DATA 块中不会合并其单记录额度；未知媒体类型继续限制单个
 引用均须显式成对声明，后台结果不能成为主响应或回退。边界见[管理草稿](docs/admin-draft-editing.md#管理页面)。
 Token 配额的补充量、窗口、突发、验证身份维度和容量策略可逐项编辑；移除配额保留模型与认证，
 维度溢出放行须明确开启，且不能放开已有桶或工作区状态容量限制。
+外部 moderation 的固定服务、模型、凭据引用和调用预算也可独立编辑；明确 flagged 始终拒绝，
+只有显式依赖故障放行才继续模型，完整正文与响应头共用一次判定期限。
 
 provider 计划支持 OpenAI、Anthropic、Google Gemini Developer API、Azure OpenAI、AWS Bedrock、
 Vertex AI、Cohere、Mistral、Hugging Face、xAI、DashScope、DeepSeek、Ollama 和 vLLM。Azure API 版本、
