@@ -1395,6 +1395,12 @@ rerank、image、audio、video、batch、file 或 WebSocket Realtime。每种 AP
 请求体、响应累计字节、流帧、持续时间和估算费用门；非 Chat API 不进入 Chat adapter，provider 原生
 request/response 字段与 media type 保持不变。Realtime 在升级后继续执行单帧、单消息和连接寿命门。
 
+模型 HTTP 文本流的 `llm.max_stream_frame_bytes` 按协议记录计量：`text/event-stream` 按 SSE 事件，
+`application/x-ndjson` 按 LF 结束的行，均包含分隔符并跨 HTTP DATA 块累计。多个合法记录合并在同一
+DATA 块中不会合并其单记录额度；未知媒体类型继续限制单个 DATA 块。模型流请求协商
+`Accept-Encoding: identity`；上述成功文本流若仍声明其它内容编码则返回 502，避免把压缩字节当作明文记录计量。
+预算内的原生字节、扩展字段与 trailers 保持原样；超额或到期时正文中止，已交付的合法前缀不会回收。
+
 provider 计划支持 OpenAI、Anthropic、Google Gemini Developer API、Azure OpenAI、AWS Bedrock、
 Vertex AI、Cohere、Mistral、Hugging Face、xAI、DashScope、DeepSeek、Ollama 和 vLLM。Azure API 版本、
 Bedrock region/SigV4、Vertex project/region 与所有 endpoint 都在候选快照中冻结；API key、AWS access

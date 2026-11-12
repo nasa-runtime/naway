@@ -4007,6 +4007,13 @@ impl GatewayProxy {
             );
             if request.stream && response.status().is_success() {
                 if !model.native_passthrough {
+                    // 文本协议转换只能消费明文事件；不支持的编码不能按压缩后长度绕过事件额度。
+                    if !llm_stream::identity_encoding(response.headers()) {
+                        return LlmForwardOutcome::Upstream(text_status(
+                            502,
+                            "unsupported LLM stream encoding",
+                        ));
+                    }
                     // 先约束提供商原始事件，避免协议解析和用量结算消费预算外的上游字节。
                     response = llm_stream::wrap_response(
                         response,
@@ -10977,16 +10984,16 @@ struct LlmStreamAccounting {
     reservation: Option<RateLimitReservation>,
 }
 
-/// 业务作用：为 provider 原生流附加累计字节、单帧与调用截止门，同时完全保留 frame 内容和顺序。
+/// 业务作用：为原生流附加累计字节、协议记录与调用截止门，保持合法原始内容和顺序。
 ///
 /// 参数说明：
 /// - `response`：已经成功建立的原生模型流响应。
 /// - `accounting`：持有保守配额预留并结算实际用量的计量状态。
 /// - `max_response_bytes`：路由冻结的累计响应字节上限。
-/// - `max_frame_bytes`：路由冻结的单帧字节上限。
+/// - `max_frame_bytes`：SSE 事件或 NDJSON 行上限；未知媒体类型仍按单个 DATA 帧限制。
 /// - `deadline`：从当前模型 I/O 开始计算的截止，响应头到达后不能重新获得完整时长。
 ///
-/// 返回：返回透明流式响应；任一预算越界时 body 产生错误并停止读取上游。
+/// 返回：文本流编码无法安全计量时返回固定 502；其它合法流透明交付，预算越界时正文终止。
 fn wrap_native_llm_stream_response(
     response: Response<BoxBody>,
     accounting: LlmStreamAccounting,
@@ -10994,6 +11001,26 @@ fn wrap_native_llm_stream_response(
     max_frame_bytes: usize,
     deadline: tokio::time::Instant,
 ) -> Response<BoxBody> {
+    let (response, max_frame_bytes) =
+        if let Some(framing) = llm_stream::text_framing(response.headers()) {
+            // 必须先确认明文再扫描协议边界，不能把压缩 DATA 当作事件或行并宣称记录预算成立。
+            if !llm_stream::identity_encoding(response.headers()) {
+                return text_status(502, "unsupported LLM stream encoding");
+            }
+            (
+                llm_stream::wrap_text_response(
+                    response,
+                    framing,
+                    max_response_bytes,
+                    max_frame_bytes,
+                    deadline,
+                ),
+                usize::MAX,
+            )
+        } else {
+            (response, max_frame_bytes)
+        };
+    // 文本内层已按跨块记录执行硬门，外层只持有计量责任与累计/期限门，不能误拒多个合法记录的合块。
     response.map(|body| {
         NativeLlmStreamBody {
             inner: body,

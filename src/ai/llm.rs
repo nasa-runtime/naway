@@ -1372,9 +1372,9 @@ impl LlmModel {
     ///
     /// 参数说明：
     /// - `parts`：是即将发送给模型 provider 的独立请求头副本
-    /// - `stream`：表示是否使用 SSE endpoint。
+    /// - `stream`：表示是否使用流式模型 endpoint；非 Realtime 流明确要求未变换实体以执行记录预算。
     ///
-    /// 返回：无；原地清理不可信凭据并注入快照构建期解析的 provider 凭据。
+    /// 返回：原地清理不可信凭据与客户端压缩协商，注入冻结的 provider 凭据及模型流编码约束。
     pub(crate) fn prepare_headers(&self, parts: &mut Parts, stream: bool) {
         parts.headers.remove(AUTHORIZATION);
         parts.headers.remove(COOKIE);
@@ -1387,6 +1387,13 @@ impl LlmModel {
         parts.headers.remove(CONTENT_LENGTH);
         parts.headers.remove(TRANSFER_ENCODING);
         parts.headers.remove(http::header::ACCEPT_ENCODING);
+        if stream && self.api_type != LlmApiType::Realtime {
+            // 缺失 Accept-Encoding 仍允许提供商自行编码；文本记录门需要明确协商无需解码的实体。
+            parts.headers.insert(
+                http::header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
+        }
         if !matches!(self.api_type, LlmApiType::File | LlmApiType::Realtime)
             && !parts
                 .headers

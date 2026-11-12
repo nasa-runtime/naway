@@ -1,8 +1,8 @@
-//! 模型响应的累计字节、可选 SSE 事件边界与绝对截止约束。
+//! 模型响应的累计字节、可选文本记录边界与绝对截止约束。
 
 use crate::{BoxBody, BoxError};
 use bytes::Bytes;
-use http::Response;
+use http::{HeaderMap, Response};
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
 use std::future::Future;
@@ -10,6 +10,54 @@ use std::io::{Error, ErrorKind};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::time::{Instant, Sleep};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TextFraming {
+    EventStream,
+    JsonLines,
+}
+
+/// 业务作用：只为明确声明的模型文本流选择记录边界，保留未知或二进制协议的原始 DATA 约束。
+///
+/// 参数说明：
+/// - `headers`：提供商成功响应的媒体类型元数据。
+///
+/// 返回：SSE 按事件、NDJSON 按 LF 行计量；其它媒体类型不启用文本扫描。
+pub(super) fn text_framing(headers: &HeaderMap) -> Option<TextFraming> {
+    let media = headers
+        .get(http::header::CONTENT_TYPE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .next()?
+        .trim();
+    if media.eq_ignore_ascii_case("text/event-stream") {
+        Some(TextFraming::EventStream)
+    } else if media.eq_ignore_ascii_case("application/x-ndjson") {
+        Some(TextFraming::JsonLines)
+    } else {
+        None
+    }
+}
+
+/// 业务作用：确认文本资源门看到的是未变换的实体，防止把压缩字节误当作已解码事件或行。
+///
+/// 参数说明：
+/// - `headers`：可能包含多值、多层 Content-Encoding 的提供商响应头。
+///
+/// 返回：未声明编码或所有编码项均为 identity 时允许原字节计量；空项、无效值或其它编码拒绝。
+pub(super) fn identity_encoding(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            value.to_str().is_ok_and(|value| {
+                value
+                    .split(',')
+                    .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+            })
+        })
+}
 
 /// 业务作用：在模型 SSE 解码或交付前限制资源消耗，同时保留原字节、扩展字段与背压。
 ///
@@ -26,10 +74,36 @@ pub(super) fn wrap_response(
     max_event_bytes: usize,
     deadline: Instant,
 ) -> Response<BoxBody> {
+    wrap_text_response(
+        response,
+        TextFraming::EventStream,
+        max_response_bytes,
+        max_event_bytes,
+        deadline,
+    )
+}
+
+/// 业务作用：在文本流解析或原生交付之前按协议记录计量，避免 HTTP 分块方式改变业务额度。
+///
+/// 参数说明：
+/// - `response`：编码已确认无需变换的提供商文本响应。
+/// - `framing`：媒体类型对应的 SSE 事件或 NDJSON 行边界。
+/// - `max_response_bytes`：当前阶段的累计 DATA 字节上限。
+/// - `max_frame_bytes`：包含记录分隔符的单个事件或行字节上限。
+/// - `deadline`：本次模型调用的绝对截止。
+///
+/// 返回：合法数据块与 trailers 原样交付；跨块记录或累计预算超额、到期时终止并释放上游。
+pub(super) fn wrap_text_response(
+    response: Response<BoxBody>,
+    framing: TextFraming,
+    max_response_bytes: usize,
+    max_frame_bytes: usize,
+    deadline: Instant,
+) -> Response<BoxBody> {
     wrap_budget(
         response,
         max_response_bytes,
-        Some(max_event_bytes),
+        Some((framing, max_frame_bytes)),
         deadline,
     )
 }
@@ -50,26 +124,26 @@ pub(super) fn wrap_opaque_response(
     wrap_budget(response, max_response_bytes, None, deadline)
 }
 
-/// 业务作用：为模型响应建立统一资源状态，使事件解析只在明确的 SSE 路径生效。
+/// 业务作用：为模型响应建立统一资源状态，使记录扫描只在明确的文本流路径生效。
 ///
 /// 参数说明：
 /// - `response`：需要附加流式资源门的提供商响应。
 /// - `max_response_bytes`：累计 DATA 字节上限。
-/// - `max_event_bytes`：SSE 事件硬门；None 表示不透明实体，不检查事件边界。
+/// - `frame_budget`：协议记录类型与单记录硬门；None 表示不透明实体，不检查记录边界。
 /// - `deadline`：跨响应阶段不延后的调用截止。
 ///
 /// 返回：持有同一累计额度与绝对截止的响应，任一预算耗尽后只报告一次正文错误。
 fn wrap_budget(
     response: Response<BoxBody>,
     max_response_bytes: usize,
-    max_event_bytes: Option<usize>,
+    frame_budget: Option<(TextFraming, usize)>,
     deadline: Instant,
 ) -> Response<BoxBody> {
     response.map(|inner| {
         BudgetBody {
             inner: Some(inner),
             remaining: max_response_bytes,
-            max_event_bytes,
+            frame_budget,
             event_bytes: 0,
             line_has_content: false,
             previous_cr: false,
@@ -84,7 +158,7 @@ fn wrap_budget(
 struct BudgetBody {
     inner: Option<BoxBody>,
     remaining: usize,
-    max_event_bytes: Option<usize>,
+    frame_budget: Option<(TextFraming, usize)>,
     event_bytes: usize,
     line_has_content: bool,
     previous_cr: bool,
@@ -94,23 +168,38 @@ struct BudgetBody {
 }
 
 impl BudgetBody {
-    /// 业务作用：统一限制累计响应字节，并只为 SSE 跨数据块识别 CR、LF、CRLF 事件边界。
+    /// 业务作用：统一限制累计字节，并跨数据块识别 SSE 事件或 NDJSON 行，保持每条记录的独立额度。
     ///
     /// 参数说明：
-    /// - `data`：本次尚未交付的 DATA；不透明实体只累计长度，SSE 仅扫描换行，不复制业务内容。
+    /// - `data`：本次尚未交付的 DATA；文本仅扫描换行，不透明实体只累计长度，均不复制业务内容。
     ///
-    /// 返回：完整数据块在预算内时扣减累计额度，并按协议维护事件位置；否则保持原计数并拒绝交付。
+    /// 返回：完整数据块在预算内时扣减累计额度并维护记录位置；否则保持原计数并拒绝交付。
     fn accept(&mut self, data: &[u8]) -> bool {
         // 当前块必须完整落在剩余额度内；不能先交付一部分，再依赖后续轮询发现累计越界。
         if data.len() > self.remaining {
             return false;
         }
         // 错误协议可能是 JSON、文本或二进制，不能把其中的换行解释为 SSE 事件或改写内容。
-        let Some(max_event_bytes) = self.max_event_bytes else {
+        let Some((framing, max_event_bytes)) = self.frame_budget else {
             self.remaining -= data.len();
             return true;
         };
         let mut event_bytes = self.event_bytes;
+        if framing == TextFraming::JsonLines {
+            for byte in data {
+                // NDJSON 只由 LF 结束一行；可选 CR 也属于原记录，不能单独用来重开额度。
+                if event_bytes == max_event_bytes {
+                    return false;
+                }
+                event_bytes += 1;
+                if *byte == b'\n' {
+                    event_bytes = 0;
+                }
+            }
+            self.remaining -= data.len();
+            self.event_bytes = event_bytes;
+            return true;
+        }
         let mut line_has_content = self.line_has_content;
         let mut previous_cr = self.previous_cr;
         let mut completed_event_bytes = self.completed_event_bytes;
