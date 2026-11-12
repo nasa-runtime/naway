@@ -38,6 +38,7 @@ import { routeMockFieldGroups } from "./route_mock.js";
 import { routeFaultFieldGroups } from "./route_fault.js";
 import { routeDubboFieldGroups } from "./route_dubbo.js";
 import { routeRedirectFieldGroups } from "./route_redirect.js";
+import { routeWsFrameFieldGroups } from "./route_ws_frame.js";
 
 const groups = {
   route: [
@@ -126,6 +127,20 @@ const groups = {
 export function nestedFields(kind, values, capacity) {
   const node = element("div", "", "draft-nested");
   const rows = [];
+  if (kind === "ws_message_plugin") {
+    node.append(
+      element(
+        "p",
+        "每项只声明所选 type 的字段：acl 使用 consumers/opcodes；json_schema 使用 schema；redact 使用 pointers；rate_limit 使用 messages/window_ms；external 使用 endpoint、authorization、ca_certificate 和三个明确权限开关。切换类型须显式移除旧类型字段，整值替换只包含本次填写的新声明。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "消息链按顺序处理完整载荷，控制帧不进入插件；身份在握手时冻结。外呼发送原始消息字节，不跟随重定向；只有依赖错误可受 fail_open 影响，非法动作、未授权改写和输出超限不会开放。页面只编辑 SecretSource，不读取材料。",
+        "subtle",
+      ),
+    );
+  }
   if (["bff_target", "bff_target_new"].includes(kind)) {
     node.append(
       element(
@@ -541,6 +556,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeFaultFieldGroups(kind),
     ...routeDubboFieldGroups(kind),
     ...routeRedirectFieldGroups(kind),
+    ...routeWsFrameFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

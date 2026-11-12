@@ -25,6 +25,7 @@ import { routeWasmDraftLists } from "./route_wasm.js";
 import { routeScriptDraftLists } from "./route_script.js";
 import { routeBffDraftLists } from "./route_bff.js";
 import { routeDubboDraftLists } from "./route_dubbo.js";
+import { routeWsFrameDraftLists } from "./route_ws_frame.js";
 import { routeResponseContractDraftLists } from "./route_response_contract.js";
 import {
   routeBodyTransformDraftLists,
@@ -65,6 +66,7 @@ function lists(kind, values) {
   result.push(...routeScriptDraftLists(kind));
   result.push(...routeBffDraftLists(kind));
   result.push(...routeDubboDraftLists(kind));
+  result.push(...routeWsFrameDraftLists(kind));
   for (const [key, value] of Object.entries(values)) {
     if (
       key !== "id" &&
@@ -260,9 +262,10 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "wasm_plugin",
           "script_plugin",
           "bff_target",
+          "ws_message_plugin",
         ].includes(selected.type)
       ) {
-        // 流路由、插件和聚合目标的新增或整值替换须显式声明 id，字段编辑不开放原元素的身份变更。
+        // 具有稳定 id 的流路由、扩展插件和聚合目标只在新增或整值替换时开放身份声明。
         const type =
           selected.type === "stream_route"
             ? "stream_route_new"
@@ -399,6 +402,17 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           : value.read();
         if (!action || action.remove) {
           throw new Error("请明确设置新元素值。");
+        }
+        // 新消息插件没有可继承的类型，必须明确选择受支持的执行语义，不能靠其它字段猜测权限。
+        if (
+          selected.type === "ws_message_plugin" &&
+          !["acl", "json_schema", "redact", "rate_limit", "external"].includes(
+            action.fields?.type,
+          )
+        ) {
+          throw new Error(
+            "新增或替换 WebSocket 消息插件必须明确选择有效的 type。",
+          );
         }
         if (
           selected.type === "stream_route" &&
