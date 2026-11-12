@@ -39,6 +39,7 @@ import { routeFaultFieldGroups } from "./route_fault.js";
 import { routeDubboFieldGroups } from "./route_dubbo.js";
 import { routeRedirectFieldGroups } from "./route_redirect.js";
 import { routeWsFrameFieldGroups } from "./route_ws_frame.js";
+import { routeForwardProxyFieldGroups } from "./route_forward_proxy.js";
 
 const groups = {
   route: [
@@ -557,6 +558,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeDubboFieldGroups(kind),
     ...routeRedirectFieldGroups(kind),
     ...routeWsFrameFieldGroups(kind),
+    ...routeForwardProxyFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
