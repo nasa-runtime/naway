@@ -3555,6 +3555,11 @@ pub(crate) struct BffTargetPolicy {
 
 impl BffAggregationPolicy {
     /// 业务作用：编译有限的只读聚合目标、并发和响应预算，禁止任意目标或无界扇出。
+    ///
+    /// 参数说明：
+    /// - `cfg`：候选声明的固定子请求目标、共享期限和响应预算。
+    ///
+    /// 返回：全部目标可表示为合法 HTTP 请求且预算有效时生成不可变计划；否则拒绝候选，不发起子请求。
     fn build(cfg: &BffAggregationCfg) -> Result<Self> {
         anyhow::ensure!(
             (1..=16).contains(&cfg.targets.len()),
@@ -3578,15 +3583,8 @@ impl BffAggregationPolicy {
                 target.id
             );
             validate_bff_uri(&target.uri)?;
-            anyhow::ensure!(
-                target.path.starts_with('/')
-                    && target.path.len() <= 2048
-                    && !target.path.contains('?')
-                    && !target.path.contains('#')
-                    && !target.path.bytes().any(|byte| byte < 0x20),
-                "target `{}` path must be a fixed origin path without query/fragment",
-                target.id
-            );
+            validate_bff_path(&target.path)
+                .with_context(|| format!("target `{}` path", target.id))?;
             anyhow::ensure!(
                 (10..=60_000).contains(&target.timeout_ms),
                 "target `{}` timeout_ms must be within 10..=60000",
@@ -3637,6 +3635,35 @@ impl BffAggregationPolicy {
             total_timeout: Duration::from_millis(cfg.total_timeout_ms),
         })
     }
+}
+
+/// 业务作用：在候选构建时验证固定路径的 HTTP 表示，避免已发布计划到请求阶段才遇到不可解析的路径。
+///
+/// 参数说明：
+/// - `raw`：不含客户端参数的原始 origin path，合法百分号编码按原文保留。
+///
+/// 返回：仅有合法 path 且不带 scheme、authority、query 或 fragment 时成功；其它输入拒绝且不自动转义。
+fn validate_bff_path(raw: &str) -> Result<()> {
+    anyhow::ensure!(
+        raw.starts_with('/')
+            && raw.len() <= 2048
+            && !raw.contains('?')
+            && !raw.contains('#')
+            && !raw.bytes().any(|byte| byte < 0x20),
+        "BFF target path must be a fixed origin path without query/fragment"
+    );
+    // 数据面直接以相同解析器构造请求 URI；先验证可表示性，不能把原始空格或非法字节留给请求任务。
+    let uri = raw
+        .parse::<http::Uri>()
+        .context("BFF target path is not a valid HTTP origin path")?;
+    anyhow::ensure!(
+        uri.scheme().is_none()
+            && uri.authority().is_none()
+            && uri.query().is_none()
+            && uri.path() == raw,
+        "BFF target path must contain only a fixed origin path"
+    );
+    Ok(())
 }
 
 /// 业务作用：限制聚合目标标识，使输出字段和诊断归因具有稳定边界。
