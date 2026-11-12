@@ -3734,6 +3734,11 @@ pub(crate) struct MockResponsePolicy {
 
 impl MockResponsePolicy {
     /// 业务作用：冻结 mock 的状态码、头部和实体，拒绝不合法的静态响应合同。
+    ///
+    /// 参数说明：
+    /// - `cfg`：固定响应声明，头部按 HTTP 名称的大小写不敏感语义编译。
+    ///
+    /// 返回：状态、实体及每个规范化头名的值均有效时生成不可变响应；冲突声明拒绝且不发布。
     fn build(cfg: &MockResponseCfg) -> Result<Self> {
         let status = StatusCode::from_u16(cfg.status).context("invalid mock status")?;
         anyhow::ensure!(
@@ -3769,7 +3774,15 @@ impl MockResponsePolicy {
             let value = raw_value
                 .parse::<HeaderValue>()
                 .with_context(|| format!("invalid mock header value for `{name}`"))?;
-            headers.insert(name, value);
+            // HTTP 头名不区分大小写；同值别名归一，冲突必须拒绝，避免映射遍历顺序决定响应。
+            if let Some(existing) = headers.get(&name) {
+                anyhow::ensure!(
+                    existing == value,
+                    "mock has conflicting values for header `{name}`"
+                );
+            } else {
+                headers.insert(name, value);
+            }
         }
         Ok(Self {
             status,
