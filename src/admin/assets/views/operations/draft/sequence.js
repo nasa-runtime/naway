@@ -24,6 +24,7 @@ import { routeGrpcEdgeDraftLists } from "./route_grpc_edge.js";
 import { routeWasmDraftLists } from "./route_wasm.js";
 import { routeScriptDraftLists } from "./route_script.js";
 import { routeBffDraftLists } from "./route_bff.js";
+import { routeDubboDraftLists } from "./route_dubbo.js";
 import { routeResponseContractDraftLists } from "./route_response_contract.js";
 import {
   routeBodyTransformDraftLists,
@@ -63,6 +64,7 @@ function lists(kind, values) {
   result.push(...routeWasmDraftLists(kind));
   result.push(...routeScriptDraftLists(kind));
   result.push(...routeBffDraftLists(kind));
+  result.push(...routeDubboDraftLists(kind));
   for (const [key, value] of Object.entries(values)) {
     if (
       key !== "id" &&

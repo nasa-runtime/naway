@@ -36,6 +36,7 @@ import { scriptCircuitFieldGroups } from "./route_script.js";
 import { routeBffFieldGroups } from "./route_bff.js";
 import { routeMockFieldGroups } from "./route_mock.js";
 import { routeFaultFieldGroups } from "./route_fault.js";
+import { routeDubboFieldGroups } from "./route_dubbo.js";
 
 const groups = {
   route: [
@@ -537,6 +538,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeBffFieldGroups(kind),
     ...routeMockFieldGroups(kind),
     ...routeFaultFieldGroups(kind),
+    ...routeDubboFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

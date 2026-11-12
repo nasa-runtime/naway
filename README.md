@@ -1453,8 +1453,20 @@ Hessian2 id=2 泛化调用。公网 body 只能提交 `{"arguments":[...]}`，in
 参数类型和 attachments 均由可信 route 固定；Hessian2 对深度、collection 项、字符串、binary、
 请求/响应 frame 和最终 JSON 分别设硬门，`byte[]` 使用标准 Base64。class definition 只作为数据
 解析，不加载 Java class 或执行 constructor/reflection；provider exception 映射为 502，非法下游
-类型在选择 upstream 前返回 400。真实 Apache Dubbo 3.3.5 provider 已覆盖 POJO、非 BMP 字符、
-`byte[]` 和异常互操作；关闭 feature 时 Hessian2 route 在快照构建阶段拒绝，JSON 路径不受影响。
+类型在选择 upstream 前返回 400。关闭 feature 时 Hessian2 route 在快照构建阶段拒绝，JSON
+路径不受影响。
+
+调用路由须明确声明精确的 `Method=POST` 断言，并使用不含变量模板的固定 `uri`。
+
+管理草稿提供十七项独立调用声明及有序 Java 参数类型列表。附件以完整字符串映射编辑，值保持
+SecretSource 引用，不在浏览器求值；保留的 `path`、`interface`、`version`、`group`、`generic`
+不能由自定义附件覆盖。表单不自动选择 codec、填充默认预算或修改上游 URI。
+
+下游 JSON、请求 frame 和响应 frame 各自限定为1字节–16MiB；TCP 建连与写入/完整响应读取的
+期限各为10–120000毫秒。每 endpoint 空闲连接最多64个，0关闭复用。Hessian2 单值字符串与
+binary 各为1字节–16MiB，递归深度为1–128，frame 内 collection/object 字段总数为1–1000000；
+这些 Hessian2 专有预算不作用于 JSON codec。实际附件最多32项，解析后的单值最多64KiB，
+参数类型最多64项；声明或资源门无效时拒绝候选，已发布调用计划继续生效。
 
 ```bash
 cargo build --release --features dubbo-hessian2

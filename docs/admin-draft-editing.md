@@ -434,6 +434,17 @@ Transfer-Encoding 与 Content-Length；实际状态、正文和头部限制由�
 正文保留换行、末尾换行和空串；表单不补入默认比例、延迟或错误，不自动修改后端声明。
 未编辑的引用、未知子项和宽整数保持原值，原目标候选构建核验实际数值与组合边界。
 
+`dubbo` 提供十七项独立原生声明，覆盖 interface、业务方法、Java 参数类型、service version/group、
+codec、请求/响应 frame 与 Hessian2 资源门、建连/调用期限、空闲连接容量及固定附件。
+调用路由须显式声明精确的 `Method=POST` 断言及不含变量模板的固定 `uri`，表单不自动添加。
+`parameter_types` 使用完整字符串名单，也可按原始位置插入、替换、移动或确认删除；其顺序须与
+下游 `arguments` 一致。附件以完整 JSON 字符串映射显式编辑，值保持 SecretSource 引用，不在
+浏览器求值；`path`、`interface`、`version`、`group`、`generic` 由调用计划保留。
+
+页面不自动选择 serialization、扩大预算或修改原上游 URI；Hessian2 须目标制品显式具备
+`dubbo-hessian2`，其专有预算不作用于 JSON codec。空闲容量0表示关闭复用，空 version/group
+和空附件映射是实际声明；未编辑的引用、未知子项与宽整数保持原值。
+
 支持的动作如下：
 
 | `type` | 其它字段 | 结果 |
