@@ -35,6 +35,7 @@ import { wasmSourceFieldGroups } from "./route_wasm.js";
 import { scriptCircuitFieldGroups } from "./route_script.js";
 import { routeBffFieldGroups } from "./route_bff.js";
 import { routeMockFieldGroups } from "./route_mock.js";
+import { routeFaultFieldGroups } from "./route_fault.js";
 
 const groups = {
   route: [
@@ -535,6 +536,7 @@ export function nestedFields(kind, values, capacity) {
     ...scriptCircuitFieldGroups(kind),
     ...routeBffFieldGroups(kind),
     ...routeMockFieldGroups(kind),
+    ...routeFaultFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

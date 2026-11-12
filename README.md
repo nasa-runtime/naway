@@ -3558,6 +3558,36 @@ FLV route 将 `format` 改为 `flv`。`start` 是**原文件字节偏移**，不
 管理路由摘要包含容器、预算和资源域指纹，不公开本地根。`gw_media_operations_total` 只按固定
 `format/outcome` 计数；`prepared` 表示响应已准备，不代表客户端已经播放或完整下载。
 
+## 路由故障注入
+
+`fault_injection` 对命中的请求注入有限异步延迟或固定4xx/5xx错误，用于明确声明的依赖异常
+场景。它保留原后端声明；未命中采样或仅延迟完成后继续原业务路径。
+
+```yaml
+schema_version: 1
+proxies:
+  - id: public
+    listen: "127.0.0.1:8080"
+    routes:
+      - id: controlled-orders
+        predicates: ["Path=/orders"]
+        uri: "http://orders.internal:8080"
+        fault_injection:
+          percentage_bps: 1000
+          delay_ms: 50
+          abort_status: 503
+          abort_body: "服务暂时不可用\n"
+```
+
+比例是1–10000 basis points，10000 表示全部命中；0 会拒绝候选，关闭须移除整段声明。
+采样绑定路由 id 和网关生成的 request-id，不以客户端任意头值选择结果。命中后先通过 Tokio
+定时器等待，再按可选 `abort_status` 返回固定错误；注入错误带 `x-gateway-fault-injected: abort`。
+延迟最多60000毫秒，错误正文最多64KiB，错误状态只接受4xx/5xx；延迟须大于0或明确声明错误状态。
+移除错误状态可改为仅延迟，固定正文不会在没有错误状态时成为业务响应。
+
+原有认证、WAF、熔断及适用的 CORS 预检先于注入处理。管理草稿提供四项独立字段及显式移除，
+错误正文使用多行原文编辑；候选无效时已发布策略继续生效。
+
 ## 固定 API mock 响应
 
 `mock_response` 在候选构建时冻结状态码、响应头与 UTF-8 正文，命中路由后直接返回共享正文，

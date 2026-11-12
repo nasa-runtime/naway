@@ -728,7 +728,7 @@ pub struct MockResponseCfg {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct FaultInjectionCfg {
-    /// 0..=10000 basis points；10000 表示每次命中。
+    /// 1..=10000 basis points；10000 表示每次命中，关闭时移除整段策略。
     pub percentage_bps: u16,
     /// 命中后异步延迟，不阻塞 Tokio worker。
     #[serde(default)]
