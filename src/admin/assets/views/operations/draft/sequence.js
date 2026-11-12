@@ -22,6 +22,7 @@ import { routeExtProcDraftLists } from "./route_ext_proc.js";
 import { routeGrpcTranscodingDraftLists } from "./route_grpc_transcoding.js";
 import { routeGrpcEdgeDraftLists } from "./route_grpc_edge.js";
 import { routeWasmDraftLists } from "./route_wasm.js";
+import { routeScriptDraftLists } from "./route_script.js";
 import { routeResponseContractDraftLists } from "./route_response_contract.js";
 import {
   routeBodyTransformDraftLists,
@@ -59,6 +60,7 @@ function lists(kind, values) {
   }
   result.push(...routeExternalPluginDraftLists(kind));
   result.push(...routeWasmDraftLists(kind));
+  result.push(...routeScriptDraftLists(kind));
   for (const [key, value] of Object.entries(values)) {
     if (
       key !== "id" &&
@@ -252,6 +254,7 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "body_transform_emit",
           "external_plugin",
           "wasm_plugin",
+          "script_plugin",
         ].includes(selected.type)
       ) {
         // 流路由和插件的新增或整值替换须显式声明 id，字段编辑不开放原元素的身份变更。
@@ -262,7 +265,9 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
               ? "external_plugin_new"
               : selected.type === "wasm_plugin"
                 ? "wasm_plugin_new"
-                : selected.type;
+                : selected.type === "script_plugin"
+                  ? "script_plugin_new"
+                  : selected.type;
         fields = draftFieldPanel(type, {}, capacity);
         body.append(
           element(
@@ -407,6 +412,15 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
         ) {
           throw new Error(
             "新增或替换 Proxy-Wasm 插件必须明确填写非空的稳定身份 id。",
+          );
+        }
+        if (
+          selected.type === "script_plugin" &&
+          (typeof action.fields?.id !== "string" ||
+            !/^[A-Za-z0-9_.-]{1,128}$/.test(action.fields.id))
+        ) {
+          throw new Error(
+            "新增或替换 Lua 脚本必须明确填写1–128字节的稳定 id，仅允许字母、数字、-、_、.。",
           );
         }
         edit = {

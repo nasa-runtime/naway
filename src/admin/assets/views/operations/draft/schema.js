@@ -11,6 +11,7 @@ import { dlpExclusionFields } from "./route_dlp.js";
 import { schemaRegistryDocumentFields } from "./route_response_contract.js";
 import { externalPluginFields } from "./route_external_plugin.js";
 import { wasmPluginFields } from "./route_wasm.js";
+import { scriptPluginFields } from "./route_script.js";
 import {
   bodyTransformOperationFields,
   bodyTransformExtractFields,
@@ -18,6 +19,8 @@ import {
 } from "./route_body_transform.js";
 
 const definitions = {
+  script_plugin: scriptPluginFields.filter(([name]) => name !== "id"),
+  script_plugin_new: scriptPluginFields,
   wasm_plugin: wasmPluginFields.filter(([name]) => name !== "id"),
   wasm_plugin_new: wasmPluginFields,
   external_plugin: externalPluginFields.filter(([name]) => name !== "id"),

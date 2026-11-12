@@ -32,6 +32,7 @@ import { routeExtProcFieldGroups } from "./route_ext_proc.js";
 import { routeGrpcTranscodingFieldGroups } from "./route_grpc_transcoding.js";
 import { routeGrpcEdgeFieldGroups } from "./route_grpc_edge.js";
 import { wasmSourceFieldGroups } from "./route_wasm.js";
+import { scriptCircuitFieldGroups } from "./route_script.js";
 
 const groups = {
   route: [
@@ -120,6 +121,25 @@ const groups = {
 export function nestedFields(kind, values, capacity) {
   const node = element("div", "", "draft-nested");
   const rows = [];
+  if (["script_plugin", "script_plugin_new"].includes(kind)) {
+    node.append(
+      element(
+        "p",
+        "目标节点须编译 lua-scripts；源码在候选构建时验证并冻结，真实路径必须在配置根内。沙箱不提供文件、网络、进程、时钟、随机数或 callout。每路由 Lua 与 Wasm 合计最多16项，头相位先 Wasm 后 Lua；同一方向正文只能由一种运行时处理。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "failure_mode 和 circuit 必须显式声明。open 只跳过解释器依赖不可用；输入、输出、指令、CPU、内存、分配、期限、容量、客体错误和主动拒绝始终关闭。熔断保留原始失败原因，同一路由、脚本 id 与源码内容的状态跨热更共享，修改预算不会清空失败事实。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "include_headers 与 mutation_headers 按完整名单显式编辑；凭据、cookie、动态身份、来源和协议安全头不可读写。head 相位须移除 max_body_bytes；body 相位必须显式设置预算并清空可写头名单。聚合预算限制完整实体，流式预算限制每片输入和输出；每片独立 VM，末尾另以空 body 和 eof=true 调用。",
+        "subtle",
+      ),
+    );
+  }
   if (["wasm_plugin", "wasm_plugin_new"].includes(kind)) {
     node.append(
       element(
@@ -491,6 +511,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeGrpcTranscodingFieldGroups(kind),
     ...routeGrpcEdgeFieldGroups(kind),
     ...wasmSourceFieldGroups(kind),
+    ...scriptCircuitFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
