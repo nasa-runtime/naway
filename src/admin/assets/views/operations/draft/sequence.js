@@ -24,6 +24,7 @@ import { routeGrpcEdgeDraftLists } from "./route_grpc_edge.js";
 import { routeWasmDraftLists } from "./route_wasm.js";
 import { routeScriptDraftLists } from "./route_script.js";
 import { routeBffDraftLists } from "./route_bff.js";
+import { routeLlmDraftLists } from "./route_llm.js";
 import { routeDubboDraftLists } from "./route_dubbo.js";
 import { routeWsFrameDraftLists } from "./route_ws_frame.js";
 import { routeForwardProxyDraftLists } from "./route_forward_proxy.js";
@@ -67,6 +68,7 @@ function lists(kind, values) {
   result.push(...routeWasmDraftLists(kind));
   result.push(...routeScriptDraftLists(kind));
   result.push(...routeBffDraftLists(kind));
+  result.push(...routeLlmDraftLists(kind));
   result.push(...routeDubboDraftLists(kind));
   result.push(...routeWsFrameDraftLists(kind));
   result.push(...routeForwardProxyDraftLists(kind));
@@ -266,10 +268,11 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "wasm_plugin",
           "script_plugin",
           "bff_target",
+          "llm_model",
           "ws_message_plugin",
         ].includes(selected.type)
       ) {
-        // 具有稳定 id 的流路由、扩展插件和聚合目标只在新增或整值替换时开放身份声明。
+        // 稳定 id 绑定路由、插件、聚合目标和模型目录中的引用，只在新增或整值替换时开放身份声明。
         const type =
           selected.type === "stream_route"
             ? "stream_route_new"
@@ -281,7 +284,9 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
                   ? "script_plugin_new"
                   : selected.type === "bff_target"
                     ? "bff_target_new"
-                    : selected.type;
+                    : selected.type === "llm_model"
+                      ? "llm_model_new"
+                      : selected.type;
         fields = draftFieldPanel(type, {}, capacity);
         body.append(
           element(
@@ -457,6 +462,25 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           throw new Error(
             "新增或替换 BFF 目标必须明确填写1–64字节的稳定 id，仅允许字母、数字、-、_、.，不得为 _errors。",
           );
+        }
+        // 新模型必须由操作者明确声明身份和真实后端，不能从其它模型或客户端请求猜测授权目标。
+        if (selected.type === "llm_model") {
+          if (
+            typeof action.fields?.id !== "string" ||
+            !/^[A-Za-z0-9_.-]{1,64}$/.test(action.fields.id)
+          ) {
+            throw new Error(
+              "新增或替换模型必须明确填写1–64字节的稳定 id，仅允许字母、数字、.、_、-。",
+            );
+          }
+          for (const key of ["provider", "uri", "model"]) {
+            if (
+              typeof action.fields[key] !== "string" ||
+              !action.fields[key].trim()
+            ) {
+              throw new Error(`新增或替换模型必须明确填写非空的 ${key}。`);
+            }
+          }
         }
         edit = {
           op,

@@ -1404,6 +1404,8 @@ DATA 块中不会合并其单记录额度；未知媒体类型继续限制单个
 [管理草稿](docs/admin-draft-editing.md#管理页面)提供 `llm.api_type` 与七项请求资源预算的独立字段。
 未编辑的模型、凭据及治理声明保留原文；设置预算不会自动添加模型或认证，发布仍须通过原目标预检、
 独立审批和持久执行。移除完整 `llm` 后切换其它后端，需要显式填写对应的后端声明。
+模型目录可按原位置新增、替换、编辑、移动和删除；已有模型的稳定 `id` 不通过字段补丁改写。
+新增或替换须明确提供 `id`、provider、URI 和模型名，未编辑的凭据、价格与能力保持原声明。
 
 provider 计划支持 OpenAI、Anthropic、Google Gemini Developer API、Azure OpenAI、AWS Bedrock、
 Vertex AI、Cohere、Mistral、Hugging Face、xAI、DashScope、DeepSeek、Ollama 和 vLLM。Azure API 版本、

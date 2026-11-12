@@ -199,8 +199,8 @@ pub struct LlmModelCfg {
     /// provider API path；空时使用 provider 安全默认值。
     #[serde(default)]
     pub path: String,
-    /// Google SSE API path；空时由 `model` 生成
-    /// `/v1beta/models/{model}:streamGenerateContent?alt=sse`。其它 provider 必须留空。
+    /// Google/Vertex AI Chat 流式 API path；空时由 provider、模型与固定云 scope 生成。
+    /// 其它 provider/api_type 组合必须留空。
     #[serde(default)]
     pub stream_path: String,
     /// provider API key SecretSource；空表示不注入凭据，适合本地 vLLM/Ollama。

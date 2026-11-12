@@ -13,6 +13,7 @@ import { externalPluginFields } from "./route_external_plugin.js";
 import { wasmPluginFields } from "./route_wasm.js";
 import { scriptPluginFields } from "./route_script.js";
 import { bffTargetFields } from "./route_bff.js";
+import { llmModelFields } from "./route_llm.js";
 import { wsMessagePluginFields } from "./route_ws_frame.js";
 import {
   bodyTransformOperationFields,
@@ -21,6 +22,8 @@ import {
 } from "./route_body_transform.js";
 
 const definitions = {
+  llm_model: llmModelFields.filter(([name]) => name !== "id"),
+  llm_model_new: llmModelFields,
   ws_message_plugin: wsMessagePluginFields,
   bff_target: bffTargetFields.filter(([name]) => name !== "id"),
   bff_target_new: bffTargetFields,
