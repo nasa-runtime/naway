@@ -23,6 +23,7 @@ pub(crate) trait Transport: Send + Sync {
     /// 参数说明: 无。
     ///
     /// 返回：工作区入口的预算；平台入口为空，不接受协议正文自报归属。
+    #[cfg(feature = "agent-protocols")]
     fn state_budget(&self) -> Option<&crate::control::ownership::state::Budget> {
         None
     }

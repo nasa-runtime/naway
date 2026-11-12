@@ -42,6 +42,7 @@ pub(super) struct AgentRequest {
 }
 
 struct GatewayTransport {
+    #[cfg(feature = "agent-protocols")]
     state_budget: Option<crate::control::ownership::state::Budget>,
     gateway: Arc<GatewayProxy>,
     snap: Arc<GatewaySnapshot>,
@@ -62,6 +63,7 @@ impl Transport for GatewayTransport {
     /// 参数说明: 无。
     ///
     /// 返回：入站冻结的预算借用。
+    #[cfg(feature = "agent-protocols")]
     fn state_budget(&self) -> Option<&crate::control::ownership::state::Budget> {
         self.state_budget.as_ref()
     }
@@ -181,6 +183,7 @@ impl GatewayProxy {
             LongProto::Sse,
         ));
         Arc::new(GatewayTransport {
+            #[cfg(feature = "agent-protocols")]
             state_budget: ctx.parts.extensions.get().cloned(),
             gateway: self.clone(),
             snap: ctx.snap.clone(),
@@ -252,6 +255,7 @@ impl GatewayProxy {
             LongProto::Sse,
         ));
         let transport = Arc::new(GatewayTransport {
+            #[cfg(feature = "agent-protocols")]
             state_budget: ctx.parts.extensions.get().cloned(),
             gateway: self.clone(),
             snap: ctx.snap,
