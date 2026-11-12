@@ -3180,6 +3180,8 @@ impl GatewayProxy {
     /// 返回：本地拒绝或经过当前路由策略裁决的模型响应；Chat 上游响应头与完整 JSON 正文
     /// 共用单次调用期限，正文超时返回 504 并保留用量未知的保守配额预留；转换的 Chat SSE
     /// 在同一调用截止及原始、转换后两阶段字节门内交付，流已建立时越界直接终止正文。
+    /// 未声明治理计划且未启用输出护栏时，最终提供商错误实体保留原状态，并按累计字节与
+    /// 同一调用截止流式交付，不解析为成功协议。
     async fn forward_llm(self: &Arc<Self>, mut ctx: LlmForwardRequest<'_>) -> LlmForwardOutcome {
         let policy = ctx
             .route
@@ -3838,6 +3840,12 @@ impl GatewayProxy {
                         "guarded AI provider returned an error",
                     ));
                 }
+                // 非成功状态不能成为实体资源门的旁路；保留错误协议与原状态，只约束字节和调用截止。
+                response = llm_stream::wrap_opaque_response(
+                    response,
+                    policy.max_response_bytes,
+                    provider_deadline,
+                );
             }
             operation.outcome("rejected");
             let (usage, response_body) = if !request.stream && response.status().is_success() {

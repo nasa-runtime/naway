@@ -1,4 +1,4 @@
-//! 模型 SSE 的累计字节、事件边界与绝对截止约束。
+//! 模型响应的累计字节、可选 SSE 事件边界与绝对截止约束。
 
 use crate::{BoxBody, BoxError};
 use bytes::Bytes;
@@ -26,6 +26,45 @@ pub(super) fn wrap_response(
     max_event_bytes: usize,
     deadline: Instant,
 ) -> Response<BoxBody> {
+    wrap_budget(
+        response,
+        max_response_bytes,
+        Some(max_event_bytes),
+        deadline,
+    )
+}
+
+/// 业务作用：约束提供商不透明响应实体的大小与等待时间，保留其状态、媒体类型和原始字节。
+///
+/// 参数说明：
+/// - `response`：已建立响应头、不能按统一成功协议解析的提供商响应。
+/// - `max_response_bytes`：允许交付的累计 DATA 字节上限。
+/// - `deadline`：本次提供商调用开始时冻结的绝对截止。
+///
+/// 返回：预算内透明交付正文及 trailers；超额或到期终止正文并释放上游，不重新生成响应头。
+pub(super) fn wrap_opaque_response(
+    response: Response<BoxBody>,
+    max_response_bytes: usize,
+    deadline: Instant,
+) -> Response<BoxBody> {
+    wrap_budget(response, max_response_bytes, None, deadline)
+}
+
+/// 业务作用：为模型响应建立统一资源状态，使事件解析只在明确的 SSE 路径生效。
+///
+/// 参数说明：
+/// - `response`：需要附加流式资源门的提供商响应。
+/// - `max_response_bytes`：累计 DATA 字节上限。
+/// - `max_event_bytes`：SSE 事件硬门；None 表示不透明实体，不检查事件边界。
+/// - `deadline`：跨响应阶段不延后的调用截止。
+///
+/// 返回：持有同一累计额度与绝对截止的响应，任一预算耗尽后只报告一次正文错误。
+fn wrap_budget(
+    response: Response<BoxBody>,
+    max_response_bytes: usize,
+    max_event_bytes: Option<usize>,
+    deadline: Instant,
+) -> Response<BoxBody> {
     response.map(|inner| {
         BudgetBody {
             inner: Some(inner),
@@ -45,7 +84,7 @@ pub(super) fn wrap_response(
 struct BudgetBody {
     inner: Option<BoxBody>,
     remaining: usize,
-    max_event_bytes: usize,
+    max_event_bytes: Option<usize>,
     event_bytes: usize,
     line_has_content: bool,
     previous_cr: bool,
@@ -55,17 +94,22 @@ struct BudgetBody {
 }
 
 impl BudgetBody {
-    /// 业务作用：跨 HTTP 数据块识别 CR、LF、CRLF 空行边界，避免拆分或合并事件改变预算含义。
+    /// 业务作用：统一限制累计响应字节，并只为 SSE 跨数据块识别 CR、LF、CRLF 事件边界。
     ///
     /// 参数说明：
-    /// - `data`：本次尚未交付的 DATA 字节；只扫描，不复制或解析业务内容。
+    /// - `data`：本次尚未交付的 DATA；不透明实体只累计长度，SSE 仅扫描换行，不复制业务内容。
     ///
-    /// 返回：完整数据块都在预算内时扣减累计额度并更新事件位置；否则保持原计数并拒绝交付。
+    /// 返回：完整数据块在预算内时扣减累计额度，并按协议维护事件位置；否则保持原计数并拒绝交付。
     fn accept(&mut self, data: &[u8]) -> bool {
         // 当前块必须完整落在剩余额度内；不能先交付一部分，再依赖后续轮询发现累计越界。
         if data.len() > self.remaining {
             return false;
         }
+        // 错误协议可能是 JSON、文本或二进制，不能把其中的换行解释为 SSE 事件或改写内容。
+        let Some(max_event_bytes) = self.max_event_bytes else {
+            self.remaining -= data.len();
+            return true;
+        };
         let mut event_bytes = self.event_bytes;
         let mut line_has_content = self.line_has_content;
         let mut previous_cr = self.previous_cr;
@@ -75,11 +119,11 @@ impl BudgetBody {
             if previous_cr && *byte == b'\n' {
                 // CRLF 是一次换行；跨块 LF 仍计入它实际结束的事件，不能借重置获得额外一个字节。
                 if let Some(completed) = completed_event_bytes {
-                    if completed == self.max_event_bytes {
+                    if completed == max_event_bytes {
                         return false;
                     }
                 } else {
-                    if event_bytes == self.max_event_bytes {
+                    if event_bytes == max_event_bytes {
                         return false;
                     }
                     event_bytes += 1;
@@ -91,7 +135,7 @@ impl BudgetBody {
             previous_cr = false;
             completed_event_bytes = None;
             // 只有完整分隔符能重置事件预算，提供商拆分 HTTP 数据块不能获得额外事件额度。
-            if event_bytes == self.max_event_bytes {
+            if event_bytes == max_event_bytes {
                 return false;
             }
             event_bytes += 1;
