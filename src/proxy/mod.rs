@@ -4040,7 +4040,7 @@ impl GatewayProxy {
                         accounting,
                         policy.max_response_bytes,
                         policy.max_stream_frame_bytes,
-                        policy.max_duration,
+                        provider_deadline,
                     )
                 } else {
                     match model.provider {
@@ -4205,15 +4205,15 @@ impl GatewayProxy {
         }
     }
 
-    /// 业务作用：转发非 Chat 的独立 AI API，保持 provider 原生字段与响应不变，同时在任何
-    /// provider I/O 前执行 content-type、能力、费用和资源预算门。
+    /// 业务作用：在 I/O 前校验独立 AI API 的类型、能力与费用，常规 provider 调用在同一
+    /// 截止内交付原生响应头与实体；Realtime 由专用握手和连接管线执行。
     ///
     /// 参数说明：
     /// - `ctx`：持有已认证请求、升级权与不可变快照
     /// - `policy`：是 route 冻结的 API/model 计划。
     ///
-    /// 返回：本地契约拒绝返回 Local；已经尝试 provider 后返回 Upstream，并仅对 transport、超时或
-    /// 5xx 使用剩余模型 fallback。
+    /// 返回：本地契约拒绝返回 Local；已经尝试 provider 后返回 Upstream。响应头阶段的传输失败、
+    /// 超时或 5xx 可回退剩余模型；成功非流式正文超时返回 504，已建立流的预算越界只终止正文。
     async fn forward_native_ai(
         &self,
         mut ctx: LlmForwardRequest<'_>,
@@ -4416,6 +4416,8 @@ impl GatewayProxy {
                 ));
             }
             let started = Instant::now();
+            // 每个模型只获得一次 I/O 额度，响应头、完整正文及后续流不能分别重新开始计时。
+            let provider_deadline = tokio::time::Instant::now() + policy.max_duration;
             // 原生 API 的连接和响应状态跨 await 保留，由独立存储承载，避免与协议实体状态嵌套。
             let future = Box::pin(self.forward(forward::ForwardRequest {
                 snap: ctx.snap,
@@ -4439,7 +4441,7 @@ impl GatewayProxy {
                 websocket_frame_limits: None,
                 trace: Some(ctx.trace),
             }));
-            let mut response = match tokio::time::timeout(policy.max_duration, future).await {
+            let mut response = match tokio::time::timeout_at(provider_deadline, future).await {
                 Err(_) if attempt + 1 < model_count => continue,
                 Err(_) => {
                     return LlmForwardOutcome::Upstream(text_status(
@@ -4461,7 +4463,12 @@ impl GatewayProxy {
                 Ok(Ok(response)) => response,
             };
             if response.status().is_server_error() && attempt + 1 < model_count {
-                drain_llm_fallback_response(response).await;
+                // 排空仅服务于连接复用，不能延长当前失败模型的额度或推迟下一模型获得独立截止。
+                let _ = tokio::time::timeout_at(
+                    provider_deadline,
+                    drain_llm_fallback_response(response),
+                )
+                .await;
                 continue;
             }
             if response.status().is_success() {
@@ -4491,17 +4498,24 @@ impl GatewayProxy {
                         },
                         policy.max_response_bytes,
                         policy.max_stream_frame_bytes,
-                        policy.max_duration.saturating_sub(started.elapsed()),
+                        provider_deadline,
                     );
                 } else {
-                    response = match inspect_native_llm_response(
-                        response,
-                        policy.max_response_bytes,
+                    response = match tokio::time::timeout_at(
+                        provider_deadline,
+                        inspect_native_llm_response(response, policy.max_response_bytes),
                     )
                     .await
                     {
-                        Ok((response, _, _)) => response,
-                        Err(error) => {
+                        Err(_) => {
+                            // 成功头后的执行结果仍可能已产生，不能因正文未结束再向其它模型重复执行。
+                            return LlmForwardOutcome::Upstream(text_status(
+                                504,
+                                "AI provider response deadline exceeded",
+                            ));
+                        }
+                        Ok(Ok((response, _, _))) => response,
+                        Ok(Err(error)) => {
                             tracing::warn!(route = %ctx.route.id, model = %model.id, %error, "invalid native AI provider response");
                             return LlmForwardOutcome::Upstream(text_status(
                                 502,
@@ -4510,6 +4524,13 @@ impl GatewayProxy {
                         }
                     };
                 }
+            } else {
+                // 原生错误协议保持透明，但不能借非成功状态绕过本模型的实体字节和等待预算。
+                response = llm_stream::wrap_opaque_response(
+                    response,
+                    policy.max_response_bytes,
+                    provider_deadline,
+                );
             }
             response.headers_mut().insert(
                 "x-gateway-llm-model",
@@ -10956,14 +10977,14 @@ struct LlmStreamAccounting {
     reservation: Option<RateLimitReservation>,
 }
 
-/// 业务作用：为 provider 原生流附加累计字节、单帧与持续时间门，同时完全保留 frame 内容和顺序。
+/// 业务作用：为 provider 原生流附加累计字节、单帧与调用截止门，同时完全保留 frame 内容和顺序。
 ///
 /// 参数说明：
 /// - `response`：已经成功建立的原生模型流响应。
 /// - `accounting`：持有保守配额预留并结算实际用量的计量状态。
 /// - `max_response_bytes`：路由冻结的累计响应字节上限。
 /// - `max_frame_bytes`：路由冻结的单帧字节上限。
-/// - `max_duration`：路由冻结的最长流生命周期。
+/// - `deadline`：从当前模型 I/O 开始计算的截止，响应头到达后不能重新获得完整时长。
 ///
 /// 返回：返回透明流式响应；任一预算越界时 body 产生错误并停止读取上游。
 fn wrap_native_llm_stream_response(
@@ -10971,14 +10992,14 @@ fn wrap_native_llm_stream_response(
     accounting: LlmStreamAccounting,
     max_response_bytes: usize,
     max_frame_bytes: usize,
-    max_duration: Duration,
+    deadline: tokio::time::Instant,
 ) -> Response<BoxBody> {
     response.map(|body| {
         NativeLlmStreamBody {
             inner: body,
             remaining: max_response_bytes,
             max_frame_bytes,
-            deadline: Box::pin(tokio::time::sleep(max_duration)),
+            deadline: Box::pin(tokio::time::sleep_until(deadline)),
             done: false,
             _accounting: accounting,
         }
@@ -11012,6 +11033,7 @@ impl Body for NativeLlmStreamBody {
         if self.done {
             return Poll::Ready(None);
         }
+        // 当前模型的资源预算不因流建立而延长，截止之后连已经就绪的数据也不再交付。
         if self.deadline.as_mut().poll(cx).is_ready() {
             self.done = true;
             return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
