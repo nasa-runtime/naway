@@ -3558,6 +3558,56 @@ FLV route 将 `format` 改为 `flv`。`start` 是**原文件字节偏移**，不
 管理路由摘要包含容器、预算和资源域指纹，不公开本地根。`gw_media_operations_total` 只按固定
 `format/outcome` 计数；`prepared` 表示响应已准备，不代表客户端已经播放或完整下载。
 
+## 只读 BFF 聚合
+
+`bff_aggregation` 把1–16个固定 HTTP GET 子请求合并为一个 JSON 响应，每个稳定 target id
+对应一个结果键。它适合把多个只读后端结果交付给同一次业务请求；不使用客户端 query/body
+选择目标，也不展开 path 模板。聚合与普通 `uri` 等终端后端互斥，切换时必须显式移除旧声明。
+
+```yaml
+schema_version: 1
+proxies:
+  - id: public
+    listen: "127.0.0.1:8080"
+    routes:
+      - id: summary
+        predicates: ["Path=/summary"]
+        bff_aggregation:
+          total_timeout_ms: 2000
+          max_total_response_bytes: 65536
+          targets:
+            - id: orders
+              uri: "http://orders.internal:8080"
+              path: /summary
+              timeout_ms: 1000
+              max_response_bytes: 32768
+              required: true
+              forward_headers: [x-request-id]
+            - id: profile
+              uri: "http://profile.internal:8080"
+              path: /profile
+              timeout_ms: 1000
+              max_response_bytes: 16384
+              required: false
+              forward_headers: []
+```
+
+URI 只接受 HTTP(S) origin 或 `lb://service`，路径独立声明且最多2048字节，不带 query 或
+fragment。候选构建校验 HTTP URI 表示，保留解析器接受的 Unicode 和百分号编码，不自动转义。
+目标 id 由1–64个 ASCII 字母、数字或 `.`、`_`、`-` 组成，唯一且不能为 `_errors`。
+每目标最多32个转发头，
+从已完成下游治理的 head 复制明确名单；Authorization、Cookie、X-Api-Key 和固定 hop-by-hop
+头被拒绝。子响应只接受成功状态下有界的 `application/json` 或 `application/*+json` 值，
+不接受 trailers，不把上游响应头复制进聚合响应。
+
+单目标期限为10–60000毫秒且不超过共同总期限，body 上限为1–4194304字节；共同期限为
+10–60000毫秒，完整聚合 JSON 编码上限为1024–16777216字节。必需目标的依赖不可用、非成功
+状态、JSON 或体积错误返回502；必需目标超时或共同期限到期返回504。可选目标失败时结果键为
+null，`_errors` 中以该 id 记录
+`timeout`、`unavailable`、`status`、`too_large` 或 `invalid_json`，不暴露依赖错误原文。
+可选声明不会豁免共同期限或总输出预算；总输出越界返回502。聚合入口仅支持 GET，其它方法
+返回405，原下游认证与允许组合的安全治理继续生效。
+
 ## 有界 Lua 脚本
 
 `lua-scripts` 是默认关闭的独立 feature，使用 Lua 5.4 执行显式路由的小型纯计算策略。

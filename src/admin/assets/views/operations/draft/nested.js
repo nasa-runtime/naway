@@ -33,6 +33,7 @@ import { routeGrpcTranscodingFieldGroups } from "./route_grpc_transcoding.js";
 import { routeGrpcEdgeFieldGroups } from "./route_grpc_edge.js";
 import { wasmSourceFieldGroups } from "./route_wasm.js";
 import { scriptCircuitFieldGroups } from "./route_script.js";
+import { routeBffFieldGroups } from "./route_bff.js";
 
 const groups = {
   route: [
@@ -121,6 +122,20 @@ const groups = {
 export function nestedFields(kind, values, capacity) {
   const node = element("div", "", "draft-nested");
   const rows = [];
+  if (["bff_target", "bff_target_new"].includes(kind)) {
+    node.append(
+      element(
+        "p",
+        "BFF 只发起固定目标和路径的 GET 子请求，不使用客户端 query 或 body 生成目标参数。uri 只含 HTTP(S) origin 或 lb://service；path 独立声明，构建时校验 HTTP URI 表示并保留编码，不展开模板。目标 id 唯一且不能为 _errors。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "forward_headers 使用明确完整名单；Authorization、Cookie、X-Api-Key 和固定 hop-by-hop 头不能转发。子响应须是有界的成功 JSON 值，不接受 trailers。required=false 只隔离该目标失败，不豁免总期限或完整聚合 JSON 编码上限。",
+        "subtle",
+      ),
+    );
+  }
   if (["script_plugin", "script_plugin_new"].includes(kind)) {
     node.append(
       element(
@@ -161,6 +176,11 @@ export function nestedFields(kind, values, capacity) {
   }
   if (kind === "route") {
     node.append(
+      element(
+        "p",
+        "BFF 与普通 uri 等终端后端二选一。启用聚合须显式移除旧 uri，关闭时须移除整个 bff_aggregation 并显式选择后端；页面不会自动改写后端。仅支持 GET，下游认证、WAF 和其它允许组合的治理继续执行。",
+        "subtle",
+      ),
       element(
         "p",
         "请求总时限覆盖上游转发的准入等待、重试、副本和完整正文；单次时限从每次实际上游发送开始，各次独立计时。两项省略或设为 0 均不增加对应截止点，入口阶段期限仍生效；总时限非 0 时单次时限不能更大。响应头发出后的超时只能终止正文。帧间空闲期限省略时继承入口，0 关闭；最长寿命约束 SSE / gRPC 长流，原生边缘桥接也使用这两项长流参数；普通上游 WebSocket 升级后的隧道使用自身策略。",
@@ -512,6 +532,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeGrpcEdgeFieldGroups(kind),
     ...wasmSourceFieldGroups(kind),
     ...scriptCircuitFieldGroups(kind),
+    ...routeBffFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

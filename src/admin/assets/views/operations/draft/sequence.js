@@ -23,6 +23,7 @@ import { routeGrpcTranscodingDraftLists } from "./route_grpc_transcoding.js";
 import { routeGrpcEdgeDraftLists } from "./route_grpc_edge.js";
 import { routeWasmDraftLists } from "./route_wasm.js";
 import { routeScriptDraftLists } from "./route_script.js";
+import { routeBffDraftLists } from "./route_bff.js";
 import { routeResponseContractDraftLists } from "./route_response_contract.js";
 import {
   routeBodyTransformDraftLists,
@@ -61,6 +62,7 @@ function lists(kind, values) {
   result.push(...routeExternalPluginDraftLists(kind));
   result.push(...routeWasmDraftLists(kind));
   result.push(...routeScriptDraftLists(kind));
+  result.push(...routeBffDraftLists(kind));
   for (const [key, value] of Object.entries(values)) {
     if (
       key !== "id" &&
@@ -255,9 +257,10 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "external_plugin",
           "wasm_plugin",
           "script_plugin",
+          "bff_target",
         ].includes(selected.type)
       ) {
-        // 流路由和插件的新增或整值替换须显式声明 id，字段编辑不开放原元素的身份变更。
+        // 流路由、插件和聚合目标的新增或整值替换须显式声明 id，字段编辑不开放原元素的身份变更。
         const type =
           selected.type === "stream_route"
             ? "stream_route_new"
@@ -267,7 +270,9 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
                 ? "wasm_plugin_new"
                 : selected.type === "script_plugin"
                   ? "script_plugin_new"
-                  : selected.type;
+                  : selected.type === "bff_target"
+                    ? "bff_target_new"
+                    : selected.type;
         fields = draftFieldPanel(type, {}, capacity);
         body.append(
           element(
@@ -421,6 +426,16 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
         ) {
           throw new Error(
             "新增或替换 Lua 脚本必须明确填写1–128字节的稳定 id，仅允许字母、数字、-、_、.。",
+          );
+        }
+        if (
+          selected.type === "bff_target" &&
+          (typeof action.fields?.id !== "string" ||
+            !/^[A-Za-z0-9_.-]{1,64}$/.test(action.fields.id) ||
+            action.fields.id === "_errors")
+        ) {
+          throw new Error(
+            "新增或替换 BFF 目标必须明确填写1–64字节的稳定 id，仅允许字母、数字、-、_、.，不得为 _errors。",
           );
         }
         edit = {
