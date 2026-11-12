@@ -27,6 +27,7 @@ import { routeBffDraftLists } from "./route_bff.js";
 import { routeDubboDraftLists } from "./route_dubbo.js";
 import { routeWsFrameDraftLists } from "./route_ws_frame.js";
 import { routeForwardProxyDraftLists } from "./route_forward_proxy.js";
+import { routeWebTransportDraftLists } from "./route_webtransport.js";
 import { routeResponseContractDraftLists } from "./route_response_contract.js";
 import {
   routeBodyTransformDraftLists,
@@ -69,6 +70,7 @@ function lists(kind, values) {
   result.push(...routeDubboDraftLists(kind));
   result.push(...routeWsFrameDraftLists(kind));
   result.push(...routeForwardProxyDraftLists(kind));
+  result.push(...routeWebTransportDraftLists(kind));
   for (const [key, value] of Object.entries(values)) {
     if (
       key !== "id" &&

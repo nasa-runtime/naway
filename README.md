@@ -1608,6 +1608,11 @@ TCP h1/h2 与 UDP h3；DATA/trailers、取消、GOAWAY、Retry、连接迁移、
   `x-naway-early-data-nonce`；nonce 在本地或 Redis 账本中一次性占位，重复、敏感凭据、DATA、
   trailers 或未授权 route 返回不可缓存的 425。客户端应在握手确认后重试 425 请求。
 
+管理草稿为路由 WebTransport 提供十一项独立字段和 Origin 原位置名单编辑：固定上游 URL、
+CA 文件与会话预算均须显式编辑，不自动开放监听能力或改写 CONNECT 方法与其它后端。
+Origin 仅接受精确 HTTP(S) 来源，不能包含通配符或业务路径；总字节与寿命的0不增加对应限制，
+空闲回收、建连、DATAGRAM 队列与单包预算仍须有效。
+
 0-RTT 使用 rustls 有状态、单次消费的 TLS 1.3 session，不能与 `tls.session_tickets` 的无状态
 共享 key 或 TLS client authentication 同时启用。多节点部署必须设置 `multi_node: true`、使用
 `runtime_state.replay_guard.backend: redis` 和 `fail_mode: closed`，并声明
