@@ -20,6 +20,9 @@ pub(super) enum Object {
     Service {
         name: String,
     },
+    Product {
+        id: String,
+    },
     Credential {
         name: String,
     },
@@ -72,6 +75,9 @@ impl Object {
                 id,
             }
             | Self::ScopePolicy {
+                id,
+            }
+            | Self::Product {
                 id,
             } => (Domain::Gateway, id, None),
             Self::Service {
@@ -135,6 +141,9 @@ impl Object {
                 id,
             }
             | Self::ScopePolicy {
+                id,
+            }
+            | Self::Product {
                 id,
             } => id,
             Self::Service {
@@ -367,6 +376,17 @@ pub(super) fn catalog(document: &Value, domain: Domain) -> Result<BTreeSet<Objec
                     }
                 }
             }
+            if let Some(portal) = document.get("developer_portal") {
+                if !portal.is_object() {
+                    // 已声明的门户必须保持对象形态，错型不能被当作没有产品的空目录。
+                    return Err(Error::Invalid);
+                }
+                for product in array(portal.get("products"))? {
+                    insert(Object::Product {
+                        id: object_id(product)?.into(),
+                    })?;
+                }
+            }
         }
         Domain::Sentinel => {
             for rule in array(document.get("flow"))? {
@@ -501,7 +521,7 @@ fn mapping_mut<'a>(
         .ok_or(Error::Invalid)
 }
 
-/// 业务作用：按固定对象类型选择集合，路由追加必须归属于已存在的显式父入口。
+/// 业务作用：按固定对象类型选择声明集合，产品不改变门户开关，路由追加必须归属于已有显式父入口。
 ///
 /// 参数说明：
 /// - `document`：已完成目录唯一性校验的原文树。
@@ -565,6 +585,17 @@ fn collection_mut<'a>(
                 create.then(|| Value::Object(Map::new())),
             )?,
             "listeners",
+        ),
+        Object::Product {
+            ..
+        } => (
+            // 只补原始产品目录，不替调用者开启公开门户或生成任何版本与订阅授权。
+            child(
+                document,
+                "developer_portal",
+                create.then(|| Value::Object(Map::new())),
+            )?,
+            "products",
         ),
         Object::Flow {
             ..

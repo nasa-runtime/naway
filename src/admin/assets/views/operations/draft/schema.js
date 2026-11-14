@@ -75,6 +75,16 @@ const definitions = {
 
   consumer_binding: [["plan", "消费者显式套餐", "string"]],
 
+  product: [
+    ["title", "API 产品标题", "string"],
+    ["description", "API 产品说明", "string"],
+    [
+      "versions",
+      "完整版本清单（替换全部生命周期、可见性、订阅和文档）",
+      "json",
+    ],
+  ],
+
   usage_plan: [
     ["requests", "窗口内基础请求数", "number"],
     ["window_ms", "固定窗口（毫秒）", "number"],
@@ -247,6 +257,7 @@ export const objectKinds = {
     ["proxy", "HTTP 入口"],
     ["route", "HTTP 路由"],
     ["service", "上游服务"],
+    ["product", "API 产品"],
     ["credential", "上游凭据"],
     ["secret_provider", "远程秘密源"],
     ["usage_plan", "用量套餐"],

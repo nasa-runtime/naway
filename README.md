@@ -2385,6 +2385,11 @@ HTTP 实体成本。开始确认丢失时可能产生孤立结束事件，不能
 `product / version / operation`，不是 route id；`management.bindings` 把已发布操作绑定到具体入口。
 OpenAPI 自动生成的旧 catalog 仍可使用，与产品目录共用公开文档投影边界。
 
+共享提案的草稿对象目录提供独立 `product` 身份，可编辑 `developer_portal.products` 的标题与说明、
+完整替换版本清单、新建或删除显式产品。已有产品身份受保护，不通过 route id 定位；不会自动开启
+门户、公开版本或扩大订阅。版本与文档使用完整声明输入，引用、合同和权限仍需原目标完整预检及
+审批执行，具体边界见[草稿编辑说明](docs/admin-draft-editing.md)。
+
 ### 合同与生命周期
 
 ```yaml

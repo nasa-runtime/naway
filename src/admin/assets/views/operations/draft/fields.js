@@ -36,6 +36,15 @@ export function draftFieldPanel(kind, values, capacity) {
   const node = element("div", "", "draft-fields");
   const rows = new Map();
   const known = draftFields(kind);
+  if (kind === "product") {
+    node.append(
+      element(
+        "p",
+        "产品身份独立于路由。版本清单为完整替换，可能改变公开可见性、订阅和文档；本编辑不会启用门户，所有引用和合同仍须原目标完整预检。",
+        "subtle",
+      ),
+    );
+  }
   const remaining = Object.keys(values).filter(
     (key) => !identityField(kind, key) && !known.some(([name]) => name === key),
   );
