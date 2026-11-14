@@ -17,6 +17,7 @@ import { llmModelFields, llmGuardrailFields } from "./route_llm.js";
 import { ragSourceFields } from "./route_rag.js";
 import { mcpToolFields } from "./route_agent_tools.js";
 import { mcpServerFields } from "./route_agent_servers.js";
+import { trafficQuotaWindowFields } from "./route_traffic_quota.js";
 import {
   openApiCatalogFields,
   openApiOperationFields,
@@ -29,6 +30,7 @@ import {
 } from "./route_body_transform.js";
 
 const definitions = {
+  traffic_quota_window: trafficQuotaWindowFields,
   mcp_openapi_catalog: openApiCatalogFields,
   mcp_openapi_operation: openApiOperationFields.filter(
     ([name]) => !["name", "operation_id"].includes(name),

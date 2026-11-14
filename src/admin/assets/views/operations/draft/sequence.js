@@ -32,6 +32,7 @@ import { routeAgentToolDraftLists } from "./route_agent_tools.js";
 import { routeAgentServerDraftLists } from "./route_agent_servers.js";
 import { routeAgentOpenApiDraftLists } from "./route_agent_openapi.js";
 import { routeAgentA2aDraftLists } from "./route_agent_a2a.js";
+import { routeTrafficQuotaDraftLists } from "./route_traffic_quota.js";
 import { routeDubboDraftLists } from "./route_dubbo.js";
 import { routeWsFrameDraftLists } from "./route_ws_frame.js";
 import { routeForwardProxyDraftLists } from "./route_forward_proxy.js";
@@ -83,6 +84,7 @@ function lists(kind, values) {
   result.push(...routeAgentServerDraftLists(kind));
   result.push(...routeAgentOpenApiDraftLists(kind, values));
   result.push(...routeAgentA2aDraftLists(kind));
+  result.push(...routeTrafficQuotaDraftLists(kind));
   result.push(...routeDubboDraftLists(kind));
   result.push(...routeWsFrameDraftLists(kind));
   result.push(...routeForwardProxyDraftLists(kind));
@@ -313,6 +315,7 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "mcp_server",
           "mcp_openapi_catalog",
           "mcp_openapi_operation",
+          "traffic_quota_window",
           "ws_message_plugin",
         ].includes(selected.type)
       ) {
@@ -469,6 +472,17 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           : value.read();
         if (!action || action.remove) {
           throw new Error("请明确设置新元素值。");
+        }
+        // 新窗口必须由操作者明确额度与长度，不能把相邻窗口的容量当作默认授权。
+        if (
+          selected.type === "traffic_quota_window" &&
+          ["limit", "window_ms"].some(
+            (key) => typeof action.fields?.[key] !== "number",
+          )
+        ) {
+          throw new Error(
+            "新增或替换额度窗口必须明确填写 limit 与 window_ms。",
+          );
         }
         // 转换目录与操作都没有可继承的授权，必须显式提供完整原生声明后再进入目标预检。
         if (selected.type === "mcp_openapi_catalog") {

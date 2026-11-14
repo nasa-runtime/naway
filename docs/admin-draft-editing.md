@@ -911,6 +911,25 @@ runtime_state.rate_limiter 连接。scope 为 route、service、global 或 share
 账本身份。fail_open 仅影响依赖不可用，非法账本、资源门和带宽等待超期仍关闭；候选仍须经过
 原目标完整预检、审批和发布。
 
+quota 提供 algorithm、windows、overflow、max_queue、max_wait_ms、cost_source、reserve、
+bytes_per_unit、max_actual、settlement_idle_ms 与 usage 子项。窗口另可按原位置编辑 limit、
+window_ms、burst，或插入、完整替换、移动与确认删除；新增和替换须明确额度与长度，不继承
+其它窗口。窗口须1–16项、额度和长度大于0，漏桶不使用 burst。delay 的队列为1–4096，最长
+等待为1–60000毫秒；资源门与请求取消仍独立约束排队。
+
+per_request 的 reserve=0 按1计费，response_bytes 的 bytes_per_unit=0 按1计算；页面保留明确
+输入，不擅自归一化。Redis 窗口另受31天、额度与窗口整数精度门约束；max_actual 约束可信
+用量或 Redis 响应结算，settlement_idle_ms 仅用于 Redis 响应回执，范围1000–600000毫秒。
+
+usage 提供 source 和 header 两项。source 仅 provider_tokens 或 response_header；前者要求
+经过解析的 Chat Completions 模型、所有模型关闭 native_passthrough 且 header 为空，后者要求
+HTTP 上游和单个1–128字节的合法非敏感计费头。两者均要求唯一真实上游，不能与本地终端、
+mirror 或内部改投组合。切换来源须显式处理旧 header，切换
+其它成本类型须移除 usage。可信用量最大成本为1–4294967296且预留不得超过它；客户端同名头
+在真实上游发送前撤下，响应插件和缓存不能提供退款证据。缺失或取消保留预留及已确认较大
+消耗，重复冲突或非法用量失败关闭，不受 fail_open 放行。完整 usage/quota 替换和子项动作
+保持各自边界，未知字段和原文引用不会因其它窗口编辑被重建。
+
 已有对象另提供“逐项编辑有序列表”，覆盖路由断言、处理链、凭据引用、静态实例、接口请求
 方法、HTTP/3 扩展及已声明的其它数组。静态实例有 URI、权重、下线、备用、健康、慢启动及
 地域字段控件；对象元素也可单独设置扩展字段。每次列表操作单独生成候选，不带上普通字段

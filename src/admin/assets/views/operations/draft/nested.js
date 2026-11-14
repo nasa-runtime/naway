@@ -52,6 +52,7 @@ import { routeAgentServerFieldGroups } from "./route_agent_servers.js";
 import { routeAgentOpenApiFieldGroups } from "./route_agent_openapi.js";
 import { routeAgentA2aFieldGroups } from "./route_agent_a2a.js";
 import { routeTrafficLimitFieldGroups } from "./route_traffic_limit.js";
+import { routeTrafficQuotaFieldGroups } from "./route_traffic_quota.js";
 
 const groups = {
   route: [
@@ -208,6 +209,16 @@ export function nestedFields(kind, values, capacity) {
   }
   if (kind === "route") {
     node.append(
+      element(
+        "p",
+        "额度窗口须全部通过；新增或替换窗口必须明确额度和长度。delay 使用有界排队与单请求期限，不扩大在途资源。Redis 另复验31天窗口、额度整数精度及响应回执寿命，不把本地兼容零自动改写为其它值。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "可信用量只取唯一真实上游，不能与本地终端、mirror 或内部改投组合。response_header 仅用于 HTTP 后端；provider_tokens 要求经过解析的 Chat Completions 模型且全部关闭 native_passthrough。客户端同名计费头先撤下，缓存或响应插件不能生成退款证据。缺失、取消和坏证据保留预留及已经确认的较大成本；矛盾或非法用量不受 fail_open 放行。切换 provider_tokens 须明确清空或移除旧 header，切换其它成本来源须移除 usage。",
+        "subtle",
+      ),
       element(
         "p",
         "traffic_limit 的两个带宽方向独立；移除整段才关闭全部账本治理。service 作用域要求固定 lb://service，同一工作区共享域内的完整策略必须一致。consumer/api_key 只读取认证后冻结事实，客户端身份头不产生额度身份。",
@@ -603,6 +614,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeAgentOpenApiFieldGroups(kind),
     ...routeAgentA2aFieldGroups(kind),
     ...routeTrafficLimitFieldGroups(kind),
+    ...routeTrafficQuotaFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
