@@ -1,4 +1,5 @@
 import { tlsIdentityFields } from "./tls.js";
+import { productVersionFields, productDocumentFields } from "./product.js";
 import { streamRouteFields } from "./stream.js";
 import { kafkaBrokerFields } from "./kafka.js";
 import { upstreamRetryFields } from "./upstream_retry.js";
@@ -31,6 +32,10 @@ import {
 } from "./route_body_transform.js";
 
 const definitions = {
+  product_version: productVersionFields.filter(([name]) => name !== "id"),
+  product_version_new: productVersionFields,
+  product_document: productDocumentFields.filter(([name]) => name !== "id"),
+  product_document_new: productDocumentFields,
   layer_match: layerMatchFields,
   traffic_quota_window: trafficQuotaWindowFields,
   mcp_openapi_catalog: openApiCatalogFields,

@@ -3,6 +3,7 @@ import { draftFields } from "./schema.js";
 import { draftFieldPanel } from "./fields.js";
 import { fieldRow } from "./controls.js";
 import { fieldAction } from "./nested.js";
+import { productDraftLists, validateProductElement } from "./product.js";
 import { tlsDraftLists } from "./tls.js";
 import { listenerDraftLists } from "./listener.js";
 import { mqttDraftLists } from "./mqtt.js";
@@ -79,6 +80,7 @@ function lists(kind, values) {
       type: "stream_route",
     });
   }
+  result.push(...productDraftLists(kind, values));
   result.push(...routeExternalPluginDraftLists(kind));
   result.push(...routeWasmDraftLists(kind));
   result.push(...routeScriptDraftLists(kind));
@@ -282,11 +284,17 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
     const selected = choices[Number(list.value)];
     const entries = selected?.values ?? [];
     button.disabled =
-      !selected?.valid || entries.length > 4096 || operation.value === "keep";
+      !selected?.valid ||
+      entries.length > (selected.maxItems ?? 4096) ||
+      operation.value === "keep" ||
+      (operation.value === "insert" &&
+        entries.length >= (selected.maxItems ?? 4096));
     note.textContent = !selected?.valid
       ? "当前位置不是列表或父字段类型不符，不能隐式覆盖。"
-      : entries.length > 4096
-        ? "列表超过逐项编辑容量，请使用原始 YAML。"
+      : entries.length > (selected.maxItems ?? 4096) ||
+          (operation.value === "insert" &&
+            entries.length >= (selected.maxItems ?? 4096))
+        ? "列表达到此类型的逐项编辑容量，不能执行当前操作。"
         : "仅明确输入的新值会写入候选，未编辑元素保持原声明。";
     if (button.disabled) {
       return;
@@ -303,6 +311,8 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
     } else if (["insert", "set"].includes(operation.value)) {
       if (
         [
+          "product_version",
+          "product_document",
           "instance",
           "tls_identity",
           "stream_route",
@@ -332,8 +342,11 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
         ].includes(selected.type)
       ) {
         // 稳定身份绑定路由、插件、聚合目标、模型、内容规则、检索来源和工具，只在新增或整值替换时开放声明。
-        const type =
-          selected.type === "stream_route"
+        const type = ["product_version", "product_document"].includes(
+          selected.type,
+        )
+          ? selected.type + "_new"
+          : selected.type === "stream_route"
             ? "stream_route_new"
             : selected.type === "external_plugin"
               ? "external_plugin_new"
@@ -485,6 +498,8 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
         if (!action || action.remove) {
           throw new Error("请明确设置新元素值。");
         }
+        // 新版本和文档必须显式声明合同与授权，不能从展示投影或相邻元素恢复未选择字段。
+        validateProductElement(selected.type, action.fields);
         // 新条件不能继承相邻项的匹配权，完整变体声明通过后才交给原目标复验可信事实和可达性。
         if (selected.type === "layer_match") {
           validateLayerMatchDeclaration(action.fields);
