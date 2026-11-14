@@ -1424,6 +1424,10 @@ Token 配额的补充量、窗口、突发、验证身份维度和容量策略�
 映射支持逐键增改与确认删除，不创建身份或信任客户端自报权限。保留策略须显式声明 `request_only`；
 移除完整治理同时关闭固定模板、RAG 和输出裁决，保留模型与路由认证。
 
+RAG 来源目录支持按原位置增改、替换、移动和确认删除，已有来源 id 保持稳定。固定检索目标、
+独立凭据、调用 ACL、文档来源及引用域白名单均可单独编辑；完整声明替换明确移除旧字段。
+引用策略和上下文预算适用于缓冲回答，完整移除 RAG 保留其它治理与认证。
+
 provider 计划支持 OpenAI、Anthropic、Google Gemini Developer API、Azure OpenAI、AWS Bedrock、
 Vertex AI、Cohere、Mistral、Hugging Face、xAI、DashScope、DeepSeek、Ollama 和 vLLM。Azure API 版本、
 Bedrock region/SigV4、Vertex project/region 与所有 endpoint 都在候选快照中冻结；API key、AWS access

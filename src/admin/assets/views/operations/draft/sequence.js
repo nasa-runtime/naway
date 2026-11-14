@@ -26,6 +26,7 @@ import { routeScriptDraftLists } from "./route_script.js";
 import { routeBffDraftLists } from "./route_bff.js";
 import { routeLlmDraftLists } from "./route_llm.js";
 import { routeAiSecurityDraftLists } from "./route_ai_security.js";
+import { routeRagDraftLists } from "./route_rag.js";
 import { routeDubboDraftLists } from "./route_dubbo.js";
 import { routeWsFrameDraftLists } from "./route_ws_frame.js";
 import { routeForwardProxyDraftLists } from "./route_forward_proxy.js";
@@ -71,6 +72,7 @@ function lists(kind, values) {
   result.push(...routeBffDraftLists(kind));
   result.push(...routeLlmDraftLists(kind));
   result.push(...routeAiSecurityDraftLists(kind));
+  result.push(...routeRagDraftLists(kind));
   result.push(...routeDubboDraftLists(kind));
   result.push(...routeWsFrameDraftLists(kind));
   result.push(...routeForwardProxyDraftLists(kind));
@@ -272,10 +274,11 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "bff_target",
           "llm_model",
           "llm_guardrail",
+          "rag_source",
           "ws_message_plugin",
         ].includes(selected.type)
       ) {
-        // 稳定 id 绑定路由、插件、聚合目标、模型与内容规则身份，只在新增或整值替换时开放声明。
+        // 稳定 id 绑定路由、插件、聚合目标、模型、内容规则与检索来源，只在新增或整值替换时开放声明。
         const type =
           selected.type === "stream_route"
             ? "stream_route_new"
@@ -291,7 +294,9 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
                       ? "llm_model_new"
                       : selected.type === "llm_guardrail"
                         ? "llm_guardrail_new"
-                        : selected.type;
+                        : selected.type === "rag_source"
+                          ? "rag_source_new"
+                          : selected.type;
         fields = draftFieldPanel(type, {}, capacity);
         body.append(
           element(
@@ -513,6 +518,31 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
             ).length !== 1
           ) {
             throw new Error("新增或替换内容规则必须明确选择恰好一种匹配来源。");
+          }
+        }
+        // 新来源没有可继承的调用权或凭据，必须明确提供完整原生声明后交给原目标预检。
+        if (selected.type === "rag_source") {
+          if (
+            typeof action.fields?.id !== "string" ||
+            !/^[A-Za-z0-9_.-]{1,64}$/.test(action.fields.id)
+          ) {
+            throw new Error(
+              "新增或替换检索来源须明确填写1–64字节的稳定安全 ASCII id。",
+            );
+          }
+          for (const key of [
+            "target",
+            "invocation",
+            "timeout_ms",
+            "max_documents",
+            "max_response_bytes",
+            "allowed_sources",
+            "allowed_citation_origins",
+            "fail_mode",
+          ]) {
+            if (!Object.hasOwn(action.fields, key)) {
+              throw new Error(`新增或替换检索来源必须明确填写 ${key}。`);
+            }
           }
         }
         edit = {
