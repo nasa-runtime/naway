@@ -56,6 +56,7 @@ import { routeTrafficQuotaFieldGroups } from "./route_traffic_quota.js";
 import { routeStaticServeFieldGroups } from "./route_static_serve.js";
 import { routeLayerFieldGroups } from "./route_layer.js";
 import { routeCgiFieldGroups } from "./route_cgi.js";
+import { routeWebdavFieldGroups } from "./route_webdav.js";
 
 const groups = {
   route: [
@@ -212,6 +213,11 @@ export function nestedFields(kind, values, capacity) {
   }
   if (kind === "route") {
     node.append(
+      element(
+        "p",
+        "WebDAV 方法须明确列出且唯一，写入或锁操作要求已启用并 fsync 的审计。local 须已有 serve.static.root、lock_scope=process 与 exclusive_process=true；try_files/index 须空，不能覆盖缓存或 MIME、允许点文件或关闭 etag/range。目录不能重叠、含主配置或审计 spool；不提供集群目录互斥。proxy 须固定 HTTP 上游，锁由上游负责，不能保留本地独占或 lock_scope，也不能 preserve_host。切换模式或移除 WebDAV 须明确处理旧字段及后端，页面不创建目录或自动开放写权限。",
+        "subtle",
+      ),
       element(
         "p",
         "CGI 必须指向固定 lb://service，服务 protocol 与 cgi.protocol 一致且目标具备对应 feature。脚本根、文件与名称只能是固定绝对字面量，文件须严格位于根内；客户端 path、query、Host 或同名头不能选择脚本。keep_conn 与 php_fpm 收尾仅用于 FastCGI，切换协议须明确处理旧声明。请求头只进入显式白名单，重名、下划线和协议控制头不能转成环境；移除 CGI 须明确选择普通 HTTP 后端，不会降级解释记录流。",
@@ -636,6 +642,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeStaticServeFieldGroups(kind),
     ...routeLayerFieldGroups(kind),
     ...routeCgiFieldGroups(kind),
+    ...routeWebdavFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

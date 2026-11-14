@@ -35,6 +35,7 @@ import { routeAgentA2aDraftLists } from "./route_agent_a2a.js";
 import { routeTrafficQuotaDraftLists } from "./route_traffic_quota.js";
 import { routeStaticServeDraftLists } from "./route_static_serve.js";
 import { routeCgiDraftLists } from "./route_cgi.js";
+import { routeWebdavDraftLists } from "./route_webdav.js";
 import {
   routeLayerDraftLists,
   validateLayerMatchDeclaration,
@@ -94,6 +95,7 @@ function lists(kind, values) {
   result.push(...routeStaticServeDraftLists(kind));
   result.push(...routeLayerDraftLists(kind));
   result.push(...routeCgiDraftLists(kind));
+  result.push(...routeWebdavDraftLists(kind));
   result.push(...routeDubboDraftLists(kind));
   result.push(...routeWsFrameDraftLists(kind));
   result.push(...routeForwardProxyDraftLists(kind));

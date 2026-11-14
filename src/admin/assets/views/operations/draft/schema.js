@@ -143,6 +143,11 @@ const definitions = {
   ],
 
   route: [
+    [
+      "webdav",
+      "完整 WebDAV 声明（替换全部；移除须明确后端和静态目录权限）",
+      "json",
+    ],
     ["cgi", "完整固定 CGI 声明（替换全部；移除须明确选择普通后端）", "json"],
     [
       "layer",

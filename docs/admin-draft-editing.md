@@ -445,6 +445,26 @@ codec、请求/响应 frame 与 Hessian2 资源门、建连/调用期限、空�
 `dubbo-hessian2`，其专有预算不作用于 JSON codec。空闲容量0表示关闭复用，空 version/group
 和空附件映射是实际声明；未编辑的引用、未知子项与宽整数保持原值。
 
+`webdav` 提供完整声明与十八项子字段：mode、mount_prefix、upstream_prefix、methods、lock_scope、
+exclusive_process、max_file_bytes、max_total_bytes、max_entries、max_path_depth、max_inflight、
+max_xml_bytes、max_xml_nodes、max_xml_depth、max_multistatus_bytes、max_locks、max_lock_seconds、
+timeout_ms。methods 使用每行一项的明确名单，也可按原位置插入、替换、移动和确认删除；不根据
+模式补写方法，空集、重复或不支持的方法由原目标拒绝。
+
+local 须已有 serve.static.root、lock_scope=process 与 exclusive_process=true，不能 upstream_prefix；
+静态配置的 try_files/index 须空或缺省，不能声明缓存或 MIME 覆盖、允许点文件或关闭 etag/range。
+目录不得包含配置或审计 spool，不能与其它 DAV 或普通静态根重叠或别名。proxy 使用固定 HTTP
+origin 或 HTTP lb 服务，不能保留 lock_scope、本地独占或 preserve_host；锁由上游负责，本地
+进程锁不提供集群互斥。允许写或锁方法要求 admin.audit.enabled 和 fsync，移除方法不撤销已经
+完成的文件写入。
+
+文件容量为1–1073741824字节，总容量至少为文件上限、至多1099511627776字节；目录项1–4096、
+路径深度1–32、在途1–128；XML 容量1024–1048576字节、节点1–16384、深度1–32；多状态响应
+容量至少 XML 容量、至多8388608字节；进程内锁1–1024、最长寿命1–86400秒、操作期限100–60000毫秒。
+完整替换不继承旧模式或目录权限，切换模式或移除完整 webdav 须明确处理互斥声明与后端；候选
+编辑不创建目录、求值引用或自动开放写方法，原文未知子项与宽整数保持不变，最终仍须原目标
+完整预检、审批和发布。
+
 `cgi` 提供完整声明与十六个子字段：protocol、script_root、script_filename、script_name、
 server_name、server_port、max_header_bytes、max_headers、max_params、max_param_bytes、
 max_stderr_bytes、max_inflight、keep_conn、fastcgi_termination、idle_timeout_ms、request_headers。
