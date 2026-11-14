@@ -445,6 +445,19 @@ codec、请求/响应 frame 与 Hessian2 资源门、建连/调用期限、空�
 `dubbo-hessian2`，其专有预算不作用于 JSON codec。空闲容量0表示关闭复用，空 version/group
 和空附件映射是实际声明；未编辑的引用、未知子项与宽整数保持原值。
 
+`media` 提供完整声明及十项子字段：format、max_file_bytes、max_metadata_bytes、max_parse_bytes、
+max_box_bytes、max_boxes、max_depth、max_samples、max_inflight、timeout_ms。format 明确为 mp4
+或 flv，页面不根据选择自动补写静态根、解析器或预算；MP4 的 start 为秒且最多六位小数，FLV
+为原文件字节整数，Range 保持原文件语义。不支持的容器布局回落原文，不提供转码或直播。
+
+目标须具备 media-streaming，并使用单一静态终端；不能与其它终端、共享缓存、压缩、正文变换、
+响应头覆盖或内部跳转组合。单文件1–1099511627776字节；元数据1024–16777216字节，累计解析
+读取至少元数据容量、至多33554432字节；单 box/tag 为1024–16777216字节，结构数量16–100000、
+深度4–32、样本或 tag 总数1–500000、在途1–8、解析期限10–10000毫秒。元数据容量乘8、样本乘96
+与结构数量乘128的保守工作集总和不得超过192MiB，进程还有独立资源门；表单不放宽这些约束。
+完整替换不继承旧预算，明确移除 media 后按普通静态语义读取；静态根、认证、引用、未知子项
+与宽整数在未编辑时保持原值，最终仍须原目标完整预检、审批和发布。
+
 `webdav` 提供完整声明与十八项子字段：mode、mount_prefix、upstream_prefix、methods、lock_scope、
 exclusive_process、max_file_bytes、max_total_bytes、max_entries、max_path_depth、max_inflight、
 max_xml_bytes、max_xml_nodes、max_xml_depth、max_multistatus_bytes、max_locks、max_lock_seconds、

@@ -57,6 +57,7 @@ import { routeStaticServeFieldGroups } from "./route_static_serve.js";
 import { routeLayerFieldGroups } from "./route_layer.js";
 import { routeCgiFieldGroups } from "./route_cgi.js";
 import { routeWebdavFieldGroups } from "./route_webdav.js";
+import { routeMediaFieldGroups } from "./route_media.js";
 
 const groups = {
   route: [
@@ -213,6 +214,11 @@ export function nestedFields(kind, values, capacity) {
   }
   if (kind === "route") {
     node.append(
+      element(
+        "p",
+        "媒体能力须目标具备 media-streaming，并使用单一静态终端；不能与其它终端、共享缓存、压缩、正文变换、响应头覆盖或内部跳转组合。mp4 的 start 为秒且最多六位小数，flv 为原文件字节整数；Range 优先读取原文件。不支持的布局回落原文件，不解码、转码或提供直播。元数据、样本和结构的保守工作集须不超过192MiB；未声明媒体或移除 media 时按普通静态语义处理。",
+        "subtle",
+      ),
       element(
         "p",
         "WebDAV 方法须明确列出且唯一，写入或锁操作要求已启用并 fsync 的审计。local 须已有 serve.static.root、lock_scope=process 与 exclusive_process=true；try_files/index 须空，不能覆盖缓存或 MIME、允许点文件或关闭 etag/range。目录不能重叠、含主配置或审计 spool；不提供集群目录互斥。proxy 须固定 HTTP 上游，锁由上游负责，不能保留本地独占或 lock_scope，也不能 preserve_host。切换模式或移除 WebDAV 须明确处理旧字段及后端，页面不创建目录或自动开放写权限。",
@@ -643,6 +649,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeLayerFieldGroups(kind),
     ...routeCgiFieldGroups(kind),
     ...routeWebdavFieldGroups(kind),
+    ...routeMediaFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

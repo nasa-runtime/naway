@@ -143,6 +143,7 @@ const definitions = {
   ],
 
   route: [
+    ["media", "完整静态媒体声明（替换全部；须明确静态根和解析预算）", "json"],
     [
       "webdav",
       "完整 WebDAV 声明（替换全部；移除须明确后端和静态目录权限）",
