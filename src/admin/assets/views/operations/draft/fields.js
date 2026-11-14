@@ -18,7 +18,10 @@ export function draftFieldPanel(kind, values, capacity) {
   const remaining = Object.keys(values).filter(
     (key) =>
       key !== "id" &&
-      !(key === "name" && ["credential", "secret_provider"].includes(kind)) &&
+      !(
+        key === "name" &&
+        ["credential", "secret_provider", "mcp_tool"].includes(kind)
+      ) &&
       !known.some(([name]) => name === key),
   );
   if (known.length + remaining.length > 128) {
@@ -65,7 +68,8 @@ export function draftFieldPanel(kind, values, capacity) {
     if (
       !name ||
       name === "id" ||
-      (name === "name" && ["credential", "secret_provider"].includes(kind)) ||
+      (name === "name" &&
+        ["credential", "secret_provider", "mcp_tool"].includes(kind)) ||
       rows.has(name) ||
       /[\x00-\x1f\x7f]/.test(name) ||
       new TextEncoder().encode(name).length > 128 ||

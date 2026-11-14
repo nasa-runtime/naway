@@ -1701,6 +1701,10 @@ cargo build --release --features agent-protocols
 consumer 的组映射可逐键修改。页面不生成默认授权或扩大预算，完整声明替换与子字段编辑分别
 保留各自边界，正式生效仍须原目标预检、审批和发布。
 
+MCP 工具目录提供原位置增改、完整替换、移动和确认删除；工具的 schema、发现与调用 ACL、
+副作用和调用预算、固定 REST 或 MCP 后端可分别编辑。已有工具名称在字段编辑中保持稳定，
+新工具不继承其它工具的权限或凭据，完整目录仍须满足原生数量与响应预算。
+
 ### MCP 固定工具目录
 
 Streamable HTTP 显式支持 `2025-11-25`：initialize、initialized、ping、tools/list、tools/call、

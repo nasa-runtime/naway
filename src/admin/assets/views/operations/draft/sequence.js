@@ -28,6 +28,7 @@ import { routeLlmDraftLists } from "./route_llm.js";
 import { routeAiSecurityDraftLists } from "./route_ai_security.js";
 import { routeRagDraftLists } from "./route_rag.js";
 import { routeAgentDraftLists } from "./route_agent.js";
+import { routeAgentToolDraftLists } from "./route_agent_tools.js";
 import { routeDubboDraftLists } from "./route_dubbo.js";
 import { routeWsFrameDraftLists } from "./route_ws_frame.js";
 import { routeForwardProxyDraftLists } from "./route_forward_proxy.js";
@@ -75,6 +76,7 @@ function lists(kind, values) {
   result.push(...routeAiSecurityDraftLists(kind));
   result.push(...routeRagDraftLists(kind));
   result.push(...routeAgentDraftLists(kind));
+  result.push(...routeAgentToolDraftLists(kind));
   result.push(...routeDubboDraftLists(kind));
   result.push(...routeWsFrameDraftLists(kind));
   result.push(...routeForwardProxyDraftLists(kind));
@@ -277,10 +279,11 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "llm_model",
           "llm_guardrail",
           "rag_source",
+          "mcp_tool",
           "ws_message_plugin",
         ].includes(selected.type)
       ) {
-        // 稳定 id 绑定路由、插件、聚合目标、模型、内容规则与检索来源，只在新增或整值替换时开放声明。
+        // 稳定身份绑定路由、插件、聚合目标、模型、内容规则、检索来源和工具，只在新增或整值替换时开放声明。
         const type =
           selected.type === "stream_route"
             ? "stream_route_new"
@@ -298,7 +301,9 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
                         ? "llm_guardrail_new"
                         : selected.type === "rag_source"
                           ? "rag_source_new"
-                          : selected.type;
+                          : selected.type === "mcp_tool"
+                            ? "mcp_tool_new"
+                            : selected.type;
         fields = draftFieldPanel(type, {}, capacity);
         body.append(
           element(
@@ -336,7 +341,7 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           ? entry
           : selected?.type?.startsWith("body_transform_")
             ? bodyTransformEntryLabel(entry)
-            : selected?.type === "bot_trusted" &&
+            : ["bot_trusted", "mcp_tool"].includes(selected?.type) &&
                 typeof entry?.name === "string"
               ? entry.name
               : selected?.type === "schema_registry_document" &&
@@ -423,6 +428,31 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           : value.read();
         if (!action || action.remove) {
           throw new Error("请明确设置新元素值。");
+        }
+        // 新工具必须由操作者完整声明授权和后端，不能从相邻工具继承权限、schema 或凭据。
+        if (selected.type === "mcp_tool") {
+          if (
+            typeof action.fields?.name !== "string" ||
+            !/^[A-Za-z0-9_.-]{1,64}$/.test(action.fields.name)
+          ) {
+            throw new Error("新增或替换工具必须明确填写1–64字节的稳定名称。");
+          }
+          for (const key of [
+            "description",
+            "input_schema",
+            "discovery",
+            "invocation",
+            "side_effect",
+            "deadline_ms",
+            "max_calls_per_session",
+            "max_request_bytes",
+            "max_response_bytes",
+            "backend",
+          ]) {
+            if (!Object.hasOwn(action.fields, key)) {
+              throw new Error(`新增或替换工具必须明确填写 ${key}。`);
+            }
+          }
         }
         // 新消息插件没有可继承的类型，必须明确选择受支持的执行语义，不能靠其它字段猜测权限。
         if (
