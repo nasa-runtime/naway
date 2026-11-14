@@ -17,6 +17,10 @@ import { llmModelFields, llmGuardrailFields } from "./route_llm.js";
 import { ragSourceFields } from "./route_rag.js";
 import { mcpToolFields } from "./route_agent_tools.js";
 import { mcpServerFields } from "./route_agent_servers.js";
+import {
+  openApiCatalogFields,
+  openApiOperationFields,
+} from "./route_agent_openapi.js";
 import { wsMessagePluginFields } from "./route_ws_frame.js";
 import {
   bodyTransformOperationFields,
@@ -25,6 +29,11 @@ import {
 } from "./route_body_transform.js";
 
 const definitions = {
+  mcp_openapi_catalog: openApiCatalogFields,
+  mcp_openapi_operation: openApiOperationFields.filter(
+    ([name]) => !["name", "operation_id"].includes(name),
+  ),
+  mcp_openapi_operation_new: openApiOperationFields,
   mcp_server: mcpServerFields.filter(([name]) => name !== "id"),
   mcp_server_new: mcpServerFields,
   mcp_tool: mcpToolFields.filter(([name]) => name !== "name"),

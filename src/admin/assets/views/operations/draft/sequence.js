@@ -30,6 +30,7 @@ import { routeRagDraftLists } from "./route_rag.js";
 import { routeAgentDraftLists } from "./route_agent.js";
 import { routeAgentToolDraftLists } from "./route_agent_tools.js";
 import { routeAgentServerDraftLists } from "./route_agent_servers.js";
+import { routeAgentOpenApiDraftLists } from "./route_agent_openapi.js";
 import { routeDubboDraftLists } from "./route_dubbo.js";
 import { routeWsFrameDraftLists } from "./route_ws_frame.js";
 import { routeForwardProxyDraftLists } from "./route_forward_proxy.js";
@@ -79,6 +80,7 @@ function lists(kind, values) {
   result.push(...routeAgentDraftLists(kind));
   result.push(...routeAgentToolDraftLists(kind));
   result.push(...routeAgentServerDraftLists(kind));
+  result.push(...routeAgentOpenApiDraftLists(kind, values));
   result.push(...routeDubboDraftLists(kind));
   result.push(...routeWsFrameDraftLists(kind));
   result.push(...routeForwardProxyDraftLists(kind));
@@ -141,6 +143,30 @@ function lists(kind, values) {
         break;
       }
       current = Object.hasOwn(current, key) ? current[key] : undefined;
+    }
+    for (const parent of item.parents ?? []) {
+      // 内层名单只从当前原文的明确数组位置显示，父项缺席或类型不符时禁止推断另一份目录。
+      if (
+        !valid ||
+        !Array.isArray(current) ||
+        !Number.isInteger(parent.index) ||
+        parent.index < 0 ||
+        parent.index >= current.length
+      ) {
+        valid = false;
+        break;
+      }
+      current = current[parent.index];
+      for (const key of parent.path) {
+        if (current === undefined) {
+          continue;
+        }
+        if (!current || Array.isArray(current) || typeof current !== "object") {
+          valid = false;
+          break;
+        }
+        current = Object.hasOwn(current, key) ? current[key] : undefined;
+      }
     }
     return {
       ...item,
@@ -283,6 +309,8 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "rag_source",
           "mcp_tool",
           "mcp_server",
+          "mcp_openapi_catalog",
+          "mcp_openapi_operation",
           "ws_message_plugin",
         ].includes(selected.type)
       ) {
@@ -308,7 +336,9 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
                             ? "mcp_tool_new"
                             : selected.type === "mcp_server"
                               ? "mcp_server_new"
-                              : selected.type;
+                              : selected.type === "mcp_openapi_operation"
+                                ? "mcp_openapi_operation_new"
+                                : selected.type;
         fields = draftFieldPanel(type, {}, capacity);
         body.append(
           element(
@@ -346,22 +376,26 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           ? entry
           : selected?.type?.startsWith("body_transform_")
             ? bodyTransformEntryLabel(entry)
-            : ["bot_trusted", "mcp_tool"].includes(selected?.type) &&
-                typeof entry?.name === "string"
-              ? entry.name
-              : selected?.type === "schema_registry_document" &&
-                  typeof entry?.url === "string"
-                ? entry.url
-                : typeof entry?.id === "string"
-                  ? entry.id
-                  : typeof entry?.uri === "string"
-                    ? entry.uri
-                    : Array.isArray(entry?.server_names) &&
-                        entry.server_names.every(
-                          (name) => typeof name === "string",
-                        )
-                      ? entry.server_names.join(", ")
-                      : "元素";
+            : selected?.type === "mcp_openapi_catalog" &&
+                typeof entry?.file === "string"
+              ? entry.file
+              : ["bot_trusted", "mcp_tool", "mcp_openapi_operation"].includes(
+                    selected?.type,
+                  ) && typeof entry?.name === "string"
+                ? entry.name
+                : selected?.type === "schema_registry_document" &&
+                    typeof entry?.url === "string"
+                  ? entry.url
+                  : typeof entry?.id === "string"
+                    ? entry.id
+                    : typeof entry?.uri === "string"
+                      ? entry.uri
+                      : Array.isArray(entry?.server_names) &&
+                          entry.server_names.every(
+                            (name) => typeof name === "string",
+                          )
+                        ? entry.server_names.join(", ")
+                        : "元素";
       const option = element("option", index + " · " + label.slice(0, 160));
       option.value = String(index);
       item.append(option);
@@ -433,6 +467,43 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           : value.read();
         if (!action || action.remove) {
           throw new Error("请明确设置新元素值。");
+        }
+        // 转换目录与操作都没有可继承的授权，必须显式提供完整原生声明后再进入目标预检。
+        if (selected.type === "mcp_openapi_catalog") {
+          if (
+            typeof action.fields?.file !== "string" ||
+            !action.fields.file.length ||
+            !Object.hasOwn(action.fields, "target") ||
+            !Object.hasOwn(action.fields, "operations")
+          ) {
+            throw new Error(
+              "新增或替换 OpenAPI 目录必须明确填写非空 file、完整 target 和 operations。",
+            );
+          }
+        }
+        if (selected.type === "mcp_openapi_operation") {
+          if (
+            typeof action.fields?.operation_id !== "string" ||
+            typeof action.fields?.name !== "string" ||
+            !/^[A-Za-z0-9_.-]{1,64}$/.test(action.fields.name)
+          ) {
+            throw new Error(
+              "新增或替换操作必须明确填写 operation_id 与1–64字节工具名称。",
+            );
+          }
+          for (const key of [
+            "discovery",
+            "invocation",
+            "side_effect",
+            "deadline_ms",
+            "max_calls_per_session",
+            "max_request_bytes",
+            "max_response_bytes",
+          ]) {
+            if (!Object.hasOwn(action.fields, key)) {
+              throw new Error(`新增或替换操作必须明确填写 ${key}。`);
+            }
+          }
         }
         // 新服务器必须显式指定身份和完整目标，不能把其它服务器的地址或凭据当作默认声明。
         if (selected.type === "mcp_server") {
@@ -601,6 +672,10 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
         };
       } else {
         throw new Error("请先选择列表操作。");
+      }
+      // 内层动作携带父目录的原始下标，未选择的目录和操作不从浏览器投影重新序列化。
+      for (const parent of [...(selected.parents ?? [])].reverse()) {
+        edit = { op: "sequence", index: parent.index, path: parent.path, edit };
       }
       submit({
         type: "patch_sequence",

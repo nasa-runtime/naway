@@ -4,6 +4,27 @@ import { fieldRow } from "./controls.js";
 import { nestedFields } from "./nested.js";
 
 /**
+ * 业务作用：保护字段编辑中已绑定的目录和授权身份，换名须由完整元素替换明确表达。
+ * 参数说明：
+ * - `kind`：当前元素的草稿类别。
+ * - `name`：原始字段名。
+ * 返回：已受保护的身份字段为 true；新增元素的已声明字段仍由其独立定义开放。
+ */
+function identityField(kind, name) {
+  return (
+    name === "id" ||
+    (name === "name" &&
+      [
+        "credential",
+        "secret_provider",
+        "mcp_tool",
+        "mcp_openapi_operation",
+      ].includes(kind)) ||
+    (name === "operation_id" && kind === "mcp_openapi_operation")
+  );
+}
+
+/**
  * 业务作用：按对象类别生成常用字段及完整扩展字段编辑，修改仅指向用户选择的原始声明。
  * 参数说明：
  * - `kind`：对象类别。
@@ -16,13 +37,7 @@ export function draftFieldPanel(kind, values, capacity) {
   const rows = new Map();
   const known = draftFields(kind);
   const remaining = Object.keys(values).filter(
-    (key) =>
-      key !== "id" &&
-      !(
-        key === "name" &&
-        ["credential", "secret_provider", "mcp_tool"].includes(kind)
-      ) &&
-      !known.some(([name]) => name === key),
+    (key) => !identityField(kind, key) && !known.some(([name]) => name === key),
   );
   if (known.length + remaining.length > 128) {
     throw new Error("此对象字段过多，请在原始 YAML 中编辑。");
@@ -67,9 +82,7 @@ export function draftFieldPanel(kind, values, capacity) {
     const name = addName.value;
     if (
       !name ||
-      name === "id" ||
-      (name === "name" &&
-        ["credential", "secret_provider", "mcp_tool"].includes(kind)) ||
+      identityField(kind, name) ||
       rows.has(name) ||
       /[\x00-\x1f\x7f]/.test(name) ||
       new TextEncoder().encode(name).length > 128 ||

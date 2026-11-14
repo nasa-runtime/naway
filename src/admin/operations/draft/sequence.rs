@@ -28,6 +28,11 @@ pub(super) enum Edit {
         index: usize,
         edits: Vec<nested::Edit>,
     },
+    Sequence {
+        index: usize,
+        path: Vec<String>,
+        edit: Box<Edit>,
+    },
 }
 
 /// 业务作用：在一个草稿对象中编辑单个有序列表，不从浏览器展示值重建未修改元素。
@@ -39,8 +44,27 @@ pub(super) enum Edit {
 ///
 /// 返回：实际声明改变时为 true；非法路径、索引、容量或元素类型拒绝整个局部文档。
 pub(super) fn patch(object: &mut Value, path: &[String], edit: Edit) -> Result<bool, Error> {
+    patch_at_depth(object, path, edit, 0)
+}
+
+/// 业务作用：按原始数组位置进入子列表，并让全部映射键和数组选择共享同一声明深度边界。
+///
+/// 参数说明：
+/// - `object`：当前已选中的原始对象子树。
+/// - `path`：仅包含显式映射键的列表位置。
+/// - `edit`：当前列表动作，子列表动作另带明确的原位置和映射路径。
+/// - `depth`：外层已消耗的映射与数组位置层数。
+///
+/// 返回：仅实际原文声明变化时为 true；超深、非法位置或类型不符拒绝整个局部编辑，不重建其它元素。
+fn patch_at_depth(
+    object: &mut Value,
+    path: &[String],
+    edit: Edit,
+    depth: usize,
+) -> Result<bool, Error> {
+    // 每次进入子列表都沿用外层消耗，不能通过重新开始局部路径绕过原声明的八层边界。
     if path.is_empty()
-        || path.len() > 8
+        || depth + path.len() > 8
         || path[0] == "id"
         || path
             .iter()
@@ -55,7 +79,7 @@ pub(super) fn patch(object: &mut Value, path: &[String], edit: Edit) -> Result<b
     {
         if edits
             .iter()
-            .any(|edit| path.len() + 1 + edit.path().len() > 8)
+            .any(|edit| depth + path.len() + 1 + edit.path().len() > 8)
         {
             return Err(Error::Invalid);
         }
@@ -71,6 +95,7 @@ pub(super) fn patch(object: &mut Value, path: &[String], edit: Edit) -> Result<b
     if items.len() > MAX_ITEMS {
         return Err(Error::Capacity);
     }
+    let child_depth = depth + path.len() + 1;
     match edit {
         Edit::Insert {
             index,
@@ -127,6 +152,19 @@ pub(super) fn patch(object: &mut Value, path: &[String], edit: Edit) -> Result<b
             index,
             edits,
         } => nested::patch(items.get_mut(index).ok_or(Error::Invalid)?, edits),
+        Edit::Sequence {
+            index,
+            path,
+            edit,
+        } => {
+            // 数组下标只选择当前原文的一个元素；缺席或非映射子项不得被隐式补成另一份目录。
+            patch_at_depth(
+                items.get_mut(index).ok_or(Error::Invalid)?,
+                &path,
+                *edit,
+                child_depth,
+            )
+        }
     }
 }
 
