@@ -3,9 +3,10 @@
 mod routes;
 mod send;
 mod services;
+mod streams;
 mod wire;
 pub(super) use send::upload;
-pub(super) use wire::{digest, frame, Candidate};
+pub(super) use wire::{digest, digest_with_streams, frame, frame_with_streams, Candidate};
 
 use crate::admin::monitor::model;
 use std::sync::Arc;
@@ -28,4 +29,6 @@ pub(super) struct Upload {
     pub at: Instant,
     pub digest: [u8; 32],
     pub legacy_digest: [u8; 32],
+    pub stream_digest: [u8; 32],
+    pub stream_legacy_digest: [u8; 32],
 }

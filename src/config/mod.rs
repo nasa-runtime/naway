@@ -193,6 +193,8 @@ pub struct GatewaySnapshot {
     pub proxies: Arc<Vec<ProxyRuntime>>,
     /// L4 stream TCP listener 列表。
     pub stream_listeners: Arc<Vec<StreamRuntime>>,
+    /// 与当前配置同代的监听器事实，不参与 socket 拓扑或运行配置的相等比较。
+    pub(crate) stream_traffic: Arc<crate::observability::stream_traffic::Catalog>,
     /// 开发者门户/API 目录；OpenAPI 文档和 operation 摘要均随快照原子换版。
     pub developer_portal: Arc<crate::portal::DeveloperPortalRuntime>,
     /// 与认证和产品目录同代的层级授权、额度和上下文策略。
@@ -859,6 +861,38 @@ impl ProxyRuntime {
 }
 
 impl GatewaySnapshot {
+    /// 业务作用：为本快照已经选择的监听器创建唯一接入观察器，旧会话不切换计数所有者。
+    ///
+    /// 参数说明：
+    /// - `listener`：调用方从同一快照选定的真实监听器身份。
+    ///
+    /// 返回：登记尝试与在途量的观察器；监控关闭、身份缺席或容量不足时为空，不阻断转发。
+    pub fn stream_observation(
+        &self,
+        listener: &str,
+    ) -> Option<crate::observability::stream_traffic::Observation> {
+        if !self.admin_monitor.enabled {
+            return None;
+        }
+        self.stream_traffic.start(listener)
+    }
+
+    /// 业务作用：为监听器的数据报门禁取得同代事实引用，不建立或重复释放会话。
+    ///
+    /// 参数说明：
+    /// - `listener`：当前快照选中的真实监听器身份。
+    ///
+    /// 返回：只更新原配置累计的引用；监控关闭、目录不完整或身份缺席时为空。
+    pub fn stream_observation_handle(
+        &self,
+        listener: &str,
+    ) -> Option<crate::observability::stream_traffic::Handle> {
+        if !self.admin_monitor.enabled {
+            return None;
+        }
+        self.stream_traffic.handle(listener)
+    }
+
     /// 业务作用：按入口 id 找当前版本的 proxy 配置。
     pub fn proxy(&self, id: &str) -> Option<&ProxyRuntime> {
         self.proxies.iter().find(|proxy| proxy.id == id)
@@ -1464,6 +1498,8 @@ fn build_snapshot_from_config(
     }
     let stream_listeners = build_stream_listeners(&cfg.stream, cfg_path, &crypto_catalog)
         .context("build stream listeners")?;
+    let stream_traffic =
+        crate::observability::stream_traffic::Catalog::build(&stream_listeners, &ownership);
     let upstreams = UpstreamDirectory::build_with_dynamic_at_discovery(
         &cfg.upstreams,
         dynamic_upstreams,
@@ -1548,6 +1584,7 @@ fn build_snapshot_from_config(
         upstreams: Arc::new(upstreams),
         proxies: Arc::new(proxies),
         stream_listeners: Arc::new(stream_listeners),
+        stream_traffic: Arc::new(stream_traffic),
         developer_portal,
         scoped_policies,
         usage_meter,

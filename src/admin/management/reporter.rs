@@ -24,6 +24,7 @@ struct Target {
     certificates_supported: bool,
     interest_until: Option<Instant>,
     service_metrics_supported: bool,
+    stream_metrics_supported: bool,
     issuer: Option<Arc<super::issuer::Verifier>>,
     #[cfg(feature = "node-actions")]
     actions: super::actions::Channel,
@@ -115,6 +116,7 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     certificates_supported: false,
                     interest_until: None,
                     service_metrics_supported: false,
+                    stream_metrics_supported: false,
                     issuer: target.issuer.clone(),
                     #[cfg(feature = "node-actions")]
                     actions: super::actions::Channel::default(),
@@ -158,6 +160,8 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                 Arc::new(telemetry::Upload {
                     digest: telemetry::digest(&sample, true),
                     legacy_digest: telemetry::digest(&sample, false),
+                    stream_digest: telemetry::digest_with_streams(&sample, true),
+                    stream_legacy_digest: telemetry::digest_with_streams(&sample, false),
                     sample,
                     at,
                 })
@@ -291,6 +295,7 @@ async fn send(target: &mut Target, round: &Round<'_>) {
         let client = target.client.clone();
         let session = target.session.clone();
         let service_supported = target.service_metrics_supported;
+        let stream_supported = target.stream_metrics_supported;
         let metrics = async {
             if let Some(sample) = upload {
                 let _ = telemetry::upload(
@@ -300,6 +305,7 @@ async fn send(target: &mut Target, round: &Round<'_>) {
                     session,
                     deadline,
                     service_supported,
+                    stream_supported,
                 )
                 .await;
             }
@@ -377,7 +383,14 @@ async fn send_catalog(
     catalog: &Catalog,
     deadline: tokio::time::Instant,
 ) -> Result<(), Status> {
-    let generation = (catalog.version, catalog.digest);
+    let streams = catalog
+        .streams
+        .as_ref()
+        .filter(|_| target.stream_metrics_supported);
+    let stream_total = streams.map_or(0, |value| value.entries.len());
+    let combined = catalog.entries.len() + stream_total;
+    let digest = catalog.wire_digest(target.stream_metrics_supported);
+    let generation = (catalog.version, digest);
     if target.catalog_generation != Some(generation) {
         target.catalog_generation = Some(generation);
         target.catalog_offset = 0;
@@ -393,14 +406,21 @@ async fn send_catalog(
         } else {
             catalog::CHUNK
         };
-        let end = (target.catalog_offset + chunk).min(catalog.entries.len());
+        let base_offset = target.catalog_offset.min(catalog.entries.len());
+        let stream_offset = target.catalog_offset.saturating_sub(catalog.entries.len());
+        let in_streams = target.catalog_offset >= catalog.entries.len();
+        let end = if in_streams {
+            (stream_offset + chunk).min(stream_total) + catalog.entries.len()
+        } else {
+            (target.catalog_offset + chunk).min(catalog.entries.len())
+        };
         let request = protocol::CatalogRequest {
             node_id: facts.node_id.clone(),
             boot_id: facts.boot_id.clone(),
             session: target.session.clone(),
             config_version: catalog.version,
             config_fingerprint: catalog.fingerprint,
-            digest: catalog.digest.to_vec(),
+            digest: digest.to_vec(),
             total: catalog.entries.len() as u32,
             offset: target.catalog_offset as u32,
             capacity: catalog.capacity,
@@ -418,7 +438,17 @@ async fn send_catalog(
             } else {
                 Vec::new()
             },
-            entries: catalog.entries[target.catalog_offset..end]
+            stream_capacity: streams.map(|value| value.capacity),
+            stream_total: stream_total as u32,
+            stream_entries: streams
+                .filter(|_| in_streams)
+                .map_or_else(Vec::new, |value| {
+                    value.entries[stream_offset..end - catalog.entries.len()]
+                        .iter()
+                        .map(catalog::encode)
+                        .collect()
+                }),
+            entries: catalog.entries[base_offset..end.min(catalog.entries.len())]
                 .iter()
                 .map(catalog::encode)
                 .collect(),
@@ -441,10 +471,7 @@ async fn send_catalog(
             }
         };
         let next = response.next_offset as usize;
-        if next < end
-            || next > catalog.entries.len()
-            || response.complete != (next == catalog.entries.len())
-        {
+        if next < end || next > combined || response.complete != (next == combined) {
             return Err(Status::data_loss("catalog acknowledgement mismatch"));
         }
         target.catalog_offset = next;
@@ -592,6 +619,7 @@ async fn exchange(
         .then(|| Instant::now() + Duration::from_millis(u64::from(response.metrics_interest_ms)));
     // 每次成功心跳重新取得能力；目标降级或切换后不能继续发送新字段及其摘要。
     target.service_metrics_supported = response.service_metrics_supported;
+    target.stream_metrics_supported = response.stream_metrics_supported;
     target.consumers_supported = response.consumers_supported;
     target.certificates_supported = response.certificates_supported;
     if !target.certificates_supported {

@@ -31,6 +31,7 @@ pub(in crate::admin) struct Catalog {
     pub scope_digest: [u8; 32],
     pub scopes: Arc<[super::ScopeAuthority]>,
     pub bytes: usize,
+    pub streams: Option<super::StreamDirectory>,
 }
 
 impl Entry {
@@ -100,6 +101,13 @@ impl Entry {
                     && self.order == 0
                     && self.flags == 0
             }
+            "stream_listener" => {
+                !self.workspace.is_empty()
+                    && self.parent.is_empty()
+                    && self.service.is_empty()
+                    && self.order == 0
+                    && self.flags < 2
+            }
             _ => false,
         }
     }
@@ -136,7 +144,7 @@ pub(in crate::admin) fn digest(entries: &[Entry], capacity: bool) -> [u8; 32] {
     hash.finalize().into()
 }
 
-/// 业务作用：仅从当前不可变执行计划提取路由、HTTP入口和逻辑上游的有限目录。
+/// 业务作用：从当前计划提取原对象目录，并在共享预算余量内冻结独立协商的监听器清单。
 ///
 /// 参数说明：
 /// - `snapshot`：业务已经采用的完整快照。
@@ -234,6 +242,7 @@ pub(super) fn collect(snapshot: &GatewaySnapshot) -> Catalog {
         bytes = 0;
     }
     entries.sort_by(|left, right| left.key().cmp(&right.key()));
+    let (streams, stream_bytes) = super::streams::collect(snapshot, entries.len(), bytes, capacity);
     Catalog {
         version: snapshot.version,
         fingerprint: snapshot.config_fingerprint,
@@ -243,7 +252,8 @@ pub(super) fn collect(snapshot: &GatewaySnapshot) -> Catalog {
         scope_supported: true,
         scope_digest: super::scope_digest(&scopes),
         scopes: scopes.into(),
-        bytes,
+        bytes: bytes + stream_bytes,
+        streams: Some(streams),
     }
 }
 
@@ -256,12 +266,13 @@ pub(super) fn collect(snapshot: &GatewaySnapshot) -> Catalog {
 /// - `snapshot`：与对象同代的归属权威。
 ///
 /// 返回：不包含对象原始配置的描述；能力位由调用方补充。
-fn new_entry(kind: &str, id: &str, parent: &str, snapshot: &GatewaySnapshot) -> Entry {
+pub(super) fn new_entry(kind: &str, id: &str, parent: &str, snapshot: &GatewaySnapshot) -> Entry {
     let id = bounded(id);
     let parent = bounded(parent);
     let key = match kind {
         "listener" => format!("proxy:{id}"),
         "route" => format!("route:{parent}/{id}"),
+        "stream_listener" => format!("stream_listener:{id}"),
         _ => format!("service:{id}"),
     };
     let owner = snapshot.ownership.object_owner(&key);

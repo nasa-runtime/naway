@@ -1005,6 +1005,7 @@ impl protocol::node_management_server::NodeManagement for Service {
             release,
             metrics_interest_ms,
             service_metrics_supported: true,
+            stream_metrics_supported: true,
             consumers_supported: true,
             certificates_supported: true,
             preview,

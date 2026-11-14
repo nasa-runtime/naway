@@ -290,6 +290,24 @@ impl Drop for KafkaConnectionGuard {
 pub(super) struct UdpSessionHandle {
     pub(super) id: u64,
     pub(super) sender: mpsc::Sender<QueuedUdpDatagram>,
+    pub(super) traffic: Option<gateway::observability::stream_traffic::Handle>,
+}
+
+/// 业务作用：统一记录 UDP 明确丢弃，并只向作出门禁的冻结监听器所有者登记事实。
+///
+/// 参数说明：
+/// - `metrics`：原有进程级指标。
+/// - `traffic`：当前门禁或原会话已经捕获的监听器事实引用。
+///
+/// 返回：全局丢弃数始终累计，缺少完整观测目录时不猜测工作区。
+fn record_stream_udp_drop(
+    metrics: &Metrics,
+    traffic: Option<&gateway::observability::stream_traffic::Handle>,
+) {
+    metrics.inc_stream_udp_drop();
+    if let Some(traffic) = traffic {
+        traffic.datagram_dropped();
+    }
 }
 
 /// listener 级 UDP 内存硬预算。单会话 channel/receive buffer 各自有界仍不够：大量 client 可
@@ -356,19 +374,22 @@ pub(super) fn spawn_stream_udp_loop(
                     break;
                 }
             };
-            let Some(runtime) = current_stream_runtime(&state.snap, &bound_runtime.id) else {
+            let snapshot = state.snap.load_full();
+            let Some(runtime) = current_stream_runtime(&snapshot, &bound_runtime.id) else {
                 // 入口已经退休时不得以旧配置新建会话；既有会话只按自己的冻结配置结束。
                 state.metrics.inc_stream_udp_drop();
                 continue;
             };
+            let traffic = snapshot.stream_observation_handle(&runtime.id);
+            drop(snapshot);
             if length > runtime.udp.max_datagram_bytes {
-                state.metrics.inc_stream_udp_drop();
+                record_stream_udp_drop(&state.metrics, traffic.as_ref());
                 continue;
             }
             // 数据报必须从可复用监听缓冲区复制一次才能独立持有；全局字节 permit
             // 在复制前取得，避免“每 session 有界但 session 总数巨大”仍形成无界 payload。
             let Some(datagram) = reserve_udp_datagram(&resource_budget, &buffer[..length]) else {
-                state.metrics.inc_stream_udp_drop();
+                record_stream_udp_drop(&state.metrics, traffic.as_ref());
                 continue;
             };
             let mut table = sessions.lock();
@@ -379,7 +400,8 @@ pub(super) fn spawn_stream_udp_loop(
                         continue;
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        state.metrics.inc_stream_udp_drop();
+                        // 已建会话的队列属于原配置，当前新归属不能接收该旧会话的丢弃事实。
+                        record_stream_udp_drop(&state.metrics, session.traffic.as_ref());
                         continue;
                     }
                     Err(mpsc::error::TrySendError::Closed(returned)) => {
@@ -400,7 +422,7 @@ pub(super) fn spawn_stream_udp_loop(
                 }
             }
             if table.len() >= runtime.udp.max_sessions {
-                state.metrics.inc_stream_udp_drop();
+                record_stream_udp_drop(&state.metrics, traffic.as_ref());
                 continue;
             }
             drop(table);
@@ -450,16 +472,18 @@ pub(super) fn create_udp_session(
         state.metrics.inc_stream_udp_drop();
         return;
     };
+    let observation = snapshot.stream_observation(&runtime.id);
+    let traffic = observation.as_ref().map(|observation| observation.handle());
     // 归属和上游必须来自同一快照，不能在异步初始化期间改用新 owner 的引用权限。
     let Ok(workspace_permit) = state
         .workspace_proxy
         .admit_stream_workspace(&snapshot, &runtime.id)
     else {
-        state.metrics.inc_stream_udp_drop();
+        record_stream_udp_drop(&state.metrics, traffic.as_ref());
         return;
     };
     let Some(route) = runtime.routes.iter().find(|route| route.default).cloned() else {
-        state.metrics.inc_stream_udp_drop();
+        record_stream_udp_drop(&state.metrics, traffic.as_ref());
         return;
     };
     let reservation = match resolve_stream_upstream(
@@ -471,12 +495,12 @@ pub(super) fn create_udp_session(
     ) {
         Ok(reservation) if reservation.tls_profile.is_none() => reservation,
         Ok(_) => {
-            state.metrics.inc_stream_udp_drop();
+            record_stream_udp_drop(&state.metrics, traffic.as_ref());
             return;
         }
         Err(error) => {
             warn!(stream = %runtime.id, %peer, %error, "resolve UDP stream upstream failed");
-            state.metrics.inc_stream_udp_drop();
+            record_stream_udp_drop(&state.metrics, traffic.as_ref());
             return;
         }
     };
@@ -485,13 +509,13 @@ pub(super) fn create_udp_session(
     let Ok(receive_buffer_permit) = resource_budget
         .try_acquire_many_owned(u32::try_from(receive_buffer_bytes).unwrap_or(u32::MAX))
     else {
-        state.metrics.inc_stream_udp_drop();
+        record_stream_udp_drop(&state.metrics, traffic.as_ref());
         return;
     };
     let id = STREAM_UDP_SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
     let (sender, receiver) = mpsc::channel(runtime.udp.queue_capacity);
     if sender.try_send(first).is_err() {
-        state.metrics.inc_stream_udp_drop();
+        record_stream_udp_drop(&state.metrics, traffic.as_ref());
         return;
     }
     sessions.lock().insert(
@@ -499,12 +523,16 @@ pub(super) fn create_udp_session(
         UdpSessionHandle {
             id,
             sender,
+            traffic: traffic.clone(),
         },
     );
     state.active_connections.fetch_add(1, Ordering::Relaxed);
     state.metrics.inc_active_connection();
     state.metrics.inc_stream_connection();
     state.metrics.inc_stream_udp_datagram(true);
+    if let Some(observation) = &observation {
+        observation.admit();
+    }
     tokio::spawn(run_udp_session(
         listener,
         sessions,
@@ -516,6 +544,7 @@ pub(super) fn create_udp_session(
         receiver,
         receive_buffer_permit,
         workspace_permit,
+        observation,
         state,
     ));
 }
@@ -534,6 +563,7 @@ pub(super) fn create_udp_session(
 /// - `receiver`：首包及后续数据包的有界接收队列。
 /// - `_receive_buffer_permit`：会话存活期间持有的接收缓冲区配额。
 /// - `_workspace_permit`：会话存活期间持有的工作区容量。
+/// - `observation`：接入时冻结的唯一监听器生命周期，取消时仍归还原在途量。
 /// - `state`：共享代理状态与观测依赖。
 ///
 /// 返回：会话正常结束或任务取消后归还工作区容量，原目录仅删除匹配的会话。
@@ -548,8 +578,10 @@ pub(super) async fn run_udp_session(
     mut receiver: mpsc::Receiver<QueuedUdpDatagram>,
     _receive_buffer_permit: OwnedSemaphorePermit,
     _workspace_permit: gateway::proxy::StreamWorkspacePermit,
+    observation: Option<gateway::observability::stream_traffic::Observation>,
     state: StreamPlaneState,
 ) {
+    let traffic = observation.as_ref().map(|observation| observation.handle());
     let started = std::time::Instant::now();
     let log_ctx = StreamAccessLogCtx {
         request_id: next_stream_request_id(),
@@ -557,6 +589,7 @@ pub(super) async fn run_udp_session(
         upstream: reservation.log_target.clone(),
         peer: peer.to_string(),
         started,
+        observation,
     };
     let mut outlier = reservation.outlier.take();
     let probe_deadline = outlier.as_ref().and_then(|attempt| attempt.deadline());
@@ -600,21 +633,27 @@ pub(super) async fn run_udp_session(
                     if outlier.is_some() && probe_deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
                         anyhow::bail!("UDP probe authority expired before send");
                     }
-                    upstream.send(&datagram.bytes).await.context("send UDP upstream datagram")?;
+                    let sent = upstream.send(&datagram.bytes).await.context("send UDP upstream datagram")?;
+                    if let Some(traffic) = &traffic {
+                        traffic.datagram_sent(gateway::observability::stream_traffic::Direction::DownstreamToUpstream, sent);
+                    }
                     down = down.saturating_add(datagram.bytes.len() as u64);
                     idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(runtime.udp.idle_timeout_ms));
                 }
                 received = upstream.recv(&mut upstream_buffer) => {
                     let length = received.context("receive UDP upstream datagram")?;
                     if length > runtime.udp.max_datagram_bytes {
-                        state.metrics.inc_stream_udp_drop();
+                        record_stream_udp_drop(&state.metrics, traffic.as_ref());
                         continue;
                     }
                     // 首个有界上游回包才证明 UDP 可达；本地 connect 成功不能作为恢复证据。
                     if let Some(attempt) = outlier.take() {
                         attempt.complete(false, started.elapsed());
                     }
-                    listener.send_to(&upstream_buffer[..length], peer).await.context("send UDP downstream datagram")?;
+                    let sent = listener.send_to(&upstream_buffer[..length], peer).await.context("send UDP downstream datagram")?;
+                    if let Some(traffic) = &traffic {
+                        traffic.datagram_sent(gateway::observability::stream_traffic::Direction::UpstreamToDownstream, sent);
+                    }
                     up = up.saturating_add(length as u64);
                     state.metrics.inc_stream_udp_datagram(false);
                     idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(runtime.udp.idle_timeout_ms));
@@ -637,6 +676,9 @@ pub(super) async fn run_udp_session(
                     break;
                 }
                 _ = &mut total, if runtime.timeout_ms > 0 => {
+                    if let Some(observation) = &log_ctx.observation {
+                        observation.finish_from_status(504);
+                    }
                     if down > 0 {
                         if let Some(attempt) = outlier.take() {
                             attempt.complete(true, started.elapsed());
@@ -748,6 +790,7 @@ pub(super) fn spawn_stream_connection(
         state.metrics.inc_stream_error();
         return;
     };
+    let observation = snapshot.stream_observation(&runtime.id);
     let Ok(workspace_permit) = state
         .workspace_proxy
         .admit_stream_workspace(&snapshot, &runtime.id)
@@ -759,6 +802,9 @@ pub(super) fn spawn_stream_connection(
     state.active_connections.fetch_add(1, Ordering::Relaxed);
     state.metrics.inc_active_connection();
     state.metrics.inc_stream_connection();
+    if let Some(observation) = &observation {
+        observation.admit();
+    }
     tokio::spawn(async move {
         let _workspace_permit = workspace_permit;
         let started = std::time::Instant::now();
@@ -771,6 +817,7 @@ pub(super) fn spawn_stream_connection(
             upstream: Arc::from(runtime.upstream.as_str()),
             peer: peer.to_string(),
             started,
+            observation,
         };
         #[cfg(feature = "mqtt-governance")]
         let _mqtt_connection_guard = if let Some(policy) = runtime.mqtt.as_ref() {
@@ -1194,6 +1241,21 @@ pub(super) fn spawn_stream_connection(
                 return;
             }
         }
+        // 协议建立阶段不属于转发正文；只在 TLS 与 PROXY 头处理之后按实际成功写入累计。
+        let mut downstream: BoxStreamIo = match log_ctx.observation.as_ref() {
+            Some(observation) => Box::new(observation.observe_io(
+                downstream,
+                gateway::observability::stream_traffic::Direction::UpstreamToDownstream,
+            )),
+            None => downstream,
+        };
+        let mut upstream: BoxStreamIo = match log_ctx.observation.as_ref() {
+            Some(observation) => Box::new(observation.observe_io(
+                upstream,
+                gateway::observability::stream_traffic::Direction::DownstreamToUpstream,
+            )),
+            None => upstream,
+        };
         #[cfg(feature = "mqtt-governance")]
         if let Some(policy) = runtime.mqtt.clone() {
             let protocol_level = preread
@@ -1559,14 +1621,15 @@ pub(super) fn stream_sni_matches(pattern: &str, sni: &str) -> bool {
 /// 业务作用：读取当前快照里的 stream listener 配置。
 ///
 /// 参数说明：
-/// - `snap`: 当前配置快照指针。
+/// - `snap`: 已捕获的唯一当前配置，调用方从同一实例取得观测和归属。
 /// - `stream_id`: 启动期已绑定 listener 的 id。
+///
+/// 返回：同一快照中的真实运行配置；入口已退休时为空，不能继续借旧 socket 推导归属。
 pub(super) fn current_stream_runtime(
-    snap: &Arc<ArcSwap<GatewaySnapshot>>,
+    snap: &GatewaySnapshot,
     stream_id: &str,
 ) -> Option<StreamRuntime> {
-    snap.load()
-        .stream_listeners
+    snap.stream_listeners
         .iter()
         .find(|runtime| runtime.id == stream_id)
         .cloned()
@@ -2458,6 +2521,7 @@ pub(super) struct StreamAccessLogCtx {
     pub(super) upstream: Arc<str>,
     pub(super) peer: String,
     pub(super) started: std::time::Instant,
+    pub(super) observation: Option<gateway::observability::stream_traffic::Observation>,
 }
 
 pub(super) static STREAM_REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -2468,7 +2532,7 @@ pub(super) fn next_stream_request_id() -> String {
     format!("stream-{seq:016x}")
 }
 
-/// 业务作用：写入一条 L4 stream 连接级 access log。
+/// 业务作用：按真实结束分支结算原监听器生命周期，并写入连接级 access log。
 ///
 /// 参数说明：
 /// - `access_log`: 非阻塞 access log。
@@ -2476,6 +2540,8 @@ pub(super) fn next_stream_request_id() -> String {
 /// - `status`: 网关侧归一化状态码。
 /// - `downstream_to_upstream`: 下游到上游字节数。
 /// - `upstream_to_downstream`: 上游到下游字节数。
+///
+/// 返回：唯一观察器只结算一次；日志输出是否启用不改变占用和终态事实。
 pub(super) fn log_stream_access(
     access_log: &AccessLogger,
     ctx: &StreamAccessLogCtx,
@@ -2483,6 +2549,9 @@ pub(super) fn log_stream_access(
     downstream_to_upstream: u64,
     upstream_to_downstream: u64,
 ) {
+    if let Some(observation) = &ctx.observation {
+        observation.finish_from_status(status);
+    }
     access_log.log(AccessRecord {
         request_id: ctx.request_id.clone(),
         trace_id: None,
@@ -2499,7 +2568,7 @@ pub(super) fn log_stream_access(
         bytes_upstream_to_downstream: Some(upstream_to_downstream),
     });
 }
-/// L4 正文传输抽象；装箱只在接入连接时分配一次，不按帧分配。
+/// L4 正文传输抽象；协议组合与写入观测只在连接建立阶段装箱，不按帧分配。
 /// TCP/TLS 组合共用转发循环，`copy_bidirectional` 仍按固定大小分块搬运，内存有界且不聚合应用消息。
 pub(super) trait StreamIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> StreamIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}

@@ -779,6 +779,9 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
         (&Method::GET, "/api/monitor/services") => {
             monitor::services::read(&state, &request, &state.snap.load_full(), None)
         }
+        (&Method::GET, "/api/monitor/streams") => {
+            monitor::streams::read(&state, &request, &state.snap.load_full(), None)
+        }
         (&Method::GET, "/api/cluster/catalog") => catalog::read(&state, &request).await,
         (&Method::GET, "/api/cluster/consumers") => {
             consumers::read::platform(&state, &request).await
@@ -1026,6 +1029,7 @@ fn admin_permission(method: &Method, path: &str) -> Option<(AdminResource, Admin
         (&Method::GET, "/api/monitor/services") => {
             Some((AdminResource::Cluster, AdminAction::Read))
         }
+        (&Method::GET, "/api/monitor/streams") => Some((AdminResource::Cluster, AdminAction::Read)),
         (
             &Method::GET,
             "/api/cluster/catalog" | "/api/cluster/consumers" | "/api/cluster/certificates",
@@ -1305,8 +1309,8 @@ const fn admin_mode_name(mode: AdminPlaneMode) -> &'static str {
 
 /// 业务作用：唤醒唯一 reload worker；本端点不直接 build/swap，保持所有触发源串行化不变式。
 fn reload_config() -> Response<BoxBody> {
-    // SAFETY: 只向本进程发送 SIGHUP，不解引用裸指针；signal handler 仅向 bounded channel 投事件。
     let rc = unsafe {
+        // SAFETY: 只向本进程发送 SIGHUP，不解引用裸指针；signal handler 仅向 bounded channel 投事件。
         libc::kill(std::process::id() as i32, libc::SIGHUP)
     };
     if rc == 0 {
@@ -1590,8 +1594,8 @@ async fn rollback_config(req: &AdminRequestParts, state: &AdminState) -> Respons
         "rollback_scheduled",
     );
     // 只唤醒唯一 reload worker,避免 Admin 直接换版导致 file watcher 再次重复 reload。
-    // SAFETY:kill 只向本进程发送 SIGHUP,不解引用指针。
     let rc = unsafe {
+        // SAFETY:kill 只向本进程发送 SIGHUP,不解引用指针。
         libc::kill(std::process::id() as i32, libc::SIGHUP)
     };
     if rc != 0 {

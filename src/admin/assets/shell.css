@@ -408,14 +408,17 @@ meter::-webkit-meter-optimum-value {
 .node-list summary {
   cursor: pointer;
 }
-.route-traffic-row button {
+.route-traffic-row button,
+.stream-traffic-row button {
   max-width: 100%;
   overflow-wrap: anywhere;
   white-space: normal;
   text-align: left;
 }
 .route-traffic-detail h2,
-.route-traffic-detail p {
+.route-traffic-detail p,
+.stream-traffic-detail h2,
+.stream-traffic-detail p {
   overflow-wrap: anywhere;
 }
 table {

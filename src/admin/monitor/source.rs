@@ -43,6 +43,21 @@ pub(super) fn sample(
     ));
     let (bounds_ms, buckets, sum_micros) =
         crate::observability::metrics::realtime::duration(&state.metrics);
+    let readings = model::readings(values);
+    let routes = crate::observability::http_stream::routes::capture(snapshot);
+    let services =
+        crate::upstream::observation::capture(snapshot, &state.active_health.unhealthy_set());
+    let mut streams = snapshot.stream_traffic.capture();
+    // 新对象域不能扩大既有单次上传工作量；其余域已用满分片预算时只撤下监听器事实。
+    if readings.len().div_ceil(64)
+        + routes.rows.len().div_ceil(32)
+        + services.rows.len().div_ceil(32)
+        + streams.rows.len().div_ceil(32)
+        > 65
+    {
+        streams.capacity = true;
+        streams.rows = Vec::new();
+    }
     model::Sample {
         schema_version: 1,
         boot_id: runtime.boot_id.clone(),
@@ -63,17 +78,15 @@ pub(super) fn sample(
             routes: summary.routes,
             services: summary.upstream_services,
         },
-        readings: model::readings(values),
+        readings,
         latency: model::Histogram {
             bounds_ms,
             buckets,
             sum_micros,
         },
-        route_traffic: Some(crate::observability::http_stream::routes::capture(snapshot)),
-        service_state: Some(crate::upstream::observation::capture(
-            snapshot,
-            &state.active_health.unhealthy_set(),
-        )),
+        route_traffic: Some(routes),
+        service_state: Some(services),
+        stream_traffic: Some(streams),
         capabilities: [
             ("core", true),
             ("sentinel_queue", true),
@@ -103,6 +116,7 @@ pub(super) fn sample(
             ("xds_server", cfg!(feature = "xds-server")),
             ("route_traffic", true),
             ("service_state", true),
+            ("stream_traffic", true),
             ("sentinel_state", false),
             ("http_bytes", true),
             ("stream_completion_latency", true),

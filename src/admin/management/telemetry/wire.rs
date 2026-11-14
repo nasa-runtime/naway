@@ -1,6 +1,6 @@
 //! 固定字段摘要与类型化分片；网络边界之外共享同一累计样本。
 
-use super::{routes, services};
+use super::{routes, services, streams};
 use super::{CHUNK, SAMPLE_BYTES};
 use crate::admin::management::protocol;
 use crate::admin::monitor::model::{self, Histogram, NodeState, Reading, Sample, Value};
@@ -20,17 +20,44 @@ pub(in crate::admin::management) struct Candidate {
     total: usize,
     route_total: usize,
     service_total: usize,
+    stream_total: usize,
     frames: usize,
 }
 
-/// 业务作用：对当前样本做无中间序列化的规范摘要，标签顺序和字段边界不能产生歧义。
+/// 业务作用：为尚未协商监听器域的目标计算原事实摘要，标签顺序与字段边界保持确定。
 ///
 /// 参数说明：
 /// - `sample`：已经验证并按指标身份排序的当前样本。
 /// - `service_supported`：目标已明确声明服务能力，否时保持原指标与路由摘要。
 ///
-/// 返回：包括全部业务字段的SHA-256，不包括传输年龄和会话令牌。
+/// 返回：覆盖已协商原有域的 SHA-256，不包含监听器事实、传输年龄或会话令牌。
 pub(in crate::admin::management) fn digest(sample: &Sample, service_supported: bool) -> [u8; 32] {
+    digest_inner(sample, service_supported, false)
+}
+
+/// 业务作用：为明确支持监听器接收的目标计算摘要，原服务能力仍独立协商。
+///
+/// 参数说明：
+/// - `sample`：同一当前累计样本。
+/// - `service_supported`：目标是否同时支持服务状态域。
+///
+/// 返回：包含已协商监听器域的规范摘要；旧样本没有该域时保持原摘要。
+pub(in crate::admin::management) fn digest_with_streams(
+    sample: &Sample,
+    service_supported: bool,
+) -> [u8; 32] {
+    digest_inner(sample, service_supported, true)
+}
+
+/// 业务作用：按每目标接收能力组合规范摘要，不能让新域阻断旧目标对原事实的接收。
+///
+/// 参数说明：
+/// - `sample`：已经验证的当前累计样本。
+/// - `service_supported`：是否包含服务状态。
+/// - `stream_supported`：是否包含监听器事实。
+///
+/// 返回：覆盖所选完整字段且不含传输年龄、会话令牌的 SHA-256。
+fn digest_inner(sample: &Sample, service_supported: bool, stream_supported: bool) -> [u8; 32] {
     let mut hash = Sha256::new();
     stamp(&mut hash, b"naway-current-sample");
     hash.update([sample.schema_version]);
@@ -105,6 +132,9 @@ pub(in crate::admin::management) fn digest(sample: &Sample, service_supported: b
     routes::digest(&mut hash, sample.route_traffic.as_ref());
     if service_supported {
         services::digest(&mut hash, sample.service_state.as_ref());
+    }
+    if stream_supported {
+        streams::digest(&mut hash, sample.stream_traffic.as_ref());
     }
     hash.finalize().into()
 }
@@ -183,6 +213,8 @@ pub(in crate::admin::management) fn frame(
             .map_or(0, |value| value.rows.len() as u32),
         service_capacity: service_state.map(|value| value.capacity),
         service_total: service_state.map_or(0, |value| value.rows.len() as u32),
+        stream_capacity: None,
+        stream_total: 0,
         bounds_ms: sample.latency.bounds_ms.clone(),
         buckets: sample.latency.buckets.clone(),
         sum_micros: sample.latency.sum_micros,
@@ -223,6 +255,7 @@ pub(in crate::admin::management) fn frame(
                     .map(services::encode)
                     .collect()
             }),
+        streams: Vec::new(),
         readings: sample.readings
             [offset.min(sample.readings.len())..(offset + CHUNK).min(sample.readings.len())]
             .iter()
@@ -247,6 +280,59 @@ pub(in crate::admin::management) fn frame(
             })
             .collect(),
     }
+}
+
+/// 业务作用：为声明监听器接收能力的目标追加该域分片，旧固定指标、路由与服务顺序保持。
+///
+/// 参数说明：
+/// - `sample`：共享的当前原生事实。
+/// - `node`：本机已经验证的管理身份。
+/// - `session`：目标本轮确认的 boot 会话。
+/// - `hash`：包含已协商监听器域的完整摘要。
+/// - `at`：原采集时刻，不能在上传中续期。
+/// - `offset`：固定指标及三个对象域共用的连续偏移。
+/// - `service_supported`：目标独立声明的服务状态接收能力。
+///
+/// 返回：一份有界类型化分片；监听器行只在原有各域完成之后发送。
+pub(in crate::admin::management) fn frame_with_streams(
+    sample: &Sample,
+    node: &str,
+    session: &[u8],
+    hash: &[u8; 32],
+    at: Instant,
+    offset: usize,
+    service_supported: bool,
+) -> protocol::SampleRequest {
+    let mut part = frame(sample, node, session, hash, at, offset, service_supported);
+    if let Some(header) = &mut part.header {
+        header.stream_capacity = sample.stream_traffic.as_ref().map(|value| value.capacity);
+        header.stream_total = sample
+            .stream_traffic
+            .as_ref()
+            .map_or(0, |value| value.rows.len() as u32);
+    }
+    let stream_offset = sample.readings.len()
+        + sample
+            .route_traffic
+            .as_ref()
+            .map_or(0, |value| value.rows.len())
+        + sample
+            .service_state
+            .as_ref()
+            .filter(|_| service_supported)
+            .map_or(0, |value| value.rows.len());
+    if let Some(snapshot) = sample
+        .stream_traffic
+        .as_ref()
+        .filter(|_| offset >= stream_offset)
+    {
+        let index = (offset - stream_offset).min(snapshot.rows.len());
+        part.streams = snapshot.rows[index..(index + streams::CHUNK).min(snapshot.rows.len())]
+            .iter()
+            .map(streams::encode)
+            .collect();
+    }
+    part
 }
 
 impl Candidate {
@@ -285,6 +371,13 @@ impl Candidate {
             || (header.route_capacity != Some(false) && header.route_total != 0)
             || header.service_total as usize > crate::upstream::observation::MAX_SERVICES
             || (header.service_capacity != Some(false) && header.service_total != 0)
+            || header.stream_total as usize > crate::observability::stream_traffic::MAX_LISTENERS
+            || (header.stream_capacity != Some(false) && header.stream_total != 0)
+            || (header.total as usize).div_ceil(CHUNK)
+                + (header.route_total as usize).div_ceil(routes::CHUNK)
+                + (header.service_total as usize).div_ceil(services::CHUNK)
+                + (header.stream_total as usize).div_ceil(streams::CHUNK)
+                > 65
             || header.bounds_ms.len() > 32
             || header.buckets.len() != header.bounds_ms.len() + 1
             || header.capabilities.len() > 64
@@ -313,6 +406,7 @@ impl Candidate {
             total: header.total as usize,
             route_total: header.route_total as usize,
             service_total: header.service_total as usize,
+            stream_total: header.stream_total as usize,
             frames: 0,
             sample: Sample {
                 schema_version: 1,
@@ -349,6 +443,12 @@ impl Candidate {
                         rows: Vec::with_capacity(header.service_total as usize),
                     }
                 }),
+                stream_traffic: header.stream_capacity.map(|capacity| {
+                    crate::observability::stream_traffic::Snapshot {
+                        capacity,
+                        rows: Vec::with_capacity(header.stream_total as usize),
+                    }
+                }),
             },
         };
         candidate.push(first)?;
@@ -376,6 +476,11 @@ impl Candidate {
             .service_state
             .as_ref()
             .map_or(0, |value| value.rows.len());
+        let streams_received = self
+            .sample
+            .stream_traffic
+            .as_ref()
+            .map_or(0, |value| value.rows.len());
         let expected_routes = if readings_remaining == 0 {
             routes::CHUNK.min(self.route_total.saturating_sub(routes_received))
         } else {
@@ -383,6 +488,14 @@ impl Candidate {
         };
         let expected_services = if readings_remaining == 0 && routes_received == self.route_total {
             services::CHUNK.min(self.service_total.saturating_sub(services_received))
+        } else {
+            0
+        };
+        let expected_streams = if readings_remaining == 0
+            && routes_received == self.route_total
+            && services_received == self.service_total
+        {
+            streams::CHUNK.min(self.stream_total.saturating_sub(streams_received))
         } else {
             0
         };
@@ -395,14 +508,19 @@ impl Candidate {
             || part.sample_id != self.sample.sample_id
             || part.digest != self.digest
             || part.offset as usize
-                != self.sample.readings.len() + routes_received + services_received
+                != self.sample.readings.len()
+                    + routes_received
+                    + services_received
+                    + streams_received
             || part.readings.len() != CHUNK.min(readings_remaining)
             || part.routes.len() != expected_routes
             || part.services.len() != expected_services
+            || part.streams.len() != expected_streams
             || (self.frames > 0
                 && readings_remaining == 0
                 && routes_received == self.route_total
                 && services_received == self.service_total)
+                && streams_received == self.stream_total
         {
             return Err(Status::invalid_argument("sample fragment mismatch"));
         }
@@ -485,6 +603,24 @@ impl Candidate {
             }
             current.rows.push(row);
         }
+        for row in part.streams {
+            let row = streams::decode(row)?;
+            let current = self
+                .sample
+                .stream_traffic
+                .as_mut()
+                .ok_or_else(|| Status::invalid_argument("unexpected stream facts"))?;
+            if current
+                .rows
+                .last()
+                .is_some_and(|old| old.listener >= row.listener)
+            {
+                return Err(Status::invalid_argument(
+                    "stream facts must be unique and ordered",
+                ));
+            }
+            current.rows.push(row);
+        }
         Ok(())
     }
 
@@ -507,8 +643,14 @@ impl Candidate {
                 .as_ref()
                 .map_or(0, |value| value.rows.len())
                 != self.service_total
+            || self
+                .sample
+                .stream_traffic
+                .as_ref()
+                .map_or(0, |value| value.rows.len())
+                != self.stream_total
             || !model::validate(&mut self.sample)
-            || digest(&self.sample, true) != self.digest
+            || digest_with_streams(&self.sample, true) != self.digest
         {
             return Err(Status::data_loss("incomplete or inconsistent sample"));
         }

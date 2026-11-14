@@ -3,6 +3,7 @@
 mod model;
 pub(super) mod read;
 mod scopes;
+mod streams;
 pub(super) mod workspace;
 pub(super) use read::read;
 
@@ -10,6 +11,7 @@ pub(super) use read::read;
 pub(in crate::admin) use model::{digest, MAX_BYTES, MAX_OBJECTS};
 pub(in crate::admin) use model::{Catalog, Entry};
 pub(in crate::admin) use scopes::{scope_digest, ScopeAuthority};
+pub(in crate::admin) use streams::StreamDirectory;
 
 use crate::config::GatewaySnapshot;
 use std::sync::{Arc, Weak};

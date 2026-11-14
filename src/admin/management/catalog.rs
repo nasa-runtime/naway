@@ -2,7 +2,7 @@
 
 use super::protocol;
 use crate::admin::catalog::{
-    digest, scope_digest, Catalog, Entry, ScopeAuthority, MAX_BYTES, MAX_OBJECTS,
+    digest, scope_digest, Catalog, Entry, ScopeAuthority, StreamDirectory, MAX_BYTES, MAX_OBJECTS,
 };
 use nasa::grpc::Status;
 use std::sync::Arc;
@@ -26,6 +26,9 @@ pub(super) struct Partial {
     scopes: Arc<[ScopeAuthority]>,
     total: usize,
     entries: Vec<Entry>,
+    stream_capacity: Option<bool>,
+    stream_total: usize,
+    stream_entries: Vec<Entry>,
     bytes: usize,
 }
 
@@ -68,19 +71,33 @@ impl State {
         budget: usize,
     ) -> Result<protocol::CatalogResponse, Status> {
         let total = request.total as usize;
+        let stream_total = request.stream_total as usize;
+        let combined = total.saturating_add(stream_total);
         let offset = request.offset as usize;
+        let base_offset = offset.min(total);
+        let stream_offset = offset.saturating_sub(total);
         let expected: [u8; 32] = request
             .digest
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid catalog digest"))?;
-        if total > MAX_OBJECTS
-            || request.entries.len() > CHUNK
-            || offset > total
-            || request.entries.len() > total - offset
-            || (total > 0 && request.entries.is_empty())
-            || (request.capacity && total != 0)
-            || (request.scope_supported && offset == 0 && request.entries.len() > 1)
+        let received = request
+            .entries
+            .len()
+            .saturating_add(request.stream_entries.len());
+        if combined > MAX_OBJECTS
+            || stream_total > crate::observability::stream_traffic::MAX_LISTENERS
+            || received > CHUNK
+            || offset > combined
+            || (combined > 0 && received == 0)
+            || (request.capacity && (total != 0 || stream_total != 0))
+            || (request.stream_capacity != Some(false) && stream_total != 0)
+            || (request.scope_supported && offset == 0 && received > 1)
+            || (offset < total
+                && (!request.stream_entries.is_empty() || request.entries.len() > total - offset))
+            || (offset >= total
+                && (!request.entries.is_empty()
+                    || request.stream_entries.len() > stream_total.saturating_sub(stream_offset)))
         {
             return Err(Status::invalid_argument("invalid catalog bounds"));
         }
@@ -101,33 +118,51 @@ impl State {
             return Err(Status::invalid_argument("unexpected scope entries"));
         }
         if request.scope_supported && offset == 0 && scope_digest(&scopes) != authority_digest {
-            // 权限集合未经完整验证不得占据接收槽，更不能与后续对象发布混用。
+            // 完整权限证明先于对象存储成立，不能让部分证明与后续清单混合授权。
             return Err(Status::data_loss("scope digest mismatch"));
         }
         let entries: Vec<Entry> = request.entries.into_iter().map(decode).collect();
-        if entries.iter().any(|entry| !entry.valid())
+        let stream_entries: Vec<Entry> = request.stream_entries.into_iter().map(decode).collect();
+        if entries
+            .iter()
+            .any(|entry| !entry.valid() || entry.kind == "stream_listener")
+            || stream_entries
+                .iter()
+                .any(|entry| !entry.valid() || entry.kind != "stream_listener")
             || entries
+                .windows(2)
+                .any(|pair| pair[0].key() >= pair[1].key())
+            || stream_entries
                 .windows(2)
                 .any(|pair| pair[0].key() >= pair[1].key())
         {
             return Err(Status::invalid_argument("invalid catalog entries"));
         }
         if let Self::Complete(catalog) = self {
-            if catalog.digest != expected
+            let stored = catalog.streams.as_ref();
+            let stored_entries = stored.map_or(&[][..], |value| value.entries.as_ref());
+            if catalog.wire_digest(request.stream_capacity.is_some()) != expected
                 || catalog.capacity != request.capacity
                 || catalog.entries.len() != total
+                || stored.map(|value| value.capacity) != request.stream_capacity
+                || stored_entries.len() != stream_total
                 || catalog.scope_supported != request.scope_supported
                 || catalog.scope_digest != authority_digest
                 || (offset == 0 && catalog.scopes.as_ref() != scopes.as_slice())
-                || catalog.entries.get(offset..offset + entries.len()) != Some(entries.as_slice())
+                || catalog
+                    .entries
+                    .get(base_offset..base_offset + entries.len())
+                    != Some(entries.as_slice())
+                || stored_entries.get(stream_offset..stream_offset + stream_entries.len())
+                    != Some(stream_entries.as_slice())
             {
-                // 一个配置代只有一个目录身份，迟到或不同内容不能借相同版本覆盖已经发布的集合。
+                // 同一代完整目录不可被迟到分片或不同能力清单覆盖。
                 return Err(Status::failed_precondition(
                     "catalog generation already committed",
                 ));
             }
             return Ok(protocol::CatalogResponse {
-                next_offset: total as u32,
+                next_offset: combined as u32,
                 complete: true,
             });
         }
@@ -135,12 +170,12 @@ impl State {
             if offset != 0 {
                 return Err(Status::out_of_range("catalog must start at zero"));
             }
-            let reserved = total * std::mem::size_of::<Entry>()
+            let reserved = combined * std::mem::size_of::<Entry>()
                 + scopes.iter().map(ScopeAuthority::bytes).sum::<usize>();
             if reserved > budget.min(MAX_BYTES) {
                 return Err(Status::resource_exhausted("catalog memory exhausted"));
             }
-            // 先验证整份结构体槽预算再分配，后续字符串逐片核算，避免Vec扩容超过受管内存。
+            // 两类清单共用原结构槽与节点预算，必须先完整预留再为任一域分配。
             *self = Self::Partial(Partial {
                 digest: expected,
                 capacity: request.capacity,
@@ -149,10 +184,13 @@ impl State {
                 scopes: scopes.into(),
                 total,
                 entries: Vec::with_capacity(total),
+                stream_capacity: request.stream_capacity,
+                stream_total,
+                stream_entries: Vec::with_capacity(stream_total),
                 bytes: reserved,
             });
         } else if offset == 0
-            && matches!(self, Self::Partial(partial) if partial.scopes.as_ref() != scopes.as_slice())
+            && matches!(self,Self::Partial(partial) if partial.scopes.as_ref() != scopes.as_slice())
         {
             return Err(Status::failed_precondition("scope replay content changed"));
         }
@@ -164,21 +202,32 @@ impl State {
             || partial.capacity != request.capacity
             || partial.scope_supported != request.scope_supported
             || partial.scope_digest != authority_digest
+            || partial.stream_capacity != request.stream_capacity
+            || partial.stream_total != stream_total
         {
             return Err(Status::failed_precondition("catalog manifest changed"));
         }
-        if offset < partial.entries.len() {
-            if partial.entries.get(offset..offset + entries.len()) != Some(entries.as_slice()) {
+        let current = partial.entries.len() + partial.stream_entries.len();
+        if offset < current {
+            if partial
+                .entries
+                .get(base_offset..base_offset + entries.len())
+                != Some(entries.as_slice())
+                || partial
+                    .stream_entries
+                    .get(stream_offset..stream_offset + stream_entries.len())
+                    != Some(stream_entries.as_slice())
+            {
                 return Err(Status::failed_precondition(
                     "catalog replay content changed",
                 ));
             }
             return Ok(protocol::CatalogResponse {
-                next_offset: partial.entries.len() as u32,
+                next_offset: current as u32,
                 complete: false,
             });
         }
-        if offset != partial.entries.len() {
+        if offset != current {
             return Err(Status::out_of_range("catalog offset skipped"));
         }
         if partial
@@ -186,6 +235,11 @@ impl State {
             .last()
             .zip(entries.first())
             .is_some_and(|(left, right)| left.key() >= right.key())
+            || partial
+                .stream_entries
+                .last()
+                .zip(stream_entries.first())
+                .is_some_and(|(left, right)| left.key() >= right.key())
         {
             return Err(Status::invalid_argument(
                 "catalog identities must be unique and ordered",
@@ -193,6 +247,7 @@ impl State {
         }
         let added = entries
             .iter()
+            .chain(stream_entries.iter())
             .map(|entry| entry.bytes() - std::mem::size_of::<Entry>())
             .sum::<usize>();
         if added > budget.min(MAX_BYTES).saturating_sub(partial.bytes) {
@@ -200,33 +255,39 @@ impl State {
         }
         partial.bytes += added;
         partial.entries.extend(entries);
-        if partial.entries.len() < total {
+        partial.stream_entries.extend(stream_entries);
+        let current = partial.entries.len() + partial.stream_entries.len();
+        if current < combined {
             return Ok(protocol::CatalogResponse {
-                next_offset: partial.entries.len() as u32,
+                next_offset: current as u32,
                 complete: false,
             });
-        }
-        if digest(&partial.entries, request.capacity) != expected {
-            // 完整内容不能证明声明摘要时释放整个在途集合，任何部分都不能进入管理读面。
-            *self = Self::Empty;
-            return Err(Status::data_loss("catalog digest mismatch"));
         }
         let Self::Partial(partial) = std::mem::take(self) else {
             unreachable!("verified catalog is partial");
         };
-        *self = Self::Complete(Arc::new(Catalog {
+        let catalog = Catalog {
             version: request.config_version,
             fingerprint: request.config_fingerprint,
             capacity: request.capacity,
-            digest: expected,
+            digest: digest(&partial.entries, request.capacity),
             entries: partial.entries.into(),
             scope_supported: partial.scope_supported,
             scope_digest: partial.scope_digest,
             scopes: partial.scopes,
+            streams: partial.stream_capacity.map(|capacity| StreamDirectory {
+                capacity,
+                entries: partial.stream_entries.into(),
+            }),
             bytes: partial.bytes,
-        }));
+        };
+        if catalog.wire_digest(request.stream_capacity.is_some()) != expected {
+            // 任一目录正文无法证明完整声明时，整个槽保持空态，绝不发布部分对象或权限。
+            return Err(Status::data_loss("catalog digest mismatch"));
+        }
+        *self = Self::Complete(Arc::new(catalog));
         Ok(protocol::CatalogResponse {
-            next_offset: total as u32,
+            next_offset: combined as u32,
             complete: true,
         })
     }

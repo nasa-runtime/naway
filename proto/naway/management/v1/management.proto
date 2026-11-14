@@ -151,6 +151,8 @@ message ReportResponse {
   MaterialPreviewOffer material_preview = 10;
   MaterialActionOffer material_action = 11;
   MaterialReleaseOffer material_release = 12;
+  // 同时支持监听器目录和流量事实接收；不代替对象归属或工作区读取授权。
+  bool stream_metrics_supported = 13;
 }
 
 // 原目标字段复用结构，内层 signature 必须为空；只有外层独立签名可以授权候选下载。
@@ -827,6 +829,24 @@ message SampleHeader {
   uint32 route_total = 12;
   optional bool service_capacity = 13;
   uint32 service_total = 14;
+  optional bool stream_capacity = 15;
+  uint32 stream_total = 16;
+}
+
+// 监听器事实只归属接入时的配置；固定数组不包含客户端地址或业务标签。
+message StreamTraffic {
+  string listener = 1;
+  string protocol = 2;
+  string workspace = 3;
+  uint64 attempts = 4;
+  uint64 admitted = 5;
+  uint64 active = 6;
+  repeated uint64 outcomes = 7;
+  repeated uint64 bytes = 8;
+  repeated uint64 datagrams = 9;
+  uint64 dropped_datagrams = 10;
+  uint64 duration_micros = 11;
+  repeated uint64 buckets = 12;
 }
 
 // 服务状态独立于入口流量，未知发现不携带旧实例计数。
@@ -879,6 +899,7 @@ message SampleRequest {
   repeated MetricReading readings = 8;
   repeated RouteTraffic routes = 9;
   repeated ServiceState services = 10;
+  repeated StreamTraffic streams = 11;
 }
 
 message SampleResponse {
@@ -918,6 +939,9 @@ message CatalogRequest {
   bool scope_supported = 11;
   bytes scope_digest = 12;
   repeated ScopeAuthority scopes = 13;
+  optional bool stream_capacity = 14;
+  uint32 stream_total = 15;
+  repeated CatalogEntry stream_entries = 16;
 }
 
 message CatalogResponse {

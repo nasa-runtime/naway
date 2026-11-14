@@ -5,6 +5,7 @@ import { mount as nodes } from "../views/nodes.js";
 import { mount as catalog } from "../views/catalog.js";
 import { mount as operations } from "../views/operations.js";
 import { mount as routeTraffic } from "../views/routes.js";
+import { mount as streamTraffic } from "../views/streams.js";
 import { mount as services } from "../views/services.js";
 import { mount as consumers } from "../views/consumers.js";
 import { mount as certificates } from "../views/certificates.js";
@@ -70,6 +71,14 @@ function navigate(name, service = "") {
     document.getElementById("subtitle").textContent =
       "集群与工作区 · 当前区间、完整覆盖与流结束事实";
     dispose = routeTraffic(root, session);
+  } else if (
+    name === "streams" &&
+    ((allowed("cluster") && allowed("config")) || session.workspaces?.length)
+  ) {
+    document.getElementById("title").textContent = "监听器实时流量";
+    document.getElementById("subtitle").textContent =
+      "集群与工作区 · TCP / UDP 当前会话与本地交付事实";
+    dispose = streamTraffic(root, session);
   } else if (
     name === "services" &&
     ((allowed("cluster") && allowed("upstreams")) || session.workspaces?.length)
@@ -209,6 +218,10 @@ async function login(event) {
       (allowed("cluster") && allowed("routes")) ||
       session.workspaces?.length
     );
+    document.getElementById("streams-nav").disabled = !(
+      (allowed("cluster") && allowed("config")) ||
+      session.workspaces?.length
+    );
     document.getElementById("nodes-nav").disabled = !allowed("cluster");
     document.getElementById("services-nav").disabled = !(
       (allowed("cluster") && allowed("upstreams")) ||
@@ -249,16 +262,19 @@ async function login(event) {
               : location.pathname === "/traffic" &&
                   !document.getElementById("traffic-nav").disabled
                 ? "traffic"
-                : location.pathname === "/operations"
-                  ? "operations"
-                  : allowed("cluster")
-                    ? location.pathname === "/catalog" &&
-                      !document.getElementById("catalog-nav").disabled
-                      ? "catalog"
-                      : location.pathname === "/cluster"
-                        ? "nodes"
-                        : "monitor"
-                    : "system",
+                : location.pathname === "/streams" &&
+                    !document.getElementById("streams-nav").disabled
+                  ? "streams"
+                  : location.pathname === "/operations"
+                    ? "operations"
+                    : allowed("cluster")
+                      ? location.pathname === "/catalog" &&
+                        !document.getElementById("catalog-nav").disabled
+                        ? "catalog"
+                        : location.pathname === "/cluster"
+                          ? "nodes"
+                          : "monitor"
+                      : "system",
     );
   } catch (error) {
     if (attempt === epoch && error.name !== "AbortError") {

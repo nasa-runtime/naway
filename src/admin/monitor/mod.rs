@@ -11,6 +11,7 @@ mod publication;
 mod response_codec;
 pub(in crate::admin) mod routes;
 pub(in crate::admin) mod services;
+pub(in crate::admin) mod streams;
 
 use publication::Publication;
 mod source;

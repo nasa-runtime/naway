@@ -66,6 +66,9 @@ pub(in crate::admin) struct Sample {
     // 服务身份同样需要同代对象目录与工作区授权，不能从原始指标接口旁路读取。
     #[serde(skip)]
     pub service_state: Option<crate::upstream::observation::Snapshot>,
+    // 原始指标抓取不授予监听器目录权；同代归属事实仅由明确授权的管理链路交付。
+    #[serde(skip)]
+    pub stream_traffic: Option<crate::observability::stream_traffic::Snapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +159,10 @@ pub(in crate::admin) fn validate(sample: &mut Sample) -> bool {
             .service_state
             .as_ref()
             .is_some_and(|services| !services.valid())
+        || sample
+            .stream_traffic
+            .as_ref()
+            .is_some_and(|streams| !streams.valid())
         || !sample
             .latency
             .bounds_ms
@@ -431,5 +438,9 @@ pub(in crate::admin) fn retained_bytes(sample: &Sample) -> usize {
         .service_state
         .as_ref()
         .map_or(0, |services| services.retained_bytes());
+    bytes += sample
+        .stream_traffic
+        .as_ref()
+        .map_or(0, |streams| streams.retained_bytes());
     bytes
 }

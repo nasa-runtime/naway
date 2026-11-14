@@ -9,4 +9,5 @@ pub mod logging;
 pub mod meter;
 pub mod metrics;
 pub(crate) mod response_codec;
+pub mod stream_traffic;
 pub mod telemetry;
