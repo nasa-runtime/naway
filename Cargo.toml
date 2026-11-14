@@ -19,7 +19,7 @@ exclude = ["zcf/.gateway-config-history/**"]
 # 跨管理节点共享候选与审批事实；关闭时不编译 PostgreSQL 或创建持久操作资源。
 admin-operations-pgsql = ["nasa/tx-pgsql", "nasa/idempotency-pgsql", "dep:sqlx"]
 # 集群工作流复用 NASA 唯一状态机，与提案共享同一 PostgreSQL 事务域。
-admin-operations-workflow-pgsql = ["admin-operations-pgsql", "nasa/saga-runtime-pgsql", "dep:nasaga-backend"]
+admin-operations-workflow-pgsql = ["admin-operations-pgsql", "nasa/saga-runtime-pgsql", "dep:nasaga-backend", "dep:naoutbox-pgsql"]
 # 节点管理采用独立受管 mTLS gRPC，关闭时不编译生成协议或创建管理连接。
 admin-grpc = ["nasa/grpc", "dep:nagrpc", "dep:nagrpc-build"]
 # 节点持久动作目录的身份与独占 owner；不引入管理数据库。
@@ -146,6 +146,7 @@ nasaga-runtime-core = { version = "2.0.1", optional = true, default-features = f
 nasaga-backend = { version = "2.0.0", optional = true, default-features = false } # 共享工作流的公开已提交投影，不引入第二套状态机
 nametrics-core = "2.0.0"             # 指标目录、结构化事实与公开序列预算
 naoutbox-core = "2.0.0"              # 用量事件身份与至少一次外部收据合同
+naoutbox-pgsql = { version = "2.0.1", optional = true } # 共享执行经 NASA 门面使用有界聚合根轮转的公开合同
 naauthz = { version = "2.0.0", optional = true } # 已验证 Agent 身份的 scope 授权
 nabudget = "2.0.0"                   # 显式协议与消息处理共用绝对 deadline 与取消树
 notify = "8.2"                        # TLS 证书文件观察；YAML 配置观察由 naml 负责

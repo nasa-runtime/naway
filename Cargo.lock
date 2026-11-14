@@ -852,9 +852,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cacheable"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98c480fe066671c15fb686e607d359c1b0c9be0c45fade2b67723e9e3e0bda59"
+checksum = "f5c2cb2d67d8ecb287043ca375e1b51e0eb88b8ac28045a107411f32e6dfb4f5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1114,9 +1114,9 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "combine"
-version = "4.6.7"
+version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
+checksum = "4356eba6976435498d05a311ee9fc486da3bc81c200d3f0d7dd9703b41913f92"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1701,7 +1701,7 @@ dependencies = [
  "asn1-rs",
  "displaydoc",
  "nom",
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-traits",
  "rusticata-macros",
 ]
@@ -3453,9 +3453,9 @@ checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
 name = "macro-support"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a66b4101712d60b41684598f2c1c39c45714fe71121c8cf42a143e6ea4640ba6"
+checksum = "2dc3b897441c371eb4433cc027856e3b0b54832efa6c6563c50516408729885f"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3693,9 +3693,9 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "naauthz"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f947794b289aa635578e53b450f302d596602550c79519975d9af82ccd293fe9"
+checksum = "9c1f9b81cd97defe90258a1a4c30e68c096ad0dd837a4f08798f0980677d9d08"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3704,9 +3704,9 @@ dependencies = [
 
 [[package]]
 name = "nabase"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7e8db05d17c96d699a5613f71f8a967c6ed931834af2b556f5f8caa860ed902"
+checksum = "b28c462e50fae6fd628785192703499b5443fab103e1410474b07e56f13cfde6"
 dependencies = [
  "chrono",
  "serde",
@@ -3714,9 +3714,9 @@ dependencies = [
 
 [[package]]
 name = "nabudget"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfa026c4b71ca9f7fe796f91b25bdbe35607b3cd3530b6e81b7fa67819f93d79"
+checksum = "6b9ec4f60117ec5def583bca1f723c3a8902eb2186fef6f8b0e26d130c0404bf"
 dependencies = [
  "tokio",
  "tokio-util",
@@ -3724,9 +3724,9 @@ dependencies = [
 
 [[package]]
 name = "nacache-macro"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fe4308f7d3ab33c587615140409d9641971c11e2eb27ee4cb54c11629cb1064"
+checksum = "2c15de6692a03d8d1dde57beda7c086f5326809958c144077e13f1ed69b02508"
 dependencies = [
  "macro-support",
  "proc-macro2",
@@ -3748,9 +3748,9 @@ dependencies = [
 
 [[package]]
 name = "nadis"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d6846bc57648995d99af4fe4e78e3f46abaac53d1d82d679b14dcfd70bc4e6f"
+checksum = "2111d73ce5adf134dafdab7e952d4df149fd50f42bc716154ac28cbd832e4cda"
 dependencies = [
  "futures",
  "hex",
@@ -3781,9 +3781,9 @@ dependencies = [
 
 [[package]]
 name = "nafka"
-version = "2.0.3"
+version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66ff9d9c89221a0c384090e507286918d755b5cb19b2c9b79283f3224eb6288a"
+checksum = "48381c509413ba6fd603ffbc3ef3ee1e967616968bf73130f3d5635472aa9409"
 dependencies = [
  "futures",
  "linkme",
@@ -3802,9 +3802,9 @@ dependencies = [
 
 [[package]]
 name = "nafka-macro"
-version = "2.0.3"
+version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab3a0cd2edabf4f7cfa4eaa597b8a38f3585646ea91b704e19b028425921c0fc"
+checksum = "5a4b7548d1d841493bf3bd575db0caf4eac23d55236aec20683826218513f5bf"
 dependencies = [
  "macro-support",
  "proc-macro2",
@@ -3814,9 +3814,9 @@ dependencies = [
 
 [[package]]
 name = "nagrpc"
-version = "2.0.3"
+version = "2.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "702c2f6a9440f71daddb8877280b70af45925ae781bca012f7a766bc3b9462b0"
+checksum = "92c3a77438aab2673649b5d984ae56de4282082e382374f6f2b11eb6a9bc6dfa"
 dependencies = [
  "bytes",
  "http-body",
@@ -3842,9 +3842,9 @@ dependencies = [
 
 [[package]]
 name = "nagrpc-build"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c26b8729b2796f5e121c2a691ce4d17335acea6ba0b0eda4045c6bfecb634655"
+checksum = "e329d762c37bd19c97c91ce6522199a951d8ce744d223d171b55cffd72b26407"
 dependencies = [
  "heck",
  "prost",
@@ -3857,9 +3857,9 @@ dependencies = [
 
 [[package]]
 name = "naidempotency"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "010410e63688680f686603148f64a8f81aa735fcd92d845aafdbd2780f6dfde3"
+checksum = "68772f96e45e31384a726fd02f5730a18b458443563ed4943e8745ccaaa4cb24"
 dependencies = [
  "async-trait",
  "serde",
@@ -3867,9 +3867,9 @@ dependencies = [
 
 [[package]]
 name = "naidempotency-pgsql"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2babab38dcef57eb7870a105ca0bad40c0882a213ea5e0b88db1b14ec6cbeb6"
+checksum = "e177dd782cb279119623d0b87ff05b848494afe1800523f62ce737c37ec16a19"
 dependencies = [
  "async-trait",
  "naidempotency",
@@ -3880,18 +3880,18 @@ dependencies = [
 
 [[package]]
 name = "nainbox-core"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2091b0919112372c63e7487edab6e45c9e2b38b97dbb992e0b8224b5c05791d0"
+checksum = "679f8dd5ab0319f0562b6d9852739190c711eccd06e0fb0bddb18892d9afdb9d"
 dependencies = [
  "async-trait",
 ]
 
 [[package]]
 name = "nainbox-pgsql"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bf088094f434dd6aebcfb94d3b691536bef207cd1c797fdf516f6549e1c9f33"
+checksum = "f9ba77fc16dee9e41c197a591c7153b60f6f7bd3b140c4060eb5c3d37b1724d2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3904,9 +3904,9 @@ dependencies = [
 
 [[package]]
 name = "nalog"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e48a202ad5e33b030ffba6e329e78ffeff24b6187bbd94c280bbd6f201b78d0c"
+checksum = "e6e9b87adc0c80871954cc4532aea74b88f2483448c5186d6cd8af2c2ac9b948"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -3919,24 +3919,24 @@ dependencies = [
 
 [[package]]
 name = "nametrics-core"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83190cbc7ad9c210e178cd96ddcb67177e57c391068115fbe639669e7086297e"
+checksum = "e5026544fa67a7a309a13d73d787bc4db98aea6ac05fbcee8463815b44476643"
 
 [[package]]
 name = "namigrate-core"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a4c4890e9385be96d5a8a3dd1e54d9320d43098a395a29d6258350c661bb902"
+checksum = "56aeb849805e9985497fa3b58df121c77a74dcbb0b35e0005c55dd4d9cab8cc2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "namigrate-pgsql"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18d3be67f21d7c8b4cdda88840153caa1abbbcd7c6826fd80783a0a749e991ea"
+checksum = "dbcbf66ab27aa90f20c1796f2841a3c8487f4af592d89c62e649fcec75b46280"
 dependencies = [
  "async-trait",
  "namigrate-core",
@@ -3947,9 +3947,9 @@ dependencies = [
 
 [[package]]
 name = "naml"
-version = "2.0.2"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb5983c9576173e6eb0659cc1108fa72060d8e6d9a05702b8d170aeac7dd060b"
+checksum = "449c8443489d0ccdf9ad550748dca589c50412dafd0ea40fd70bf86271e8d9a7"
 dependencies = [
  "anyhow",
  "config",
@@ -4014,9 +4014,9 @@ dependencies = [
 
 [[package]]
 name = "nanotify-core"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6554f6d8068f8eb86e954e682dd7c29c28ccec57938dc227b4bd7946d22ef2b"
+checksum = "c29f316a50876515d04b46672ff322898bdf8b79b520c8e32cdcd2fc5eb37d0d"
 dependencies = [
  "async-trait",
  "nametrics-core",
@@ -4026,18 +4026,18 @@ dependencies = [
 
 [[package]]
 name = "naopenapi"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e34f72af48be1dc0d534a447273d56cda45384a6211f19d771413aa5c9cce897"
+checksum = "1ba45d62395e967ca6cbd6ac0cf74c430d544127f1468b15b8de91ff826a4783"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "naoutbox-core"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50481ec06f533bb7100cb16ffc369860f6809667e880c27a8460e3ff0d4c0802"
+checksum = "44f805952f504b50fd85d449ebc18321ae527a0798bb7a368beb38bfbda31324"
 dependencies = [
  "async-trait",
  "tokio",
@@ -4046,9 +4046,9 @@ dependencies = [
 
 [[package]]
 name = "naoutbox-pgsql"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34f2098a82c0c53c8b9f6a410fc30641b4075f36448e7a689bc16888be74d0ae"
+checksum = "309ee15decf4cfc64c27f1c4a99e2747f282d88b813e2426f831e6d218f2e523"
 dependencies = [
  "async-trait",
  "naoutbox-core",
@@ -4060,9 +4060,9 @@ dependencies = [
 
 [[package]]
 name = "napart"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b2ea8e5fe4c2938a5ea5d06b3dd96cbc35c743df44a4d4adbd58d193522ab11"
+checksum = "9e3a8376cb09297e1d181b925c274c919a19c42b87b9b9c2e96edabae78b52c7"
 dependencies = [
  "arc-swap",
  "dashmap",
@@ -4074,9 +4074,9 @@ dependencies = [
 
 [[package]]
 name = "napp"
-version = "2.0.3"
+version = "2.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2923b41542ae7bf2775bc8fa2029ada8b1bc31bca6b86e91b8908c12b510317"
+checksum = "5cbf67cbfdb12680063d4e1b30f03833b05e11183c71574ec4dc45f5c3686006"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4171,9 +4171,9 @@ dependencies = [
 
 [[package]]
 name = "nasaga-backend"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a0274b2c0d44494a9dade140694e316bfe83aeceb1a3b67ee1a11fc0c15f838"
+checksum = "fb28d748c58c92373126c912591a845146009d8e6857f8d8e94f6409b0efaba4"
 dependencies = [
  "async-trait",
  "nainbox-core",
@@ -4185,9 +4185,9 @@ dependencies = [
 
 [[package]]
 name = "nasaga-core"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed31a1692fc071d888783f0c6d4a3cbec48e277cacc384cd762849e0340b8f9d"
+checksum = "60cfdc9c8dfbccc4cc875f98069419e875aafc9202a66d36e52ed4c7d5fe650b"
 dependencies = [
  "serde",
  "serde_json",
@@ -4209,9 +4209,9 @@ dependencies = [
 
 [[package]]
 name = "nasaga-pgsql"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ef40bbb7c4a8bc65a85e0d65a724d5b22fe3c85cef22efd0d2c00be5f50bee9"
+checksum = "4cfa922813a629428b5408c60f0755ca85afc7f4b0a3614b6791f579408dd3a5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4224,9 +4224,9 @@ dependencies = [
 
 [[package]]
 name = "nasaga-runtime-core"
-version = "2.0.1"
+version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e1a680ae01bab469b64caec1a57b87a71dda47915a2903927c4b9bf5e9f82c1"
+checksum = "30df7fc3493a8dafd8d5102f1ce0d3d9b267281d10b703ce5670d1b1dc4e1e40"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4250,9 +4250,9 @@ dependencies = [
 
 [[package]]
 name = "nasaga-runtime-pgsql"
-version = "2.0.2"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cde7da73a9fdc39e2f9b64c69570d501726658b648c9d7977d905e43eacf483f"
+checksum = "a466d3f6eaff4792e4d3ea8e99b4ea5c0e0ad90eafbebb220719afaef841d11e"
 dependencies = [
  "anyhow",
  "linkme",
@@ -4270,9 +4270,9 @@ dependencies = [
 
 [[package]]
 name = "nasecret"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f6ffb2f8ebd83170e7f5affdc310be9469f59306d5f82d05c04433ef048e88a"
+checksum = "f90642fe092d4cb275f17fcb4fca967f0e768261e80c2628c6613cf24389dc3a"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4285,9 +4285,9 @@ dependencies = [
 
 [[package]]
 name = "natelemetry"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6c582fd5bea63ebc0c0687d32cbcad97627906f80474e4406dfa54d4a69214a"
+checksum = "74a1d01723f0cd72a7426f0dad483d1184f4377b8095e7476a4c71cf1772b745"
 dependencies = [
  "hex",
  "rand 0.8.7",
@@ -4296,9 +4296,9 @@ dependencies = [
 
 [[package]]
 name = "natx-core"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c337b1a6965531bfe7d2f84cce834a61e17a94b8931a10b8fa456e2295e50d5c"
+checksum = "474f4427f2f7533821d39179acd2eea994f99242cec176432c3aba5f2d266f6e"
 dependencies = [
  "anyhow",
  "nametrics-core",
@@ -4311,9 +4311,9 @@ dependencies = [
 
 [[package]]
 name = "natx-macro"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e08c5a1374c37d6ea9b42515308c754b2cb27f2a22a03bd78977709af938a02b"
+checksum = "f7234dba7d33a6fbb90cae078363435ed1cbc401d9c66812f573d0e2f15e9464"
 dependencies = [
  "macro-support",
  "proc-macro2",
@@ -4323,9 +4323,9 @@ dependencies = [
 
 [[package]]
 name = "natx-pgsql"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29c9d1c9816d1f170ff4fe6e014ca1d5ead7201b4fa0df4fcaba997691bc97f0"
+checksum = "a015935e6bddb09edf1d02d0bf9114b6c376ef9eda4483b76433e6651f399e9f"
 dependencies = [
  "anyhow",
  "log",
@@ -4340,9 +4340,9 @@ dependencies = [
 
 [[package]]
 name = "nauth-oauth"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9546d347e3c1b8745974d3bd04f8d3ed75f16a26a38efe4948e11572a4e0c1fc"
+checksum = "d0870e8555c4faa2a4ca5bb2abdc5628517bde7eafbd4073fb659ddf201c88c1"
 dependencies = [
  "arc-swap",
  "base64",
@@ -4405,6 +4405,7 @@ dependencies = [
  "nametrics-core",
  "naml",
  "naoutbox-core",
+ "naoutbox-pgsql",
  "nasa",
  "nasaga-backend",
  "nasaga-runtime-core",
@@ -4460,9 +4461,9 @@ dependencies = [
 
 [[package]]
 name = "naweb"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "897e5642e658ed487a1c7488e19d5f98fd42a867a0bc31336eac61c677dc28fc"
+checksum = "8b3439bfb8fa31b14eb2c4e92009904683d33788310c1434993d4cdd20cdbaef"
 dependencies = [
  "arc-swap",
  "axum",
@@ -4474,9 +4475,9 @@ dependencies = [
 
 [[package]]
 name = "naweb-macro"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a085d73928a366be82b12e386d54736c0ff3760298657855c246e96e4b4b555"
+checksum = "3f73abbebd2dfe9d49c6502058463c948b31eab05de9946ff008e8ff49b40318"
 dependencies = [
  "macro-support",
  "proc-macro2",
@@ -4486,10 +4487,11 @@ dependencies = [
 
 [[package]]
 name = "naws-proto"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55384a58e883efeed9c4e57f4481074f92f1a77a7b3dd8cd478f0d6e2248d09b"
+checksum = "3f2320e87c482883547ce60b243b1b7133834c93bb501687e5352d53d75360e3"
 dependencies = [
+ "base64",
  "bytes",
  "naws-proto-derive",
  "serde",
@@ -4498,10 +4500,11 @@ dependencies = [
 
 [[package]]
 name = "naws-proto-derive"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6f64ba9726c1c60f2a3bccc05ccef708ab279afc859801d15c28748f0ce5b27"
+checksum = "a98edf27d0429e285ee6b24e05a16d6366da8fd1d4dcf1b5786333c4b4eb4295"
 dependencies = [
+ "proc-macro-crate",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4509,9 +4512,9 @@ dependencies = [
 
 [[package]]
 name = "ncrypto"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9aaba9cf61ea945e5fa4cbd19012815fe451e087431f5b2cf8076fb0b20e783"
+checksum = "cff688b7214f649b963600c73c3ec4e79760fb141de3dd0c34fca24c3670a969"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -4603,7 +4606,7 @@ version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-complex",
  "num-integer",
  "num-iter",
@@ -4616,6 +4619,16 @@ name = "num-bigint"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-bigint"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
 dependencies = [
  "num-integer",
  "num-traits",
@@ -4684,7 +4697,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-integer",
  "num-traits",
 ]
@@ -5637,9 +5650,9 @@ dependencies = [
 
 [[package]]
 name = "redis"
-version = "1.4.0"
+version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cb5358643f48330db5c78856982faf39c93ba50c60d682b43d0344a3b649769"
+checksum = "db7f3d75b5a3301746bff39a767bf4c5c42506b08513527308b3875bfb64a031"
 dependencies = [
  "arc-swap",
  "arcstr",
@@ -5653,7 +5666,7 @@ dependencies = [
  "futures-util",
  "itoa",
  "log",
- "num-bigint",
+ "num-bigint 0.5.1",
  "percent-encoding",
  "pin-project-lite",
  "rand 0.10.2",
@@ -5793,7 +5806,7 @@ dependencies = [
  "lazy_static",
  "lru",
  "msvc_spectre_libs",
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-traits",
  "parking_lot",
  "rand 0.10.2",
@@ -6557,7 +6570,7 @@ version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-traits",
  "thiserror 2.0.18",
  "time",
@@ -7118,9 +7131,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",

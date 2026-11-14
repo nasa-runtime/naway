@@ -79,7 +79,7 @@ impl Workflow {
 ///
 /// 返回：已提交结构或实际验证后的定义摘要；失败关闭资源，提交不确定须原身份复查。
 pub(super) async fn maintain(plan: Arc<Plan>, migrate: bool) -> anyhow::Result<serde_json::Value> {
-    let store = Store::connect(plan).await?;
+    let store = Store::connect_for_workflow_maintenance(plan, migrate).await?;
     let result = async {
         require_binding(&store).await?;
         if migrate {

@@ -104,8 +104,28 @@ impl Store {
     ///
     /// 返回：已绑定 NASA 命名事务且尚未登记容量、保留或启动后台任务的 owner。
     pub(super) async fn connect(plan: Arc<Plan>) -> anyhow::Result<Arc<Self>> {
+        Self::connect_for_workflow_maintenance(plan, false).await
+    }
+
+    /// 业务作用：为维护入口装配受管存储，只有显式工作流升级允许读取索引尚未安装的旧合同。
+    ///
+    /// 参数说明：
+    /// - `plan`：当前数据库身份与预算声明。
+    /// - `migrate`：显式工作流升级命令的选择，普通启动与状态查询必须为假。
+    ///
+    /// 返回：已验证旧结构且尚无后台任务的 owner；维护流程仍须复验永久集群绑定后才能写入。
+    pub(super) async fn connect_for_workflow_maintenance(
+        plan: Arc<Plan>,
+        migrate: bool,
+    ) -> anyhow::Result<Arc<Self>> {
         let pool = super::schema::connect(&plan).await?;
-        let installed = match super::schema::gate(&pool, &plan, false, false).await {
+        // 旧结构豁免只用于显式升级的前置读取；普通业务连接始终要求聚合索引已经安装。
+        let inspection = if migrate {
+            super::schema::inspect_workflow_migration(&pool, &plan).await
+        } else {
+            super::schema::gate(&pool, &plan, false, false).await
+        };
+        let installed = match inspection {
             Ok(installed) => installed,
             Err(error) => {
                 pool.close().await;

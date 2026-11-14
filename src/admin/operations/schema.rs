@@ -5,6 +5,7 @@ use nasa::migration::pgsql::{MigrationMode, MigrationSettings, Migrator};
 use sqlx::{postgres::PgPoolOptions, ConnectOptions, PgPool, SqlSafeStr};
 use std::{str::FromStr, time::Duration};
 
+mod aggregate;
 mod certificates;
 mod delivery;
 mod material_execution;
@@ -110,7 +111,7 @@ pub(super) async fn connect(plan: &Plan) -> anyhow::Result<PgPool> {
 /// - `pool`：专用直连或 session pooling 连接池。
 /// - `plan`：指定受管 schema 的冻结声明。
 /// - `apply`：仅命令行显式初始化可置真。
-/// - `with_workflow`：显式工作流初始化时包含工作流和交付合同；否则只验证已经提交的尾部。
+/// - `with_workflow`：显式工作流初始化时补齐共享执行前置结构与聚合根索引；否则只验证已提交合同。
 ///
 /// 返回：所有已安装结构匹配时返回工作流、交付、材料和影响合同的初始化事实；漂移或缺失阻断启动。
 pub(super) async fn gate(
@@ -119,8 +120,56 @@ pub(super) async fn gate(
     apply: bool,
     with_workflow: bool,
 ) -> anyhow::Result<Installed> {
+    gate_inner(pool, plan, apply, with_workflow, false).await
+}
+
+/// 业务作用：为显式工作流升级只读复验旧结构，允许尚未追加聚合索引的受管合同进入维护路径。
+///
+/// 参数说明：
+/// - `pool`：尚未安装后台任务的专用连接池。
+/// - `plan`：当前完整配置选定的永久数据库身份。
+///
+/// 返回：旧账本与实际结构一致时返回安装事实；不执行 DDL，漂移与未知迁移仍拒绝。
+pub(super) async fn inspect_workflow_migration(
+    pool: &PgPool,
+    plan: &Plan,
+) -> anyhow::Result<Installed> {
+    gate_inner(pool, plan, false, false, true).await
+}
+
+/// 业务作用：按启动或显式维护用途选择合同，并核对账本及实际数据库对象。
+///
+/// 参数说明：
+/// - `pool`：专用受管连接池。
+/// - `plan`：冻结的数据库身份与功能声明。
+/// - `apply`：是否允许显式初始化写入结构。
+/// - `with_workflow`：是否显式安装完整共享工作流。
+/// - `allow_legacy_workflow`：仅显式工作流升级预检可接受缺少聚合索引的旧合同。
+///
+/// 返回：所选全部合同匹配时返回安装事实；缺失、漂移或越界用途拒绝后续动作。
+async fn gate_inner(
+    pool: &PgPool,
+    plan: &Plan,
+    apply: bool,
+    with_workflow: bool,
+    allow_legacy_workflow: bool,
+) -> anyhow::Result<Installed> {
     let installed = installed_tail(pool).await?;
-    let with_material_execution = installed >= 9 || plan.config.certificates.execution.enabled;
+    let with_aggregate = installed >= 10 || (apply && with_workflow);
+    // 已有工作流的普通启动必须具备调度索引，避免先关闭执行启动后再热开启时绕过结构门。
+    // 显式提案初始化仍可分步建立前置合同，只有工作流迁移会追加共享执行结构。
+    anyhow::ensure!(
+        apply
+            || allow_legacy_workflow
+            || (installed < 5
+                && !plan.config.execution.enabled
+                && !plan.config.certificates.execution.enabled)
+            || with_aggregate,
+        "aggregate dispatch schema requires explicit workflow migration"
+    );
+    // 显式共享执行初始化保留连续的永久前置合同；建立空表不授予材料业务权或装载密钥。
+    let with_material_execution =
+        with_aggregate || installed >= 9 || plan.config.certificates.execution.enabled;
     let with_material_impact = with_material_execution
         || installed >= 8
         || (plan.config.certificates.enabled && plan.config.certificates.impact_approvals.enabled);
@@ -204,6 +253,15 @@ pub(super) async fn gate(
             false,
         ));
     }
+    if with_aggregate {
+        migrations.push(sqlx::migrate::Migration::new(
+            10,
+            "independent aggregate dispatch".into(),
+            sqlx::migrate::MigrationType::Simple,
+            aggregate::MIGRATION.into_sql_str(),
+            false,
+        ));
+    }
     let migrator = Migrator::with_migrations(migrations);
     let settings = MigrationSettings {
         mode: if apply {
@@ -217,8 +275,10 @@ pub(super) async fn gate(
     if let Err(error) =
         nasa::migration::pgsql::run_gate(pool, &plan.config.schema, &migrator, &settings).await
     {
-        // 等待迁移锁期间另一入口可能已提交工作流尾部；只允许按该已存在事实重选一次完整合同。
-        let selected = if with_material_execution {
+        // 等待迁移锁期间另一入口可能已提交更长合同；只按已提交事实重新选择，未知尾部仍拒绝。
+        let selected = if with_aggregate {
+            10
+        } else if with_material_execution {
             9
         } else if with_material_impact {
             8
@@ -232,8 +292,8 @@ pub(super) async fn gate(
             4
         };
         let committed = installed_tail(pool).await?;
-        if committed > selected && committed <= 9 {
-            return Box::pin(gate(pool, plan, apply, false)).await;
+        if committed > selected && committed <= 10 {
+            return Box::pin(gate_inner(pool, plan, apply, false, allow_legacy_workflow)).await;
         }
         return Err(error.into());
     }

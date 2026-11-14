@@ -127,6 +127,7 @@ async fn drive(
     cache: Arc<Cache>,
 ) {
     let mut cursor = Cursor::default();
+    let mut dispatch_cursor = nasa::outbox::pgsql::AggregateCursor::default();
     let mut materials =
         crate::admin::operations::certificates::execution::release::Cursor::default();
     let mut material_turn = false;
@@ -181,14 +182,16 @@ async fn drive(
                     let outbox = nasa::outbox::pgsql::PgOutbox::with_datasource(DATASOURCE)
                         .map_err(|_| Error::Unavailable)?;
                     let report = outbox
-                        .dispatch_batch(
+                        // 原控制权门成立后只投递一个聚合根的头事件；失败保留原行，下轮允许另一操作前进。
+                        .dispatch_next_aggregate(
                             &Publisher {
                                 state: &state,
                                 store: &store,
                                 owner: &owner,
                                 cache: &cache,
                             },
-                            1,
+                            &mut dispatch_cursor,
+                            16 * 1024,
                         )
                         .await
                         .map_err(|_| Error::Unavailable)?;
