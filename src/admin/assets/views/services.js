@@ -108,8 +108,7 @@ export function mount(root, session, initialService = "") {
   let inFlight = null;
   let timer = null;
   let current = null;
-  let receivedAt = 0;
-  let sourceAge = 0;
+  let expiresAt = 0;
 
   /**
    * 业务作用：撤下旧服务身份、配置代和实例事实，未知状态不能沿用旧值。
@@ -118,6 +117,7 @@ export function mount(root, session, initialService = "") {
    */
   function clear() {
     current = null;
+    expiresAt = 0;
     cards.replaceChildren();
     nodes.replaceChildren();
   }
@@ -202,6 +202,7 @@ export function mount(root, session, initialService = "") {
     const workspace = scope.value;
     const controller = new AbortController();
     inFlight = controller;
+    const started = performance.now();
     const endpoint = workspace
       ? `/api/workspaces/${encodeURIComponent(workspace)}/monitor/services`
       : "/api/monitor/services";
@@ -234,9 +235,22 @@ export function mount(root, session, initialService = "") {
       ) {
         throw new Error("服务状态响应不符合当前范围。 ");
       }
+      const remaining = result.headers.get("x-naway-valid-for-ms");
+      const ttl =
+        remaining !== null && /^\d+$/.test(remaining)
+          ? Number(remaining) - (performance.now() - started)
+          : NaN;
+      if (
+        !Number.isFinite(ttl) ||
+        ttl <= 0 ||
+        ttl > value.sampling_period_ms * 3
+      ) {
+        clear();
+        status.textContent = "当前服务状态已过期，等待重新读取。";
+        return;
+      }
       current = value;
-      sourceAge = age;
-      receivedAt = performance.now();
+      expiresAt = performance.now() + ttl;
       render();
     } catch (error) {
       if (attempt === epoch && error.name !== "AbortError") {
@@ -252,7 +266,15 @@ export function mount(root, session, initialService = "") {
         inFlight = null;
       }
       if (!stopped && !paused && !document.hidden && attempt === epoch) {
-        timer = setTimeout(poll, current?.sampling_period_ms ?? 2000);
+        const now = performance.now();
+        // 当前事实的余量可能来自更快采样的远端节点，不能等满本机周期才回读。
+        const delay = current
+          ? Math.min(
+              current.sampling_period_ms,
+              Math.max(250, (expiresAt - now) / 2),
+            )
+          : 2000;
+        timer = setTimeout(poll, delay);
       }
     }
   }
@@ -303,14 +325,10 @@ export function mount(root, session, initialService = "") {
   /**
    * 业务作用：网络尚未返回时独立撤下过期样本，避免慢请求续期旧实例事实。
    * 参数说明: 无。
-   * 返回：超过三周期的可见数据被清空。
+   * 返回：最早有效节点或聚合结果到期后，撤下服务存在性与实例事实。
    */
   function expire() {
-    if (
-      current &&
-      sourceAge + performance.now() - receivedAt >
-        current.sampling_period_ms * 3
-    ) {
+    if (current && performance.now() >= expiresAt) {
       clear();
       status.textContent = "当前服务状态已过期，等待重新读取。";
     }
@@ -333,7 +351,7 @@ export function mount(root, session, initialService = "") {
     void poll();
   });
   document.addEventListener("visibilitychange", visibility);
-  const ageTimer = setInterval(expire, 1000);
+  const ageTimer = setInterval(expire, 250);
   if (platform || session.workspaces?.length) {
     void poll();
   } else {

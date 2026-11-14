@@ -4,6 +4,7 @@ mod buckets;
 mod capture;
 mod circuit;
 mod cluster;
+mod expiry;
 mod http_stream;
 pub(super) mod model;
 mod process;

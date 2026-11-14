@@ -122,7 +122,8 @@ pub(in crate::admin) fn read(
         publication.total.max(ids.len())
     };
     let mut nodes = Vec::with_capacity(ids.len());
-    let mut valid_until = publication.at + snapshot.admin_monitor.period * 3;
+    let mut window =
+        super::super::expiry::Window::new(publication.at, snapshot.admin_monitor.period);
     let mut rows = aggregate::Rows::default();
     let (mut complete, mut valid, mut controls) = (0usize, 0usize, 0usize);
     let mut hash = Sha256::new();
@@ -175,8 +176,7 @@ pub(in crate::admin) fn read(
         if availability == "available" {
             let node = node.expect("available node");
             let sample = node.sample.as_ref().expect("verified sample");
-            valid_until =
-                valid_until.min(node.at + Duration::from_millis(sample.sampling_period_ms) * 3);
+            window.include(node.at, Duration::from_millis(sample.sampling_period_ms));
             if !rows.add(node, workspace, &query.search) {
                 // 全量目录超出聚合预算时撤下整页，禁止把截断结果标为完整或无匹配监听器。
                 return super::super::pending("capacity", snapshot.admin_monitor.period);
@@ -193,6 +193,9 @@ pub(in crate::admin) fn read(
                 availability = "sampling";
             }
         } else if availability == "control_only" {
+            let node = node.expect("control node");
+            let sample = node.sample.as_ref().expect("control sample");
+            window.include(node.at, Duration::from_millis(sample.sampling_period_ms));
             controls += 1;
         }
         stamp(&mut hash, id.as_bytes());
@@ -246,10 +249,6 @@ pub(in crate::admin) fn read(
     let Some(body) = super::super::encode(&value) else {
         return super::super::pending("capacity", snapshot.admin_monitor.period);
     };
-    if Instant::now() >= valid_until {
-        // 聚合与编码期间最旧的有效节点可能到期，不能用新生成响应的年龄延长旧流量。
-        return super::super::pending("stale", snapshot.admin_monitor.period);
-    }
     if !Arc::ptr_eq(&state.snap.load_full(), snapshot) {
         // 编码期间本机权限或成员范围可能被热撤销，旧授权实体必须在交付前失效。
         return crate::admin::plain(
@@ -257,7 +256,11 @@ pub(in crate::admin) fn read(
             "stream monitoring authority changed\n",
         );
     }
-    response(body, &publication, etag, valid_until)
+    let Some(remaining_ms) = window.remaining_ms(Instant::now()) else {
+        // 聚合与编码期间最旧的有效节点可能到期，不能用新生成响应的年龄延长旧流量或角色证明。
+        return super::super::pending("stale", snapshot.admin_monitor.period);
+    };
+    response(body, &publication, etag, remaining_ms)
 }
 
 /// 业务作用：区分控制节点、旧协议、容量与陈旧采样，任何缺口不默认成为零流量。
@@ -371,14 +374,14 @@ fn stamp(hash: &mut Sha256, bytes: &[u8]) {
 /// - `body`：已在1MiB预算内编码的完整实体。
 /// - `publication`：原采样轮次，用于有效年龄。
 /// - `etag`：本范围的分页条件。
-/// - `valid_until`：本次实际使用样本与聚合结果中最早的失效时刻。
+/// - `remaining_ms`：交付前核对的最短节点与聚合剩余有效毫秒数。
 ///
 /// 返回：共享Bytes的私有JSON响应，不创建额外正文副本。
 fn response(
     body: bytes::Bytes,
     publication: &Publication,
     etag: String,
-    valid_until: Instant,
+    remaining_ms: u64,
 ) -> Response<BoxBody> {
     Response::builder()
         .status(StatusCode::OK)
@@ -389,13 +392,7 @@ fn response(
         .header(http::header::CACHE_CONTROL, "private, no-store")
         .header("x-content-type-options", "nosniff")
         .header(http::header::ETAG, etag)
-        .header(
-            "x-naway-valid-for-ms",
-            valid_until
-                .saturating_duration_since(Instant::now())
-                .as_millis()
-                .to_string(),
-        )
+        .header("x-naway-valid-for-ms", remaining_ms.to_string())
         .header(
             "x-naway-sample-age-ms",
             publication.at.elapsed().as_millis().to_string(),

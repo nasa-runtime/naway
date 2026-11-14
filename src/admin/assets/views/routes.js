@@ -129,8 +129,7 @@ export function mount(root, session) {
     nextOffset = null,
     selected = null;
   let period = 1000,
-    received = 0,
-    age = 0,
+    expires = 0,
     due = 0;
 
   /**
@@ -144,7 +143,7 @@ export function mount(root, session) {
     etag = null;
     nextOffset = null;
     selected = null;
-    received = 0;
+    expires = 0;
     cards.replaceChildren();
     nodes.replaceChildren();
     rows.replaceChildren();
@@ -340,15 +339,16 @@ export function mount(root, session) {
         clear(states[result.data.availability] ?? "正在建立当前区间");
         return;
       }
-      age =
-        Number(result.headers.get("x-naway-sample-age-ms") ?? Infinity) +
-        performance.now() -
-        started;
-      if (!Number.isFinite(age) || age > period * 3) {
+      const remaining = result.headers.get("x-naway-valid-for-ms");
+      const ttl =
+        remaining !== null && /^\d+$/.test(remaining)
+          ? Number(remaining) - (performance.now() - started)
+          : NaN;
+      if (!Number.isFinite(ttl) || ttl <= 0 || ttl > period * 3) {
         clear("当前样本已过期，等待新采样。");
         return;
       }
-      received = performance.now();
+      expires = performance.now() + ttl;
       etag = result.headers.get("etag");
       render(result.data);
     } catch (error) {
@@ -357,13 +357,23 @@ export function mount(root, session) {
           offset = 0;
           clear("实时样本已更新，重新读取首页。");
         } else {
+          if ([403, 404].includes(error.status)) {
+            paused = true;
+            pause.textContent = "继续";
+          }
           clear(error.message);
         }
       }
     } finally {
       if (controller === active) {
         controller = null;
-        due = performance.now() + period;
+        const now = performance.now();
+        // 原节点余量短于采样周期时提前回读，网络未返回仍由独立计时器撤下到期事实。
+        due =
+          now +
+          (current
+            ? Math.min(period, Math.max(250, (expires - now) / 2))
+            : period);
       }
     }
   }
@@ -377,7 +387,7 @@ export function mount(root, session) {
     if (stopped) {
       return;
     }
-    if (current && performance.now() - received + age > period * 3) {
+    if (current && performance.now() >= expires) {
       clear("当前样本已过期，等待新采样。");
     }
     if (performance.now() >= due) {

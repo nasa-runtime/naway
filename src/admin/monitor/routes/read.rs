@@ -11,7 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct Query {
     search: String,
@@ -122,6 +122,8 @@ pub(in crate::admin) fn read(
         publication.total.max(ids.len())
     };
     let mut nodes = Vec::with_capacity(ids.len());
+    let mut window =
+        super::super::expiry::Window::new(publication.at, snapshot.admin_monitor.period);
     let mut rows = aggregate::Rows::default();
     let (mut complete, mut valid, mut controls) = (0usize, 0usize, 0usize);
     let mut hash = Sha256::new();
@@ -174,6 +176,8 @@ pub(in crate::admin) fn read(
         }
         if availability == "available" {
             let node = node.expect("available node");
+            let sample = node.sample.as_ref().expect("verified sample");
+            window.include(node.at, Duration::from_millis(sample.sampling_period_ms));
             if !rows.add(node, workspace, &query.search) {
                 // 全量目录超出聚合预算时撤下整页，禁止把截断结果标为完整或无匹配路由。
                 return super::super::pending("capacity", snapshot.admin_monitor.period);
@@ -184,6 +188,9 @@ pub(in crate::admin) fn read(
                 availability = "sampling";
             }
         } else if availability == "control_only" {
+            let node = node.expect("control node");
+            let sample = node.sample.as_ref().expect("control sample");
+            window.include(node.at, Duration::from_millis(sample.sampling_period_ms));
             controls += 1;
         }
         stamp(&mut hash, id.as_bytes());
@@ -241,7 +248,11 @@ pub(in crate::admin) fn read(
         // 编码期间本机权限或成员范围可能被热撤销，旧授权实体必须在交付前失效。
         return crate::admin::plain(StatusCode::CONFLICT, "route monitoring authority changed\n");
     }
-    response(body, &publication, etag)
+    let Some(remaining_ms) = window.remaining_ms(Instant::now()) else {
+        // 编码和复验不能延长最旧节点的期限，当前业务值与纯管理角色都必须仍有证据。
+        return super::super::pending("stale", snapshot.admin_monitor.period);
+    };
+    response(body, &publication, etag, remaining_ms)
 }
 
 /// 业务作用：区分控制节点、旧协议、容量与陈旧采样，任何缺口不默认成为零流量。
@@ -355,9 +366,15 @@ fn stamp(hash: &mut Sha256, bytes: &[u8]) {
 /// - `body`：已在1MiB预算内编码的完整实体。
 /// - `publication`：原采样轮次，用于有效年龄。
 /// - `etag`：本范围的分页条件。
+/// - `remaining_ms`：交付前核对的最短节点与聚合剩余有效毫秒数。
 ///
 /// 返回：共享Bytes的私有JSON响应，不创建额外正文副本。
-fn response(body: bytes::Bytes, publication: &Publication, etag: String) -> Response<BoxBody> {
+fn response(
+    body: bytes::Bytes,
+    publication: &Publication,
+    etag: String,
+    remaining_ms: u64,
+) -> Response<BoxBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -367,6 +384,7 @@ fn response(body: bytes::Bytes, publication: &Publication, etag: String) -> Resp
         .header(http::header::CACHE_CONTROL, "private, no-store")
         .header("x-content-type-options", "nosniff")
         .header(http::header::ETAG, etag)
+        .header("x-naway-valid-for-ms", remaining_ms.to_string())
         .header(
             "x-naway-sample-age-ms",
             publication.at.elapsed().as_millis().to_string(),

@@ -12,7 +12,7 @@ use http::{request::Parts, Response, StatusCode};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Serialize)]
 struct NodeView<'a> {
@@ -121,6 +121,7 @@ pub(in crate::admin) fn read(
         publication.total.max(ids.len())
     };
     let mut nodes = Vec::with_capacity(ids.len());
+    let mut window = super::expiry::Window::new(publication.at, snapshot.admin_monitor.period);
     let (mut observed, mut not_present, mut controls) = (0usize, 0usize, 0usize);
     let mut observations = Counts::default();
     for id in ids {
@@ -170,6 +171,7 @@ pub(in crate::admin) fn read(
         if availability == "available" {
             let node = node.expect("verified node");
             let sample = node.sample.as_deref().expect("verified sample");
+            window.include(node.at, Duration::from_millis(sample.sampling_period_ms));
             let rows = &sample
                 .service_state
                 .as_ref()
@@ -202,6 +204,9 @@ pub(in crate::admin) fn read(
                 availability = "not_present";
             }
         } else if availability == "control_only" {
+            let node = node.expect("control node");
+            let sample = node.sample.as_ref().expect("control sample");
+            window.include(node.at, Duration::from_millis(sample.sampling_period_ms));
             controls += 1;
         }
         view.availability = availability;
@@ -247,6 +252,10 @@ pub(in crate::admin) fn read(
             "service monitoring authority changed\n",
         );
     }
+    let Some(remaining_ms) = window.remaining_ms(Instant::now()) else {
+        // 服务存在、缺席和发现状态都来自本轮节点证据，编码后不能继续交付已到期事实。
+        return super::pending("stale", snapshot.admin_monitor.period);
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -255,6 +264,7 @@ pub(in crate::admin) fn read(
         )
         .header(http::header::CACHE_CONTROL, "private, no-store")
         .header("x-content-type-options", "nosniff")
+        .header("x-naway-valid-for-ms", remaining_ms.to_string())
         .header(
             "x-naway-sample-age-ms",
             publication.at.elapsed().as_millis().to_string(),
