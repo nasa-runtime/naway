@@ -16,6 +16,7 @@ import { bffTargetFields } from "./route_bff.js";
 import { llmModelFields, llmGuardrailFields } from "./route_llm.js";
 import { ragSourceFields } from "./route_rag.js";
 import { mcpToolFields } from "./route_agent_tools.js";
+import { mcpServerFields } from "./route_agent_servers.js";
 import { wsMessagePluginFields } from "./route_ws_frame.js";
 import {
   bodyTransformOperationFields,
@@ -24,6 +25,8 @@ import {
 } from "./route_body_transform.js";
 
 const definitions = {
+  mcp_server: mcpServerFields.filter(([name]) => name !== "id"),
+  mcp_server_new: mcpServerFields,
   mcp_tool: mcpToolFields.filter(([name]) => name !== "name"),
   mcp_tool_new: mcpToolFields,
   rag_source: ragSourceFields.filter(([name]) => name !== "id"),

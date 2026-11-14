@@ -29,6 +29,7 @@ import { routeAiSecurityDraftLists } from "./route_ai_security.js";
 import { routeRagDraftLists } from "./route_rag.js";
 import { routeAgentDraftLists } from "./route_agent.js";
 import { routeAgentToolDraftLists } from "./route_agent_tools.js";
+import { routeAgentServerDraftLists } from "./route_agent_servers.js";
 import { routeDubboDraftLists } from "./route_dubbo.js";
 import { routeWsFrameDraftLists } from "./route_ws_frame.js";
 import { routeForwardProxyDraftLists } from "./route_forward_proxy.js";
@@ -77,6 +78,7 @@ function lists(kind, values) {
   result.push(...routeRagDraftLists(kind));
   result.push(...routeAgentDraftLists(kind));
   result.push(...routeAgentToolDraftLists(kind));
+  result.push(...routeAgentServerDraftLists(kind));
   result.push(...routeDubboDraftLists(kind));
   result.push(...routeWsFrameDraftLists(kind));
   result.push(...routeForwardProxyDraftLists(kind));
@@ -280,6 +282,7 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "llm_guardrail",
           "rag_source",
           "mcp_tool",
+          "mcp_server",
           "ws_message_plugin",
         ].includes(selected.type)
       ) {
@@ -303,7 +306,9 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
                           ? "rag_source_new"
                           : selected.type === "mcp_tool"
                             ? "mcp_tool_new"
-                            : selected.type;
+                            : selected.type === "mcp_server"
+                              ? "mcp_server_new"
+                              : selected.type;
         fields = draftFieldPanel(type, {}, capacity);
         body.append(
           element(
@@ -428,6 +433,18 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           : value.read();
         if (!action || action.remove) {
           throw new Error("请明确设置新元素值。");
+        }
+        // 新服务器必须显式指定身份和完整目标，不能把其它服务器的地址或凭据当作默认声明。
+        if (selected.type === "mcp_server") {
+          if (
+            typeof action.fields?.id !== "string" ||
+            !/^[A-Za-z0-9_.-]{1,64}$/.test(action.fields.id) ||
+            !Object.hasOwn(action.fields, "target")
+          ) {
+            throw new Error(
+              "新增或替换 MCP 服务器必须明确填写1–64字节的稳定 id 和完整 target。",
+            );
+          }
         }
         // 新工具必须由操作者完整声明授权和后端，不能从相邻工具继承权限、schema 或凭据。
         if (selected.type === "mcp_tool") {
