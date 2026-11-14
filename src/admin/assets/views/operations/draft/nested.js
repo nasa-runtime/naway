@@ -46,6 +46,7 @@ import { routeLlmFieldGroups } from "./route_llm.js";
 import { routeAiSecurityFieldGroups } from "./route_ai_security.js";
 import { routeRagFieldGroups } from "./route_rag.js";
 import { routeOutputModerationFieldGroups } from "./route_output_moderation.js";
+import { routeAgentFieldGroups } from "./route_agent.js";
 
 const groups = {
   route: [
@@ -571,6 +572,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeAiSecurityFieldGroups(kind),
     ...routeRagFieldGroups(kind),
     ...routeOutputModerationFieldGroups(kind),
+    ...routeAgentFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

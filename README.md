@@ -1697,6 +1697,10 @@ proxies:
 cargo build --release --features agent-protocols
 ```
 
+管理草稿提供独立的 Agent 协议、可信身份和十项状态预算字段；Origin 可逐项维护，已认证
+consumer 的组映射可逐键修改。页面不生成默认授权或扩大预算，完整声明替换与子字段编辑分别
+保留各自边界，正式生效仍须原目标预检、审批和发布。
+
 ### MCP 固定工具目录
 
 Streamable HTTP 显式支持 `2025-11-25`：initialize、initialized、ping、tools/list、tools/call、

@@ -124,6 +124,11 @@ const definitions = {
   ],
 
   route: [
+    [
+      "agent",
+      "完整 Agent 声明（替换协议与目录；移除关闭会话及任务入口，保留路由认证）",
+      "json",
+    ],
     ["uri", "上游 URI", "string"],
     ["order", "匹配顺序", "number"],
     ["predicates", "路由断言（每行一项）", "lines"],

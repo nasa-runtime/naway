@@ -27,6 +27,7 @@ import { routeBffDraftLists } from "./route_bff.js";
 import { routeLlmDraftLists } from "./route_llm.js";
 import { routeAiSecurityDraftLists } from "./route_ai_security.js";
 import { routeRagDraftLists } from "./route_rag.js";
+import { routeAgentDraftLists } from "./route_agent.js";
 import { routeDubboDraftLists } from "./route_dubbo.js";
 import { routeWsFrameDraftLists } from "./route_ws_frame.js";
 import { routeForwardProxyDraftLists } from "./route_forward_proxy.js";
@@ -73,6 +74,7 @@ function lists(kind, values) {
   result.push(...routeLlmDraftLists(kind));
   result.push(...routeAiSecurityDraftLists(kind));
   result.push(...routeRagDraftLists(kind));
+  result.push(...routeAgentDraftLists(kind));
   result.push(...routeDubboDraftLists(kind));
   result.push(...routeWsFrameDraftLists(kind));
   result.push(...routeForwardProxyDraftLists(kind));
