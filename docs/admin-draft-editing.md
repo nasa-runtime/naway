@@ -445,6 +445,22 @@ codec、请求/响应 frame 与 Hessian2 资源门、建连/调用期限、空�
 `dubbo-hessian2`，其专有预算不作用于 JSON codec。空闲容量0表示关闭复用，空 version/group
 和空附件映射是实际声明；未编辑的引用、未知子项与宽整数保持原值。
 
+`serve` 提供完整本地服务声明，`serve.static` 可完整替换或独立编辑 root、try_files、index、
+cache_control、expires、default_type、types、allow_dotfiles、etag、range 十项。try_files 与
+index 使用每行一项的有序字符串，也可按原位置插入、替换、移动和确认删除；types 是完整扩展名
+到 MIME 映射。未编辑的引用、未知字段和宽整数保持原文，完整替换只保留本次明确的新声明。
+
+静态文件只服务 GET/HEAD，root 相对主配置目录解析且必须为已存在目录；页面不创建目录或读取
+文件内容。uri 与 static 互斥，切换须明确编辑两项，移除 static 后须明确选择其它后端。
+try_files/index 空列表使用原生默认文件选择，SPA 回落须明确声明。index 只能是文件名，不能
+包含路径、反斜线、连续两点或控制字节；types 扩展名可带前导点并按小写匹配，不能空白或含路径。
+点文件默认关闭，allow_dotfiles 不解除 canonical 路径必须位于固定根内的边界。
+
+缓存和 MIME 值须是合法响应头；expires 接受秒整数或 s/m/h/d 后缀，off 关闭，显式0仍合法。
+cache_control 明确值优先于 expires 自动 max-age。etag 控制弱 ETag，range 控制单段 HTTP
+Range，关闭 ETag 不关闭 Last-Modified 条件请求。完整 serve/static 与子项编辑分别受祖先冲突门
+约束；权限和路径合法性仍由原目标完整预检、审批与运行时处理。
+
 `gateway_redirect` 提供七项独立声明，覆盖 scheme、hostname、port、status_code、完整路径替换
 和成对的前缀替换。它是终端后端；启用时须显式移除普通 `uri` 等其它终端后端，停用时须移除
 完整策略并明确选择后端，页面不自动切换。未声明的字段不补入默认值。

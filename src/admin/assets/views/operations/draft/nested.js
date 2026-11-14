@@ -53,6 +53,7 @@ import { routeAgentOpenApiFieldGroups } from "./route_agent_openapi.js";
 import { routeAgentA2aFieldGroups } from "./route_agent_a2a.js";
 import { routeTrafficLimitFieldGroups } from "./route_traffic_limit.js";
 import { routeTrafficQuotaFieldGroups } from "./route_traffic_quota.js";
+import { routeStaticServeFieldGroups } from "./route_static_serve.js";
 
 const groups = {
   route: [
@@ -209,6 +210,11 @@ export function nestedFields(kind, values, capacity) {
   }
   if (kind === "route") {
     node.append(
+      element(
+        "p",
+        "静态文件只服务 GET/HEAD，固定 root 相对主配置目录解析且必须存在；uri 与 serve.static 互斥，切换须明确处理两项。try_files/index 空列表使用原生默认顺序，SPA 回落须明确声明。点文件默认关闭，allow_dotfiles 不解除符号链接的根目录边界。ETag 与单段 Range 独立开关；关闭 ETag 仍保留 Last-Modified 条件请求。Cache-Control 显式值优先，expires 的0仍是合法时长。",
+        "subtle",
+      ),
       element(
         "p",
         "额度窗口须全部通过；新增或替换窗口必须明确额度和长度。delay 使用有界排队与单请求期限，不扩大在途资源。Redis 另复验31天窗口、额度整数精度及响应回执寿命，不把本地兼容零自动改写为其它值。",
@@ -615,6 +621,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeAgentA2aFieldGroups(kind),
     ...routeTrafficLimitFieldGroups(kind),
     ...routeTrafficQuotaFieldGroups(kind),
+    ...routeStaticServeFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

@@ -3444,6 +3444,23 @@ consumer 还需单独 grant。冻结主体不能在子域重映射为同名用�
 一次最多 8 个并发层级推演，deadline 2 秒。`gw_layered_route_selections_total` 只使用
 八种深度和固定结果标签，Prometheus 与 OTLP 复用 `nametrics-core` 的同一计数源。
 
+## 静态文件与 SPA
+
+`serve.static` 将路由绑定到固定本地目录，只服务 GET/HEAD；它与普通 `uri` 互斥。相对 `root`
+按主配置目录解析，目录必须已存在。`try_files` 按顺序选择文件，`index` 按顺序选择目录索引；
+两者的空列表分别使用 `${uri}`、`${uri}/index.html` 与 `index.html`。SPA 回落须明确在
+`try_files` 末尾声明 `/index.html`。
+
+点文件默认关闭；明确开启 `allow_dotfiles` 也不能越过固定根的符号链接边界。文件提供弱 ETag、
+Last-Modified 条件响应和单段 Range；`etag`、`range` 可独立关闭，关闭 ETag 仍保留日期条件。
+`types` 覆盖扩展名 MIME，未知扩展名使用 `default_type` 或 `application/octet-stream`。
+`cache_control` 明确值优先于 `expires` 自动生成的 max-age；`expires` 支持秒整数、s/m/h/d、
+off 和合法的0。
+
+管理草稿提供完整本地服务、完整 static 及十个子字段；文件模板与索引可按原位置增改、移动和
+确认删除。切换后端须明确处理互斥字段；候选编辑不创建目录、不读取文件内容或改变文件权限，
+正式生效仍须原目标预检、审批和发布。
+
 ## 固定脚本的 CGI 上游
 
 `fastcgi`、`uwsgi`、`scgi` 是三个独立 feature。它们将普通 HTTP 路由直接接入记录协议后端，
