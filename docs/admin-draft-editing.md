@@ -445,6 +445,23 @@ codec、请求/响应 frame 与 Hessian2 资源门、建连/调用期限、空�
 `dubbo-hessian2`，其专有预算不作用于 JSON codec。空闲容量0表示关闭复用，空 version/group
 和空附件映射是实际声明；未编辑的引用、未知子项与宽整数保持原值。
 
+`cgi` 提供完整声明与十六个子字段：protocol、script_root、script_filename、script_name、
+server_name、server_port、max_header_bytes、max_headers、max_params、max_param_bytes、
+max_stderr_bytes、max_inflight、keep_conn、fastcgi_termination、idle_timeout_ms、request_headers。
+关联 service 的 protocol 另可独立显式编辑；页面不自动同步两个协议或选择后端，路由须固定
+lb://service 且协议一致，目标须有相应 fastcgi/uwsgi/scgi feature。
+
+脚本路径只接受固定绝对字面量，filename 严格在 root 内；脚本不从客户端 path、query、Host 或
+header 生成。server_name 是固定主机名，server_port 不能0，移除后按可信监听协议选择默认值。
+响应头容量为1024–65536字节、1–128项；参数为16–128项、1024–65535字节；诊断流容量允许显式0，
+至多1048576字节；在途为1–1024，无进展 I/O 与空闲连接期限为100–60000毫秒。keep_conn 仅用于
+FastCGI 单请求连接复用；php_fpm 收尾也仅可用于 FastCGI，切换其它协议须明确恢复 streams。
+
+request_headers 使用每行一项的白名单，也可按原位置插入、替换、移动与确认删除。最多32项，
+规范化后不得重名，不能含下划线或 proxy、connection 等协议保留名称；未列入的头不生成 CGI
+环境。完整 CGI 替换不继承旧脚本、白名单或权限，移除须明确普通 HTTP 后端；未知字段与引用保持
+原文，祖先和子项不能在同一动作中争用，最终依赖与失败语义仍由原目标完整预检和发布校验。
+
 `layer` 可完整替换，或独立编辑 parent_ref、branch、完整 matches 与 context。可信条件最多16项，
 支持原位置插入、字段编辑、完整替换、移动和确认删除；type 明确选择 authenticated、consumer、
 claim、claim_contains、risk 或 variable。authenticated 的 value 使用 JSON 布尔值，

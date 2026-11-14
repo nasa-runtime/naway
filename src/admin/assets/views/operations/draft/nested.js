@@ -55,6 +55,7 @@ import { routeTrafficLimitFieldGroups } from "./route_traffic_limit.js";
 import { routeTrafficQuotaFieldGroups } from "./route_traffic_quota.js";
 import { routeStaticServeFieldGroups } from "./route_static_serve.js";
 import { routeLayerFieldGroups } from "./route_layer.js";
+import { routeCgiFieldGroups } from "./route_cgi.js";
 
 const groups = {
   route: [
@@ -211,6 +212,11 @@ export function nestedFields(kind, values, capacity) {
   }
   if (kind === "route") {
     node.append(
+      element(
+        "p",
+        "CGI 必须指向固定 lb://service，服务 protocol 与 cgi.protocol 一致且目标具备对应 feature。脚本根、文件与名称只能是固定绝对字面量，文件须严格位于根内；客户端 path、query、Host 或同名头不能选择脚本。keep_conn 与 php_fpm 收尾仅用于 FastCGI，切换协议须明确处理旧声明。请求头只进入显式白名单，重名、下划线和协议控制头不能转成环境；移除 CGI 须明确选择普通 HTTP 后端，不会降级解释记录流。",
+        "subtle",
+      ),
       element(
         "p",
         "层级父引用只能指向同一入口的分支，分支不能带终端后端且必须有可达子层；根不能按尚未产生的认证或风险选择。子层条件读取父策略完成后的冻结事实，客户端同名头不能提供身份、风险或可信变量。上下文沿父链只写一次，条件之间全部满足；无子层命中不会退回普通路由。切换分支、父引用或条件类型须明确处理旧字段，页面不自动改变后端或授权。",
@@ -629,6 +635,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeTrafficQuotaFieldGroups(kind),
     ...routeStaticServeFieldGroups(kind),
     ...routeLayerFieldGroups(kind),
+    ...routeCgiFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

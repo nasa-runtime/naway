@@ -1,5 +1,9 @@
 export const upstreamRetryFields = [
-  ["protocol", "上游协议：auto / h1 / h2 / h2c / h3", "string"],
+  [
+    "protocol",
+    "明确上游协议：auto / h1 / h2 / h2c / h3 / fastcgi / uwsgi / scgi",
+    "string",
+  ],
   ["next_upstream", "换实例触发条件（每行一项，空列表禁用）", "lines"],
   ["next_upstream_tries", "总尝试次数（含首次；0 到候选耗尽）", "number"],
   ["next_upstream_backoff_ms", "换实例前退避（毫秒）", "number"],
