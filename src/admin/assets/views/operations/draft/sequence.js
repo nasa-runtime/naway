@@ -34,6 +34,10 @@ import { routeAgentOpenApiDraftLists } from "./route_agent_openapi.js";
 import { routeAgentA2aDraftLists } from "./route_agent_a2a.js";
 import { routeTrafficQuotaDraftLists } from "./route_traffic_quota.js";
 import { routeStaticServeDraftLists } from "./route_static_serve.js";
+import {
+  routeLayerDraftLists,
+  validateLayerMatchDeclaration,
+} from "./route_layer.js";
 import { routeDubboDraftLists } from "./route_dubbo.js";
 import { routeWsFrameDraftLists } from "./route_ws_frame.js";
 import { routeForwardProxyDraftLists } from "./route_forward_proxy.js";
@@ -87,6 +91,7 @@ function lists(kind, values) {
   result.push(...routeAgentA2aDraftLists(kind));
   result.push(...routeTrafficQuotaDraftLists(kind));
   result.push(...routeStaticServeDraftLists(kind));
+  result.push(...routeLayerDraftLists(kind));
   result.push(...routeDubboDraftLists(kind));
   result.push(...routeWsFrameDraftLists(kind));
   result.push(...routeForwardProxyDraftLists(kind));
@@ -318,6 +323,7 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           "mcp_openapi_catalog",
           "mcp_openapi_operation",
           "traffic_quota_window",
+          "layer_match",
           "ws_message_plugin",
         ].includes(selected.type)
       ) {
@@ -474,6 +480,10 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
           : value.read();
         if (!action || action.remove) {
           throw new Error("请明确设置新元素值。");
+        }
+        // 新条件不能继承相邻项的匹配权，完整变体声明通过后才交给原目标复验可信事实和可达性。
+        if (selected.type === "layer_match") {
+          validateLayerMatchDeclaration(action.fields);
         }
         // 新窗口必须由操作者明确额度与长度，不能把相邻窗口的容量当作默认授权。
         if (

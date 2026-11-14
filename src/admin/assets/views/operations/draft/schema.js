@@ -18,6 +18,7 @@ import { ragSourceFields } from "./route_rag.js";
 import { mcpToolFields } from "./route_agent_tools.js";
 import { mcpServerFields } from "./route_agent_servers.js";
 import { trafficQuotaWindowFields } from "./route_traffic_quota.js";
+import { layerMatchFields } from "./route_layer.js";
 import {
   openApiCatalogFields,
   openApiOperationFields,
@@ -30,6 +31,7 @@ import {
 } from "./route_body_transform.js";
 
 const definitions = {
+  layer_match: layerMatchFields,
   traffic_quota_window: trafficQuotaWindowFields,
   mcp_openapi_catalog: openApiCatalogFields,
   mcp_openapi_operation: openApiOperationFields.filter(
@@ -141,6 +143,11 @@ const definitions = {
   ],
 
   route: [
+    [
+      "layer",
+      "完整层级声明（替换拓扑、条件与上下文；移除须明确处理父子引用）",
+      "json",
+    ],
     ["serve", "完整本地服务声明（替换全部；移除后须明确选择其它后端）", "json"],
     [
       "traffic_limit",

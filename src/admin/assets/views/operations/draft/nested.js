@@ -54,6 +54,7 @@ import { routeAgentA2aFieldGroups } from "./route_agent_a2a.js";
 import { routeTrafficLimitFieldGroups } from "./route_traffic_limit.js";
 import { routeTrafficQuotaFieldGroups } from "./route_traffic_quota.js";
 import { routeStaticServeFieldGroups } from "./route_static_serve.js";
+import { routeLayerFieldGroups } from "./route_layer.js";
 
 const groups = {
   route: [
@@ -210,6 +211,11 @@ export function nestedFields(kind, values, capacity) {
   }
   if (kind === "route") {
     node.append(
+      element(
+        "p",
+        "层级父引用只能指向同一入口的分支，分支不能带终端后端且必须有可达子层；根不能按尚未产生的认证或风险选择。子层条件读取父策略完成后的冻结事实，客户端同名头不能提供身份、风险或可信变量。上下文沿父链只写一次，条件之间全部满足；无子层命中不会退回普通路由。切换分支、父引用或条件类型须明确处理旧字段，页面不自动改变后端或授权。",
+        "subtle",
+      ),
       element(
         "p",
         "静态文件只服务 GET/HEAD，固定 root 相对主配置目录解析且必须存在；uri 与 serve.static 互斥，切换须明确处理两项。try_files/index 空列表使用原生默认顺序，SPA 回落须明确声明。点文件默认关闭，allow_dotfiles 不解除符号链接的根目录边界。ETag 与单段 Range 独立开关；关闭 ETag 仍保留 Last-Modified 条件请求。Cache-Control 显式值优先，expires 的0仍是合法时长。",
@@ -622,6 +628,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeTrafficLimitFieldGroups(kind),
     ...routeTrafficQuotaFieldGroups(kind),
     ...routeStaticServeFieldGroups(kind),
+    ...routeLayerFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

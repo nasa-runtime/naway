@@ -445,6 +445,23 @@ codec、请求/响应 frame 与 Hessian2 资源门、建连/调用期限、空�
 `dubbo-hessian2`，其专有预算不作用于 JSON codec。空闲容量0表示关闭复用，空 version/group
 和空附件映射是实际声明；未编辑的引用、未知子项与宽整数保持原值。
 
+`layer` 可完整替换，或独立编辑 parent_ref、branch、完整 matches 与 context。可信条件最多16项，
+支持原位置插入、字段编辑、完整替换、移动和确认删除；type 明确选择 authenticated、consumer、
+claim、claim_contains、risk 或 variable。authenticated 的 value 使用 JSON 布尔值，
+claim_contains 的 value 使用 JSON 字符串；其它比较值与名称使用普通文本。新增或完整替换只
+包含所选变体的必需字段，不能继承相邻条件；编辑旧 type 不自动移除旧字段，组合由原目标拒绝
+或接受。
+
+context 另可按固定名称逐项维护，来源只接受 literal/value 或 claim/name。每层最多16项，
+整条链最多32项且同名只能写入一次；名称为1–128字节安全 ASCII，值为1–256字节且无控制字符。
+新增须唯一名称，完整替换只包含新来源，删除须确认；未修改的原文引用与未知宽数保持不变。
+可信事实来自已成功完成的父层认证、WAF 或固定声明，不能由客户端同名头提供。
+
+父引用只指向同一入口的 branch，分支不能带终端且须有可达子层，根不能使用认证后的条件。
+公开断言只接受有界路径、Host 与 Method；无子层命中不退回普通路由。完整 layer 替换、移除或
+分支转换不自动改变后端、认证、其它层或跨工作区授权，须在完整候选中明确处理引用与互斥字段，
+仍由原目标完整预检、审批和发布。
+
 `serve` 提供完整本地服务声明，`serve.static` 可完整替换或独立编辑 root、try_files、index、
 cache_control、expires、default_type、types、allow_dotfiles、etag、range 十项。try_files 与
 index 使用每行一项的有序字符串，也可按原位置插入、替换、移动和确认删除；types 是完整扩展名

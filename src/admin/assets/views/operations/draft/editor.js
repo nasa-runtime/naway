@@ -7,6 +7,7 @@ import { keyEditor, keySecret } from "./keys.js";
 import { degraphqlVariableEditor } from "./route_degraphql.js";
 import { aiConsumerGroupEditor } from "./route_ai_security.js";
 import { agentConsumerGroupEditor } from "./route_agent.js";
+import { layerContextEditor } from "./route_layer_context.js";
 
 /**
  * 业务作用：围绕当前候选提供显式对象编辑，所有结果仍须进入共享提案和原目标执行。
@@ -218,6 +219,22 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
             capacity,
             (action) => {
               // 组映射只属于仍有效的原 Agent 路由选择，不能向新的候选提交旧身份输入。
+              if (selected === object && fields && !creating) {
+                perform(action, publish);
+              }
+            },
+            () => {
+              generation += 1;
+            },
+          ),
+        );
+        body.append(
+          layerContextEditor(
+            object,
+            values,
+            capacity,
+            (action) => {
+              // 上下文只属于仍有效的原路由选择，旧面板不能向新候选写入可信事实来源。
               if (selected === object && fields && !creating) {
                 perform(action, publish);
               }
