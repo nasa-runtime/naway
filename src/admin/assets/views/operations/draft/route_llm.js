@@ -1,3 +1,18 @@
+export const llmModerationFields = [
+  ["uri", "固定判定服务（http(s):// 或 lb://service）", "string"],
+  ["model", "固定 Moderation 模型名（显式非空，最多256字节）", "string"],
+  ["path", "固定 API path（空使用 /v1/moderations）", "string"],
+  ["api_key", "判定服务 API key 的 SecretSource 引用（不读取秘密）", "string"],
+  ["timeout_ms", "单次判定含完整正文期限（毫秒；1–60000）", "number"],
+  ["max_request_bytes", "序列化判定请求字节上限（1–16777216）", "number"],
+  ["max_response_bytes", "判定响应聚合字节上限（1–4194304）", "number"],
+  [
+    "fail_mode",
+    "依赖故障策略（closed、open；明确 flagged 始终拒绝）",
+    "string",
+  ],
+];
+
 /**
  * 业务作用：显式维护 LLM 入口预算、选择、配额、缓存和内容策略，避免重建模型凭据或其它治理配置。
  * 参数说明：
@@ -155,28 +170,7 @@ export function routeLlmFieldGroups(kind) {
         ],
       ],
     ],
-    [
-      ["llm", "moderation"],
-      "LLM 外部 Moderation 判定",
-      [
-        ["uri", "固定判定服务（http(s):// 或 lb://service）", "string"],
-        ["model", "固定 Moderation 模型名（显式非空，最多256字节）", "string"],
-        ["path", "固定 API path（空使用 /v1/moderations）", "string"],
-        [
-          "api_key",
-          "判定服务 API key 的 SecretSource 引用（不读取秘密）",
-          "string",
-        ],
-        ["timeout_ms", "单次判定含完整正文期限（毫秒；1–60000）", "number"],
-        ["max_request_bytes", "序列化判定请求字节上限（1–16777216）", "number"],
-        ["max_response_bytes", "判定响应聚合字节上限（1–4194304）", "number"],
-        [
-          "fail_mode",
-          "依赖故障策略（closed、open；明确 flagged 始终拒绝）",
-          "string",
-        ],
-      ],
-    ],
+    [["llm", "moderation"], "LLM 外部 Moderation 判定", llmModerationFields],
     [
       ["llm"],
       "LLM Token 配额完整声明",

@@ -1428,6 +1428,9 @@ RAG 来源目录支持按原位置增改、替换、移动和确认删除，已�
 独立凭据、调用 ACL、文档来源及引用域白名单均可单独编辑；完整声明替换明确移除旧字段。
 引用策略和上下文预算适用于缓冲回答，完整移除 RAG 保留其它治理与认证。
 
+输出裁决支持独立编辑判定服务、交付前文本窗口和调用次数；显式依赖故障放行不会绕过明确拒绝、
+非法裁决或本地预算耗尽。移除该裁决保留安全身份、RAG、固定模板及其它内容规则。
+
 provider 计划支持 OpenAI、Anthropic、Google Gemini Developer API、Azure OpenAI、AWS Bedrock、
 Vertex AI、Cohere、Mistral、Hugging Face、xAI、DashScope、DeepSeek、Ollama 和 vLLM。Azure API 版本、
 Bedrock region/SigV4、Vertex project/region 与所有 endpoint 都在候选快照中冻结；API key、AWS access
