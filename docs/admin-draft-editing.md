@@ -882,6 +882,22 @@ openapi 提供 file、固定 target 和完整 operations，以及目录和每个
 缺失的内层映射或列表。未修改元素由原始文档持有，未知宽整数和未求值引用不会因页面显示被改写。
 这些动作只返回候选，不读取文档文件、不调用后端或保存提案，正式生效仍须原目标预检、审批和发布。
 
+A2A 提供 target、public_url、binding、card_path、card_security_schemes、card_security、discovery
+和 invocation 独立字段。target 的 uri、path、api_key 及两个 ACL 的四个维度可分别修改；完整
+target、ACL 或认证描述替换只保留明确的新声明。card_security 另可原位置插入、替换、移动和
+确认删除单项需求，不从相邻项继承 scope 或身份。
+
+binding 仅 jsonrpc 或 rest，protocol_version 须为0.3.0。public_url 是最多2048字节的显式
+HTTP(S) 网关 URL，其 path 决定实际协议入口，不接受 query、fragment、变量或父路径。上游
+card_path 与业务 target.path 独立，二者只访问固定目标并使用独立 Bearer SecretSource，不转发
+客户端凭据。公开卡片使用网关地址和明确认证说明，不发布上游私有地址或认证端点。
+
+card_security_schemes 与 card_security 均须1–8项。认证名称为1–64字节 ASCII 标识；支持合法
+header 名称的 apiKey、http bearer/basic 或 HTTPS openIdConnect。每个需求须为非空映射且只
+引用已声明名称，每个 scope 名单最多32项、每项1–128字节。原目标校验描述形态与引用关系，
+操作者须使其与实际路由认证保持一致；描述不会建立认证机制。发现与调用 ACL 独立，所有请求
+仍先通过实际路由认证及可信身份门；各维约束同时满足，空 ACL 须显式允许已认证身份。
+
 已有对象另提供“逐项编辑有序列表”，覆盖路由断言、处理链、凭据引用、静态实例、接口请求
 方法、HTTP/3 扩展及已声明的其它数组。静态实例有 URI、权重、下线、备用、健康、慢启动及
 地域字段控件；对象元素也可单独设置扩展字段。每次列表操作单独生成候选，不带上普通字段

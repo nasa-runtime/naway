@@ -31,6 +31,7 @@ import { routeAgentDraftLists } from "./route_agent.js";
 import { routeAgentToolDraftLists } from "./route_agent_tools.js";
 import { routeAgentServerDraftLists } from "./route_agent_servers.js";
 import { routeAgentOpenApiDraftLists } from "./route_agent_openapi.js";
+import { routeAgentA2aDraftLists } from "./route_agent_a2a.js";
 import { routeDubboDraftLists } from "./route_dubbo.js";
 import { routeWsFrameDraftLists } from "./route_ws_frame.js";
 import { routeForwardProxyDraftLists } from "./route_forward_proxy.js";
@@ -81,6 +82,7 @@ function lists(kind, values) {
   result.push(...routeAgentToolDraftLists(kind));
   result.push(...routeAgentServerDraftLists(kind));
   result.push(...routeAgentOpenApiDraftLists(kind, values));
+  result.push(...routeAgentA2aDraftLists(kind));
   result.push(...routeDubboDraftLists(kind));
   result.push(...routeWsFrameDraftLists(kind));
   result.push(...routeForwardProxyDraftLists(kind));

@@ -50,6 +50,7 @@ import { routeAgentFieldGroups } from "./route_agent.js";
 import { routeAgentToolFieldGroups } from "./route_agent_tools.js";
 import { routeAgentServerFieldGroups } from "./route_agent_servers.js";
 import { routeAgentOpenApiFieldGroups } from "./route_agent_openapi.js";
+import { routeAgentA2aFieldGroups } from "./route_agent_a2a.js";
 
 const groups = {
   route: [
@@ -206,6 +207,16 @@ export function nestedFields(kind, values, capacity) {
   }
   if (kind === "route") {
     node.append(
+      element(
+        "p",
+        "A2A 必须显式选择 jsonrpc 或 rest 和协议版本0.3.0。public_url 的 path 决定网关协议入口；后端 target.path 与独立 card_path 只访问固定目标，不复制客户端凭据。公开卡片只发布网关地址与显式认证描述。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "A2A card_security_schemes 与 card_security 只描述网关认证，不建立认证机制；请与实际路由认证保持一致。需求引用必须已声明，每个 scope 名单最多32项且每项1–128字节。发现和调用 ACL 独立，各维约束同时满足；空 ACL 须显式允许已认证身份。",
+        "subtle",
+      ),
       element(
         "p",
         "BFF 与普通 uri 等终端后端二选一。启用聚合须显式移除旧 uri，关闭时须移除整个 bff_aggregation 并显式选择后端；页面不会自动改写后端。仅支持 GET，下游认证、WAF 和其它允许组合的治理继续执行。",
@@ -579,6 +590,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeAgentToolFieldGroups(kind),
     ...routeAgentServerFieldGroups(kind),
     ...routeAgentOpenApiFieldGroups(kind),
+    ...routeAgentA2aFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
