@@ -45,6 +45,15 @@ export function draftFieldPanel(kind, values, capacity) {
       ),
     );
   }
+  if (kind === "portal_team") {
+    node.append(
+      element(
+        "p",
+        "团队身份独立于产品与路由。角色映射为完整替换，可能授予或撤销团队权限；这里只编辑声明，不建立 SSO、不开启门户，也不迁移应用。角色声明仍须原目标完整预检，访问时只信任已验证的 SSO 身份。",
+        "subtle",
+      ),
+    );
+  }
   const remaining = Object.keys(values).filter(
     (key) => !identityField(kind, key) && !known.some(([name]) => name === key),
   );

@@ -693,6 +693,13 @@ API 产品以独立 `product` 对象定位 `developer_portal.products` 中的稳
 完整集合或元素替换会移除旧声明中未提供的其它字段。编辑成功不代表文件可读、门户已开启、合同合法或取得了发布权限，最终由原
 目标完整预检、审批和执行裁决。
 
+门户团队以 `portal_team` 独立身份定位 `developer_portal.management.teams`，提供标题、应用数量
+上限与完整 `group_roles` / `subject_roles` JSON 映射。映射替换会移除未提供的旧成员授权，角色为
+`viewer / developer / owner`；可信 subject 和 groups 只能来自实际 SSO 验证，客户端头不能代替。
+已有团队 `id` 受保护；显式新建只补声明容器，不自动建立登录、开启门户或创建应用。管理声明为
+`null` 时保持关闭，不能因新建团队隐式改成对象。删除团队不会迁移或删除依赖应用；团队总数、
+角色映射、应用数量和全部引用仍需原目标完整预检，编辑成功不代表权限已经生效。
+
 HTTP 与 stream 入口的 TLS 子字段覆盖默认文件或 manifest 来源、外部签名引用、SPIRE、
 客户端 CA/CRL/SPIFFE 验证、客户端在线 OCSP、当前身份的 OCSP staple 及会话票据。
 stream 单独提供握手期限，HTTP 的 TLS 监听地址不会写入 stream TLS 对象。切换来源时必须

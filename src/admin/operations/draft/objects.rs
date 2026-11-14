@@ -23,6 +23,9 @@ pub(super) enum Object {
     Product {
         id: String,
     },
+    PortalTeam {
+        id: String,
+    },
     Credential {
         name: String,
     },
@@ -78,6 +81,9 @@ impl Object {
                 id,
             }
             | Self::Product {
+                id,
+            }
+            | Self::PortalTeam {
                 id,
             } => (Domain::Gateway, id, None),
             Self::Service {
@@ -144,6 +150,9 @@ impl Object {
                 id,
             }
             | Self::Product {
+                id,
+            }
+            | Self::PortalTeam {
                 id,
             } => id,
             Self::Service {
@@ -386,6 +395,18 @@ pub(super) fn catalog(document: &Value, domain: Domain) -> Result<BTreeSet<Objec
                         id: object_id(product)?.into(),
                     })?;
                 }
+                if let Some(management) = portal.get("management").filter(|value| !value.is_null())
+                {
+                    if !management.is_object() {
+                        // null 明确表示关闭管理；其它错型声明不能被当作没有团队的空目录。
+                        return Err(Error::Invalid);
+                    }
+                    for team in array(management.get("teams"))? {
+                        insert(Object::PortalTeam {
+                            id: object_id(team)?.into(),
+                        })?;
+                    }
+                }
             }
         }
         Domain::Sentinel => {
@@ -521,7 +542,7 @@ fn mapping_mut<'a>(
         .ok_or(Error::Invalid)
 }
 
-/// 业务作用：按固定对象类型选择声明集合，产品不改变门户开关，路由追加必须归属于已有显式父入口。
+/// 业务作用：按固定类型选择声明集合，门户对象不改变登录或开关，路由追加必须归属于已有显式父入口。
 ///
 /// 参数说明：
 /// - `document`：已完成目录唯一性校验的原文树。
@@ -596,6 +617,21 @@ fn collection_mut<'a>(
                 create.then(|| Value::Object(Map::new())),
             )?,
             "products",
+        ),
+        Object::PortalTeam {
+            ..
+        } => (
+            // 只补团队声明容器，不替调用者开启门户、建立 SSO 或生成任何默认成员和应用。
+            child(
+                child(
+                    document,
+                    "developer_portal",
+                    create.then(|| Value::Object(Map::new())),
+                )?,
+                "management",
+                create.then(|| Value::Object(Map::new())),
+            )?,
+            "teams",
         ),
         Object::Flow {
             ..

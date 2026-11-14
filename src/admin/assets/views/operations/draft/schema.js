@@ -90,6 +90,21 @@ const definitions = {
     ],
   ],
 
+  portal_team: [
+    ["title", "门户团队标题", "string"],
+    [
+      "group_roles",
+      "完整可信 SSO 组角色映射（viewer / developer / owner）",
+      "json",
+    ],
+    [
+      "subject_roles",
+      "完整可信 SSO subject 角色映射（viewer / developer / owner）",
+      "json",
+    ],
+    ["max_applications", "团队应用数量上限（1–1024）", "number"],
+  ],
+
   usage_plan: [
     ["requests", "窗口内基础请求数", "number"],
     ["window_ms", "固定窗口（毫秒）", "number"],
@@ -263,6 +278,7 @@ export const objectKinds = {
     ["route", "HTTP 路由"],
     ["service", "上游服务"],
     ["product", "API 产品"],
+    ["portal_team", "门户团队"],
     ["credential", "上游凭据"],
     ["secret_provider", "远程秘密源"],
     ["usage_plan", "用量套餐"],
