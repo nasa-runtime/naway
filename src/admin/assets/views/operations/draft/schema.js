@@ -140,6 +140,11 @@ const definitions = {
 
   route: [
     [
+      "traffic_limit",
+      "完整流量账本与带宽声明（替换全部；移除关闭全部方向与额度）",
+      "json",
+    ],
+    [
       "agent",
       "完整 Agent 声明（替换协议与目录；移除关闭会话及任务入口，保留路由认证）",
       "json",

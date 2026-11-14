@@ -51,6 +51,7 @@ import { routeAgentToolFieldGroups } from "./route_agent_tools.js";
 import { routeAgentServerFieldGroups } from "./route_agent_servers.js";
 import { routeAgentOpenApiFieldGroups } from "./route_agent_openapi.js";
 import { routeAgentA2aFieldGroups } from "./route_agent_a2a.js";
+import { routeTrafficLimitFieldGroups } from "./route_traffic_limit.js";
 
 const groups = {
   route: [
@@ -207,6 +208,16 @@ export function nestedFields(kind, values, capacity) {
   }
   if (kind === "route") {
     node.append(
+      element(
+        "p",
+        "traffic_limit 的两个带宽方向独立；移除整段才关闭全部账本治理。service 作用域要求固定 lb://service，同一工作区共享域内的完整策略必须一致。consumer/api_key 只读取认证后冻结事实，客户端身份头不产生额度身份。",
+        "subtle",
+      ),
+      element(
+        "p",
+        "Redis 账本需要目标具备 redis-runtime 并使用已验证的 runtime_state.rate_limiter 连接；页面不建立连接或迁移余额。fail_open 只处理依赖不可用，资源名额、非法账本和带宽等待超期仍关闭。events=true 必须同时配置 quota 与 runtime_state.traffic_meter，切换计量开关不清空现有债务。",
+        "subtle",
+      ),
       element(
         "p",
         "A2A 必须显式选择 jsonrpc 或 rest 和协议版本0.3.0。public_url 的 path 决定网关协议入口；后端 target.path 与独立 card_path 只访问固定目标，不复制客户端凭据。公开卡片只发布网关地址与显式认证描述。",
@@ -591,6 +602,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeAgentServerFieldGroups(kind),
     ...routeAgentOpenApiFieldGroups(kind),
     ...routeAgentA2aFieldGroups(kind),
+    ...routeTrafficLimitFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

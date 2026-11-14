@@ -348,6 +348,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/route_agent_a2a.js"),
         ),
+        "/ui/views/operations/draft/route_traffic_limit.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/route_traffic_limit.js"),
+        ),
         "/ui/views/operations/draft/listener.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/listener.js"),

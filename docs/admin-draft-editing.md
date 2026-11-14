@@ -898,6 +898,19 @@ header 名称的 apiKey、http bearer/basic 或 HTTPS openIdConnect。每个需�
 操作者须使其与实际路由认证保持一致；描述不会建立认证机制。发现与调用 ACL 独立，所有请求
 仍先通过实际路由认证及可信身份门；各维约束同时满足，空 ACL 须显式允许已认证身份。
 
+traffic_limit 提供 events、backend、scope、key、request_bandwidth、response_bandwidth、quota
+与 fail_mode 独立字段。两个带宽方向分别提供 bytes_per_second、burst_bytes、after_bytes 和
+max_wait_ms；速率必须大于0，每帧等待为1–60000毫秒，突发和前置字节可显式0。单方向完整替换
+只保留明确的新声明，移除一方向不影响另一方向及额度；移除整个 traffic_limit 才关闭全部策略。
+quota 在此按完整 JSON 声明所有窗口与成本来源，未编辑子树继续保留原始字节及未求值引用。
+
+backend 为 local 或 redis；Redis 需要目标编译 redis-runtime 并复用已验证的
+runtime_state.rate_limiter 连接。scope 为 route、service、global 或 shared:名称，service
+要求固定 lb://service，同一工作区共享域内的完整策略必须一致。consumer/api_key 维度只接受
+认证后冻结身份，页面不建立认证机制或迁移余额。events=true 须有 quota 与 runtime_state.traffic_meter，计量开关不改变既有
+账本身份。fail_open 仅影响依赖不可用，非法账本、资源门和带宽等待超期仍关闭；候选仍须经过
+原目标完整预检、审批和发布。
+
 已有对象另提供“逐项编辑有序列表”，覆盖路由断言、处理链、凭据引用、静态实例、接口请求
 方法、HTTP/3 扩展及已声明的其它数组。静态实例有 URI、权重、下线、备用、健康、慢启动及
 地域字段控件；对象元素也可单独设置扩展字段。每次列表操作单独生成候选，不带上普通字段
