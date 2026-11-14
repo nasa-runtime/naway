@@ -43,6 +43,7 @@ import { routeForwardProxyFieldGroups } from "./route_forward_proxy.js";
 import { routeWebTransportFieldGroups } from "./route_webtransport.js";
 import { routeEarlyDataFieldGroups } from "./route_early_data.js";
 import { routeLlmFieldGroups } from "./route_llm.js";
+import { routeAiSecurityFieldGroups } from "./route_ai_security.js";
 
 const groups = {
   route: [
@@ -565,6 +566,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeWebTransportFieldGroups(kind),
     ...routeEarlyDataFieldGroups(kind),
     ...routeLlmFieldGroups(kind),
+    ...routeAiSecurityFieldGroups(kind),
     ...listenerFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),

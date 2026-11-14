@@ -788,6 +788,22 @@ consumer 或 API-Key 指纹，客户端自报身份不能创建额度权威，ap
 完整 prompt 值替换整个模板声明；移除 `llm.governance.prompt` 仅停止模板注入，保留既有
 治理身份、request_only 保留策略、检索、输出裁决、模型与认证。
 
+“AI 可信租户与身份来源”提供 tenant、allowed_origins、tenant_claim、groups_claim、scopes_claim
+和 consumer_groups 六项原生声明。Origin 名单可整份替换或按原位置操作；有 Origin 时必须精确
+匹配，缺少 Origin 的服务端客户端不受该项限制。tenant_claim 声明后必须由已验签 claim 提供，
+值须等于固定 tenant；groups_claim 与 scopes_claim 只读取已验证声明，移除 scopes_claim 后读取
+默认 scope。页面不会授予身份、把请求头当作 claim 或自动补齐租户和组。
+
+完整 consumer_groups 值替换全部映射；“逐项编辑 AI consumer 组映射”只新增、替换或确认删除
+一个精确 consumer 键的完整组名单，其它 consumer 不随展示重新编码。点和斜线是名称字符，
+不作为路径分隔符；逐键名称最多128字节，更长的原生合法名称可使用完整映射。新增组名单不
+继承其它 consumer；空名单不授予组，映射只对路由已经认证的 consumer 生效。
+
+“AI 治理身份与保留”要求显式 request_only，当前不支持其它保留策略。安全身份在治理声明存在时
+不可缺失；整段安全身份替换会移除旧身份的其它字段，单独移除必需字段将被目标预检拒绝。
+移除完整 llm.governance 同时停止固定模板、RAG 与输出裁决，保留模型、路由认证、本地护栏及
+独立 llm.moderation。上述动作只生成候选，正式生效仍须原目标预检、审批和发布。
+
 已有对象另提供“逐项编辑有序列表”，覆盖路由断言、处理链、凭据引用、静态实例、接口请求
 方法、HTTP/3 扩展及已声明的其它数组。静态实例有 URI、权重、下线、备用、健康、慢启动及
 地域字段控件；对象元素也可单独设置扩展字段。每次列表操作单独生成候选，不带上普通字段

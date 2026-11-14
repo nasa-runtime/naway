@@ -1420,6 +1420,10 @@ Token 配额的补充量、窗口、突发、验证身份维度和容量策略�
 固定提示模板也可独立编辑名称、业务修订、文件与固定变量；变量不读取请求或执行表达式，
 移除模板保留其余治理和认证。
 
+治理安全身份可独立编辑固定租户、已验签 claim 来源、Origin 名单和已认证 consumer 的组映射；
+映射支持逐键增改与确认删除，不创建身份或信任客户端自报权限。保留策略须显式声明 `request_only`；
+移除完整治理同时关闭固定模板、RAG 和输出裁决，保留模型与路由认证。
+
 provider 计划支持 OpenAI、Anthropic、Google Gemini Developer API、Azure OpenAI、AWS Bedrock、
 Vertex AI、Cohere、Mistral、Hugging Face、xAI、DashScope、DeepSeek、Ollama 和 vLLM。Azure API 版本、
 Bedrock region/SigV4、Vertex project/region 与所有 endpoint 都在候选快照中冻结；API key、AWS access
