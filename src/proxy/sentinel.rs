@@ -1,6 +1,7 @@
 //! 请求入口的原生速率、预热与匀速队列准入。
 
 use super::*;
+use crate::observability::http_stream::routes::{record_sentinel_rejection, SentinelRejection};
 use crate::runtime::sentinel::queue::{self, Rejected};
 
 pub(super) struct AdmissionContext {
@@ -125,6 +126,16 @@ impl GatewayProxy {
                 attempt.complete(outcome);
                 if let Err(reason) = outcome {
                     self.metrics.inc_rate_limited();
+                    record_sentinel_rejection(
+                        parts,
+                        match reason {
+                            Rejected::Retired => SentinelRejection::QueueRetired,
+                            Rejected::Unavailable | Rejected::Clock => {
+                                SentinelRejection::QueueUnavailable
+                            }
+                            _ => SentinelRejection::Queue,
+                        },
+                    );
                     return Some(match reason {
                         Rejected::Retired => text_status(409, "queue authority changed"),
                         Rejected::Unavailable | Rejected::Clock => {
@@ -147,6 +158,7 @@ impl GatewayProxy {
             };
             if !decision.allowed {
                 self.metrics.inc_rate_limited();
+                record_sentinel_rejection(parts, SentinelRejection::Rate);
                 // 租户规则的拒绝不能升级为全平台 IP 封禁；平台入口仍遵守全局自动封禁策略。
                 if parts
                     .extensions

@@ -81,8 +81,10 @@ export function mount(root, session) {
   submit.type = "submit";
   const pause = element("button", "暂停");
   pause.type = "button";
+  const refreshButton = element("button", "刷新当前页");
+  refreshButton.type = "button";
   const toolbar = element("form", "", "monitor-toolbar");
-  toolbar.append(scope, search, limit, submit, pause);
+  toolbar.append(scope, search, limit, submit, pause, refreshButton);
   const status = element("p", "正在读取当前路由流量…", "status-pill");
   status.setAttribute("role", "status");
   const cards = element("section", "", "metric-grid");
@@ -211,6 +213,36 @@ export function mount(root, session) {
     }
     detail.append(
       values,
+      element("h3", "Sentinel 当前拒绝"),
+      element(
+        "p",
+        `${states[row.sentinel?.availability] ?? "缺少当前事实"} · ${row.sentinel?.valid_nodes ?? 0}/${row.sentinel?.present_nodes ?? row.present_nodes} 个对象节点形成防护区间，另有 ${row.sentinel?.unknown_nodes ?? row.unknown_nodes} 个未知节点。仅汇总实际观测节点；旧节点缺席不能视为零拒绝。`,
+        "subtle",
+      ),
+    );
+    const protection = element("div", "", "metric-grid");
+    for (const [index, label] of [
+      "请求速率拒绝",
+      "并发额度拒绝",
+      "队列额度拒绝",
+      "队列权威不可用",
+      "队列配置撤权",
+    ].entries()) {
+      protection.append(
+        card(
+          label,
+          number(row.sentinel?.rejections_per_second?.[index]),
+          "次 / 秒",
+        ),
+      );
+    }
+    detail.append(
+      protection,
+      element(
+        "p",
+        "来自原生准入分支的明确裁决，沿用首次公开入口归属；上游返回429和其它安全拒绝不计入。父层与叶子不重复归属，当前事实不包含客户key、进程桶余额或共享额度。",
+        "subtle",
+      ),
       element("p", `当前对象节点：${row.nodes.join("、")}`, "subtle"),
     );
     detail.hidden = false;
@@ -302,11 +334,12 @@ export function mount(root, session) {
 
   /**
    * 业务作用：串行请求当前授权范围，绝对年龄超限与新采样分页冲突都撤销旧数据。
-   * 参数说明: 无。
+   * 参数说明：
+   * - `manual`：用户明确要求的一次当前读取，不开启隐藏页自动采样。
    * 返回：发布一次当前页；错误保留明确原因，迟到结果不改变页面。
    */
-  async function refresh() {
-    if (stopped || paused || document.hidden || controller) {
+  async function refresh(manual = false) {
+    if (stopped || paused || (document.hidden && !manual) || controller) {
       return;
     }
     const round = epoch;
@@ -318,12 +351,15 @@ export function mount(root, session) {
       : "/api/monitor/routes";
     const query = new URLSearchParams({
       search: search.value,
+
       offset: String(offset),
+
       limit: limit.value,
     });
     try {
       const result = await request(`${base}?${query}`, {
         signal: active.signal,
+
         headers: offset && etag ? { "If-Match": etag } : {},
       });
       if (stopped || round !== epoch || active.signal.aborted) {
@@ -360,6 +396,7 @@ export function mount(root, session) {
           if ([403, 404].includes(error.status)) {
             paused = true;
             pause.textContent = "继续";
+            refreshButton.disabled = true;
           }
           clear(error.message);
         }
@@ -406,7 +443,7 @@ export function mount(root, session) {
     event?.preventDefault();
     offset = 0;
     invalidate("正在读取当前范围…");
-    void refresh();
+    void refresh(true);
   }
 
   /**
@@ -431,6 +468,7 @@ export function mount(root, session) {
   function toggle() {
     paused = !paused;
     pause.textContent = paused ? "继续" : "暂停";
+    refreshButton.disabled = paused;
     offset = 0;
     invalidate(paused ? "已暂停，当前值已清空。" : "正在恢复当前采样…");
     void refresh();
@@ -453,6 +491,10 @@ export function mount(root, session) {
   scope.addEventListener("change", reset);
   limit.addEventListener("change", reset);
   pause.addEventListener("click", toggle);
+  refreshButton.addEventListener("click", () => {
+    // 明确点击只读取一次；隐藏页的定时读取仍由 refresh 的默认门关闭。
+    void refresh(true);
+  });
   previous.addEventListener("click", () => {
     move(Math.max(0, offset - Number(limit.value)));
   });

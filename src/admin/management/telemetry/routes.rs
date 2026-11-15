@@ -61,6 +61,7 @@ pub(super) fn encode(row: &Reading) -> protocol::RouteTraffic {
         outcomes: row.totals.outcomes.to_vec(),
         duration_micros: row.totals.duration_micros,
         buckets: row.totals.buckets.to_vec(),
+        sentinel_rejections: Vec::new(),
     }
 }
 
@@ -98,6 +99,67 @@ pub(super) fn decode(row: protocol::RouteTraffic) -> Result<Reading, Status> {
                 .buckets
                 .try_into()
                 .map_err(|_| Status::invalid_argument("invalid route duration buckets"))?,
+            sentinel_rejections: if row.sentinel_rejections.is_empty() {
+                None
+            } else {
+                Some(row.sentinel_rejections.try_into().map_err(|_| {
+                    Status::invalid_argument("invalid route Sentinel rejection classes")
+                })?)
+            },
         },
     })
+}
+
+/// 业务作用：为明确支持路由 Sentinel 的目标扩展原样本摘要，缺席的新域保持旧摘要逐字一致。
+///
+/// 参数说明：
+/// - `snapshot`：同一当前样本的完整路由目录。
+/// - `base`：按该目标既有服务与监听器能力计算的原摘要。
+///
+/// 返回：存在明确裁决时返回覆盖全部可选计数的域隔离摘要；全部缺席时返回原摘要。
+pub(super) fn sentinel_digest(snapshot: Option<&Snapshot>, base: [u8; 32]) -> [u8; 32] {
+    let Some(snapshot) = snapshot.filter(|value| {
+        value
+            .rows
+            .iter()
+            .any(|row| row.totals.sentinel_rejections.is_some())
+    }) else {
+        return base;
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"naway-route-sentinel\0");
+    hash.update(base);
+    hash.update((snapshot.rows.len() as u64).to_be_bytes());
+    for row in &snapshot.rows {
+        hash.update([u8::from(row.totals.sentinel_rejections.is_some())]);
+        if let Some(counts) = row.totals.sentinel_rejections {
+            for value in counts {
+                hash.update(value.to_be_bytes());
+            }
+        }
+    }
+    hash.finalize().into()
+}
+
+/// 业务作用：只向本轮心跳确认新能力的目标发送裁决计数，不能让旧接收器遇到无法验证的摘要。
+///
+/// 参数说明：
+/// - `part`：已经按原有域和固定行数构造的路由分片。
+/// - `snapshot`：与分片及摘要绑定的原生路由目录。
+///
+/// 返回：按已排序的完整对象身份填入最多五个计数，不改变原字段、偏移或分片大小。
+pub(super) fn add_sentinel(part: &mut protocol::SampleRequest, snapshot: Option<&Snapshot>) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    for row in &mut part.routes {
+        if let Ok(index) = snapshot
+            .rows
+            .binary_search_by(|value| (&value.proxy, &value.route).cmp(&(&row.proxy, &row.route)))
+        {
+            if let Some(counts) = snapshot.rows[index].totals.sentinel_rejections {
+                row.sentinel_rejections = counts.to_vec();
+            }
+        }
+    }
 }

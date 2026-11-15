@@ -1454,6 +1454,10 @@ impl GatewayProxy {
             route_id = Some(route.id_shared.clone());
             // 公开根入口确定后立即绑定，后续拒绝、取消、内部转路由与叶子执行都沿用原归属。
             observation.select_route(&route.traffic);
+            crate::observability::http_stream::routes::select_sentinel_owner(
+                &mut parts,
+                &route.traffic,
+            );
             let mut authorization_identity = AuthorizationIdentity::default();
             let layered_rejected = if let Some(plan) = proxy_runtime
                 .router
@@ -8100,6 +8104,14 @@ impl GatewayProxy {
     }
 
     /// 业务作用：在进入业务转发前申请并发额度，拒绝时不创建无预算上游请求。
+    ///
+    /// 参数说明：
+    /// - `parts`：含首次公开入口归属的请求头。
+    /// - `route`：当前实际执行并发规则的已编译路由。
+    /// - `client_ip`：权威客户端地址，只用于原规则维度。
+    /// - `acquired`：本次请求已取得的并发占用，拒绝时一并释放。
+    ///
+    /// 返回：全部规则取得占用时继续；拒绝时归还已取得占用并记录原入口的明确裁决。
     async fn enforce_limit_conn(
         &self,
         parts: &Parts,
@@ -8118,6 +8130,10 @@ impl GatewayProxy {
             let Some(guard) = self.acquire_limit_conn_slot(key, policy.limit).await else {
                 acquired.clear();
                 self.metrics.inc_conn_limited();
+                crate::observability::http_stream::routes::record_sentinel_rejection(
+                    parts,
+                    crate::observability::http_stream::routes::SentinelRejection::Concurrency,
+                );
                 return Some(conn_limited_response(policy.limit));
             };
             acquired.push(guard);

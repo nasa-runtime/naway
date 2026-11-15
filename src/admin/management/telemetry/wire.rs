@@ -650,7 +650,10 @@ impl Candidate {
                 .map_or(0, |value| value.rows.len())
                 != self.stream_total
             || !model::validate(&mut self.sample)
-            || digest_with_streams(&self.sample, true) != self.digest
+            || routes::sentinel_digest(
+                self.sample.route_traffic.as_ref(),
+                digest_with_streams(&self.sample, true),
+            ) != self.digest
         {
             return Err(Status::data_loss("incomplete or inconsistent sample"));
         }

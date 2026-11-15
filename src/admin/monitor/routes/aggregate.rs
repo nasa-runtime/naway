@@ -23,6 +23,9 @@ struct Sum<'a> {
     responses: [f64; 5],
     bytes: f64,
     outcomes: [f64; 4],
+    sentinel_supported: usize,
+    sentinel_valid: usize,
+    sentinel_rejections: [f64; 5],
     latency: Aggregate,
 }
 
@@ -42,6 +45,17 @@ pub(super) struct Row<'a> {
     response_bytes_per_second: Option<f64>,
     outcomes_per_second: Option<[f64; 4]>,
     latency: serde_json::Value,
+    sentinel: Sentinel,
+}
+
+#[derive(Serialize)]
+struct Sentinel {
+    availability: &'static str,
+    supported_nodes: usize,
+    valid_nodes: usize,
+    present_nodes: usize,
+    unknown_nodes: usize,
+    rejections_per_second: Option<[f64; 5]>,
 }
 
 impl<'a> Rows<'a> {
@@ -86,6 +100,7 @@ impl<'a> Rows<'a> {
                 return false;
             }
             let sum = self.rows.entry(key).or_default();
+            sum.sentinel_supported += usize::from(row.totals.sentinel_rejections.is_some());
             sum.active = if sum.nodes.is_empty() {
                 Some(row.totals.active)
             } else {
@@ -118,6 +133,13 @@ impl<'a> Rows<'a> {
                 }
                 for (sum, value) in sum.outcomes.iter_mut().zip(delta.outcomes) {
                     *sum += value as f64 / seconds;
+                }
+                // 新域缺席或回退只撤下该域区间，不能把旧节点或旧计数解释为零拒绝。
+                if let Some(counts) = delta.sentinel_rejections {
+                    sum.sentinel_valid += 1;
+                    for (sum, value) in sum.sentinel_rejections.iter_mut().zip(counts) {
+                        *sum += value as f64 / seconds;
+                    }
                 }
                 let count = delta
                     .buckets
@@ -180,6 +202,23 @@ impl<'a> Rows<'a> {
                     response_bytes_per_second: (value.valid > 0).then_some(value.bytes),
                     outcomes_per_second: (value.valid > 0).then_some(value.outcomes),
                     latency: value.latency.latency(present + unknown),
+                    sentinel: Sentinel {
+                        availability: if value.sentinel_supported == 0 {
+                            "unsupported"
+                        } else if value.sentinel_valid == 0 {
+                            "sampling"
+                        } else if unknown > 0 || value.sentinel_valid < present {
+                            "partial"
+                        } else {
+                            "available"
+                        },
+                        supported_nodes: value.sentinel_supported,
+                        valid_nodes: value.sentinel_valid,
+                        present_nodes: present,
+                        unknown_nodes: unknown,
+                        rejections_per_second: (value.sentinel_valid > 0)
+                            .then_some(value.sentinel_rejections),
+                    },
                 }
             })
             .collect();
@@ -204,6 +243,10 @@ fn delta(current: &Reading, previous: &Reading) -> Option<Totals> {
         outcomes: subtract(&now.outcomes, &old.outcomes)?,
         duration_micros: now.duration_micros.checked_sub(old.duration_micros)?,
         buckets: subtract(&now.buckets, &old.buckets)?,
+        sentinel_rejections: now
+            .sentinel_rejections
+            .zip(old.sentinel_rejections)
+            .and_then(|(now, old)| subtract(&now, &old)),
     })
 }
 

@@ -4,8 +4,10 @@ mod snapshot;
 pub(crate) use snapshot::{capture, Reading, Snapshot, MAX_ROUTES};
 
 use super::{metrics::BOUNDS_MS, Outcome};
+use http::request::Parts;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Default)]
@@ -17,6 +19,7 @@ pub(crate) struct Counters {
     outcomes: [AtomicU64; 4],
     duration_micros: AtomicU64,
     buckets: [AtomicU64; 13],
+    sentinel_rejections: [AtomicU64; 5],
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -29,6 +32,8 @@ pub(crate) struct Totals {
     pub outcomes: [u64; 4],
     pub duration_micros: u64,
     pub buckets: [u64; 13],
+    #[serde(default)]
+    pub sentinel_rejections: Option<[u64; 5]>,
 }
 
 impl Counters {
@@ -103,6 +108,48 @@ impl Counters {
             outcomes: std::array::from_fn(|index| self.outcomes[index].load(Ordering::Relaxed)),
             duration_micros: self.duration_micros.load(Ordering::Relaxed),
             buckets: std::array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed)),
+            sentinel_rejections: Some(std::array::from_fn(|index| {
+                self.sentinel_rejections[index].load(Ordering::Relaxed)
+            })),
         }
+    }
+}
+
+/// Sentinel 明确裁决的固定目录，数组顺序同时用于管理协议和当前区间展示。
+#[derive(Clone, Copy)]
+pub(crate) enum SentinelRejection {
+    Rate = 0,
+    Concurrency = 1,
+    Queue = 2,
+    QueueUnavailable = 3,
+    QueueRetired = 4,
+}
+
+#[derive(Clone)]
+struct SentinelOwner(Arc<Counters>);
+
+/// 业务作用：在首次公开路由命中时冻结防护计数所有者，父层、叶子和内部跳转不能重新归属。
+///
+/// 参数说明：
+/// - `parts`：当前请求的原生扩展，不读取客户端提供的身份。
+/// - `counters`：同一配置快照编译的公开入口计数。
+///
+/// 返回：仅首次绑定保留一个共享引用；后续选择不创建第二份计数或改变归属。
+pub(crate) fn select_sentinel_owner(parts: &mut Parts, counters: &Arc<Counters>) {
+    if parts.extensions.get::<SentinelOwner>().is_none() {
+        parts.extensions.insert(SentinelOwner(counters.clone()));
+    }
+}
+
+/// 业务作用：在实际 Sentinel 拒绝分支记录明确裁决，不由最终响应状态推断防护行为。
+///
+/// 参数说明：
+/// - `parts`：仍持有首次公开入口所有者的当前请求。
+/// - `reason`：速率、并发或队列拒绝的固定类别。
+///
+/// 返回：存在入口所有者时只更新原配置代；未命中公开入口时不制造工作区事实。
+pub(crate) fn record_sentinel_rejection(parts: &Parts, reason: SentinelRejection) {
+    if let Some(owner) = parts.extensions.get::<SentinelOwner>() {
+        owner.0.sentinel_rejections[reason as usize].fetch_add(1, Ordering::Relaxed);
     }
 }

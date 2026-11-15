@@ -25,6 +25,7 @@ struct Target {
     interest_until: Option<Instant>,
     service_metrics_supported: bool,
     stream_metrics_supported: bool,
+    route_sentinel_supported: bool,
     issuer: Option<Arc<super::issuer::Verifier>>,
     #[cfg(feature = "node-actions")]
     actions: super::actions::Channel,
@@ -117,6 +118,7 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     interest_until: None,
                     service_metrics_supported: false,
                     stream_metrics_supported: false,
+                    route_sentinel_supported: false,
                     issuer: target.issuer.clone(),
                     #[cfg(feature = "node-actions")]
                     actions: super::actions::Channel::default(),
@@ -296,6 +298,7 @@ async fn send(target: &mut Target, round: &Round<'_>) {
         let session = target.session.clone();
         let service_supported = target.service_metrics_supported;
         let stream_supported = target.stream_metrics_supported;
+        let sentinel_supported = target.route_sentinel_supported;
         let metrics = async {
             if let Some(sample) = upload {
                 let _ = telemetry::upload(
@@ -304,8 +307,7 @@ async fn send(target: &mut Target, round: &Round<'_>) {
                     facts.node_id.clone(),
                     session,
                     deadline,
-                    service_supported,
-                    stream_supported,
+                    (service_supported, stream_supported, sentinel_supported),
                 )
                 .await;
             }
@@ -620,6 +622,7 @@ async fn exchange(
     // 每次成功心跳重新取得能力；目标降级或切换后不能继续发送新字段及其摘要。
     target.service_metrics_supported = response.service_metrics_supported;
     target.stream_metrics_supported = response.stream_metrics_supported;
+    target.route_sentinel_supported = response.route_sentinel_supported;
     target.consumers_supported = response.consumers_supported;
     target.certificates_supported = response.certificates_supported;
     if !target.certificates_supported {

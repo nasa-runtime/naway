@@ -153,6 +153,8 @@ message ReportResponse {
   MaterialReleaseOffer material_release = 12;
   // 同时支持监听器目录和流量事实接收；不代替对象归属或工作区读取授权。
   bool stream_metrics_supported = 13;
+  // 路由 Sentinel 裁决使用独立协商，旧接收端继续验证原流量字段及摘要。
+  bool route_sentinel_supported = 14;
 }
 
 // 原目标字段复用结构，内层 signature 必须为空；只有外层独立签名可以授权候选下载。
@@ -886,6 +888,8 @@ message RouteTraffic {
   repeated uint64 outcomes = 8;
   uint64 duration_micros = 9;
   repeated uint64 buckets = 10;
+  // 顺序为速率、并发、队列额度、队列权威不可用、队列撤权；空数组表示未提供。
+  repeated uint64 sentinel_rejections = 11;
 }
 
 message SampleRequest {

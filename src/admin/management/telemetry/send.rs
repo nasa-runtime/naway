@@ -13,8 +13,7 @@ use std::sync::Arc;
 /// - `node`：当前本机管理身份。
 /// - `session`：刚被心跳确认的目标会话。
 /// - `deadline`：心跳、目录与指标共用的绝对期限。
-/// - `service_supported`：刚被目标心跳确认的服务接收能力。
-/// - `stream_supported`：刚被同一目标心跳确认的监听器接收能力。
+/// - `features`：同一次目标心跳确认的服务、监听器与路由 Sentinel 接收能力。
 ///
 /// 返回：只有完整样本ACK匹配才成功；失败由下一轮重新选择最新样本，不自动补发旧样本。
 pub(in crate::admin::management) async fn upload(
@@ -23,9 +22,9 @@ pub(in crate::admin::management) async fn upload(
     node: String,
     session: Vec<u8>,
     deadline: tokio::time::Instant,
-    service_supported: bool,
-    stream_supported: bool,
+    features: (bool, bool, bool),
 ) -> Result<(), Status> {
+    let (service_supported, stream_supported, sentinel_supported) = features;
     let sample_id = value.sample.sample_id;
     let series = value.sample.readings.len();
     let routes = value
@@ -63,6 +62,18 @@ pub(in crate::admin::management) async fn upload(
                 .map(move |offset| series + routes + services + offset),
         )
         .chain((series == 0 && routes == 0 && services == 0 && streams == 0).then_some(0));
+    let base = match (service_supported, stream_supported) {
+        (true, true) => value.stream_digest,
+        (false, true) => value.stream_legacy_digest,
+        (true, false) => value.digest,
+        (false, false) => value.legacy_digest,
+    };
+    // 新计数只在当前目标明确接收时进入字段和摘要，异构 Admin 仍复用同一采样所有者。
+    let digest = if sentinel_supported {
+        super::routes::sentinel_digest(value.sample.route_traffic.as_ref(), base)
+    } else {
+        base
+    };
     let chunks = futures::stream::iter(offsets).map(move |offset| {
         // 每目标能力独立决定字段与摘要；旧 Admin 不接收无法验证的新监听器域。
         let encode = if stream_supported {
@@ -70,21 +81,19 @@ pub(in crate::admin::management) async fn upload(
         } else {
             frame
         };
-        let digest = match (service_supported, stream_supported) {
-            (true, true) => &value.stream_digest,
-            (false, true) => &value.stream_legacy_digest,
-            (true, false) => &value.digest,
-            (false, false) => &value.legacy_digest,
-        };
-        encode(
+        let mut part = encode(
             &value.sample,
             &node,
             &session,
-            digest,
+            &digest,
             value.at,
             offset,
             service_supported,
-        )
+        );
+        if sentinel_supported {
+            super::routes::add_sentinel(&mut part, value.sample.route_traffic.as_ref());
+        }
+        part
     });
     let response = client
         .sample(reporter::timed_request(chunks, deadline)?)
