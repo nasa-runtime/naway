@@ -705,6 +705,14 @@ API 产品以独立 `product` 对象定位 `developer_portal.products` 中的稳
 预算和 TTL 与登录策略取更小上限，实际会话还受 token 剩余有效期限制。更大的管理预算不能
 提高更小的登录策略上限。字段和逐项 origin 编辑都只生成声明，须原目标完整预检与审批执行。
 
+SSO 提供固定 `sso` 路径的 `type`、`filter`、`groups_claim`、`groups_header`、`acs_path` 原位
+编辑。OIDC 使用 `groups_claim`，SAML 使用 `groups_header` 与 `acs_path`；切换协议须显式
+移除旧协议字段，不自动清理或补默认身份源。`filter` 仍是完整原生 `oidc_rp` / `saml_auth`
+DSL，不是其全部参数的类型化配置，不读取秘密。OIDC 组只来自已验证身份；SAML 组头必须由
+已签名属性映射拥有，并使用 HTTP-POST 和专属 `/api/developer/account/callback`，ACS 的
+精确 HTTPS origin 必须已获批准。错型的父值须整值替换，不隐式覆盖；整值与子项同次编辑
+会被拒绝。未修改声明保持原值，协议合同与权限仍由原目标完整预检裁决。
+
 门户团队以 `portal_team` 独立身份定位 `developer_portal.management.teams`，提供标题、应用数量
 上限与完整 `group_roles` / `subject_roles` JSON 映射。映射替换会移除未提供的旧成员授权，角色为
 `viewer / developer / owner`；可信 subject 和 groups 只能来自实际 SSO 验证，客户端头不能代替。

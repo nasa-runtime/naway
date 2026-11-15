@@ -60,6 +60,20 @@ import { routeWebdavFieldGroups } from "./route_webdav.js";
 import { routeMediaFieldGroups } from "./route_media.js";
 
 const groups = {
+  portal_management: [
+    [
+      ["sso"],
+      "SSO 登录与可信组来源（只填写所选协议字段）",
+      [
+        ["type", "登录协议：oidc / saml", "string"],
+        ["filter", "完整原生 oidc_rp / saml_auth DSL 声明", "string"],
+        ["groups_claim", "OIDC 已验证身份中的组 claim", "string"],
+        ["groups_header", "SAML 已签名属性映射拥有的组头", "string"],
+        ["acs_path", "SAML 专属 ACS 路径", "string"],
+      ],
+    ],
+  ],
+
   route: [
     [
       ["usage_plan"],
@@ -146,6 +160,15 @@ const groups = {
 export function nestedFields(kind, values, capacity) {
   const node = element("div", "", "draft-nested");
   const rows = [];
+  if (kind === "portal_management") {
+    node.append(
+      element(
+        "p",
+        "SSO 子字段只修改显式原文，不拆分或求值 filter 中的 DSL 与秘密引用。切换 oidc / saml 必须明确设置完整新协议字段，并移除旧协议字段；不会自动清理或推断 IdP。OIDC 组来自已验证身份，SAML 组头必须由已签名属性映射拥有；客户端头不能授予角色。SAML 须使用 HTTP-POST 与 /api/developer/account/callback，且 ACS 的 HTTPS origin 已获批准。整值 SSO 与子项不能同次编辑，所有合同仍须原目标完整预检。",
+        "subtle",
+      ),
+    );
+  }
   if (kind === "ws_message_plugin") {
     node.append(
       element(
