@@ -2424,6 +2424,8 @@ SSO 也可原位编辑协议、原生 filter DSL 和可信组来源字段；切�
 显式 OIDC 声明另提供 `timeout_ms`、`session_ttl_secs`、`pending_ttl_secs`、`max_pending` 与
 `max_sessions` 五项预算编辑，只替换或移除选中参数，新增参数须明确填写；其它 DSL token、
 端点、秘密引用与原空白保持原文。重复预算参数或无法定位的声明须使用整段 filter 编辑。
+客户端身份、凭据、认证方式与 CA 来源也可独立编辑，保留既有 CA 参数别名；秘密和材料引用
+不求值。同次操作只能选择一组 filter 参数，不能与预算或整段 filter、SSO 替换混用。
 
 门户团队提供独立 `portal_team` 草稿身份，可设置标题、应用数量上限和完整可信 SSO 组或 subject
 角色映射，以及显式新建和删除。已有团队身份受保护，操作不会自动开启门户、建立 SSO、生成成员

@@ -1,6 +1,7 @@
 import { element } from "../../../core/dom.js";
 import { fieldRow } from "./controls.js";
 import { portalOidcBudgetFields } from "./portal_oidc_budget.js";
+import { portalOidcClientFields } from "./portal_oidc_client.js";
 import { tlsFieldGroups } from "./tls.js";
 import { upstreamTlsFieldGroups } from "./upstream_tls.js";
 import { upstreamRetryFieldGroups } from "./upstream_retry.js";
@@ -167,6 +168,10 @@ export function nestedFields(kind, values, capacity) {
   const oidcBudget = portalOidcBudgetFields(kind, values, capacity);
   if (oidcBudget) {
     node.append(oidcBudget.node);
+  }
+  const oidcClient = portalOidcClientFields(kind, values, capacity);
+  if (oidcClient) {
+    node.append(oidcClient.node);
   }
   if (kind === "portal_catalog") {
     node.append(
@@ -755,7 +760,10 @@ export function nestedFields(kind, values, capacity) {
    * 返回：有限设置和移除序列，不包含完整原始父对象；同次动作的祖先与子项重叠时拒绝。
    */
   function read() {
-    const edits = oidcBudget?.read() ?? [];
+    const edits = [
+      ...(oidcBudget?.read() ?? []),
+      ...(oidcClient?.read() ?? []),
+    ];
     for (const { path, row } of rows) {
       const action = row.read();
       if (action?.remove) {

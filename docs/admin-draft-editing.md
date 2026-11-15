@@ -765,7 +765,14 @@ DSL，不是其全部参数的类型化配置，不读取秘密。OIDC 组只来
 语义，不补其它默认字段。端点、凭据与 CA 引用、未编辑参数、原顺序和空白保持原文，不读取
 材料或连接身份服务。重复预算或残缺 token 不进行子项编辑，须明确处理整段 filter。
 预算子项不能与整段 SSO 或 `sso.filter` 同次编辑；有效会话仍受管理预算与 token 剩余寿命
-共同收紧，不能因增大某一项而绕过其它上限。其它 OIDC 参数和 SAML filter 继续使用原文编辑。
+共同收紧，不能因增大某一项而绕过其它上限。其余端点、回调、scope 与 SAML filter 继续使用原文编辑。
+
+OIDC 客户端组提供 `client_id`、`client_secret`、`client_auth` 与 CA 来源的原位编辑。已有
+`ca_certificate`、`ca_pem` 或 `ca_file` 保持原名，同义来源重复时须处理整段 filter。
+显式设置须为非空单个原生 token，身份不超过512字节，认证方式支持 basic/post 及其原生别名。
+凭据和 CA 仅作为 SecretSource 原文，不读取材料；移除 CA 使用原生系统信任，移除必需身份或
+凭据会被原目标预检拒绝。此组与预算、整段 filter 或 SSO 同次编辑时拒绝，不合并两次字符串
+重写；端点、scope、回调与其它参数仍保留原文，最终合法性由原目标完整构建器裁决。
 
 门户团队以 `portal_team` 独立身份定位 `developer_portal.management.teams`，提供标题、应用数量
 上限与完整 `group_roles` / `subject_roles` JSON 映射。映射替换会移除未提供的旧成员授权，角色为
