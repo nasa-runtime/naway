@@ -480,6 +480,44 @@ Admin 节点以及本次随机挑战、node/boot/session 的绑定；不支持�
 内存输入，提交或隐藏后清空；结果未知时只按原身份查询，不自动重传。部署、权限和恢复方式见
 [加密证书材料提案](docs/admin-certificate-proposals.md#使用材料管理页)。
 
+## 运行态治理
+
+完整管理台的 `/runtime-actions` 页面提供 IP 封禁与解封、动态接口禁用、接入进程长连接关闭与
+旧代排空、精确路由缓存失效。页面使用已有原生执行体，不把这些动作包装成多节点持久提案，
+也不承诺自动回滚。Data 与 Sidecar 不开放该页面或动作入口。
+
+`GET /api/runtime-actions` 返回当前主体的最小动作能力与 `ETag`。`POST /api/runtime-actions`
+接收最多 8192 字节、类型化且不含未知字段的 JSON，必须携带原 `If-Match`；条件绑定当前随机
+进程身份、配置代、配置指纹与主体权限。条件不是一次性动作令牌，也不代替权限或事实源 CAS。
+执行等待期间重新认证，并与配置发布共用协调器，防止在检查与写入之间切换配置或后端。
+
+动作合同如下，所有毫秒数与配置代使用规范 u64 十进制**字符串**，避免浏览器整数舍入：
+
+- `blacklist`：`ip`、`blocked`、可选 `ttl_ms`；解封不能携带 TTL。IP 支持 IPv4/IPv6。
+- `interface_disable`：精确 `id`、`disabled`；禁用时必须有 `rule`，撤销时不得携带规则。
+  规则包含 `path` Glob、最多16个 `methods`、200–599的最终 `status`、最多4096字节 UTF-8
+  `body`、可选 `ttl_ms`。写入前通过同一守卫编译器，响应固定为纯文本。
+- `connections`：互斥 `selector`。`by: route` 携带 `route`，`by: ip` 携带 `ip`，
+  `by: consumer` 携带认证后 `consumer`，`by: stale` 携带 `before` 与 `grace_ms`。
+  宽限期为0至365天；按 route 名字覆盖本机所有入口的同名路由。
+- `cache_invalidate`：精确 `proxy` 与 `route`，只使用该路由当前的原生缓存策略。
+
+TTL 省略或 `null` 表示永久声明，显式 TTL 必须为正数，沿用原生到期时间的饱和边界。
+中文和 URI 保留字符作为 JSON 数据逐字交付，不拼成原始查询串。封禁、解封分别要求
+`acl/emergency-kill`，接口动作要求 `interface-guard/emergency-kill`，连接动作要求
+`connections/emergency-kill`，缓存失效要求 `cache/write`；读取权限不隐含这些动作权限。
+
+动态事实写入成功只表示事实源写入与接入进程缓存刷新完成，其它节点仍须独立观察。
+连接结果是首次关闭信号数或安排时的匹配数，不能当成对端已关闭数量；关闭不能撤销。
+缓存 `generation` 是失效代，L1 属于接入进程，L2 按原生共享后端执行，不是配置发布或逐节点确认。
+计数与失效代也以十进制字符串交付。
+
+进程最多受理四个动作，受理槽和配置发布权随实际任务存活。持久审计先记录 attempt，再执行动作，
+最后记录 completed；结果审计、传输或等待超时可能发生在动作之后。HTTP 等待取消不会撤销已受理
+任务，响应的 `operation_may_have_completed` 标明副作用是否可能发生，不自动重试或补偿。
+页面先展示完整冻结范围再显式执行一次；编辑撤去已复核动作，隐藏、暂停或退出清空输入与原条件。
+重新读取当前权限与条件不代表此前未知动作未执行，仍须核对实际事实或审计后再决定后续操作。
+
 ## 持久管理提案
 
 配置编辑前可使用[配置候选差异](docs/admin-configuration-diff.md)核对固定活动基线；

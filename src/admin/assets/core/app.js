@@ -8,6 +8,7 @@ import { mount as routeTraffic } from "../views/routes.js";
 import { mount as ingressProtection } from "../views/ingress.js";
 import { mount as providers } from "../views/providers.js";
 import { mount as diagnostics } from "../views/diagnostics.js";
+import { mount as runtimeActions } from "../views/runtime_actions.js";
 import { mount as streamTraffic } from "../views/streams.js";
 import { mount as services } from "../views/services.js";
 import { mount as consumers } from "../views/consumers.js";
@@ -92,6 +93,17 @@ function navigate(name, service = "") {
     document.getElementById("subtitle").textContent =
       "接入进程 · 双人复核、有限脱敏样本与显式交付";
     dispose = diagnostics(root, session);
+  } else if (
+    name === "runtime-actions" &&
+    (allowed("acl", "emergency-kill") ||
+      allowed("interface-guard", "emergency-kill") ||
+      allowed("connections", "emergency-kill") ||
+      allowed("cache", "write"))
+  ) {
+    document.getElementById("title").textContent = "运行态治理";
+    document.getElementById("subtitle").textContent =
+      "接入进程 · 明确范围、原条件与一次显式执行";
+    dispose = runtimeActions(root, session);
   } else if (
     name === "ingress" &&
     ((allowed("cluster") && allowed("interface-guard")) ||
@@ -257,6 +269,12 @@ async function login(event) {
       session.workspaces?.length
     );
     document.getElementById("nodes-nav").disabled = !allowed("cluster");
+    document.getElementById("runtime-actions-nav").disabled = !(
+      allowed("acl", "emergency-kill") ||
+      allowed("interface-guard", "emergency-kill") ||
+      allowed("connections", "emergency-kill") ||
+      allowed("cache", "write")
+    );
     document.getElementById("diagnostics-nav").disabled = !(
       session.diagnostics?.enabled &&
       (allowed("diagnostics") || allowed("diagnostics", "write"))
@@ -289,43 +307,46 @@ async function login(event) {
       !["routes", "config", "upstreams"].some((resource) => allowed(resource));
     notice.textContent = "";
     navigate(
-      location.pathname === "/diagnostics" &&
-        !document.getElementById("diagnostics-nav").disabled
-        ? "diagnostics"
-        : location.pathname === "/providers" &&
-            !document.getElementById("providers-nav").disabled
-          ? "providers"
-          : location.pathname === "/ingress" &&
-              !document.getElementById("ingress-nav").disabled
-            ? "ingress"
-            : location.pathname === "/certificate-proposals" &&
-                !document.getElementById("materials-nav").disabled
-              ? "materials"
-              : location.pathname === "/certificates" &&
-                  !document.getElementById("certificates-nav").disabled
-                ? "certificates"
-                : location.pathname === "/consumers" &&
-                    !document.getElementById("consumers-nav").disabled
-                  ? "consumers"
-                  : location.pathname === "/services" &&
-                      !document.getElementById("services-nav").disabled
-                    ? "services"
-                    : location.pathname === "/traffic" &&
-                        !document.getElementById("traffic-nav").disabled
-                      ? "traffic"
-                      : location.pathname === "/streams" &&
-                          !document.getElementById("streams-nav").disabled
-                        ? "streams"
-                        : location.pathname === "/operations"
-                          ? "operations"
-                          : allowed("cluster")
-                            ? location.pathname === "/catalog" &&
-                              !document.getElementById("catalog-nav").disabled
-                              ? "catalog"
-                              : location.pathname === "/cluster"
-                                ? "nodes"
-                                : "monitor"
-                            : "system",
+      location.pathname === "/runtime-actions" &&
+        !document.getElementById("runtime-actions-nav").disabled
+        ? "runtime-actions"
+        : location.pathname === "/diagnostics" &&
+            !document.getElementById("diagnostics-nav").disabled
+          ? "diagnostics"
+          : location.pathname === "/providers" &&
+              !document.getElementById("providers-nav").disabled
+            ? "providers"
+            : location.pathname === "/ingress" &&
+                !document.getElementById("ingress-nav").disabled
+              ? "ingress"
+              : location.pathname === "/certificate-proposals" &&
+                  !document.getElementById("materials-nav").disabled
+                ? "materials"
+                : location.pathname === "/certificates" &&
+                    !document.getElementById("certificates-nav").disabled
+                  ? "certificates"
+                  : location.pathname === "/consumers" &&
+                      !document.getElementById("consumers-nav").disabled
+                    ? "consumers"
+                    : location.pathname === "/services" &&
+                        !document.getElementById("services-nav").disabled
+                      ? "services"
+                      : location.pathname === "/traffic" &&
+                          !document.getElementById("traffic-nav").disabled
+                        ? "traffic"
+                        : location.pathname === "/streams" &&
+                            !document.getElementById("streams-nav").disabled
+                          ? "streams"
+                          : location.pathname === "/operations"
+                            ? "operations"
+                            : allowed("cluster")
+                              ? location.pathname === "/catalog" &&
+                                !document.getElementById("catalog-nav").disabled
+                                ? "catalog"
+                                : location.pathname === "/cluster"
+                                  ? "nodes"
+                                  : "monitor"
+                              : "system",
     );
   } catch (error) {
     if (attempt === epoch && error.name !== "AbortError") {

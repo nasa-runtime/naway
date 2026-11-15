@@ -184,8 +184,10 @@ export async function request(path, options = {}) {
     }
     if (!response.ok) {
       let code = "";
+      let operationMayHaveCompleted;
       try {
-        const declared = JSON.parse(chunks.join("")).error;
+        const payload = JSON.parse(chunks.join(""));
+        const declared = payload.error;
         if (
           [
             "invalid_proposal",
@@ -207,9 +209,37 @@ export async function request(path, options = {}) {
             "outcome_unknown",
             "not_found",
             "forbidden",
+            "invalid_runtime_action",
+            "runtime_action_capacity",
+            "runtime_action_condition_required",
+            "runtime_action_condition_changed",
+            "runtime_action_audit_unavailable",
+            "runtime_action_outcome_unknown",
+            "runtime_action_rejected",
+            "runtime_action_unavailable",
           ].includes(declared)
         ) {
           code = declared;
+        }
+        // 只有固定运行态动作入口交付这一副作用语义，其它端点的同名字段不能改变动作判断。
+        if (
+          target.pathname === "/api/runtime-actions" &&
+          method === "POST" &&
+          [
+            "invalid_runtime_action",
+            "runtime_action_capacity",
+            "runtime_action_condition_required",
+            "runtime_action_condition_changed",
+            "runtime_action_audit_unavailable",
+            "runtime_action_outcome_unknown",
+            "runtime_action_rejected",
+            "runtime_action_unavailable",
+            "forbidden",
+            "not_found",
+          ].includes(code) &&
+          typeof payload.operation_may_have_completed === "boolean"
+        ) {
+          operationMayHaveCompleted = payload.operation_may_have_completed;
         }
       } catch {
         // 错误正文不可信；只交付固定错误身份，不把代理HTML或秘密带入页面。
@@ -225,6 +255,7 @@ export async function request(path, options = {}) {
       );
       failure.status = response.status;
       failure.code = code;
+      failure.operationMayHaveCompleted = operationMayHaveCompleted;
       throw failure;
     }
     const text = chunks.join("");

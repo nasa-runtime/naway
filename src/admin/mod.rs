@@ -29,6 +29,7 @@ mod publication;
 use publication::{publish_document_set, publish_scoped_document_set, publish_validated_config};
 #[cfg(feature = "config-providers")]
 mod providers;
+mod runtime_actions;
 mod session;
 mod ui;
 mod workspaces;
@@ -115,6 +116,8 @@ pub struct AdminState {
     apply_coordinator: Arc<crate::control::reload::SnapshotApplyCoordinator>,
     /// 候选许可覆盖实际阻塞工作与清理，所有管理入口共用同一有界容量。
     candidate_builds: candidate::Admission,
+    /// 运行态动作的进程身份与受理容量；HTTP取消不会重新开放实际工作仍占用的槽。
+    runtime_actions: runtime_actions::Runtime,
     /// 数据面是否已就绪(监听已绑定、可接流量);停机时置 false → /readyz 转 503,供 LB 摘流。
     ready: Arc<AtomicBool>,
     /// xDS require_xds 独立启动门与低基数状态；未启用 xDS 时为 None。
@@ -337,6 +340,7 @@ impl AdminState {
             config_history: runtime_state.config_history,
             apply_coordinator: runtime_state.apply_coordinator,
             candidate_builds: candidate::Admission::new(),
+            runtime_actions: runtime_actions::Runtime::new(),
             ready,
             #[cfg(feature = "xds-client")]
             xds_status: runtime_state.xds_status,
@@ -588,6 +592,9 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
     #[cfg(feature = "config-providers")]
     if req.uri().path() == "/api/providers" || req.uri().path().starts_with("/api/providers/") {
         return providers::handle(req, state).await;
+    }
+    if req.uri().path() == "/api/runtime-actions" {
+        return Box::pin(runtime_actions::handle(req, state)).await;
     }
     #[cfg(feature = "telemetry-otlp")]
     if req.uri().path() == "/api/diagnostics" || req.uri().path().starts_with("/api/diagnostics/") {
@@ -946,7 +953,7 @@ fn is_mutating_action(action: AdminAction) -> bool {
     )
 }
 
-/// 业务作用：写一条不含敏感原文的管理审计；query 仅记录 SHA-256，便于关联而不泄漏参数。
+/// 业务作用：写一条不含敏感原文的管理审计；query或类型化动作正文只记录SHA-256，不泄漏参数。
 ///
 /// 参数说明：
 /// - `state`: 提供审计器和当前配置版本。
@@ -956,6 +963,8 @@ fn is_mutating_action(action: AdminAction) -> bool {
 /// - `action`: 固定风险动作。
 /// - `phase`: `attempt` 或 `completed`。
 /// - `status`: completed 响应状态。
+///
+/// 返回：持久审计确认成功；失败由调用方区分尚未执行与动作结果未知。
 async fn record_admin_audit(
     state: &AdminState,
     identity: &AdminIdentity,
@@ -965,7 +974,11 @@ async fn record_admin_audit(
     phase: &'static str,
     status: Option<u16>,
 ) -> anyhow::Result<()> {
-    let query_sha256 = req.uri.query().map(nasa::crypto::sha256);
+    let query_sha256 = if let Some(digest) = runtime_actions::audit_digest(req) {
+        Some(digest.to_owned())
+    } else {
+        req.uri.query().map(nasa::crypto::sha256)
+    };
     let config_version = state.snap.load().version;
     state
         .audit
@@ -1340,9 +1353,14 @@ fn reload_config() -> Response<BoxBody> {
 ///
 /// 只 clone 当前 `Arc<HttpCachePolicy>` 后就释放 ArcSwap guard，再执行 Redis I/O；不能让控制面
 /// await 长时间钉住整个旧配置快照。
+///
+/// 参数说明：
+/// - `req`：旧查询参数或类型化入口交付的精确proxy与route。
+/// - `state`：当前接入进程及同一HTTP缓存运行态。
+///
+/// 返回：原生L1/L2失效generation或明确拒绝；不代表配置发布或所有节点已经观察到失效。
 async fn purge_http_cache(req: &AdminRequestParts, state: &AdminState) -> Response<BoxBody> {
-    let query = req.uri.query().unwrap_or_default();
-    let Some(proxy_id) = query_param(query, "proxy") else {
+    let Some(proxy_id) = runtime_actions::parameter(req, "proxy") else {
         return json(
             StatusCode::BAD_REQUEST,
             serde_json::json!({
@@ -1351,7 +1369,7 @@ async fn purge_http_cache(req: &AdminRequestParts, state: &AdminState) -> Respon
             }),
         );
     };
-    let Some(route_id) = query_param(query, "route") else {
+    let Some(route_id) = runtime_actions::parameter(req, "route") else {
         return json(
             StatusCode::BAD_REQUEST,
             serde_json::json!({
@@ -8833,20 +8851,25 @@ fn dry_run_snapshot_response(state: &AdminState, candidate: GatewaySnapshot) -> 
 }
 
 /// 业务作用：执行已授权的连接治理动作，按指定 route、IP 或 consumer 关闭匹配长连接。
+///
+/// 参数说明：
+/// - `req`：原查询串，或类型化入口交付的互斥选择器与旧代宽限期。
+/// - `state`：接入进程实际使用的长连接注册表。
+///
+/// 返回：首次发出的关闭信号数或安排时的匹配数；route名字覆盖本机所有同名路由，不代表对端已关闭。
 fn close_long_connections(req: &AdminRequestParts, state: &AdminState) -> Response<BoxBody> {
-    let query = req.uri.query().unwrap_or_default();
-    if let Some(route) = query_param(query, "route") {
+    if let Some(route) = runtime_actions::parameter(req, "route") {
         let n = state.conn_registry.close_by_route(route);
         return plain(StatusCode::OK, &format!("closed route={route} count={n}\n"));
     }
-    if let Some(raw_ip) = query_param(query, "ip") {
+    if let Some(raw_ip) = runtime_actions::parameter(req, "ip") {
         let Ok(ip) = raw_ip.parse::<IpAddr>() else {
             return plain(StatusCode::BAD_REQUEST, "invalid ip\n");
         };
         let n = state.conn_registry.close_by_ip(ip);
         return plain(StatusCode::OK, &format!("closed ip={ip} count={n}\n"));
     }
-    if let Some(consumer) = query_param(query, "consumer") {
+    if let Some(consumer) = runtime_actions::parameter(req, "consumer") {
         if consumer.is_empty() || consumer.len() > 256 {
             return plain(StatusCode::BAD_REQUEST, "invalid consumer\n");
         }
@@ -8856,11 +8879,11 @@ fn close_long_connections(req: &AdminRequestParts, state: &AdminState) -> Respon
             &format!("closed consumer={consumer} count={n}\n"),
         );
     }
-    if let Some(raw_version) = query_param(query, "stale_before") {
+    if let Some(raw_version) = runtime_actions::parameter(req, "stale_before") {
         let Ok(version) = raw_version.parse::<u64>() else {
             return plain(StatusCode::BAD_REQUEST, "invalid stale_before\n");
         };
-        let grace_ms = match query_param(query, "grace_ms") {
+        let grace_ms = match runtime_actions::parameter(req, "grace_ms") {
             Some(raw) => match raw.parse::<u64>() {
                 Ok(value) => value,
                 Err(_) => return plain(StatusCode::BAD_REQUEST, "invalid grace_ms\n"),
@@ -8888,12 +8911,20 @@ fn close_long_connections(req: &AdminRequestParts, state: &AdminState) -> Respon
 }
 
 /// 业务作用：把管理面的 IP 封禁或撤销写入动态事实源，并触发本地黑名单同步。
+///
+/// 参数说明：
+/// - `req`：原查询参数或进程内类型化输入，正文原文不进入审计。
+/// - `state`：当前动态事实源、黑名单缓存与长连接注册表。
+/// - `blocked`：发布封禁时为真，撤销时为假。
+///
+/// 返回：事实源写入及本机刷新结果；成功封禁会同时发出本机匹配IP的连接关闭信号。
+/// 写入后刷新失败仍可能留下已提交事实，不代表可自动重试或撤销。
 async fn set_blacklist_ip(
     req: &AdminRequestParts,
     state: &AdminState,
     blocked: bool,
 ) -> Response<BoxBody> {
-    let Some(raw_ip) = query_param(req.uri.query().unwrap_or_default(), "ip") else {
+    let Some(raw_ip) = runtime_actions::parameter(req, "ip") else {
         return plain(StatusCode::BAD_REQUEST, "missing ip query parameter\n");
     };
     let Ok(ip) = raw_ip.parse::<IpAddr>() else {
@@ -8905,9 +8936,16 @@ async fn set_blacklist_ip(
     }
     let key = ip.to_string();
     let result = if blocked {
-        let value = match blacklist_value(req.uri.query().unwrap_or_default()) {
-            Ok(value) => value,
-            Err(msg) => return plain(StatusCode::BAD_REQUEST, msg),
+        // 只有已验证的进程内输入可绕过原始query解释；不把JSON值重新拼成URI改变IP或TTL语义。
+        let value = match req.extensions.get::<runtime_actions::Inputs>() {
+            Some(input) => match input.native_value() {
+                Some(value) => value,
+                None => return plain(StatusCode::BAD_REQUEST, "invalid blacklist input\n"),
+            },
+            None => match blacklist_value(req.uri.query().unwrap_or_default()) {
+                Ok(value) => value,
+                Err(msg) => return plain(StatusCode::BAD_REQUEST, msg),
+            },
         };
         state
             .dynamic_store
@@ -8937,7 +8975,7 @@ async fn set_blacklist_ip(
     if blocked {
         let closed = state.conn_registry.close_by_ip(ip);
         //  审计:手工拉黑记 who/why/source + TTL。
-        let ttl_ms = query_param(req.uri.query().unwrap_or_default(), "ttl_ms")
+        let ttl_ms = runtime_actions::parameter(req, "ttl_ms")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         state.blacklist.record_ban(ip, "admin", ttl_ms);
@@ -8953,13 +8991,20 @@ async fn set_blacklist_ip(
 }
 
 /// 业务作用：发布或撤销接口关闭事实，使新请求由统一接口守卫裁决。
+///
+/// 参数说明：
+/// - `req`：原查询参数或已完整编译验证的类型化规则。
+/// - `state`：动态事实源与接入进程实际守卫缓存。
+/// - `disabled`：发布规则时为真，删除规则时为假。
+///
+/// 返回：原生写入及本机刷新结果，不证明其它节点已观察到该事实；失败可能发生在写入之后。
 async fn set_interface_disable(
     req: &AdminRequestParts,
     state: &AdminState,
     disabled: bool,
 ) -> Response<BoxBody> {
     let query = req.uri.query().unwrap_or_default();
-    let Some(id) = query_param(query, "id") else {
+    let Some(id) = runtime_actions::parameter(req, "id") else {
         return plain(StatusCode::BAD_REQUEST, "missing id query parameter\n");
     };
     let cfg = state.snap.load().runtime_state.interface_disable.clone();
@@ -8967,9 +9012,16 @@ async fn set_interface_disable(
         return plain(StatusCode::CONFLICT, "interface disable disabled\n");
     }
     let result = if disabled {
-        let value = match interface_disable_value(query, id) {
-            Ok(value) => value,
-            Err(msg) => return plain(StatusCode::BAD_REQUEST, msg),
+        // 中文和保留字符由类型化输入逐字交付，旧query入口继续遵守原有解释合同。
+        let value = match req.extensions.get::<runtime_actions::Inputs>() {
+            Some(input) => match input.native_value() {
+                Some(value) => value,
+                None => return plain(StatusCode::BAD_REQUEST, "invalid interface disable input\n"),
+            },
+            None => match interface_disable_value(query, id) {
+                Ok(value) => value,
+                Err(msg) => return plain(StatusCode::BAD_REQUEST, msg),
+            },
         };
         state
             .dynamic_store
