@@ -765,7 +765,7 @@ DSL，不是其全部参数的类型化配置，不读取秘密。OIDC 组只来
 语义，不补其它默认字段。端点、凭据与 CA 引用、未编辑参数、原顺序和空白保持原文，不读取
 材料或连接身份服务。重复预算或残缺 token 不进行子项编辑，须明确处理整段 filter。
 预算子项不能与整段 SSO 或 `sso.filter` 同次编辑；有效会话仍受管理预算与 token 剩余寿命
-共同收紧，不能因增大某一项而绕过其它上限。SAML filter 继续使用原文编辑。
+共同收紧，不能因增大某一项而绕过其它上限。
 
 OIDC 客户端组提供 `client_id`、`client_secret`、`client_auth` 与 CA 来源的原位编辑。已有
 `ca_certificate`、`ca_pem` 或 `ca_file` 保持原名，同义来源重复时须处理整段 filter。
@@ -787,6 +787,19 @@ token 须编辑整段 filter。所有值保持单 token 原文，不求值或发
 的任意切换或缺失时补值。`redirect_uri` 必须使用固定 callback 和已批准 HTTPS origin；
 全部 IdP 网络端点必须为与 issuer 同 authority 的固定 HTTPS URI。此组与客户端、预算、
 整段 filter 或 SSO 同次编辑时原子拒绝；URI 合法性、全部信任与依赖仍由原目标完整预检裁决。
+
+显式 `type: saml` 且以 `saml_auth ` 开头的原文另提供 `metadata`、`metadata_signing_cert`、
+`idp_entity_id`、`sp_entity_id`、`acs`、`max_assertion_bytes`、`clock_skew_secs`、
+`replay_ttl_secs` 与 `identity_headers` 九类声明的设置和移除。metadata 必须是 file、k8s-file
+或 vault-agent 文件源；签名证书仅填写 SecretSource，不读取材料。任何重复键、空值或残缺
+token 都须处理整段 filter；未选中的声明、引用与 Unicode 空白保持原文，不补默认参数。
+断言字节上限为1024–1048576，时钟容差为0–3600秒，重放保留为1–86400秒；明确设置预算使用
+十进制整数。身份映射允许非空且最多128字节的属性名和最多16个唯一普通业务头，禁止敏感头。
+
+门户固定使用 HTTP-POST，`header` 输入参数必须缺失，ACS 须为专属 callback 和已批准的
+HTTPS origin；`groups_header` 必须由已签名属性映射拥有。可以明确联动修改组头和映射的
+不同字段，不能同次改写整段 SSO 或 filter。移除必需信任或组映射仍会被原目标预检拒绝，
+签名、entity、ACS、依赖和全部协议合同由原目标完整构建器裁决，编辑声明不表示已建立会话。
 
 门户团队以 `portal_team` 独立身份定位 `developer_portal.management.teams`，提供标题、应用数量
 上限与完整 `group_roles` / `subject_roles` JSON 映射。映射替换会移除未提供的旧成员授权，角色为

@@ -2538,6 +2538,8 @@ SAML 需编译 `enterprise-saml`：`sso.type: saml`，`filter` 使用既有 `sam
 登录跳转或 SAML Single Logout。Response/Assertion 双签名、audience、时间和重放门全部适用。
 门户重放域在进程中常驻且有容量/TTL，reload 不清空；不是跨节点或跨进程持久重放服务。
 一个签名 group 属性值映射一个组，不把任意分隔符字符串拆成多个权限。也可用 `subject_roles` 显式映射主体。
+管理台支持 SAML 信任文件、entity、ACS、断言预算与签名属性映射的逐项原文编辑；固定 HTTP-POST
+输入方式保持关闭任意 header 切换，签名与门户归属仍由原目标完整预检裁决。
 
 viewer 可读所属团队资料；developer 可注册/更新应用和管理凭据；owner 还可撤销应用、转移 owner 和导出明细。
 转移必须同时拥有旧、新团队的 owner 权限。所有写请求需要唯一可信 Origin、当前 If-Match 和严格有界 JSON。
