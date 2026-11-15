@@ -123,6 +123,12 @@ const definitions = {
     ["credentials", "完整凭据摘要与撤销状态清单", "json"],
   ],
 
+  portal_binding: [
+    ["product", "明确绑定的产品身份", "string"],
+    ["version", "明确绑定的产品版本身份", "string"],
+    ["operation", "产品文档中的完整操作身份", "string"],
+  ],
+
   usage_plan: [
     ["requests", "窗口内基础请求数", "number"],
     ["window_ms", "固定窗口（毫秒）", "number"],
@@ -298,6 +304,7 @@ export const objectKinds = {
     ["product", "API 产品"],
     ["portal_team", "门户团队"],
     ["portal_application", "门户应用"],
+    ["portal_binding", "产品路由绑定"],
     ["credential", "上游凭据"],
     ["secret_provider", "远程秘密源"],
     ["usage_plan", "用量套餐"],
@@ -349,6 +356,9 @@ export function namedObject(kind) {
  * 返回：可作为纯文本显示的名称，不用于解析或还原对象身份。
  */
 export function objectLabel(object) {
+  if (object.kind === "portal_binding") {
+    return `portal_binding · ${object.proxy} → ${object.route}`;
+  }
   const name = object.name ?? object.id;
   return object.kind === "route"
     ? `route · ${object.proxy} → ${name}`

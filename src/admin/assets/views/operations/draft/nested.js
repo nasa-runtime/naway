@@ -764,7 +764,7 @@ export function nestedFields(kind, values, capacity) {
  * - `object`：冻结的对象身份。
  * - `patch`：表单读出的独立动作。
  * - `creating`：是否创建新对象。
- * 返回：旧字段 patch、有限嵌套 patch 或完整新对象；冲突祖先与新增移除均拒绝。
+ * 返回：旧字段 patch、有限嵌套 patch 或完整新对象；冲突祖先、新增移除与缺少显式合同的新绑定均拒绝。
  */
 export function fieldAction(object, patch, creating) {
   const edits = patch.edits ?? [];
@@ -785,6 +785,24 @@ export function fieldAction(object, patch, creating) {
         }
       }
       parent[edit.path.at(-1)] = edit.value;
+    }
+    if (object.kind === "portal_binding") {
+      // 新绑定没有可继承的合同，完整产品、版本与原始操作身份必须由操作者明确提供。
+      if (
+        ["product", "version"].some(
+          (key) =>
+            typeof fields[key] !== "string" ||
+            !/^[A-Za-z0-9_.-]{1,64}$/.test(fields[key]),
+        ) ||
+        typeof fields.operation !== "string" ||
+        !fields.operation.length ||
+        new TextEncoder().encode(fields.operation).length > 256 ||
+        /[\x00-\x1f\x7f-\x9f]/.test(fields.operation)
+      ) {
+        throw new Error(
+          "新增产品绑定须明确填写有效 product、version 和1–256字节的完整 operation。",
+        );
+      }
     }
     return {
       type: "create",

@@ -13,6 +13,7 @@ import { nestedFields } from "./nested.js";
 function identityField(kind, name) {
   return (
     name === "id" ||
+    (kind === "portal_binding" && ["proxy", "route"].includes(name)) ||
     (name === "name" &&
       [
         "credential",
@@ -59,6 +60,15 @@ export function draftFieldPanel(kind, values, capacity) {
       element(
         "p",
         "应用身份独立于团队与路由。更换团队、消费者、套餐或状态会改变授权归属；回调、订阅与凭据清单为完整 JSON 替换，遗漏的旧项将被移除。这里只编辑声明，不建立 SSO、不生成明文凭据，也不自动订阅产品；全部引用、权限、配额与摘要仍须原目标完整预检。",
+        "subtle",
+      ),
+    );
+  }
+  if (kind === "portal_binding") {
+    node.append(
+      element(
+        "p",
+        "绑定身份由所属入口与路由共同确定，合同必须明确产品、版本和操作。绑定按活动订阅凭据生成应用鉴权、套餐和计量归属；解除后路由采用自身声明的认证，请同时明确路由访问策略。这里只编辑声明，不建立路由、应用或订阅，全部引用与权限仍须原目标完整预检。",
         "subtle",
       ),
     );

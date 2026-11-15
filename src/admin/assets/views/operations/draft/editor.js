@@ -58,7 +58,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
   for (const [title, input] of [
     ["新增对象类型", kind],
     ["新增对象身份", name],
-    ["所属 HTTP 入口身份（仅路由；单入口为 default）", parent],
+    ["所属 HTTP 入口身份（路由或产品绑定；单入口为 default）", parent],
   ]) {
     const label = element("label", title);
     label.append(input);
@@ -351,9 +351,11 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
       if (
         !name.value ||
         !kind.value ||
-        (kind.value === "route" && !parent.value)
+        (["route", "portal_binding"].includes(kind.value) && !parent.value)
       ) {
-        throw new Error("请填写对象身份；新增路由还需完整的所属入口身份。");
+        throw new Error(
+          "请填写对象身份；新增路由或产品绑定还需完整的所属入口身份。",
+        );
       }
       const object = namedObject(kind.value)
         ? {
@@ -361,19 +363,25 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
 
             name: name.value,
           }
-        : kind.value === "route"
+        : kind.value === "portal_binding"
           ? {
               kind: kind.value,
-
               proxy: parent.value,
-
-              id: name.value,
+              route: name.value,
             }
-          : {
-              kind: kind.value,
+          : kind.value === "route"
+            ? {
+                kind: kind.value,
 
-              id: name.value,
-            };
+                proxy: parent.value,
+
+                id: name.value,
+              }
+            : {
+                kind: kind.value,
+
+                id: name.value,
+              };
       show(object, {}, true);
     } catch (error) {
       notice.textContent = error.message;

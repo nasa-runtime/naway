@@ -29,6 +29,10 @@ pub(super) enum Object {
     PortalApplication {
         id: String,
     },
+    PortalBinding {
+        proxy: String,
+        route: String,
+    },
     Credential {
         name: String,
     },
@@ -73,6 +77,10 @@ impl Object {
             Self::Route {
                 proxy,
                 id,
+            }
+            | Self::PortalBinding {
+                proxy,
+                route: id,
             } => (Domain::Gateway, id, Some(proxy)),
             Self::Proxy {
                 id,
@@ -126,7 +134,7 @@ impl Object {
         Ok(())
     }
 
-    /// 业务作用：取得集合内的稳定键，具名映射使用父键，具名材料使用 name，其它对象使用 id。
+    /// 业务作用：取得映射键或数组的单段身份，复合绑定借用 route 分量，实际命中仍复验 proxy。
     ///
     /// 参数说明: 无。
     ///
@@ -164,6 +172,10 @@ impl Object {
             | Self::PortalApplication {
                 id,
             } => id,
+            Self::PortalBinding {
+                route,
+                ..
+            } => route,
             Self::Service {
                 name,
             }
@@ -189,7 +201,7 @@ impl Object {
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：数组对象使用 id 或 name；服务、套餐、组和消费者绑定由父 mapping 持有身份。
+    /// 返回：普通数组对象使用 id 或 name；具名 mapping 和使用 proxy/route 组合的门户绑定无单字段身份。
     fn identity_field(&self) -> Option<&'static str> {
         match self {
             Self::Service {
@@ -202,6 +214,9 @@ impl Object {
                 ..
             }
             | Self::ConsumerBinding {
+                ..
+            }
+            | Self::PortalBinding {
                 ..
             } => None,
             Self::Credential {
@@ -246,6 +261,28 @@ impl Object {
         matches!(self, Self::ConsumerBinding { .. })
     }
 
+    /// 业务作用：按完整原文身份命中一个数组对象，复合绑定不能误选其它入口的同名路由。
+    ///
+    /// 参数说明：
+    /// - `value`：已完成目录唯一性校验的原始数组成员。
+    ///
+    /// 返回：普通数组的稳定字段或门户绑定两段身份均一致时为 true，缺失身份和错型不命中。
+    fn matches_value(&self, value: &Value) -> bool {
+        match self {
+            Self::PortalBinding {
+                proxy,
+                route,
+            } => {
+                // 只比较 route 会越过入口边界；两段原始身份必须同时一致才能读写绑定。
+                value.get("proxy").and_then(Value::as_str) == Some(proxy.as_str())
+                    && value.get("route").and_then(Value::as_str) == Some(route.as_str())
+            }
+            _ => self
+                .identity_field()
+                .is_some_and(|key| value.get(key).and_then(Value::as_str) == Some(self.id())),
+        }
+    }
+
     /// 业务作用：在原文修改前拒绝对稳定身份的字段动作，不能通过嵌套或列表操作绕过选择器。
     ///
     /// 参数说明：
@@ -257,7 +294,10 @@ impl Object {
         fields: impl Iterator<Item = &'a str>,
     ) -> Result<(), Error> {
         for field in fields {
-            if Some(field) == self.identity_field() {
+            if Some(field) == self.identity_field()
+                || (matches!(self, Self::PortalBinding { .. })
+                    && matches!(field, "proxy" | "route"))
+            {
                 return Err(Error::Invalid);
             }
         }
@@ -407,7 +447,7 @@ pub(super) fn catalog(document: &Value, domain: Domain) -> Result<BTreeSet<Objec
                 if let Some(management) = portal.get("management").filter(|value| !value.is_null())
                 {
                     if !management.is_object() {
-                        // null 明确表示关闭管理；其它错型声明不能被当作没有团队与应用的空目录。
+                        // null 明确表示关闭管理；其它错型声明不能被当作没有团队、应用与绑定的空目录。
                         return Err(Error::Invalid);
                     }
                     for team in array(management.get("teams"))? {
@@ -419,6 +459,9 @@ pub(super) fn catalog(document: &Value, domain: Domain) -> Result<BTreeSet<Objec
                         insert(Object::PortalApplication {
                             id: object_id(application)?.into(),
                         })?;
+                    }
+                    for binding in array(management.get("bindings"))? {
+                        insert(object_binding(binding)?)?;
                     }
                 }
             }
@@ -489,6 +532,29 @@ fn object_name(value: &Value) -> Result<&str, Error> {
         .ok_or(Error::Invalid)
 }
 
+/// 业务作用：读取门户绑定的两段显式身份，不用数组位置、合同字段或分隔符拼接生成伪 id。
+///
+/// 参数说明：
+/// - `value`：绑定目录中的一个原文成员。
+///
+/// 返回：proxy 与 route 均为有界原文标识时返回组合对象；缺失、错型或非法标识拒绝整个目录。
+fn object_binding(value: &Value) -> Result<Object, Error> {
+    let proxy = value
+        .get("proxy")
+        .and_then(Value::as_str)
+        .filter(|name| valid_name(name))
+        .ok_or(Error::Invalid)?;
+    let route = value
+        .get("route")
+        .and_then(Value::as_str)
+        .filter(|name| valid_name(name))
+        .ok_or(Error::Invalid)?;
+    Ok(Object::PortalBinding {
+        proxy: proxy.into(),
+        route: route.into(),
+    })
+}
+
 /// 业务作用：取得已验证唯一身份的原对象，具名映射键和数组对象身份分别定位。
 ///
 /// 参数说明：
@@ -507,12 +573,7 @@ pub(super) fn find_mut<'a>(
     }
     collection_mut(document, object, false)?
         .iter_mut()
-        .find(|value| {
-            value
-                .get(object.identity_field().expect("array identity"))
-                .and_then(Value::as_str)
-                == Some(object.id())
-        })
+        .find(|value| object.matches_value(value))
         .ok_or(Error::Missing)
 }
 
@@ -662,6 +723,21 @@ fn collection_mut<'a>(
             )?,
             "applications",
         ),
+        Object::PortalBinding {
+            ..
+        } => (
+            // 只补绑定声明容器，不建立路由、SSO、应用订阅或另一份默认认证。
+            child(
+                child(
+                    document,
+                    "developer_portal",
+                    create.then(|| Value::Object(Map::new())),
+                )?,
+                "management",
+                create.then(|| Value::Object(Map::new())),
+            )?,
+            "bindings",
+        ),
         Object::Flow {
             ..
         } => (document, "flow"),
@@ -715,10 +791,20 @@ pub(super) fn create(
         };
         values.insert(object.id().into(), value);
     } else {
-        fields.insert(
-            object.identity_field().expect("array identity").into(),
-            Value::String(object.id().into()),
-        );
+        if let Object::PortalBinding {
+            proxy,
+            route,
+        } = object
+        {
+            // 绑定没有 id，两段身份只来自已校验选择器，不能由自由字段覆盖为另一入口。
+            fields.insert("proxy".into(), Value::String(proxy.clone()));
+            fields.insert("route".into(), Value::String(route.clone()));
+        } else {
+            fields.insert(
+                object.identity_field().expect("array identity").into(),
+                Value::String(object.id().into()),
+            );
+        }
         collection_mut(document, object, true)?.push(Value::Object(fields));
     }
     Ok(())
@@ -740,12 +826,7 @@ pub(super) fn delete(document: &mut Value, object: &Object) -> Result<(), Error>
         let collection = collection_mut(document, object, false)?;
         let index = collection
             .iter()
-            .position(|value| {
-                value
-                    .get(object.identity_field().expect("array identity"))
-                    .and_then(Value::as_str)
-                    == Some(object.id())
-            })
+            .position(|value| object.matches_value(value))
             .ok_or(Error::Missing)?;
         collection.remove(index);
     }
