@@ -70,9 +70,8 @@ impl Store {
         if !entry.previews_enabled {
             return Err(Reason::Disabled);
         }
-        // 预览没有跨重启恢复语义；原 boot 或原基线缺失必须保留失败，不能从当前节点补齐。
+        // 预览没有跨重启恢复语义；原 boot 或配置已不相同时，后续完整报告也不能恢复此原目标。
         if entry.boot != intent.boot
-            || entry.baseline.as_deref() != Some(&intent.baseline)
             || !entry.facts.as_ref().is_some_and(|facts| {
                 facts.config_version == intent.version
                     && facts
@@ -82,6 +81,11 @@ impl Store {
                         == Some(intent.fingerprint)
             })
         {
+            return Err(Reason::BaselineChanged);
+        }
+        // 缺少同次持久证明只能报告不可用，不能用历史值补齐，也不能据此断言实际基线不同。
+        let baseline = entry.baseline.as_deref().ok_or(Reason::Unavailable)?;
+        if baseline != &intent.baseline {
             return Err(Reason::BaselineChanged);
         }
         Ok(entry.session)

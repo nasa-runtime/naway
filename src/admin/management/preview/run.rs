@@ -29,7 +29,7 @@ pub(in crate::admin) struct Completed {
 /// - `intent`：原提案绑定的唯一原目标。
 /// - `session`：返回结果的原远端会话；本机原生路径为空。
 ///
-/// 返回：当前观察仍与原基线一致才成功；远端未知或本机换代均撤销已有差异。
+/// 返回：当前观察仍与原基线一致才成功；缺失或忙碌报告不可用，远端未知或本机换代均撤销已有差异。
 pub(in crate::admin) async fn recheck(
     state: &AdminState,
     snapshot: &Arc<GatewaySnapshot>,
@@ -64,7 +64,9 @@ pub(in crate::admin) async fn recheck(
         .management
         .action_plan(snapshot, &intent.baseline.cluster_id)
         .map_err(|_| Reason::Denied)?;
-    if observation.baseline.as_ref() != Some(&intent.baseline) {
+    // 未取得当前证明时只能撤下结果，不能将观察繁忙当成已确认的基线变化或继续使用旧证明。
+    let baseline = observation.baseline.as_ref().ok_or(Reason::Unavailable)?;
+    if baseline != &intent.baseline {
         return Err(Reason::BaselineChanged);
     }
     Ok(())

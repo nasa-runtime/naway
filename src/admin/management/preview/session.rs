@@ -231,7 +231,7 @@ impl Work {
     /// 参数说明：
     /// - `state`：原节点的唯一持久目录与快照 owner。
     ///
-    /// 返回：原 store、代际与三文档摘要仍完全一致时成功；缺失、忙碌、换代或失权拒绝。
+    /// 返回：原 store、代际与三文档摘要仍完全一致时成功；缺失或忙碌报告不可用，换代或失权拒绝。
     pub(super) async fn baseline(&self, state: &AdminState) -> Result<(), Reason> {
         self.authorize(state)?;
         let observation = state
@@ -239,7 +239,9 @@ impl Work {
             .node_observation(self.active.clone())
             .await;
         self.authorize(state)?;
-        if observation.baseline.as_ref() != Some(&self.command.intent.baseline) {
+        // 当前观察缺席不能证明发生换代，也不能借用上次基线；保留不可用结果并撤下本次差异。
+        let baseline = observation.baseline.as_ref().ok_or(Reason::Unavailable)?;
+        if baseline != &self.command.intent.baseline {
             return Err(Reason::BaselineChanged);
         }
         Ok(())
