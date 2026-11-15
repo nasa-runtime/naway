@@ -401,6 +401,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/portal_oidc_client.js"),
         ),
+        "/ui/views/operations/draft/portal_oidc_endpoints.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/portal_oidc_endpoints.js"),
+        ),
         "/ui/views/operations/draft/route_media.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/route_media.js"),

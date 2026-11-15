@@ -2528,6 +2528,8 @@ OIDC 使用固定 issuer/JWKS/端点、PKCE、state 和 nonce；discovery 的其
 Cookie 不向明文公网客户端提供会话。每次配置换代使门户旧会话失效。
 OIDC 本地回调、退出和返回路径拒绝原始反斜线、双斜杠起始和控制字符，避免浏览器重新解释
 路径后改变 origin；有界的本地查询与保持编码的路径仍按原文处理。
+管理台支持逐项编辑 OIDC 端点、scope、ID token 算法与身份头映射，保留原生别名和未选中的
+原文；门户固定回调、退出和 Cookie 身份不允许任意切换。所有端点与信任合同仍须原目标完整预检。
 
 SAML 需编译 `enterprise-saml`：`sso.type: saml`，`filter` 使用既有 `saml_auth` DSL，提供已签名 metadata、
 固定 metadata_signing_cert、idp_entity_id、sp_entity_id、HTTPS acs 和 `identity_headers`；另配置

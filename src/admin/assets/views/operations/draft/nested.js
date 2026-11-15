@@ -2,6 +2,7 @@ import { element } from "../../../core/dom.js";
 import { fieldRow } from "./controls.js";
 import { portalOidcBudgetFields } from "./portal_oidc_budget.js";
 import { portalOidcClientFields } from "./portal_oidc_client.js";
+import { portalOidcEndpointFields } from "./portal_oidc_endpoints.js";
 import { tlsFieldGroups } from "./tls.js";
 import { upstreamTlsFieldGroups } from "./upstream_tls.js";
 import { upstreamRetryFieldGroups } from "./upstream_retry.js";
@@ -172,6 +173,10 @@ export function nestedFields(kind, values, capacity) {
   const oidcClient = portalOidcClientFields(kind, values, capacity);
   if (oidcClient) {
     node.append(oidcClient.node);
+  }
+  const oidcEndpoints = portalOidcEndpointFields(kind, values, capacity);
+  if (oidcEndpoints) {
+    node.append(oidcEndpoints.node);
   }
   if (kind === "portal_catalog") {
     node.append(
@@ -763,6 +768,7 @@ export function nestedFields(kind, values, capacity) {
     const edits = [
       ...(oidcBudget?.read() ?? []),
       ...(oidcClient?.read() ?? []),
+      ...(oidcEndpoints?.read() ?? []),
     ];
     for (const { path, row } of rows) {
       const action = row.read();

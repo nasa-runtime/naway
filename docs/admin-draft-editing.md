@@ -765,7 +765,7 @@ DSL，不是其全部参数的类型化配置，不读取秘密。OIDC 组只来
 语义，不补其它默认字段。端点、凭据与 CA 引用、未编辑参数、原顺序和空白保持原文，不读取
 材料或连接身份服务。重复预算或残缺 token 不进行子项编辑，须明确处理整段 filter。
 预算子项不能与整段 SSO 或 `sso.filter` 同次编辑；有效会话仍受管理预算与 token 剩余寿命
-共同收紧，不能因增大某一项而绕过其它上限。其余端点、回调、scope 与 SAML filter 继续使用原文编辑。
+共同收紧，不能因增大某一项而绕过其它上限。SAML filter 继续使用原文编辑。
 
 OIDC 客户端组提供 `client_id`、`client_secret`、`client_auth` 与 CA 来源的原位编辑。已有
 `ca_certificate`、`ca_pem` 或 `ca_file` 保持原名，同义来源重复时须处理整段 filter。
@@ -773,6 +773,20 @@ OIDC 客户端组提供 `client_id`、`client_secret`、`client_auth` 与 CA 来
 凭据和 CA 仅作为 SecretSource 原文，不读取材料；移除 CA 使用原生系统信任，移除必需身份或
 凭据会被原目标预检拒绝。此组与预算、整段 filter 或 SSO 同次编辑时拒绝，不合并两次字符串
 重写；端点、scope、回调与其它参数仍保留原文，最终合法性由原目标完整构建器裁决。
+
+OIDC 端点与登录组提供 `issuer`、`discovery_url`、`authorization_endpoint`、`token_endpoint`、
+`userinfo_endpoint`、`introspection_endpoint`、`redirect_uri`、`post_logout_uri`、`scope`、
+`algorithm` 和 `identity_headers` 的明确设置和移除。原生同义键保持原名；同义重复或残缺
+token 须编辑整段 filter。所有值保持单 token 原文，不求值或发起网络请求，不自动调整其它
+端点或信任配置。scope 须含 openid 且不超过32项和1024字节；算法为 RS256/ES256；身份头为
+1–16项唯一普通业务头，不允许凭据、路由和 framing 头。退出返回值必须为有界本地 URI，
+拒绝原始反斜线和双斜杠起始，保持编码的路径不解码重写。
+
+门户固定 `callback_path=/api/developer/account/callback`、
+`logout_path=/api/developer/account/logout`、`cookie_name=naway_portal_oidc`，不提供这些身份
+的任意切换或缺失时补值。`redirect_uri` 必须使用固定 callback 和已批准 HTTPS origin；
+全部 IdP 网络端点必须为与 issuer 同 authority 的固定 HTTPS URI。此组与客户端、预算、
+整段 filter 或 SSO 同次编辑时原子拒绝；URI 合法性、全部信任与依赖仍由原目标完整预检裁决。
 
 门户团队以 `portal_team` 独立身份定位 `developer_portal.management.teams`，提供标题、应用数量
 上限与完整 `group_roles` / `subject_roles` JSON 映射。映射替换会移除未提供的旧成员授权，角色为
