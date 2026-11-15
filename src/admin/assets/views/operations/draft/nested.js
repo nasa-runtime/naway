@@ -59,7 +59,19 @@ import { routeCgiFieldGroups } from "./route_cgi.js";
 import { routeWebdavFieldGroups } from "./route_webdav.js";
 import { routeMediaFieldGroups } from "./route_media.js";
 
+const usagePlanGroups = [
+  [
+    ["usage_plan"],
+    "用量套餐绑定",
+    [
+      ["default_plan", "未单独映射身份的套餐", "string"],
+      ["require_consumer", "要求可信消费者身份", "boolean"],
+    ],
+  ],
+];
+
 const groups = {
+  portal_catalog: usagePlanGroups,
   portal_management: [
     [
       ["sso"],
@@ -74,16 +86,7 @@ const groups = {
     ],
   ],
 
-  route: [
-    [
-      ["usage_plan"],
-      "用量套餐绑定",
-      [
-        ["default_plan", "未单独映射身份的套餐", "string"],
-        ["require_consumer", "要求可信消费者身份", "boolean"],
-      ],
-    ],
-  ],
+  route: usagePlanGroups,
 
   scope_policy: [
     [
@@ -160,6 +163,15 @@ const groups = {
 export function nestedFields(kind, values, capacity) {
   const node = element("div", "", "draft-nested");
   const rows = [];
+  if (kind === "portal_catalog") {
+    node.append(
+      element(
+        "p",
+        "用量套餐子项只改变当前目录生成路由的显式绑定。可信 consumer 优先使用全局映射，其次使用 default_plan；客户端同名头不能提供身份。require_consumer=true 要求已声明身份来源，false 须有默认套餐，且不会撤下已有认证 filter。移除默认套餐可能使未映射身份被拒绝，移除整段只关闭此用量策略。子项与整段 JSON 不能同次编辑，套餐引用与认证边界仍须原目标完整预检。",
+        "subtle",
+      ),
+    );
+  }
   if (kind === "portal_management") {
     node.append(
       element(

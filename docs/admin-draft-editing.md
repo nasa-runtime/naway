@@ -711,6 +711,12 @@ OpenAPI 路由目录以 `portal_catalog` 和稳定 `id` 定位 `developer_portal
 门户启用时若删除最后目录且没有产品，构建会拒绝。所有文档加载、投影与路由构建完成后才
 交换快照，草稿不会单独发布半完成路由。
 
+目录的 `usage_plan.default_plan` 与 `usage_plan.require_consumer` 提供原位子项，保留未编辑的
+绑定内容；整段 JSON 与子项不能同次编辑。省略父字段时仅构造明确设置的路径，显式 `null`、
+数组或标量须先通过整值编辑处理，不猜测默认值。可信 consumer 优先使用全局映射，再使用
+默认套餐；要求身份时须有认证来源，允许匿名套餐时必须有默认套餐且现有认证 filter 仍生效。
+移除默认套餐可能让未映射 consumer 返回403；移除整段只撤下用量策略，不改变认证 filter。
+
 待审批 key 申请设置使用 `portal_key_applications` 单例，固定定位既有
 `developer_portal.key_applications`。可原位设置 `enabled`、`authorization_token`、`collection`、
 `max_body_bytes` 与 `max_pending`，无额外 `id` 或 `name`；缺失声明不列入目录，不补默认字段，

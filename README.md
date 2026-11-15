@@ -2399,6 +2399,10 @@ OpenAPI 路由目录提供独立 `portal_catalog` 草稿身份，定位 `develop
 静态上游须为带主机的 HTTP(S) URI 或非空 `lb://` 服务引用；变量目标继续遵循普通路由的
 受限渲染与运行时目标校验。
 
+目录的用量套餐也可原位编辑 `default_plan` 与 `require_consumer`。套餐选择先取已验证 consumer
+的全局映射，再取默认套餐；允许使用默认套餐不会撤下既有认证。移除默认套餐后，缺少映射的
+身份会被拒绝；全部引用与身份来源须通过原目标预检。
+
 既有待审批 key 申请配置提供 `portal_key_applications` 草稿单例，可编辑启用状态、专用 Bearer
 的 SecretSource、存储集合、请求体与集合容量上限。它只受理 `pending` 记录，不签发 key，
 管理员凭据和 SSO 角色不能替代专用 Bearer。关闭时须明确移除或清空凭据声明；集合换名保留
