@@ -121,38 +121,48 @@ export async function request(path, options = {}) {
     const decoder = new TextDecoder("utf-8", { fatal: true });
     const chunks = [];
     let length = 0;
+    // 来源正文原生预算为4MiB，导出外壳另留有界余量；路径与方法共同决定该额度。
     const capacity =
-      method === "GET" && execution
-        ? 4 * 1024 * 1024 + 128 * 128 * 1024 + 65536
-        : impact && ["GET", "POST"].includes(method)
-          ? 4 * 1024 * 1024 + 16384
-          : (method === "POST" &&
-                target.pathname === "/api/certificate-conditions") ||
-              (method === "GET" &&
-                (target.pathname === "/api/certificate-proposals" ||
-                  /^\/api\/certificate-proposals\/targets(?:\/[A-Za-z0-9_.-]{1,128})?$/.test(
+      (method === "GET" &&
+        /^\/api\/providers\/[A-Za-z0-9_-]{1,64}\/export$/.test(
+          target.pathname,
+        )) ||
+      (method === "POST" &&
+        /^\/api\/providers\/[A-Za-z0-9_-]{1,64}\/(dry-run|diff)$/.test(
+          target.pathname,
+        ))
+        ? 4 * 1024 * 1024 + 16384
+        : method === "GET" && execution
+          ? 4 * 1024 * 1024 + 128 * 128 * 1024 + 65536
+          : impact && ["GET", "POST"].includes(method)
+            ? 4 * 1024 * 1024 + 16384
+            : (method === "POST" &&
+                  target.pathname === "/api/certificate-conditions") ||
+                (method === "GET" &&
+                  (target.pathname === "/api/certificate-proposals" ||
+                    /^\/api\/certificate-proposals\/targets(?:\/[A-Za-z0-9_.-]{1,128})?$/.test(
+                      target.pathname,
+                    ))) ||
+                (method === "POST" &&
+                  /^\/api\/certificate-proposals\/[0-9a-f]{32}\/preview$/.test(
                     target.pathname,
-                  ))) ||
-              (method === "POST" &&
-                /^\/api\/certificate-proposals\/[0-9a-f]{32}\/preview$/.test(
+                  )) ||
+                target.pathname === "/api/cluster/catalog" ||
+                target.pathname === "/api/cluster/consumers" ||
+                target.pathname === "/api/cluster/certificates" ||
+                /^\/api\/workspaces\/[^/]+\/cluster\/certificates$/.test(
                   target.pathname,
-                )) ||
-              target.pathname === "/api/cluster/catalog" ||
-              target.pathname === "/api/cluster/consumers" ||
-              target.pathname === "/api/cluster/certificates" ||
-              /^\/api\/workspaces\/[^/]+\/cluster\/certificates$/.test(
-                target.pathname,
-              ) ||
-              /^\/api\/workspaces\/[^/]+\/cluster\/consumers$/.test(
-                target.pathname,
-              ) ||
-              target.pathname === "/api/operations/proposals" ||
-              /^\/api\/operations\/proposals\/[0-9a-f]{32}\/preview$/.test(
-                target.pathname,
-              ) ||
-              target.pathname === "/api/operations/proposals/draft"
-            ? 4 * 1024 * 1024
-            : 1024 * 1024;
+                ) ||
+                /^\/api\/workspaces\/[^/]+\/cluster\/consumers$/.test(
+                  target.pathname,
+                ) ||
+                target.pathname === "/api/operations/proposals" ||
+                /^\/api\/operations\/proposals\/[0-9a-f]{32}\/preview$/.test(
+                  target.pathname,
+                ) ||
+                target.pathname === "/api/operations/proposals/draft"
+              ? 4 * 1024 * 1024
+              : 1024 * 1024;
     try {
       while (true) {
         const { value, done } = await reader.read();

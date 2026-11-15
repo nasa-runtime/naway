@@ -49,7 +49,7 @@ pub(super) async fn handle(req: AdminRequest, state: Arc<AdminState>) -> Respons
         let sources: Vec<_> = providers
             .owners()
             .filter(|(_, owner)| allowed(&active, &identity, owner, false))
-            .filter_map(|(id, _)| providers.summary(id))
+            .filter_map(|(id, _)| summary(&active, &identity, &providers, id))
             .collect();
         if state.snap.load().version != active.version {
             return plain(StatusCode::CONFLICT, "source authority changed\n");
@@ -181,7 +181,10 @@ pub(super) async fn handle(req: AdminRequest, state: Arc<AdminState>) -> Respons
     } else {
         drop(body);
         match endpoint {
-            "status" => json(StatusCode::OK, providers.summary(id).expect("known source")),
+            "status" => json(
+                StatusCode::OK,
+                summary(&active, &identity, &providers, id).expect("known source"),
+            ),
             "explain" => json(
                 StatusCode::OK,
                 providers.explain(id, offset, limit).expect("known source"),
@@ -266,6 +269,28 @@ fn allowed(
             Action::Read
         },
     )
+}
+
+/// 业务作用：为来源页面交付当前主体的候选能力和原生正文预算，不从角色名推断写权限。
+///
+/// 参数说明：
+/// - `snapshot`：当前配置、工作区成员及权限权威。
+/// - `identity`：本次认证得到的主体与平台权限。
+/// - `providers`：同代已发布来源目录。
+/// - `id`：已通过读取授权的来源身份。
+///
+/// 返回：原低敏摘要及候选能力、字节上限；未知来源为空，不授予发布或事实源写入能力。
+fn summary(
+    snapshot: &GatewaySnapshot,
+    identity: &AdminIdentity,
+    providers: &Snapshot,
+    id: &str,
+) -> Option<serde_json::Value> {
+    let (_, owner) = providers.owners().find(|(source, _)| *source == id)?;
+    let mut value = providers.summary(id)?;
+    value["can_validate"] = serde_json::json!(allowed(snapshot, identity, owner, true));
+    value["max_body_bytes"] = serde_json::json!(providers.body_limit(id)?);
+    Some(value)
 }
 
 /// 业务作用：使用完整产品构建器验证来源候选，失败不发布目录、水位、路由或外部来源写入。

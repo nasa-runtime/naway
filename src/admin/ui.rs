@@ -16,6 +16,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
         return None;
     }
     let (mime, content): (&str, &[u8]) = match path {
+        "/providers" if cfg!(feature = "config-providers") => (
+            "text/html; charset=utf-8",
+            include_bytes!("assets/index.html"),
+        ),
         "/monitor"
         | "/cluster"
         | "/catalog"
@@ -57,6 +61,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
         "/ui/views/ingress.js" => (
             "application/javascript; charset=utf-8",
             include_bytes!("assets/views/ingress.js"),
+        ),
+        "/ui/views/providers.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/providers.js"),
         ),
         "/ui/views/streams.js" => (
             "application/javascript; charset=utf-8",

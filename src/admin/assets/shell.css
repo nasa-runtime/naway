@@ -297,6 +297,20 @@ textarea {
   width: 100%;
   padding: 10px 12px;
 }
+.provider-source,
+.provider-detail,
+.provider-object {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.provider-detail textarea {
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+}
+.provider-object {
+  border-top: 1px solid var(--line);
+  padding: 10px 0;
+}
 .monitor-toolbar,
 .panel-heading {
   display: flex;
