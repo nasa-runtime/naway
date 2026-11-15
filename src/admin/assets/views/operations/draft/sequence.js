@@ -4,6 +4,10 @@ import { draftFieldPanel } from "./fields.js";
 import { fieldRow } from "./controls.js";
 import { fieldAction } from "./nested.js";
 import { productDraftLists, validateProductElement } from "./product.js";
+import {
+  portalApplicationDraftLists,
+  validatePortalApplicationElement,
+} from "./portal_application.js";
 import { tlsDraftLists } from "./tls.js";
 import { listenerDraftLists } from "./listener.js";
 import { mqttDraftLists } from "./mqtt.js";
@@ -81,6 +85,7 @@ function lists(kind, values) {
     });
   }
   result.push(...productDraftLists(kind, values));
+  result.push(...portalApplicationDraftLists(kind));
   result.push(...routeExternalPluginDraftLists(kind));
   result.push(...routeWasmDraftLists(kind));
   result.push(...routeScriptDraftLists(kind));
@@ -313,6 +318,8 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
         [
           "product_version",
           "product_document",
+          "portal_subscription",
+          "portal_credential",
           "instance",
           "tls_identity",
           "stream_route",
@@ -342,9 +349,11 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
         ].includes(selected.type)
       ) {
         // 稳定身份绑定路由、插件、聚合目标、模型、内容规则、检索来源和工具，只在新增或整值替换时开放声明。
-        const type = ["product_version", "product_document"].includes(
-          selected.type,
-        )
+        const type = [
+          "product_version",
+          "product_document",
+          "portal_credential",
+        ].includes(selected.type)
           ? selected.type + "_new"
           : selected.type === "stream_route"
             ? "stream_route_new"
@@ -500,6 +509,11 @@ export function sequenceEditor(object, values, capacity, submit, changed) {
         }
         // 新版本和文档必须显式声明合同与授权，不能从展示投影或相邻元素恢复未选择字段。
         validateProductElement(selected.type, action.fields);
+        // 应用订阅与凭据是独立授权声明，必须明确新值；普通字段投影和相邻元素不提供默认权限。
+        validatePortalApplicationElement(
+          selected.validate ?? selected.type,
+          fields ? action.fields : action.value,
+        );
         // 新条件不能继承相邻项的匹配权，完整变体声明通过后才交给原目标复验可信事实和可达性。
         if (selected.type === "layer_match") {
           validateLayerMatchDeclaration(action.fields);
