@@ -441,6 +441,42 @@ meter::-webkit-meter-optimum-value {
 .stream-traffic-detail p {
   overflow-wrap: anywhere;
 }
+.diagnostics-form,
+.diagnostics-detail,
+.diagnostics-directory {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.diagnostics-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.diagnostics-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.diagnostics-form input,
+.diagnostics-form textarea {
+  min-width: 0;
+  max-width: 100%;
+}
+.diagnostics-body {
+  min-width: 0;
+  margin: 12px 0;
+  border: 1px solid var(--line);
+}
+.diagnostics-frozen,
+.diagnostics-samples pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+  font-size: 12px;
+  line-height: 1.6;
+}
 table {
   width: 100%;
   border-collapse: collapse;

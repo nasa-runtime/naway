@@ -70,7 +70,6 @@ struct Entry {
 struct Inner {
     entries: BTreeMap<String, Entry>,
     sweeping: bool,
-    sequence: u64,
 }
 
 #[derive(Default)]
@@ -202,7 +201,7 @@ impl Registry {
     /// - `initiator`：是已认证且有诊断写权限的主体
     /// - `generation`：绑定认证代。
     ///
-    /// 返回：申请元信息和不可变摘要；预算、目标、代际或容量不满足时拒绝。
+    /// 返回：独立申请身份与不可变摘要；身份熵源、预算、目标、代际或容量不满足时拒绝。
     pub(crate) fn propose(
         self: &Arc<Self>,
         request: Request,
@@ -227,6 +226,17 @@ impl Registry {
             .ownership
             .route_owner(&request.proxy, &request.route)
             .cloned();
+        // 配置代和计数会随进程重建，不能作为申请身份；熵源失败时拒绝创建，不回退到可复用标识。
+        let mut identity = [0_u8; 16];
+        getrandom::getrandom(&mut identity)
+            .map_err(|_| anyhow::anyhow!("diagnostics identity unavailable"))?;
+        let id = format!(
+            "tap-{}",
+            identity
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
         let mut inner = self.inner.lock();
         Self::expire(&mut inner, &snapshot);
         // 全部申请共享固定进程硬门，不允许反复审批或换代叠加内存预算。
@@ -234,14 +244,15 @@ impl Registry {
             inner.entries.len() < 8,
             "diagnostics session capacity reached"
         );
-        inner.sequence = inner
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("diagnostics id capacity reached"))?;
-        let id = format!("tap-{}-{}", generation, inner.sequence);
+        // 身份冲突必须拒绝，不能覆盖仍在等待复核或交付样本的另一份申请。
+        anyhow::ensure!(
+            !inner.entries.contains_key(&id),
+            "diagnostics identity unavailable"
+        );
         let digest = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&(
+                &id,
                 generation,
                 snapshot.config_fingerprint,
                 &owner,

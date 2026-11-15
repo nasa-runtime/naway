@@ -7,6 +7,7 @@ import { mount as operations } from "../views/operations.js";
 import { mount as routeTraffic } from "../views/routes.js";
 import { mount as ingressProtection } from "../views/ingress.js";
 import { mount as providers } from "../views/providers.js";
+import { mount as diagnostics } from "../views/diagnostics.js";
 import { mount as streamTraffic } from "../views/streams.js";
 import { mount as services } from "../views/services.js";
 import { mount as consumers } from "../views/consumers.js";
@@ -82,6 +83,15 @@ function navigate(name, service = "") {
     document.getElementById("subtitle").textContent =
       "接入节点 · 已发布来源、对象解释与不发布的候选校验";
     dispose = providers(root, session);
+  } else if (
+    name === "diagnostics" &&
+    session.diagnostics?.enabled &&
+    (allowed("diagnostics") || allowed("diagnostics", "write"))
+  ) {
+    document.getElementById("title").textContent = "限时诊断";
+    document.getElementById("subtitle").textContent =
+      "接入进程 · 双人复核、有限脱敏样本与显式交付";
+    dispose = diagnostics(root, session);
   } else if (
     name === "ingress" &&
     ((allowed("cluster") && allowed("interface-guard")) ||
@@ -247,6 +257,10 @@ async function login(event) {
       session.workspaces?.length
     );
     document.getElementById("nodes-nav").disabled = !allowed("cluster");
+    document.getElementById("diagnostics-nav").disabled = !(
+      session.diagnostics?.enabled &&
+      (allowed("diagnostics") || allowed("diagnostics", "write"))
+    );
     document.getElementById("providers-nav").disabled = !(
       session.features?.config_providers &&
       (allowed("config") || session.workspaces?.length)
@@ -275,40 +289,43 @@ async function login(event) {
       !["routes", "config", "upstreams"].some((resource) => allowed(resource));
     notice.textContent = "";
     navigate(
-      location.pathname === "/providers" &&
-        !document.getElementById("providers-nav").disabled
-        ? "providers"
-        : location.pathname === "/ingress" &&
-            !document.getElementById("ingress-nav").disabled
-          ? "ingress"
-          : location.pathname === "/certificate-proposals" &&
-              !document.getElementById("materials-nav").disabled
-            ? "materials"
-            : location.pathname === "/certificates" &&
-                !document.getElementById("certificates-nav").disabled
-              ? "certificates"
-              : location.pathname === "/consumers" &&
-                  !document.getElementById("consumers-nav").disabled
-                ? "consumers"
-                : location.pathname === "/services" &&
-                    !document.getElementById("services-nav").disabled
-                  ? "services"
-                  : location.pathname === "/traffic" &&
-                      !document.getElementById("traffic-nav").disabled
-                    ? "traffic"
-                    : location.pathname === "/streams" &&
-                        !document.getElementById("streams-nav").disabled
-                      ? "streams"
-                      : location.pathname === "/operations"
-                        ? "operations"
-                        : allowed("cluster")
-                          ? location.pathname === "/catalog" &&
-                            !document.getElementById("catalog-nav").disabled
-                            ? "catalog"
-                            : location.pathname === "/cluster"
-                              ? "nodes"
-                              : "monitor"
-                          : "system",
+      location.pathname === "/diagnostics" &&
+        !document.getElementById("diagnostics-nav").disabled
+        ? "diagnostics"
+        : location.pathname === "/providers" &&
+            !document.getElementById("providers-nav").disabled
+          ? "providers"
+          : location.pathname === "/ingress" &&
+              !document.getElementById("ingress-nav").disabled
+            ? "ingress"
+            : location.pathname === "/certificate-proposals" &&
+                !document.getElementById("materials-nav").disabled
+              ? "materials"
+              : location.pathname === "/certificates" &&
+                  !document.getElementById("certificates-nav").disabled
+                ? "certificates"
+                : location.pathname === "/consumers" &&
+                    !document.getElementById("consumers-nav").disabled
+                  ? "consumers"
+                  : location.pathname === "/services" &&
+                      !document.getElementById("services-nav").disabled
+                    ? "services"
+                    : location.pathname === "/traffic" &&
+                        !document.getElementById("traffic-nav").disabled
+                      ? "traffic"
+                      : location.pathname === "/streams" &&
+                          !document.getElementById("streams-nav").disabled
+                        ? "streams"
+                        : location.pathname === "/operations"
+                          ? "operations"
+                          : allowed("cluster")
+                            ? location.pathname === "/catalog" &&
+                              !document.getElementById("catalog-nav").disabled
+                              ? "catalog"
+                              : location.pathname === "/cluster"
+                                ? "nodes"
+                                : "monitor"
+                            : "system",
     );
   } catch (error) {
     if (attempt === epoch && error.name !== "AbortError") {

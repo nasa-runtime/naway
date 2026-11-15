@@ -79,6 +79,11 @@ pub(super) fn read(state: &AdminState, identity: &AdminIdentity) -> Response<Box
             "enabled": false
         }),
     };
+    #[cfg(feature = "telemetry-otlp")]
+    let diagnostics_enabled =
+        state.mode.full_control_plane() && crate::observability::telemetry::tap::enabled(&snapshot);
+    #[cfg(not(feature = "telemetry-otlp"))]
+    let diagnostics_enabled = false;
     let mut response = super::json(
         StatusCode::OK,
         serde_json::json!({
@@ -88,6 +93,9 @@ pub(super) fn read(state: &AdminState, identity: &AdminIdentity) -> Response<Box
             "permissions": permissions,
             "ownership_enabled": snapshot.ownership.enabled(),
             "operations": operations,
+            "diagnostics": {
+                "enabled": diagnostics_enabled,
+            },
             "monitor": {
                 "enabled": snapshot.admin_monitor.enabled,
                 "sampling_period_ms": snapshot.admin_monitor.period.as_millis(),
