@@ -97,6 +97,18 @@ const definitions = {
     ],
   ],
 
+  portal_catalog: [
+    ["title", "OpenAPI 路由目录标题", "string"],
+    ["description", "OpenAPI 路由目录说明", "string"],
+    ["openapi_file", "原目标上的 OpenAPI 文件声明", "string"],
+    ["proxy_id", "承载生成路由的入口身份", "string"],
+    ["upstream", "生成路由的明确上游", "string"],
+    ["filters", "每条生成路由的完整 filter DSL（每行一项）", "lines"],
+    ["usage_plan", "完整用量套餐绑定 JSON", "json"],
+    ["max_validation_body_bytes", "正文校验字节上限（1–16777216）", "number"],
+    ["order", "生成路由顺序", "number"],
+  ],
+
   portal_settings: [
     ["enabled", "启用开发者门户", "boolean"],
     ["public_catalog", "允许公开读取门户目录与文档", "boolean"],
@@ -316,6 +328,7 @@ export const objectKinds = {
     ["route", "HTTP 路由"],
     ["service", "上游服务"],
     ["product", "API 产品"],
+    ["portal_catalog", "OpenAPI 路由目录"],
     ["portal_team", "门户团队"],
     ["portal_application", "门户应用"],
     ["portal_binding", "产品路由绑定"],

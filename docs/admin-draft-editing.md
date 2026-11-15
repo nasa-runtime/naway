@@ -693,6 +693,24 @@ API 产品以独立 `product` 对象定位 `developer_portal.products` 中的稳
 完整集合或元素替换会移除旧声明中未提供的其它字段。编辑成功不代表文件可读、门户已开启、合同合法或取得了发布权限，最终由原
 目标完整预检、审批和执行裁决。
 
+OpenAPI 路由目录以 `portal_catalog` 和稳定 `id` 定位 `developer_portal.catalogs`；它将 operation
+物化为真实网关路由，与 `product` 的产品、版本和文档目录分别管理。标题、说明、文件、
+`proxy_id`、`upstream`、逐行完整 `filters` DSL、完整 `usage_plan` JSON、
+`max_validation_body_bytes` 和 `order` 可原位设置；未修改的引用、认证、配额和未知值保留原声明值。
+完整 JSON 或 DSL 不是其所有参数的类型化表单。
+
+已有目录 `id` 不能用字段动作改名。新建须明确 OpenAPI 文件和上游，只补目录容器，不启用
+门户、不读取文件或秘密、不继承其它目录权限。旧单入口的 `proxy_id` 须为 `default`，多入口
+须命中真实 `proxies[].id`。原始文件受全局文档上限约束，正文校验预算为1–16777216字节，
+静态上游须为带主机的 HTTP(S) URI 或非空 `lb://` 服务引用；变量目标保留普通路由的受限渲染
+与逐次目标校验，不在草稿读取时求值。
+路由目录最多64份、物化操作合计最多4096个；草稿目录仍共用1024对象上限。
+
+文件、上游、filters 或目录删除会改变实际路由及访问策略，须完整预检、独立审批和执行。
+删除只移除所选目录声明，其它产品、管理和路由不跟随删除；引用与路由冲突由原目标裁决。
+门户启用时若删除最后目录且没有产品，构建会拒绝。所有文档加载、投影与路由构建完成后才
+交换快照，草稿不会单独发布半完成路由。
+
 门户全局设置使用无额外身份字段的 `portal_settings` 单例，固定定位既有的 `developer_portal`。
 仅编辑 `enabled`、`public_catalog` 和 `max_document_bytes` 三个标量；`catalogs`、`products`、
 `management`、`key_applications` 受普通、移除、嵌套和列表动作共同保护，应各自独立维护。

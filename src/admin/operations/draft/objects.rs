@@ -23,6 +23,9 @@ pub(super) enum Object {
     Product {
         id: String,
     },
+    PortalCatalog {
+        id: String,
+    },
     PortalSettings {},
     PortalManagement {},
     PortalTeam {
@@ -98,6 +101,9 @@ impl Object {
             | Self::Product {
                 id,
             }
+            | Self::PortalCatalog {
+                id,
+            }
             | Self::PortalTeam {
                 id,
             }
@@ -170,6 +176,9 @@ impl Object {
                 id,
             }
             | Self::Product {
+                id,
+            }
+            | Self::PortalCatalog {
                 id,
             }
             | Self::PortalTeam {
@@ -455,6 +464,11 @@ pub(super) fn catalog(document: &Value, domain: Domain) -> Result<BTreeSet<Objec
                     return Err(Error::Invalid);
                 }
                 insert(Object::PortalSettings {})?;
+                for catalog in array(portal.get("catalogs"))? {
+                    insert(Object::PortalCatalog {
+                        id: object_id(catalog)?.into(),
+                    })?;
+                }
                 for product in array(portal.get("products"))? {
                     insert(Object::Product {
                         id: object_id(product)?.into(),
@@ -721,6 +735,17 @@ fn collection_mut<'a>(
                 create.then(|| Value::Object(Map::new())),
             )?,
             "products",
+        ),
+        Object::PortalCatalog {
+            ..
+        } => (
+            // 只补目录容器，不启用门户或选择认证；文档、上游与生成路由仍须原目标完整构建。
+            child(
+                document,
+                "developer_portal",
+                create.then(|| Value::Object(Map::new())),
+            )?,
+            "catalogs",
         ),
         Object::PortalTeam {
             ..

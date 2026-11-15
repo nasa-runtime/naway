@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use serde::Serialize;
 use serde_json::Value;
@@ -120,7 +120,8 @@ impl DeveloperPortalRuntime {
             return Ok(Arc::new(Self::disabled()));
         }
         anyhow::ensure!(
-            portal.catalogs.len() <= MAX_CATALOGS && (!portal.catalogs.is_empty() || !portal.products.is_empty()),
+            portal.catalogs.len() <= MAX_CATALOGS
+                && (!portal.catalogs.is_empty() || !portal.products.is_empty()),
             "developer_portal requires catalogs or products, with at most {MAX_CATALOGS} route catalogs"
         );
         anyhow::ensure!(
@@ -347,7 +348,7 @@ fn build_key_applications(
 /// - `config_dir`：为文档根
 /// - `max_document_bytes`：限制读取及展开。
 ///
-/// 返回：全部操作可物化时返回目录与路由；失败不产生局部发布。
+/// 返回：静态 HTTP 地址合法且全部操作可物化时返回目录与路由；失败不产生局部发布。
 fn build_catalog(
     cfg: &DeveloperCatalogCfg,
     config_dir: &Path,
@@ -363,6 +364,26 @@ fn build_catalog(
         "developer catalog `{}` upstream cannot be empty",
         cfg.id
     );
+    // 静态地址先满足普通转发的协议和主机约束，避免已知坏地址进入快照后才中断业务请求。
+    // 模板继续由现有受限渲染和逐次目标校验裁决，声明读取不能提前猜测运行时取值。
+    if !cfg.upstream.contains("${") {
+        if let Some(service) = cfg.upstream.strip_prefix("lb://") {
+            anyhow::ensure!(
+                !service.is_empty(),
+                "developer catalog `{}` upstream service cannot be empty",
+                cfg.id
+            );
+        } else {
+            let uri: http::Uri = cfg.upstream.parse().with_context(|| {
+                format!("developer catalog `{}` upstream URI is invalid", cfg.id)
+            })?;
+            anyhow::ensure!(
+                matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some(),
+                "developer catalog `{}` upstream must be an absolute HTTP(S) URI or lb:// service",
+                cfg.id
+            );
+        }
+    }
     let path = resolve_relative(config_dir, &cfg.openapi_file);
     // 先在同一文件句柄上做 max+1 有界读取，阻断 metadata→fs::read 的替换/增长竞态。
     let raw =

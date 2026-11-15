@@ -43,6 +43,15 @@ export function draftFieldPanel(kind, values, capacity) {
   const node = element("div", "", "draft-fields");
   const rows = new Map();
   const known = draftFields(kind);
+  if (kind === "portal_catalog") {
+    node.append(
+      element(
+        "p",
+        "此目录将 OpenAPI operation 物化为真实路由；改变文件、入口、上游或 filters 会改变实际部署与访问策略。文件与上游须明确声明，已有目录身份受保护。filters 保留完整原生 DSL，usage_plan 为完整 JSON 替换，不从其它目录继承认证或套餐。这里只生成声明，不读取文件或秘密、不启用门户；文件字节、合同、入口、重复路由及操作数量仍须原目标完整预检与审批执行。",
+        "subtle",
+      ),
+    );
+  }
   if (kind === "portal_settings") {
     node.append(
       element(

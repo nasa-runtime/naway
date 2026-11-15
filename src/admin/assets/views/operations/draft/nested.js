@@ -787,7 +787,7 @@ export function nestedFields(kind, values, capacity) {
  * - `object`：冻结的对象身份。
  * - `patch`：表单读出的独立动作。
  * - `creating`：是否创建新对象。
- * 返回：旧字段 patch、有限嵌套 patch 或完整新对象；冲突祖先、新增移除与缺少显式合同的新绑定均拒绝。
+ * 返回：旧字段 patch、有限嵌套 patch 或完整新对象；冲突祖先、新增移除与缺少显式部署合同的新对象均拒绝。
  */
 export function fieldAction(object, patch, creating) {
   const edits = patch.edits ?? [];
@@ -800,6 +800,15 @@ export function fieldAction(object, patch, creating) {
       throw new Error("新增对象不能移除字段，请将不需要的字段保持未声明。");
     }
     const fields = patch.fields;
+    if (
+      object.kind === "portal_catalog" &&
+      ["openapi_file", "upstream"].some(
+        (key) => typeof fields[key] !== "string" || !fields[key].trim(),
+      )
+    ) {
+      // 新目录会产生真实路由，文件和上游必须明确提供，不能借用其它目录的部署合同。
+      throw new Error("新增 OpenAPI 路由目录须明确填写文件和上游。");
+    }
     for (const edit of edits) {
       let parent = fields;
       for (const key of edit.path.slice(0, -1)) {
