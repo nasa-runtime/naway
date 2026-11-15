@@ -7804,8 +7804,12 @@ fn validate_oidc_idp_endpoint(endpoint: &str, issuer: &str, field: &str) -> Resu
 /// 参数说明：
 /// - `value`：是配置或已保存的本地 URI。
 ///
-/// 返回：以单斜杠开头、无控制字符且长度不超过 8192 字节时返回 true。
+/// 返回：可解析的单斜杠本地 URI 且无控制字符、反斜线，长度不超过8192字节时返回 true。
 fn valid_oidc_local_path(value: &str) -> bool {
+    // 浏览器会把反斜线解释为分隔符；HTTP URI 可解析也不能证明跳转后仍属于本地 origin。
+    if value.contains('\\') {
+        return false;
+    }
     value.starts_with('/')
         && !value.starts_with("//")
         && value.len() <= 8_192

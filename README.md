@@ -2526,6 +2526,8 @@ OIDC 使用固定 issuer/JWKS/端点、PKCE、state 和 nonce；discovery 的其
 回调、注销路径、专用 Cookie、HTTPS origin 和会话预算必须一致。`/api/developer/account/login` 完成登录
 后只返回固定门户，不能指定任意 return URL。门户应置于可信 HTTPS 前置层之后；Secure/HttpOnly/SameSite
 Cookie 不向明文公网客户端提供会话。每次配置换代使门户旧会话失效。
+OIDC 本地回调、退出和返回路径拒绝原始反斜线、双斜杠起始和控制字符，避免浏览器重新解释
+路径后改变 origin；有界的本地查询与保持编码的路径仍按原文处理。
 
 SAML 需编译 `enterprise-saml`：`sso.type: saml`，`filter` 使用既有 `saml_auth` DSL，提供已签名 metadata、
 固定 metadata_signing_cert、idp_entity_id、sp_entity_id、HTTPS acs 和 `identity_headers`；另配置
