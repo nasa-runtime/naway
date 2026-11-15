@@ -54,6 +54,15 @@ export function draftFieldPanel(kind, values, capacity) {
       ),
     );
   }
+  if (kind === "portal_application") {
+    node.append(
+      element(
+        "p",
+        "应用身份独立于团队与路由。更换团队、消费者、套餐或状态会改变授权归属；回调、订阅与凭据清单为完整 JSON 替换，遗漏的旧项将被移除。这里只编辑声明，不建立 SSO、不生成明文凭据，也不自动订阅产品；全部引用、权限、配额与摘要仍须原目标完整预检。",
+        "subtle",
+      ),
+    );
+  }
   const remaining = Object.keys(values).filter(
     (key) => !identityField(kind, key) && !known.some(([name]) => name === key),
   );

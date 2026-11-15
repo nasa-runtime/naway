@@ -706,6 +706,15 @@ API 产品以独立 `product` 对象定位 `developer_portal.products` 中的稳
 相同角色替换保持原文字节；删除最后项保留显式空映射，不提供缺省授权。已有身份不通过替换
 角色改名；原文、字段、成员、角色或删除确认变化后，旧请求不能恢复过期编辑结果。
 
+门户应用以 `portal_application` 独立身份定位 `developer_portal.management.applications`。
+标题、`team`、`consumer`、`plan`、`state` 可显式设置；`redirect_uris`、`subscriptions` 和
+`credentials` 使用完整 JSON 替换，遗漏旧项会改变回调、订阅或凭据授权，不代表逐项维护。
+已有 `id` 受保护；创建只补应用声明容器，不建立 SSO、团队、套餐或明文密钥，管理声明为
+`null` 时不能被隐式打开。删除不会迁移其它应用或改变团队成员。原生状态只接受 `active` 和
+`revoked`，撤销应用仍可在有权账号的管理读面中出现，不代表可用于业务认证。团队配额、消费者
+与凭据归属、产品版本授权、HTTPS 回调及摘要格式由原目标完整预检裁决；草稿目录共用1024对象
+上限，超出时须使用原始 YAML。完整预检和审批执行前，编辑成功不代表运行权限已经改变。
+
 HTTP 与 stream 入口的 TLS 子字段覆盖默认文件或 manifest 来源、外部签名引用、SPIRE、
 客户端 CA/CRL/SPIFFE 验证、客户端在线 OCSP、当前身份的 OCSP staple 及会话票据。
 stream 单独提供握手期限，HTTP 的 TLS 监听地址不会写入 stream TLS 对象。切换来源时必须

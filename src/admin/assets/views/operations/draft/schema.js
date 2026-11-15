@@ -105,6 +105,17 @@ const definitions = {
     ["max_applications", "团队应用数量上限（1–1024）", "number"],
   ],
 
+  portal_application: [
+    ["title", "门户应用标题", "string"],
+    ["team", "显式所属团队", "string"],
+    ["consumer", "唯一消费者身份", "string"],
+    ["plan", "显式用量套餐", "string"],
+    ["state", "应用状态（active / revoked）", "string"],
+    ["redirect_uris", "完整 HTTPS 回调地址清单", "json"],
+    ["subscriptions", "完整产品版本订阅清单", "json"],
+    ["credentials", "完整凭据摘要与撤销状态清单", "json"],
+  ],
+
   usage_plan: [
     ["requests", "窗口内基础请求数", "number"],
     ["window_ms", "固定窗口（毫秒）", "number"],
@@ -279,6 +290,7 @@ export const objectKinds = {
     ["service", "上游服务"],
     ["product", "API 产品"],
     ["portal_team", "门户团队"],
+    ["portal_application", "门户应用"],
     ["credential", "上游凭据"],
     ["secret_provider", "远程秘密源"],
     ["usage_plan", "用量套餐"],
