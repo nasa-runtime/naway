@@ -97,6 +97,12 @@ const definitions = {
     ],
   ],
 
+  portal_settings: [
+    ["enabled", "启用开发者门户", "boolean"],
+    ["public_catalog", "允许公开读取门户目录与文档", "boolean"],
+    ["max_document_bytes", "单份原始文档字节上限（1024–8388608）", "number"],
+  ],
+
   portal_management: [
     ["identity_domain", "SSO 主体身份域（变更将改变主体归属）", "string"],
     ["sso", "完整 SSO JSON 声明（替换全部登录策略）", "json"],
@@ -364,6 +370,9 @@ export function namedObject(kind) {
  * 返回：可作为纯文本显示的名称，不用于解析或还原对象身份。
  */
 export function objectLabel(object) {
+  if (object.kind === "portal_settings") {
+    return "portal_settings · 门户全局设置";
+  }
   if (object.kind === "portal_management") {
     return "portal_management · 身份与会话设置";
   }

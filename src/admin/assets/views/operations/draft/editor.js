@@ -299,7 +299,8 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
     }
     identity.textContent = `${isNew ? "准备新增" : "当前对象"}：${objectLabel(object)}`;
     apply.disabled = false;
-    agreeLabel.hidden = isNew || object.kind === "portal_management";
+    agreeLabel.hidden =
+      isNew || ["portal_management", "portal_settings"].includes(object.kind);
     notice.textContent =
       "仅显式设置或移除的字段进入候选，最终合法性由目标完整构建器判断。";
   }
@@ -403,12 +404,12 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
       !agreement.checked ||
       !selected ||
       creating ||
-      selected.kind === "portal_management";
+      ["portal_management", "portal_settings"].includes(selected.kind);
   });
   remove.addEventListener("click", () => {
     if (
       selected &&
-      selected.kind !== "portal_management" &&
+      !["portal_management", "portal_settings"].includes(selected.kind) &&
       !creating &&
       agreement.checked
     ) {

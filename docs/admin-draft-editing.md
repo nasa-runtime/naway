@@ -693,6 +693,16 @@ API 产品以独立 `product` 对象定位 `developer_portal.products` 中的稳
 完整集合或元素替换会移除旧声明中未提供的其它字段。编辑成功不代表文件可读、门户已开启、合同合法或取得了发布权限，最终由原
 目标完整预检、审批和执行裁决。
 
+门户全局设置使用无额外身份字段的 `portal_settings` 单例，固定定位既有的 `developer_portal`。
+仅编辑 `enabled`、`public_catalog` 和 `max_document_bytes` 三个标量；`catalogs`、`products`、
+`management`、`key_applications` 受普通、移除、嵌套和列表动作共同保护，应各自独立维护。
+缺失门户不列入目录，错型声明拒绝，此入口不能新建或移除整个门户。
+
+文档上限为1024–8388608字节，完整预检按实际原始文件和投影合同构建。关闭门户必须同时满足
+目录与产品为空、无管理声明、申请入口关闭且 `public_catalog=false`，不会自动清除这些配置。
+公开读开关只控制门户目录与文档，不授予团队角色、订阅或产品业务请求权限；生成候选仍须
+原目标完整预检、独立审批与执行后生效。
+
 门户身份与会话设置使用无额外身份字段的 `portal_management` 单例，固定定位既有的
 `developer_portal.management`。管理声明缺失或为 `null` 时不列入目录；此入口不能新建或删除
 整个管理声明，也不会改变门户开关。`teams`、`applications`、`bindings` 三个子容器受保护，

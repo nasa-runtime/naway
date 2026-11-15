@@ -13,6 +13,10 @@ import { nestedFields } from "./nested.js";
 export function identityField(kind, name) {
   return (
     name === "id" ||
+    (kind === "portal_settings" &&
+      ["catalogs", "products", "management", "key_applications"].includes(
+        name,
+      )) ||
     (kind === "portal_management" &&
       ["teams", "applications", "bindings"].includes(name)) ||
     (kind === "portal_binding" && ["proxy", "route"].includes(name)) ||
@@ -39,6 +43,15 @@ export function draftFieldPanel(kind, values, capacity) {
   const node = element("div", "", "draft-fields");
   const rows = new Map();
   const known = draftFields(kind);
+  if (kind === "portal_settings") {
+    node.append(
+      element(
+        "p",
+        "这里只编辑既有门户的总开关、公开读面和文档上限。关闭门户要求目录与产品为空、无管理声明、申请入口关闭且不公开目录；这些关系仍须完整预检。目录、产品、身份管理和申请配置各自独立维护，此入口不能新建或移除整个门户。公开目录不授予团队角色、应用订阅或产品业务权限。文档上限按原始文件实际字节校验。",
+        "subtle",
+      ),
+    );
+  }
   if (kind === "portal_management") {
     node.append(
       element(
