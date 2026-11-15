@@ -353,6 +353,12 @@ textarea {
   font-size: 10px;
   color: var(--muted);
 }
+
+.ingress-protection-detail .metric-card:nth-child(2n) strong {
+  font-size: clamp(1rem, 2.2vw, 1.5rem);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
 .monitor-panels {
   display: grid;
   grid-template-columns: 1fr 1fr;

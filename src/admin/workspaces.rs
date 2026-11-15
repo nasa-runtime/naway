@@ -107,6 +107,9 @@ pub(super) async fn handle(req: AdminRequest, state: Arc<AdminState>) -> Respons
     if endpoint == "monitor/services" {
         return monitor::services::read(&state, &request, &snapshot, Some(&workspace));
     }
+    if endpoint == "monitor/ingress" {
+        return monitor::ingress::read(&state, &request, &snapshot, Some(&workspace));
+    }
     if endpoint == "monitor/streams" {
         return monitor::streams::read(&state, &request, &snapshot, Some(&workspace));
     }

@@ -98,6 +98,7 @@ fn name(identity: &Identity<'_>) -> String {
 /// 返回：接入、安全、资源和传输策略一致时为真，不读取流量或连接统计。
 fn same_proxy(current: &ProxyRuntime, candidate: &ProxyRuntime) -> bool {
     let ProxyRuntime {
+        ingress_protection: _,
         #[cfg(feature = "xds-client-extensions")]
         xds_extension_bound,
         id: _,

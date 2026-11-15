@@ -1007,6 +1007,7 @@ impl protocol::node_management_server::NodeManagement for Service {
             service_metrics_supported: true,
             stream_metrics_supported: true,
             route_sentinel_supported: true,
+            ingress_protection_supported: true,
             consumers_supported: true,
             certificates_supported: true,
             preview,

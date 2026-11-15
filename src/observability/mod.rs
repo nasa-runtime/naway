@@ -4,6 +4,7 @@ pub mod access_log;
 pub(crate) mod ai;
 pub(crate) mod circuit;
 pub(crate) mod http_stream;
+pub(crate) mod ingress_protection;
 pub(crate) mod log_sink;
 pub mod logging;
 pub mod meter;

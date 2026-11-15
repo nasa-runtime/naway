@@ -1,5 +1,6 @@
 //! 当前样本的有界上传、完整性校验与内存许可，不建立历史队列。
 
+mod ingress;
 mod routes;
 mod send;
 mod services;

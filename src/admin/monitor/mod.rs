@@ -6,6 +6,7 @@ mod circuit;
 mod cluster;
 mod expiry;
 mod http_stream;
+pub(in crate::admin) mod ingress;
 pub(super) mod model;
 mod process;
 mod publication;

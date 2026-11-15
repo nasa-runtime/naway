@@ -595,6 +595,8 @@ pub struct ProxyProtocolRuntimeCfg {
 #[derive(Clone)]
 /// 已完成校验、可直接驱动数据面的代理运行时快照。
 pub struct ProxyRuntime {
+    /// 接入入口的明确守卫拒绝属于本配置所有者，不能从尚未匹配的路由推导归属。
+    pub(crate) ingress_protection: Arc<crate::observability::ingress_protection::Counters>,
     /// 动态终结器必须在当前快照中仍具备权威；旧物理连接不能代替已撤回的 ECDS 证明。
     #[cfg(feature = "xds-client-extensions")]
     pub(crate) xds_extension_bound: bool,
@@ -4526,6 +4528,7 @@ fn build_proxy_from_parts(
         }
     );
     Ok(ProxyRuntime {
+        ingress_protection: Arc::default(),
         #[cfg(feature = "xds-client-extensions")]
         xds_extension_bound: false,
         id: id.to_string(),

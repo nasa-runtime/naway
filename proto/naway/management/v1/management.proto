@@ -155,6 +155,8 @@ message ReportResponse {
   bool stream_metrics_supported = 13;
   // 路由 Sentinel 裁决使用独立协商，旧接收端继续验证原流量字段及摘要。
   bool route_sentinel_supported = 14;
+  // HTTP入口守卫事实独立协商，不授予全局规则或动态管理权限。
+  bool ingress_protection_supported = 15;
 }
 
 // 原目标字段复用结构，内层 signature 必须为空；只有外层独立签名可以授权候选下载。
@@ -833,6 +835,15 @@ message SampleHeader {
   uint32 service_total = 14;
   optional bool stream_capacity = 15;
   uint32 stream_total = 16;
+  optional bool ingress_capacity = 17;
+  uint32 ingress_total = 18;
+}
+
+// 按实际接入HTTP入口观察，固定顺序为静态守卫、动态接口禁用；不携带规则或请求身份。
+message IngressProtection {
+  string listener = 1;
+  string workspace = 2;
+  repeated uint64 rejections = 3;
 }
 
 // 监听器事实只归属接入时的配置；固定数组不包含客户端地址或业务标签。
@@ -904,6 +915,7 @@ message SampleRequest {
   repeated RouteTraffic routes = 9;
   repeated ServiceState services = 10;
   repeated StreamTraffic streams = 11;
+  repeated IngressProtection ingress = 12;
 }
 
 message SampleResponse {

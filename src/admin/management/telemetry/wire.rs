@@ -1,6 +1,6 @@
 //! 固定字段摘要与类型化分片；网络边界之外共享同一累计样本。
 
-use super::{routes, services, streams};
+use super::{ingress, routes, services, streams};
 use super::{CHUNK, SAMPLE_BYTES};
 use crate::admin::management::protocol;
 use crate::admin::monitor::model::{self, Histogram, NodeState, Reading, Sample, Value};
@@ -21,6 +21,7 @@ pub(in crate::admin::management) struct Candidate {
     route_total: usize,
     service_total: usize,
     stream_total: usize,
+    ingress_total: usize,
     frames: usize,
 }
 
@@ -215,6 +216,8 @@ pub(in crate::admin::management) fn frame(
         service_total: service_state.map_or(0, |value| value.rows.len() as u32),
         stream_capacity: None,
         stream_total: 0,
+        ingress_capacity: None,
+        ingress_total: 0,
         bounds_ms: sample.latency.bounds_ms.clone(),
         buckets: sample.latency.buckets.clone(),
         sum_micros: sample.latency.sum_micros,
@@ -256,6 +259,7 @@ pub(in crate::admin::management) fn frame(
                     .collect()
             }),
         streams: Vec::new(),
+        ingress: Vec::new(),
         readings: sample.readings
             [offset.min(sample.readings.len())..(offset + CHUNK).min(sample.readings.len())]
             .iter()
@@ -373,10 +377,13 @@ impl Candidate {
             || (header.service_capacity != Some(false) && header.service_total != 0)
             || header.stream_total as usize > crate::observability::stream_traffic::MAX_LISTENERS
             || (header.stream_capacity != Some(false) && header.stream_total != 0)
+            || header.ingress_total as usize > crate::observability::ingress_protection::MAX_ENTRIES
+            || (header.ingress_capacity != Some(false) && header.ingress_total != 0)
             || (header.total as usize).div_ceil(CHUNK)
                 + (header.route_total as usize).div_ceil(routes::CHUNK)
                 + (header.service_total as usize).div_ceil(services::CHUNK)
                 + (header.stream_total as usize).div_ceil(streams::CHUNK)
+                + (header.ingress_total as usize).div_ceil(ingress::CHUNK)
                 > 65
             || header.bounds_ms.len() > 32
             || header.buckets.len() != header.bounds_ms.len() + 1
@@ -407,6 +414,7 @@ impl Candidate {
             route_total: header.route_total as usize,
             service_total: header.service_total as usize,
             stream_total: header.stream_total as usize,
+            ingress_total: header.ingress_total as usize,
             frames: 0,
             sample: Sample {
                 schema_version: 1,
@@ -449,6 +457,12 @@ impl Candidate {
                         rows: Vec::with_capacity(header.stream_total as usize),
                     }
                 }),
+                ingress_protection: header.ingress_capacity.map(|capacity| {
+                    crate::observability::ingress_protection::Snapshot {
+                        capacity,
+                        rows: Vec::with_capacity(header.ingress_total as usize),
+                    }
+                }),
             },
         };
         candidate.push(first)?;
@@ -481,6 +495,11 @@ impl Candidate {
             .stream_traffic
             .as_ref()
             .map_or(0, |value| value.rows.len());
+        let ingress_received = self
+            .sample
+            .ingress_protection
+            .as_ref()
+            .map_or(0, |value| value.rows.len());
         let expected_routes = if readings_remaining == 0 {
             routes::CHUNK.min(self.route_total.saturating_sub(routes_received))
         } else {
@@ -499,6 +518,15 @@ impl Candidate {
         } else {
             0
         };
+        let expected_ingress = if readings_remaining == 0
+            && routes_received == self.route_total
+            && services_received == self.service_total
+            && streams_received == self.stream_total
+        {
+            ingress::CHUNK.min(self.ingress_total.saturating_sub(ingress_received))
+        } else {
+            0
+        };
         if self.frames >= 65
             || part.encoded_len() > super::super::MAX_MESSAGE
             || part.header.is_some()
@@ -512,15 +540,18 @@ impl Candidate {
                     + routes_received
                     + services_received
                     + streams_received
+                    + ingress_received
             || part.readings.len() != CHUNK.min(readings_remaining)
             || part.routes.len() != expected_routes
             || part.services.len() != expected_services
             || part.streams.len() != expected_streams
+            || part.ingress.len() != expected_ingress
             || (self.frames > 0
                 && readings_remaining == 0
                 && routes_received == self.route_total
                 && services_received == self.service_total)
                 && streams_received == self.stream_total
+                && ingress_received == self.ingress_total
         {
             return Err(Status::invalid_argument("sample fragment mismatch"));
         }
@@ -621,6 +652,24 @@ impl Candidate {
             }
             current.rows.push(row);
         }
+        for row in part.ingress {
+            let row = ingress::decode(row)?;
+            let current = self
+                .sample
+                .ingress_protection
+                .as_mut()
+                .ok_or_else(|| Status::invalid_argument("unexpected ingress facts"))?;
+            if current
+                .rows
+                .last()
+                .is_some_and(|old| old.listener >= row.listener)
+            {
+                return Err(Status::invalid_argument(
+                    "ingress facts must be unique and ordered",
+                ));
+            }
+            current.rows.push(row);
+        }
         Ok(())
     }
 
@@ -649,10 +698,19 @@ impl Candidate {
                 .as_ref()
                 .map_or(0, |value| value.rows.len())
                 != self.stream_total
+            || self
+                .sample
+                .ingress_protection
+                .as_ref()
+                .map_or(0, |value| value.rows.len())
+                != self.ingress_total
             || !model::validate(&mut self.sample)
-            || routes::sentinel_digest(
-                self.sample.route_traffic.as_ref(),
-                digest_with_streams(&self.sample, true),
+            || ingress::digest(
+                self.sample.ingress_protection.as_ref(),
+                routes::sentinel_digest(
+                    self.sample.route_traffic.as_ref(),
+                    digest_with_streams(&self.sample, true),
+                ),
             ) != self.digest
         {
             return Err(Status::data_loss("incomplete or inconsistent sample"));

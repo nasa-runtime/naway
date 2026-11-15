@@ -1368,10 +1368,16 @@ impl GatewayProxy {
         } else if let Some((resp, rule_id)) = self.interface_disable.check(&parts) {
             tracing::debug!(rule = %rule_id, path = parts.uri.path(), "interface dynamically disabled");
             self.metrics.inc_interface_blocked();
+            proxy_runtime
+                .ingress_protection
+                .reject(crate::observability::ingress_protection::Rejection::Dynamic);
             resp
         } else if let Some((resp, rule_id)) = snap.interface_guard.check(&parts) {
             tracing::debug!(rule = rule_id, path = parts.uri.path(), "interface blocked");
             self.metrics.inc_interface_blocked();
+            proxy_runtime
+                .ingress_protection
+                .reject(crate::observability::ingress_protection::Rejection::Static);
             resp
         } else if !host_allowed(&parts, proxy_runtime.server_names.as_slice()) {
             self.metrics.inc_no_route();

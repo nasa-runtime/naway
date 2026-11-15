@@ -616,6 +616,7 @@ pub(crate) fn materialize_policy_snapshot(
                 .map(|tls| materialize_listener_tls(listener, tls, &policy.secrets))
                 .transpose()?;
             proxies.push(ProxyRuntime {
+                ingress_protection: Arc::default(),
                 #[cfg(feature = "xds-client-extensions")]
                 xds_extension_bound: listener.extension_name.is_some(),
                 id: listener.name.clone(),

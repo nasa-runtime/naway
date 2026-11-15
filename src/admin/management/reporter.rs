@@ -26,6 +26,7 @@ struct Target {
     service_metrics_supported: bool,
     stream_metrics_supported: bool,
     route_sentinel_supported: bool,
+    ingress_protection_supported: bool,
     issuer: Option<Arc<super::issuer::Verifier>>,
     #[cfg(feature = "node-actions")]
     actions: super::actions::Channel,
@@ -119,6 +120,7 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     service_metrics_supported: false,
                     stream_metrics_supported: false,
                     route_sentinel_supported: false,
+                    ingress_protection_supported: false,
                     issuer: target.issuer.clone(),
                     #[cfg(feature = "node-actions")]
                     actions: super::actions::Channel::default(),
@@ -299,6 +301,7 @@ async fn send(target: &mut Target, round: &Round<'_>) {
         let service_supported = target.service_metrics_supported;
         let stream_supported = target.stream_metrics_supported;
         let sentinel_supported = target.route_sentinel_supported;
+        let ingress_supported = target.ingress_protection_supported;
         let metrics = async {
             if let Some(sample) = upload {
                 let _ = telemetry::upload(
@@ -307,7 +310,12 @@ async fn send(target: &mut Target, round: &Round<'_>) {
                     facts.node_id.clone(),
                     session,
                     deadline,
-                    (service_supported, stream_supported, sentinel_supported),
+                    (
+                        service_supported,
+                        stream_supported,
+                        sentinel_supported,
+                        ingress_supported,
+                    ),
                 )
                 .await;
             }
@@ -623,6 +631,7 @@ async fn exchange(
     target.service_metrics_supported = response.service_metrics_supported;
     target.stream_metrics_supported = response.stream_metrics_supported;
     target.route_sentinel_supported = response.route_sentinel_supported;
+    target.ingress_protection_supported = response.ingress_protection_supported;
     target.consumers_supported = response.consumers_supported;
     target.certificates_supported = response.certificates_supported;
     if !target.certificates_supported {

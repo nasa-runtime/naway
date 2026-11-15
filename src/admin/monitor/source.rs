@@ -58,6 +58,18 @@ pub(super) fn sample(
         streams.capacity = true;
         streams.rows = Vec::new();
     }
+    let mut ingress = crate::observability::ingress_protection::capture(snapshot);
+    // 入口观测复用原总分片预算；其它事实已占满时撤下新域，不能挤掉既有事实或提交部分入口。
+    if readings.len().div_ceil(64)
+        + routes.rows.len().div_ceil(32)
+        + services.rows.len().div_ceil(32)
+        + streams.rows.len().div_ceil(32)
+        + ingress.rows.len().div_ceil(32)
+        > 65
+    {
+        ingress.capacity = true;
+        ingress.rows = Vec::new();
+    }
     model::Sample {
         schema_version: 1,
         boot_id: runtime.boot_id.clone(),
@@ -87,6 +99,7 @@ pub(super) fn sample(
         route_traffic: Some(routes),
         service_state: Some(services),
         stream_traffic: Some(streams),
+        ingress_protection: Some(ingress),
         capabilities: [
             ("core", true),
             ("sentinel_queue", true),

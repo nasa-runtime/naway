@@ -69,6 +69,9 @@ pub(in crate::admin) struct Sample {
     // 原始指标抓取不授予监听器目录权；同代归属事实仅由明确授权的管理链路交付。
     #[serde(skip)]
     pub stream_traffic: Option<crate::observability::stream_traffic::Snapshot>,
+    // 入口身份只通过授权管理链交付，不能由原始HTTP指标抓取旁路读取。
+    #[serde(skip)]
+    pub ingress_protection: Option<crate::observability::ingress_protection::Snapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,6 +166,10 @@ pub(in crate::admin) fn validate(sample: &mut Sample) -> bool {
             .stream_traffic
             .as_ref()
             .is_some_and(|streams| !streams.valid())
+        || sample
+            .ingress_protection
+            .as_ref()
+            .is_some_and(|ingress| !ingress.valid())
         || !sample
             .latency
             .bounds_ms
@@ -442,5 +449,9 @@ pub(in crate::admin) fn retained_bytes(sample: &Sample) -> usize {
         .stream_traffic
         .as_ref()
         .map_or(0, |streams| streams.retained_bytes());
+    bytes += sample
+        .ingress_protection
+        .as_ref()
+        .map_or(0, |ingress| ingress.retained_bytes());
     bytes
 }

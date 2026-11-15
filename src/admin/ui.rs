@@ -21,6 +21,7 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
         | "/catalog"
         | "/operations"
         | "/traffic"
+        | "/ingress"
         | "/streams"
         | "/services"
         | "/consumers"
@@ -52,6 +53,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
         "/ui/views/routes.js" => (
             "application/javascript; charset=utf-8",
             include_bytes!("assets/views/routes.js"),
+        ),
+        "/ui/views/ingress.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/ingress.js"),
         ),
         "/ui/views/streams.js" => (
             "application/javascript; charset=utf-8",

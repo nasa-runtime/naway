@@ -5,6 +5,7 @@ import { mount as nodes } from "../views/nodes.js";
 import { mount as catalog } from "../views/catalog.js";
 import { mount as operations } from "../views/operations.js";
 import { mount as routeTraffic } from "../views/routes.js";
+import { mount as ingressProtection } from "../views/ingress.js";
 import { mount as streamTraffic } from "../views/streams.js";
 import { mount as services } from "../views/services.js";
 import { mount as consumers } from "../views/consumers.js";
@@ -71,6 +72,15 @@ function navigate(name, service = "") {
     document.getElementById("subtitle").textContent =
       "集群与工作区 · 当前区间、完整覆盖与流结束事实";
     dispose = routeTraffic(root, session);
+  } else if (
+    name === "ingress" &&
+    ((allowed("cluster") && allowed("interface-guard")) ||
+      session.workspaces?.length)
+  ) {
+    document.getElementById("title").textContent = "HTTP入口防护";
+    document.getElementById("subtitle").textContent =
+      "集群与工作区 · 实际接入入口的静态与动态守卫拒绝";
+    dispose = ingressProtection(root, session);
   } else if (
     name === "streams" &&
     ((allowed("cluster") && allowed("config")) || session.workspaces?.length)
@@ -222,6 +232,10 @@ async function login(event) {
       (allowed("cluster") && allowed("config")) ||
       session.workspaces?.length
     );
+    document.getElementById("ingress-nav").disabled = !(
+      (allowed("cluster") && allowed("interface-guard")) ||
+      session.workspaces?.length
+    );
     document.getElementById("nodes-nav").disabled = !allowed("cluster");
     document.getElementById("services-nav").disabled = !(
       (allowed("cluster") && allowed("upstreams")) ||
@@ -247,34 +261,37 @@ async function login(event) {
       !["routes", "config", "upstreams"].some((resource) => allowed(resource));
     notice.textContent = "";
     navigate(
-      location.pathname === "/certificate-proposals" &&
-        !document.getElementById("materials-nav").disabled
-        ? "materials"
-        : location.pathname === "/certificates" &&
-            !document.getElementById("certificates-nav").disabled
-          ? "certificates"
-          : location.pathname === "/consumers" &&
-              !document.getElementById("consumers-nav").disabled
-            ? "consumers"
-            : location.pathname === "/services" &&
-                !document.getElementById("services-nav").disabled
-              ? "services"
-              : location.pathname === "/traffic" &&
-                  !document.getElementById("traffic-nav").disabled
-                ? "traffic"
-                : location.pathname === "/streams" &&
-                    !document.getElementById("streams-nav").disabled
-                  ? "streams"
-                  : location.pathname === "/operations"
-                    ? "operations"
-                    : allowed("cluster")
-                      ? location.pathname === "/catalog" &&
-                        !document.getElementById("catalog-nav").disabled
-                        ? "catalog"
-                        : location.pathname === "/cluster"
-                          ? "nodes"
-                          : "monitor"
-                      : "system",
+      location.pathname === "/ingress" &&
+        !document.getElementById("ingress-nav").disabled
+        ? "ingress"
+        : location.pathname === "/certificate-proposals" &&
+            !document.getElementById("materials-nav").disabled
+          ? "materials"
+          : location.pathname === "/certificates" &&
+              !document.getElementById("certificates-nav").disabled
+            ? "certificates"
+            : location.pathname === "/consumers" &&
+                !document.getElementById("consumers-nav").disabled
+              ? "consumers"
+              : location.pathname === "/services" &&
+                  !document.getElementById("services-nav").disabled
+                ? "services"
+                : location.pathname === "/traffic" &&
+                    !document.getElementById("traffic-nav").disabled
+                  ? "traffic"
+                  : location.pathname === "/streams" &&
+                      !document.getElementById("streams-nav").disabled
+                    ? "streams"
+                    : location.pathname === "/operations"
+                      ? "operations"
+                      : allowed("cluster")
+                        ? location.pathname === "/catalog" &&
+                          !document.getElementById("catalog-nav").disabled
+                          ? "catalog"
+                          : location.pathname === "/cluster"
+                            ? "nodes"
+                            : "monitor"
+                        : "system",
     );
   } catch (error) {
     if (attempt === epoch && error.name !== "AbortError") {

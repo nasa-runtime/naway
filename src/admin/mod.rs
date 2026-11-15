@@ -782,6 +782,9 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
         (&Method::GET, "/api/monitor/streams") => {
             monitor::streams::read(&state, &request, &state.snap.load_full(), None)
         }
+        (&Method::GET, "/api/monitor/ingress") => {
+            monitor::ingress::read(&state, &request, &state.snap.load_full(), None)
+        }
         (&Method::GET, "/api/cluster/catalog") => catalog::read(&state, &request).await,
         (&Method::GET, "/api/cluster/consumers") => {
             consumers::read::platform(&state, &request).await
@@ -1030,6 +1033,7 @@ fn admin_permission(method: &Method, path: &str) -> Option<(AdminResource, Admin
             Some((AdminResource::Cluster, AdminAction::Read))
         }
         (&Method::GET, "/api/monitor/streams") => Some((AdminResource::Cluster, AdminAction::Read)),
+        (&Method::GET, "/api/monitor/ingress") => Some((AdminResource::Cluster, AdminAction::Read)),
         (
             &Method::GET,
             "/api/cluster/catalog" | "/api/cluster/consumers" | "/api/cluster/certificates",
