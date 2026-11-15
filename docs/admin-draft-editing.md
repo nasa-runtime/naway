@@ -759,6 +759,14 @@ DSL，不是其全部参数的类型化配置，不读取秘密。OIDC 组只来
 精确 HTTPS origin 必须已获批准。错型的父值须整值替换，不隐式覆盖；整值与子项同次编辑
 会被拒绝。未修改声明保持原值，协议合同与权限仍由原目标完整预检裁决。
 
+显式 `type: oidc` 且以 `oidc_rp ` 开头的原始 filter 另提供五项登录预算控件：`timeout_ms`
+为1–60000毫秒，`session_ttl_secs` 为60–86400秒，`pending_ttl_secs` 为30–900秒，`max_pending`
+为1–10000，`max_sessions` 为1–1000000。设置只接受明确的十进制整数；移除参数恢复原生缺省
+语义，不补其它默认字段。端点、凭据与 CA 引用、未编辑参数、原顺序和空白保持原文，不读取
+材料或连接身份服务。重复预算或残缺 token 不进行子项编辑，须明确处理整段 filter。
+预算子项不能与整段 SSO 或 `sso.filter` 同次编辑；有效会话仍受管理预算与 token 剩余寿命
+共同收紧，不能因增大某一项而绕过其它上限。其它 OIDC 参数和 SAML filter 继续使用原文编辑。
+
 门户团队以 `portal_team` 独立身份定位 `developer_portal.management.teams`，提供标题、应用数量
 上限与完整 `group_roles` / `subject_roles` JSON 映射。映射替换会移除未提供的旧成员授权，角色为
 `viewer / developer / owner`；可信 subject 和 groups 只能来自实际 SSO 验证，客户端头不能代替。
