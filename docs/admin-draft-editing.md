@@ -711,6 +711,18 @@ OpenAPI 路由目录以 `portal_catalog` 和稳定 `id` 定位 `developer_portal
 门户启用时若删除最后目录且没有产品，构建会拒绝。所有文档加载、投影与路由构建完成后才
 交换快照，草稿不会单独发布半完成路由。
 
+待审批 key 申请设置使用 `portal_key_applications` 单例，固定定位既有
+`developer_portal.key_applications`。可原位设置 `enabled`、`authorization_token`、`collection`、
+`max_body_bytes` 与 `max_pending`，无额外 `id` 或 `name`；缺失声明不列入目录，不补默认字段，
+显式 `null` 或其它错型拒绝。此入口不能新建或删除整个配置，也不能直接编辑存储中的申请记录。
+
+专用 Bearer 与管理员凭据、SSO 身份独立，界面只编辑 SecretSource 原文，不读取材料；启用时
+原目标构建须解析为16–65536字节。关闭入口必须明确移除或清空凭据声明，不会自动清理。请求体
+上限为1024–65536字节，集合容量为1–100000；集合换名不会删除旧集合。容量满仍可覆盖相同
+目录与申请人标识的既有记录，受理成功只返回 `pending`，不会签发 key、授予订阅或业务权限。
+启用的集合名只接受1–64个 ASCII 字母、数字或 `.`、`_`、`-`，并拒绝保留点路径 `.` 和 `..`。
+目录与用量套餐引用、集合名、凭据和预算由原目标完整预检裁决，审批执行前不会改变在线入口。
+
 门户全局设置使用无额外身份字段的 `portal_settings` 单例，固定定位既有的 `developer_portal`。
 仅编辑 `enabled`、`public_catalog` 和 `max_document_bytes` 三个标量；`catalogs`、`products`、
 `management`、`key_applications` 受普通、移除、嵌套和列表动作共同保护，应各自独立维护。

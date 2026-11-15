@@ -303,7 +303,7 @@ impl DeveloperPortalRuntime {
 /// - `cfg`：为申请策略
 /// - `config_dir`：用于解析 SecretSource。
 ///
-/// 返回：启用时返回合法策略，关闭时为 None；畸形预算或凭据拒绝候选。
+/// 返回：启用时返回合法策略，关闭时为 None；启用策略的集合名、预算或凭据不合法时拒绝候选。
 fn build_key_applications(
     cfg: &DeveloperKeyApplicationsCfg,
     config_dir: &Path,
@@ -316,6 +316,11 @@ fn build_key_applications(
         return Ok(None);
     }
     validate_token(&cfg.collection, "key application collection")?;
+    // 点路径是 DynamicStore 的保留组件，不能让已知无法持久化的集合等到受理申请时才失败。
+    anyhow::ensure!(
+        !matches!(cfg.collection.as_str(), "." | ".."),
+        "key application collection cannot be a reserved dot path"
+    );
     anyhow::ensure!(
         (1024..=64 * 1024).contains(&cfg.max_body_bytes),
         "developer key application max_body_bytes must be within 1024..=65536"

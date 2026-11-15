@@ -28,6 +28,7 @@ pub(super) enum Object {
     },
     PortalSettings {},
     PortalManagement {},
+    PortalKeyApplications {},
     PortalTeam {
         id: String,
     },
@@ -80,6 +81,7 @@ impl Object {
     pub(super) fn validate(&self, domain: Domain) -> Result<(), Error> {
         let (expected, id, parent): (Domain, &str, Option<&str>) = match self {
             Self::PortalSettings {} => (Domain::Gateway, "developer_portal", None),
+            Self::PortalKeyApplications {} => (Domain::Gateway, "key_applications", None),
             Self::PortalManagement {} => (Domain::Gateway, "management", None),
             Self::Route {
                 proxy,
@@ -152,6 +154,7 @@ impl Object {
     fn id(&self) -> &str {
         match self {
             Self::PortalSettings {} => "developer_portal",
+            Self::PortalKeyApplications {} => "key_applications",
             Self::PortalManagement {} => "management",
             Self::Route {
                 id,
@@ -235,7 +238,8 @@ impl Object {
                 ..
             }
             | Self::PortalManagement {}
-            | Self::PortalSettings {} => None,
+            | Self::PortalSettings {}
+            | Self::PortalKeyApplications {} => None,
             Self::Credential {
                 ..
             }
@@ -250,7 +254,7 @@ impl Object {
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：服务、套餐、组和消费者绑定的内部父键及集合键；数组对象返回空。
+    /// 返回：服务、套餐、组和消费者绑定的内部父键及集合键；其它对象返回空。
     fn mapping_path(&self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::Service {
@@ -495,6 +499,13 @@ pub(super) fn catalog(document: &Value, domain: Domain) -> Result<BTreeSet<Objec
                         insert(object_binding(binding)?)?;
                     }
                 }
+                if let Some(settings) = portal.get("key_applications") {
+                    if !settings.is_object() {
+                        // 申请配置不是可空管理策略，null 不能被解释成原生的默认关闭声明。
+                        return Err(Error::Invalid);
+                    }
+                    insert(Object::PortalKeyApplications {})?;
+                }
             }
         }
         Domain::Sentinel => {
@@ -606,6 +617,14 @@ pub(super) fn find_mut<'a>(
         return child(
             child(document, "developer_portal", None)?,
             "management",
+            None,
+        );
+    }
+    if matches!(object, Object::PortalKeyApplications {}) {
+        // 只编辑既有申请策略，不创建申请记录或隐式生成独立 Bearer 凭据。
+        return child(
+            child(document, "developer_portal", None)?,
+            "key_applications",
             None,
         );
     }
@@ -814,7 +833,8 @@ fn collection_mut<'a>(
             ..
         }
         | Object::PortalManagement {}
-        | Object::PortalSettings {} => return Err(Error::Invalid),
+        | Object::PortalSettings {}
+        | Object::PortalKeyApplications {} => return Err(Error::Invalid),
     };
     child(parent, key, create.then(|| Value::Array(Vec::new())))?
         .as_array_mut()
@@ -836,7 +856,7 @@ pub(super) fn create(
 ) -> Result<(), Error> {
     if matches!(
         object,
-        Object::PortalManagement {} | Object::PortalSettings {}
+        Object::PortalManagement {} | Object::PortalSettings {} | Object::PortalKeyApplications {}
     ) {
         // 门户单例承载独立授权声明，不能通过通用新建动作生成不完整配置。
         return Err(Error::Invalid);
@@ -883,7 +903,7 @@ pub(super) fn create(
 pub(super) fn delete(document: &mut Value, object: &Object) -> Result<(), Error> {
     if matches!(
         object,
-        Object::PortalManagement {} | Object::PortalSettings {}
+        Object::PortalManagement {} | Object::PortalSettings {} | Object::PortalKeyApplications {}
     ) {
         // 单例设置入口不承担整体移除语义，不能连带删除门户目录、团队和应用授权。
         return Err(Error::Invalid);

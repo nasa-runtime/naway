@@ -109,6 +109,14 @@ const definitions = {
     ["order", "生成路由顺序", "number"],
   ],
 
+  portal_key_applications: [
+    ["enabled", "开放待审批 key 申请入口", "boolean"],
+    ["authorization_token", "申请专用 Bearer 的 SecretSource 原文", "string"],
+    ["collection", "pending 申请存储集合", "string"],
+    ["max_body_bytes", "单份申请 JSON 字节上限（1024–65536）", "number"],
+    ["max_pending", "申请集合容量上限（1–100000）", "number"],
+  ],
+
   portal_settings: [
     ["enabled", "启用开发者门户", "boolean"],
     ["public_catalog", "允许公开读取门户目录与文档", "boolean"],
@@ -383,6 +391,9 @@ export function namedObject(kind) {
  * 返回：可作为纯文本显示的名称，不用于解析或还原对象身份。
  */
 export function objectLabel(object) {
+  if (object.kind === "portal_key_applications") {
+    return "portal_key_applications · 待审批 key 申请设置";
+  }
   if (object.kind === "portal_settings") {
     return "portal_settings · 门户全局设置";
   }

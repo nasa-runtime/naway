@@ -43,6 +43,15 @@ export function draftFieldPanel(kind, values, capacity) {
   const node = element("div", "", "draft-fields");
   const rows = new Map();
   const known = draftFields(kind);
+  if (kind === "portal_key_applications") {
+    node.append(
+      element(
+        "p",
+        "此策略只控制 pending 申请，成功受理不会签发 key 或赋予业务权限。申请使用独立 Bearer，管理员 Token 与 SSO 角色不能替代；这里只编辑 SecretSource 原文，不读取材料。关闭时须明确移除或清空凭据声明。集合换名不会删除旧申请，满额仍允许同一目录与申请人标识的幂等覆盖；预算和引用须完整预检。此入口只编辑既有配置，不能新建或删除整个申请策略，也不直接编辑待审批记录。",
+        "subtle",
+      ),
+    );
+  }
   if (kind === "portal_catalog") {
     node.append(
       element(

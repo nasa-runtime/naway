@@ -793,7 +793,13 @@ export function fieldAction(object, patch, creating) {
   const edits = patch.edits ?? [];
   if (creating) {
     // 单例依赖完整既有登录声明，不能从通用新增面板隐式建立授权配置。
-    if (["portal_management", "portal_settings"].includes(object.kind)) {
+    if (
+      [
+        "portal_management",
+        "portal_settings",
+        "portal_key_applications",
+      ].includes(object.kind)
+    ) {
       throw new Error("此设置只能编辑既有声明。");
     }
     if (patch.remove.length || edits.some((edit) => edit.op === "remove")) {
