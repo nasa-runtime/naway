@@ -3,6 +3,7 @@ import { draftFieldPanel } from "./fields.js";
 import { objectKinds, objectLabel, namedObject } from "./schema.js";
 import { fieldAction } from "./nested.js";
 import { sequenceEditor } from "./sequence.js";
+import { portalTeamRoleEditor } from "./portal_team_roles.js";
 import { keyEditor, keySecret } from "./keys.js";
 import { degraphqlVariableEditor } from "./route_degraphql.js";
 import { aiConsumerGroupEditor } from "./route_ai_security.js";
@@ -195,6 +196,23 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
           },
         ),
       );
+      if (object.kind === "portal_team") {
+        body.append(
+          portalTeamRoleEditor(
+            object,
+            values,
+            (action) => {
+              // 成员动作始终绑定已读团队与原文，不能沿用新建或已退休选择的授权。
+              if (selected === object && fields && !creating) {
+                perform(action, publish);
+              }
+            },
+            () => {
+              generation += 1;
+            },
+          ),
+        );
+      }
       if (object.kind === "route") {
         body.append(
           aiConsumerGroupEditor(

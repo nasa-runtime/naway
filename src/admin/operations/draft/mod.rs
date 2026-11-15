@@ -4,9 +4,10 @@ mod binding;
 mod keys;
 mod nested;
 mod objects;
+mod roles;
 mod sequence;
 
-use super::model::{hex, Domain, Error};
+use super::model::{Domain, Error, hex};
 use crate::admin::{self, AdminState, BoxBody};
 use bytes::Bytes;
 use http::{Response, StatusCode};
@@ -29,6 +30,11 @@ struct Request {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
+    TeamRoles {
+        object: Object,
+        field: roles::Field,
+        edit: roles::Edit,
+    },
     Keys {
         object: Object,
         edit: keys::Edit,
@@ -174,6 +180,17 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
         }));
     }
     let changed = match action {
+        Action::TeamRoles {
+            object,
+            field,
+            edit,
+        } => {
+            roles::validate_object(&object, domain)?;
+            if !catalog.contains(&object) {
+                return Err(Error::Missing);
+            }
+            roles::patch(objects::find_mut(&mut document, &object)?, field, edit)?
+        }
         Action::Keys {
             object,
             edit,
