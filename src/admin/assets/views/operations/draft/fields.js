@@ -4,15 +4,17 @@ import { fieldRow } from "./controls.js";
 import { nestedFields } from "./nested.js";
 
 /**
- * 业务作用：保护字段编辑中已绑定的目录和授权身份，换名须由完整元素替换明确表达。
+ * 业务作用：保护字段编辑中的目录身份与独立管理容器，避免绕过对象边界改变授权。
  * 参数说明：
  * - `kind`：当前元素的草稿类别。
  * - `name`：原始字段名。
- * 返回：已受保护的身份字段为 true；新增元素的已声明字段仍由其独立定义开放。
+ * 返回：身份或单例子容器受保护时为 true；其它字段继续由其独立定义开放。
  */
-function identityField(kind, name) {
+export function identityField(kind, name) {
   return (
     name === "id" ||
+    (kind === "portal_management" &&
+      ["teams", "applications", "bindings"].includes(name)) ||
     (kind === "portal_binding" && ["proxy", "route"].includes(name)) ||
     (name === "name" &&
       [
@@ -37,6 +39,15 @@ export function draftFieldPanel(kind, values, capacity) {
   const node = element("div", "", "draft-fields");
   const rows = new Map();
   const known = draftFields(kind);
+  if (kind === "portal_management") {
+    node.append(
+      element(
+        "p",
+        "这里只编辑既有管理声明的身份、SSO、origin 与会话设置。SSO 使用完整 JSON 替换，不读取秘密或授予默认角色；身份域变更会改变主体归属。会话预算与登录策略及 token 剩余有效期共同收紧，不能提高更小的上限。团队、应用和绑定须分别维护；此入口不能新建、删除管理声明或开启门户。",
+        "subtle",
+      ),
+    );
+  }
   if (kind === "product") {
     node.append(
       element(

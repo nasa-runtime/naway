@@ -97,6 +97,14 @@ const definitions = {
     ],
   ],
 
+  portal_management: [
+    ["identity_domain", "SSO 主体身份域（变更将改变主体归属）", "string"],
+    ["sso", "完整 SSO JSON 声明（替换全部登录策略）", "json"],
+    ["allowed_origins", "批准的精确 HTTPS origin（每行一项，1–16项）", "lines"],
+    ["max_sessions", "管理会话容量上限（1–16384）", "number"],
+    ["session_ttl_seconds", "管理会话有效期上限（60–86400秒）", "number"],
+  ],
+
   portal_team: [
     ["title", "门户团队标题", "string"],
     [
@@ -356,6 +364,9 @@ export function namedObject(kind) {
  * 返回：可作为纯文本显示的名称，不用于解析或还原对象身份。
  */
 export function objectLabel(object) {
+  if (object.kind === "portal_management") {
+    return "portal_management · 身份与会话设置";
+  }
   if (object.kind === "portal_binding") {
     return `portal_binding · ${object.proxy} → ${object.route}`;
   }

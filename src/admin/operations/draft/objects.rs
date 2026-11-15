@@ -23,6 +23,7 @@ pub(super) enum Object {
     Product {
         id: String,
     },
+    PortalManagement {},
     PortalTeam {
         id: String,
     },
@@ -73,7 +74,8 @@ impl Object {
     ///
     /// 返回：名称有界且领域一致时成功；分隔符按普通身份字符保留，不做路径解码。
     pub(super) fn validate(&self, domain: Domain) -> Result<(), Error> {
-        let (expected, id, parent) = match self {
+        let (expected, id, parent): (Domain, &str, Option<&str>) = match self {
+            Self::PortalManagement {} => (Domain::Gateway, "management", None),
             Self::Route {
                 proxy,
                 id,
@@ -134,13 +136,14 @@ impl Object {
         Ok(())
     }
 
-    /// 业务作用：取得映射键或数组的单段身份，复合绑定借用 route 分量，实际命中仍复验 proxy。
+    /// 业务作用：取得集合成员的单段身份或单例内部名称，复合绑定命中仍复验 proxy。
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：借用调用者声明中的业务身份，不拼接代理与路由名称。
+    /// 返回：借用成员业务身份；管理单例只使用固定内部名称，不向声明注入身份字段。
     fn id(&self) -> &str {
         match self {
+            Self::PortalManagement {} => "management",
             Self::Route {
                 id,
                 ..
@@ -201,7 +204,7 @@ impl Object {
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：普通数组对象使用 id 或 name；具名 mapping 和使用 proxy/route 组合的门户绑定无单字段身份。
+    /// 返回：普通数组对象使用 id 或 name；具名 mapping、管理单例与组合绑定无单字段身份。
     fn identity_field(&self) -> Option<&'static str> {
         match self {
             Self::Service {
@@ -218,7 +221,8 @@ impl Object {
             }
             | Self::PortalBinding {
                 ..
-            } => None,
+            }
+            | Self::PortalManagement {} => None,
             Self::Credential {
                 ..
             }
@@ -283,12 +287,12 @@ impl Object {
         }
     }
 
-    /// 业务作用：在原文修改前拒绝对稳定身份的字段动作，不能通过嵌套或列表操作绕过选择器。
+    /// 业务作用：保护稳定身份及单例中的独立管理容器，不能通过嵌套或列表动作越过对象边界。
     ///
     /// 参数说明：
     /// - `fields`：普通字段或精确路径的第一段，仅借用调用者声明。
     ///
-    /// 返回：全部字段均不改变对象身份时成功；身份只能在显式新建对象时由选择器提供。
+    /// 返回：字段不改变身份或受保护容器时成功；团队、应用和绑定必须经各自选择器编辑。
     pub(super) fn protect_identity<'a>(
         &self,
         fields: impl Iterator<Item = &'a str>,
@@ -297,6 +301,8 @@ impl Object {
             if Some(field) == self.identity_field()
                 || (matches!(self, Self::PortalBinding { .. })
                     && matches!(field, "proxy" | "route"))
+                || (matches!(self, Self::PortalManagement {})
+                    && matches!(field, "teams" | "applications" | "bindings"))
             {
                 return Err(Error::Invalid);
             }
@@ -450,6 +456,7 @@ pub(super) fn catalog(document: &Value, domain: Domain) -> Result<BTreeSet<Objec
                         // null 明确表示关闭管理；其它错型声明不能被当作没有团队、应用与绑定的空目录。
                         return Err(Error::Invalid);
                     }
+                    insert(Object::PortalManagement {})?;
                     for team in array(management.get("teams"))? {
                         insert(Object::PortalTeam {
                             id: object_id(team)?.into(),
@@ -566,6 +573,14 @@ pub(super) fn find_mut<'a>(
     document: &'a mut Value,
     object: &Object,
 ) -> Result<&'a mut Value, Error> {
+    if matches!(object, Object::PortalManagement {}) {
+        // 单例只定位既有声明，不能沿用集合补齐逻辑隐式建立登录和授权配置。
+        return child(
+            child(document, "developer_portal", None)?,
+            "management",
+            None,
+        );
+    }
     if let Some(path) = object.mapping_path() {
         return mapping_mut(document, path, false)?
             .get_mut(object.id())
@@ -758,7 +773,8 @@ fn collection_mut<'a>(
         }
         | Object::ConsumerBinding {
             ..
-        } => return Err(Error::Invalid),
+        }
+        | Object::PortalManagement {} => return Err(Error::Invalid),
     };
     child(parent, key, create.then(|| Value::Array(Vec::new())))?
         .as_array_mut()
@@ -778,6 +794,10 @@ pub(super) fn create(
     object: &Object,
     mut fields: Map<String, Value>,
 ) -> Result<(), Error> {
+    if matches!(object, Object::PortalManagement {}) {
+        // 管理声明承载完整 SSO 与子对象关系，不能通过通用新建动作生成不完整授权配置。
+        return Err(Error::Invalid);
+    }
     object.protect_identity(fields.keys().map(String::as_str))?;
     if let Some(path) = object.mapping_path() {
         let values = mapping_mut(document, path, true)?;
@@ -818,6 +838,10 @@ pub(super) fn create(
 ///
 /// 返回：精确删除成功；引用是否允许删除由后续目标预检裁决，本函数不发布路由。
 pub(super) fn delete(document: &mut Value, object: &Object) -> Result<(), Error> {
+    if matches!(object, Object::PortalManagement {}) {
+        // 单例设置入口不承担整体停用语义，不能连带删除团队、应用和路由绑定。
+        return Err(Error::Invalid);
+    }
     if let Some(path) = object.mapping_path() {
         mapping_mut(document, path, false)?
             .remove(object.id())

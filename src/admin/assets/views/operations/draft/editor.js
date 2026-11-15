@@ -299,7 +299,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
     }
     identity.textContent = `${isNew ? "准备新增" : "当前对象"}：${objectLabel(object)}`;
     apply.disabled = false;
-    agreeLabel.hidden = isNew;
+    agreeLabel.hidden = isNew || object.kind === "portal_management";
     notice.textContent =
       "仅显式设置或移除的字段进入候选，最终合法性由目标完整构建器判断。";
   }
@@ -399,10 +399,19 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
     }
   });
   agreement.addEventListener("change", () => {
-    remove.disabled = !agreement.checked || !selected || creating;
+    remove.disabled =
+      !agreement.checked ||
+      !selected ||
+      creating ||
+      selected.kind === "portal_management";
   });
   remove.addEventListener("click", () => {
-    if (selected && !creating && agreement.checked) {
+    if (
+      selected &&
+      selected.kind !== "portal_management" &&
+      !creating &&
+      agreement.checked
+    ) {
       perform(
         {
           type: "delete",

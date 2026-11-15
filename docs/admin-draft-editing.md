@@ -693,6 +693,18 @@ API 产品以独立 `product` 对象定位 `developer_portal.products` 中的稳
 完整集合或元素替换会移除旧声明中未提供的其它字段。编辑成功不代表文件可读、门户已开启、合同合法或取得了发布权限，最终由原
 目标完整预检、审批和执行裁决。
 
+门户身份与会话设置使用无额外身份字段的 `portal_management` 单例，固定定位既有的
+`developer_portal.management`。管理声明缺失或为 `null` 时不列入目录；此入口不能新建或删除
+整个管理声明，也不会改变门户开关。`teams`、`applications`、`bindings` 三个子容器受保护，
+普通、嵌套和列表动作均不能从设置单例修改它们，应使用各自的独立对象入口。
+
+设置字段包括 `identity_domain`、完整 `sso` JSON、`allowed_origins`、`max_sessions` 和
+`session_ttl_seconds`。SSO 整值替换须提供完整登录策略，不是所有 SSO DSL 参数的类型化表单；
+界面不读取秘密、不选择 IdP、不授默认角色。身份域变更会改变主体归属。origin 必须为1–16个
+精确 HTTPS origin，管理会话容量为1–16384，有效期为60–86400秒；OIDC 的待登录与活动会话
+预算和 TTL 与登录策略取更小上限，实际会话还受 token 剩余有效期限制。更大的管理预算不能
+提高更小的登录策略上限。字段和逐项 origin 编辑都只生成声明，须原目标完整预检与审批执行。
+
 门户团队以 `portal_team` 独立身份定位 `developer_portal.management.teams`，提供标题、应用数量
 上限与完整 `group_roles` / `subject_roles` JSON 映射。映射替换会移除未提供的旧成员授权，角色为
 `viewer / developer / owner`；可信 subject 和 groups 只能来自实际 SSO 验证，客户端头不能代替。

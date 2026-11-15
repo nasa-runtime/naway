@@ -1,6 +1,6 @@
 import { element } from "../../../core/dom.js";
 import { draftFields } from "./schema.js";
-import { draftFieldPanel } from "./fields.js";
+import { draftFieldPanel, identityField } from "./fields.js";
 import { fieldRow } from "./controls.js";
 import { fieldAction } from "./nested.js";
 import { productDraftLists, validateProductElement } from "./product.js";
@@ -69,6 +69,9 @@ function lists(kind, values) {
       path: [key],
       title,
       type: "string",
+      ...(kind === "portal_management" && key === "allowed_origins"
+        ? { maxItems: 16 }
+        : {}),
     }));
   if (kind === "service") {
     result.push({
@@ -109,7 +112,7 @@ function lists(kind, values) {
   result.push(...routeWebTransportDraftLists(kind));
   for (const [key, value] of Object.entries(values)) {
     if (
-      key !== "id" &&
+      !identityField(kind, key) &&
       Array.isArray(value) &&
       !result.some((item) => item.path[0] === key)
     ) {

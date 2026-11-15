@@ -769,6 +769,10 @@ export function nestedFields(kind, values, capacity) {
 export function fieldAction(object, patch, creating) {
   const edits = patch.edits ?? [];
   if (creating) {
+    // 单例依赖完整既有登录声明，不能从通用新增面板隐式建立授权配置。
+    if (object.kind === "portal_management") {
+      throw new Error("身份与会话设置只能编辑既有管理声明。");
+    }
     if (patch.remove.length || edits.some((edit) => edit.op === "remove")) {
       throw new Error("新增对象不能移除字段，请将不需要的字段保持未声明。");
     }
