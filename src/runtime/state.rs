@@ -106,6 +106,26 @@ pub trait DynamicStore: Send + Sync {
     /// 业务作用：删除一个 key；不存在时也视为成功。
     fn delete<'a>(&'a self, collection: &'a str, key: &'a str) -> StoreFuture<'a, Result<()>>;
 
+    /// 业务作用：仅回收仍与读取值相同的动态事实，避免过期清理删除并发续期。
+    ///
+    /// 参数说明：
+    /// - `collection`：事实所属集合。
+    /// - `key`：待回收的事实键。
+    /// - `expected`：调用方读取的完整原值。
+    ///
+    /// 返回：原子比较并删除成功返回 true；缺失、值变化或后端不支持原子比较时返回 false。
+    fn delete_if_value<'a>(
+        &'a self,
+        collection: &'a str,
+        key: &'a str,
+        expected: &'a [u8],
+    ) -> StoreFuture<'a, Result<bool>> {
+        let _ = (collection, key, expected);
+        Box::pin(async {
+            Ok(false)
+        })
+    }
+
     /// 业务作用：列出 collection 当前全部 key；只供低频控制面刷新使用。
     fn list_keys<'a>(&'a self, collection: &'a str) -> StoreFuture<'a, Result<Vec<String>>>;
 
@@ -373,6 +393,40 @@ impl DynamicStore for FileDynamicStore {
                 Err(e) => {
                     Err(e).with_context(|| format!("delete dynamic store {}", path.display()))
                 }
+            }
+        })
+    }
+
+    /// 业务作用：在文件写入锁内比较原值并回收，保留并发写入的新声明。
+    ///
+    /// 参数说明：
+    /// - `collection`：事实所属集合。
+    /// - `key`：待回收的事实键。
+    /// - `expected`：清理方读取的完整原值。
+    ///
+    /// 返回：原值匹配且文件删除成功返回 true；缺失或变化返回 false，读写错误返回失败。
+    fn delete_if_value<'a>(
+        &'a self,
+        collection: &'a str,
+        key: &'a str,
+        expected: &'a [u8],
+    ) -> StoreFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            let _guard = self.write_lock.lock();
+            let path = self.path_for(collection, key)?;
+            let current = crate::io::bounded_io::read_optional_file(
+                &path,
+                MAX_DYNAMIC_VALUE_BYTES,
+                "dynamic store value",
+            )?;
+            if current.as_deref() != Some(expected) {
+                // 同一写锁保护比较与删除；后来续期的值不属于本次回收权限。
+                return Ok(false);
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error).context("delete matching dynamic store value"),
             }
         })
     }
@@ -655,6 +709,45 @@ impl DynamicStore for RedisDynamicStore {
         })
     }
 
+    /// 业务作用：通过 Redis 原子比较删除过期事实，不让旧清理覆盖并发续期。
+    ///
+    /// 参数说明：
+    /// - `collection`：事实所属集合。
+    /// - `key`：待回收的事实键。
+    /// - `expected`：清理方读取的完整原值，保留二进制语义。
+    ///
+    /// 返回：删除成功返回 true 并尽力通知观察者；缺失或变化返回 false，未知提交返回错误且不重发。
+    fn delete_if_value<'a>(
+        &'a self,
+        collection: &'a str,
+        key: &'a str,
+        expected: &'a [u8],
+    ) -> StoreFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            validate_dynamic_key(key)?;
+            let redis_key = self.collection_key(collection)?;
+            let mut command = nasa::redis::RedisCommand::new();
+            command
+                .arg("EVAL")
+                .arg(include_str!("redis/dynamic_delete_matching.lua"))
+                .arg(1)
+                .arg(&redis_key)
+                .arg(key)
+                .arg(expected);
+            // 比较和删除必须在服务端同一原子动作中完成，不能以先读后删替代。
+            let deleted: u64 = self.client.execute_raw(&command).await?;
+            if deleted != 0 {
+                if let Err(error) = self
+                    .publish_change(collection, key, DynamicStoreChangeKind::Delete)
+                    .await
+                {
+                    tracing::warn!(collection, key, error = %error, "publish conditional dynamic store delete event failed");
+                }
+            }
+            Ok(deleted != 0)
+        })
+    }
+
     /// 业务作用：读取当前集合的事实目录，供有界缓存重建与对账使用。
     fn list_keys<'a>(&'a self, collection: &'a str) -> StoreFuture<'a, Result<Vec<String>>> {
         Box::pin(async move {
@@ -782,7 +875,8 @@ enum NacosStoreCommand {
     Delete {
         data_id: String,
         key: String,
-        reply: tokio::sync::oneshot::Sender<Result<()>>,
+        expected: Option<Vec<u8>>,
+        reply: tokio::sync::oneshot::Sender<Result<bool>>,
     },
     List {
         data_id: String,
@@ -1071,6 +1165,7 @@ impl DynamicStore for NacosDynamicStore {
                 .send(NacosStoreCommand::Delete {
                     data_id,
                     key,
+                    expected: None,
                     reply,
                 })
                 .await
@@ -1078,6 +1173,48 @@ impl DynamicStore for NacosDynamicStore {
             response
                 .await
                 .context("Nacos DynamicStore delete reply dropped")?
+                .map(|_| ())
+        })
+    }
+
+    /// 业务作用：将有条件回收交给 Nacos 文档 CAS，冲突重读时继续复验原值。
+    ///
+    /// 参数说明：
+    /// - `collection`：事实所属集合。
+    /// - `key`：待回收的事实键。
+    /// - `expected`：清理方读取的完整原值。
+    ///
+    /// 返回：匹配并提交删除时返回 true；缺失或变化返回 false，actor 或远端失败返回错误。
+    fn delete_if_value<'a>(
+        &'a self,
+        collection: &'a str,
+        key: &'a str,
+        expected: &'a [u8],
+    ) -> StoreFuture<'a, Result<bool>> {
+        let result = self.data_id(collection).and_then(|data_id| {
+            validate_dynamic_key(key)?;
+            anyhow::ensure!(
+                expected.len() <= MAX_DYNAMIC_VALUE_BYTES,
+                "dynamic store value too large"
+            );
+            Ok((data_id, key.to_owned(), expected.to_vec()))
+        });
+        let commands = self.commands.clone();
+        Box::pin(async move {
+            let (data_id, key, expected) = result?;
+            let (reply, response) = tokio::sync::oneshot::channel();
+            commands
+                .send(NacosStoreCommand::Delete {
+                    data_id,
+                    key,
+                    expected: Some(expected),
+                    reply,
+                })
+                .await
+                .context("Nacos DynamicStore actor stopped")?;
+            response
+                .await
+                .context("Nacos DynamicStore conditional delete reply dropped")?
         })
     }
 
@@ -1259,6 +1396,7 @@ async fn run_nacos_store_actor(
             NacosStoreCommand::Delete {
                 data_id,
                 key,
+                expected,
                 reply,
             } => {
                 let result = nacos_delete_value(
@@ -1267,6 +1405,7 @@ async fn run_nacos_store_actor(
                     &cfg.group,
                     cfg.max_document_bytes as usize,
                     &key,
+                    expected.as_deref(),
                 )
                 .await;
                 let _ = reply.send(result);
@@ -1418,23 +1557,30 @@ async fn nacos_put_value(
 /// - `group`：定位集合
 /// - `max_document_bytes`：约束文档
 /// - `key`：是已验证业务键。
+/// - `expected`：指定时只允许删除仍与原值相同的条目。
 ///
-/// 返回：缺失集合或 key 返回成功；删除发布成功返回成功；冲突耗尽与远端错误返回失败。
+/// 返回：实际删除并提交返回 true；缺失或原值变化返回 false，冲突耗尽与远端错误返回失败。
 async fn nacos_delete_value(
     client: &nasa::config::nacos::NacosConfigClient,
     data_id: &str,
     group: &str,
     max_document_bytes: usize,
     key: &str,
-) -> Result<()> {
+    expected: Option<&[u8]>,
+) -> Result<bool> {
     for _ in 0..8 {
         let Some((mut snapshot, md5)) =
             nacos_load_snapshot(client, data_id, group, max_document_bytes).await?
         else {
-            return Ok(());
+            return Ok(false);
         };
+        if expected.is_some_and(|value| snapshot.entries.get(key).map(Vec::as_slice) != Some(value))
+        {
+            // CAS 冲突后的重读也必须复验原值，不能删除另一 writer 已续期的声明。
+            return Ok(false);
+        }
         if snapshot.entries.remove(key).is_none() {
-            return Ok(());
+            return Ok(false);
         }
         snapshot.revision = snapshot
             .revision
@@ -1445,7 +1591,7 @@ async fn nacos_delete_value(
             .publish_cas_typed(data_id, group, &content, "json", &md5)
             .await?
         {
-            return Ok(());
+            return Ok(true);
         }
         tokio::task::yield_now().await;
     }
@@ -1717,6 +1863,26 @@ impl SwappableDynamicStore {
 }
 
 impl DynamicStore for SwappableDynamicStore {
+    /// 业务作用：将条件回收绑定到一次冻结的存储指针，不跨后端比较和删除。
+    ///
+    /// 参数说明：
+    /// - `collection`：事实所属集合。
+    /// - `key`：待回收的事实键。
+    /// - `expected`：清理方读取的完整原值。
+    ///
+    /// 返回：所选后端的原子回收结果；换代不重发旧操作。
+    fn delete_if_value<'a>(
+        &'a self,
+        collection: &'a str,
+        key: &'a str,
+        expected: &'a [u8],
+    ) -> StoreFuture<'a, Result<bool>> {
+        let current = self.current();
+        Box::pin(async move {
+            current.delete_if_value(collection, key, expected).await
+        })
+    }
+
     /// 业务作用：将派生缓存读取交给一次冻结的后端代次，不跨代拼接数据。
     ///
     /// 参数说明：

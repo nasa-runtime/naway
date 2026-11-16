@@ -435,7 +435,7 @@ pub struct AutoBanCfg {
     /// 统计窗口(ms)。
     #[serde(default = "default_auto_ban_window_ms")]
     pub window_ms: u64,
-    /// 拉黑 TTL(ms),到期后后台刷新自动解封。
+    /// 拉黑 TTL(ms)，数据面命中时复验期限，后台按完整原值回收过期记录。
     #[serde(default = "default_auto_ban_ttl_ms")]
     pub ban_ttl_ms: u64,
     /// 解封后短期豁免窗口(ms,「ban/unban 抖动」)。手工解封某 IP 后,本节点在该窗口内

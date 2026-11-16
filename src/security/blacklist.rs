@@ -1,8 +1,8 @@
 //! 动态 IP 黑名单缓存。
 //!
-//! DynamicStore 是低频事实源;数据面热路径只读本地 `HashSet<IpAddr>`,避免请求期访问 Redis/文件。
+//! DynamicStore 是低频事实源；数据面只读本地地址与期限快照，避免请求期访问 Redis/文件。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -41,20 +41,20 @@ pub struct BlacklistAuditEvent {
     pub ttl_ms: Option<u64>,
 }
 
-/// 黑名单本地快照:精确 IP 走 O(1) HashSet;CIDR 段走小规模线性扫描。
+/// 黑名单本地快照：精确 IP 走 O(1) 哈希查询；CIDR 段走小规模线性扫描。
 ///
 /// 精确 IP 与 CIDR 分开存储，保证网段封禁不会因按单 IP 解析而失效。
 /// 高频单 IP 命中保持 O(1)，少量 CIDR 使用线性扫描，不增加普通哈希查找的成本。
 #[derive(Default)]
 pub struct BlacklistEntries {
     /// 精确单 IP,O(1) 命中。
-    ips: HashSet<IpAddr>,
+    ips: HashMap<IpAddr, Option<i64>>,
     /// CIDR 网段，构建期已解析成位比较结构，运行期零分配匹配。
-    cidrs: Vec<crate::io::net::Cidr>,
+    cidrs: Vec<(crate::io::net::Cidr, Option<i64>)>,
 }
 
 impl BlacklistEntries {
-    /// 业务作用：有效条目总数(精确 IP + CIDR 段)。
+    /// 业务作用：返回快照保存的条目数；请求命中时另行复验到期时间。
     pub fn len(&self) -> usize {
         self.ips.len() + self.cidrs.len()
     }
@@ -64,12 +64,23 @@ impl BlacklistEntries {
         self.ips.is_empty() && self.cidrs.is_empty()
     }
 
-    /// 业务作用：判断 IP 是否命中黑名单:先查精确 IP(O(1)),再扫 CIDR 段。
+    /// 业务作用：判定仍在有效期内的地址封禁，不依赖后台刷新及时到达。
     ///
     /// 参数说明：
     /// - `ip`: 待检查的真实客户端 IP。
+    ///
+    /// 返回：存在永久或未到期的精确地址或网段封禁时为 true；重叠条目独立生效。
     fn contains(&self, ip: IpAddr) -> bool {
-        self.ips.contains(&ip) || self.cidrs.iter().any(|cidr| cidr.contains(ip))
+        if self.is_empty() {
+            return false;
+        }
+        let now_ms = unix_now_ms();
+        self.ips
+            .get(&ip)
+            .is_some_and(|expiry| expiry.is_none_or(|until| until > now_ms))
+            || self.cidrs.iter().any(|(cidr, expiry)| {
+                expiry.is_none_or(|until| until > now_ms) && cidr.contains(ip)
+            })
     }
 }
 
@@ -79,6 +90,8 @@ pub struct BlacklistCache {
     collection: RwLock<String>,
     refresh_interval_ms: AtomicU64,
     entries: ArcSwap<BlacklistEntries>,
+    /// 配置、直接发布和刷新领取共用短锁；迟到读取不能覆盖后续撤销或新集合。
+    publication: Mutex<Arc<()>>,
     /// 解封后短期豁免窗口(ms);0 = 关闭。auto-ban 对窗口内 IP 直接跳过。
     unban_exempt_ms: AtomicU64,
     /// 本节点解封豁免表:ip -> 豁免截止时刻。仅手工解封写入,过期即失效。
@@ -101,6 +114,7 @@ impl BlacklistCache {
             collection: RwLock::new(cfg.collection.clone()),
             refresh_interval_ms: AtomicU64::new(cfg.refresh_interval_ms),
             entries: ArcSwap::from_pointee(BlacklistEntries::default()),
+            publication: Mutex::new(Arc::new(())),
             unban_exempt_ms: AtomicU64::new(cfg.auto_ban.unban_exempt_ms),
             exemptions: Mutex::new(HashMap::new()),
             audit: Mutex::new(VecDeque::new()),
@@ -112,16 +126,23 @@ impl BlacklistCache {
     ///
     /// 参数说明：
     /// - `cfg`: 已解析并待校验的新配置。
+    ///
+    /// 返回：合法配置立即撤销旧刷新权；禁用或更换集合时清空原快照，非法配置保留原状态。
     pub fn apply_config(&self, cfg: &BlacklistCfg) -> Result<()> {
         validate_config(cfg)?;
+        // 先撤销已领取的刷新权，再改变集合；旧 I/O 即使完成也不能重新发布。
+        let mut publication = self.publication.lock();
+        *publication = Arc::new(());
+        let changed_collection = *self.collection.read() != cfg.collection;
         *self.collection.write() = cfg.collection.clone();
         self.refresh_interval_ms
             .store(cfg.refresh_interval_ms, Ordering::Relaxed);
         self.unban_exempt_ms
             .store(cfg.auto_ban.unban_exempt_ms, Ordering::Relaxed);
         self.enabled.store(cfg.enabled, Ordering::Relaxed);
-        if !cfg.enabled {
-            self.clear();
+        if !cfg.enabled || changed_collection {
+            self.entries.store(Arc::new(BlacklistEntries::default()));
+            self.exemptions.lock().clear();
         }
         Ok(())
     }
@@ -213,7 +234,11 @@ impl BlacklistCache {
     ///
     /// 参数说明：
     /// - `entries`: 已完成过期清理的精确 IP + CIDR 段集合。
+    ///
+    /// 返回：发布完整快照并撤销先前刷新权，不允许迟到读取覆盖本次发布。
     pub fn replace_entries(&self, entries: BlacklistEntries) {
+        let mut publication = self.publication.lock();
+        *publication = Arc::new(());
         self.entries.store(Arc::new(entries));
     }
 
@@ -228,16 +253,28 @@ impl BlacklistCache {
     /// - `store`: 动态存储事实源。
     /// - `collection`: 要读取的集合名。
     ///
-    /// 返回本次加载的有效地址数量。
+    /// 返回：成功时返回当前缓存条目数；读取失败保留原快照，失去发布权时保留后续快照。
     pub async fn refresh_from_store(
         &self,
         store: &dyn DynamicStore,
         collection: &str,
     ) -> Result<usize> {
+        let ticket = {
+            let mut publication = self.publication.lock();
+            if !self.is_enabled() || *self.collection.read() != collection {
+                // 非当前集合没有发布资格，避免旧配置调用把另一来源的封禁带回。
+                return Ok(self.entries.load().len());
+            }
+            *publication = Arc::new(());
+            publication.clone()
+        };
         let entries = load_blacklist_ips(store, collection).await?;
-        let count = entries.len();
-        self.replace_entries(entries);
-        Ok(count)
+        let publication = self.publication.lock();
+        if Arc::ptr_eq(&publication, &ticket) {
+            // 撤销和新刷新领取都在同一锁下改变令牌，发布点复验封住迟到结果。
+            self.entries.store(Arc::new(entries));
+        }
+        Ok(self.entries.load().len())
     }
 
     /// 业务作用：提供动态黑名单的后台对账周期，不让请求线程承担事实源轮询。
@@ -287,11 +324,13 @@ pub fn validate_config(cfg: &BlacklistCfg) -> Result<()> {
     Ok(())
 }
 
-/// 业务作用：从动态存储加载未过期的 IP，并删除已过期条目。
+/// 业务作用：加载仍存在且未过期的封禁，并仅在值未变化时回收过期事实。
 ///
 /// 参数说明：
 /// - `store`: 动态存储事实源。
 /// - `collection`: 黑名单集合名。
+///
+/// 返回：完整读取成功时返回带期限的地址快照；读取失败返回错误，不发布部分集合。
 pub async fn load_blacklist_ips(
     store: &dyn DynamicStore,
     collection: &str,
@@ -302,7 +341,7 @@ pub async fn load_blacklist_ips(
         .await
         .with_context(|| format!("load blacklist collection `{collection}`"))?;
     let mut entries = BlacklistEntries {
-        ips: HashSet::with_capacity(keys.len()),
+        ips: HashMap::with_capacity(keys.len()),
         cidrs: Vec::new(),
     };
     let now_ms = unix_now_ms();
@@ -310,12 +349,20 @@ pub async fn load_blacklist_ips(
         // 单 IP 与 CIDR 段统一按 `Cidr::parse` 解析:含 `/` → 网段,否则精确 IP(「CIDR 单 IP + 段」)。
         match crate::io::net::Cidr::parse(&key) {
             Ok(cidr) => {
-                let value = store
+                let Some(value) = store
                     .get(collection, &key)
                     .await
-                    .with_context(|| format!("load blacklist entry `{collection}/{key}`"))?;
-                if entry_expired(value.as_deref(), now_ms) {
-                    if let Err(e) = store.delete(collection, &key).await {
+                    .with_context(|| format!("load blacklist entry `{collection}/{key}`"))?
+                else {
+                    // 枚举后被解封的键已经失去封禁事实，缺失值不能升级为永久条目。
+                    continue;
+                };
+                let expiry = serde_json::from_slice::<BlacklistEntryMeta>(&value)
+                    .ok()
+                    .and_then(|meta| meta.expire_at_unix_ms);
+                if expiry.is_some_and(|until| until <= now_ms) {
+                    // 续期可能与对账并发；只有原值仍匹配时才有删除权。
+                    if let Err(e) = store.delete_if_value(collection, &key, &value).await {
                         tracing::warn!(
                             collection,
                             key = %key,
@@ -327,9 +374,9 @@ pub async fn load_blacklist_ips(
                     // 精确单 IP 进哈希表(O(1) 命中),真正的网段进 CIDR 表(线性扫描)。
                     match cidr {
                         crate::io::net::Cidr::Single(ip) => {
-                            entries.ips.insert(ip);
+                            entries.ips.insert(ip, expiry);
                         }
-                        cidr => entries.cidrs.push(cidr),
+                        cidr => entries.cidrs.push((cidr, expiry)),
                     }
                 }
             }
@@ -350,19 +397,6 @@ pub async fn load_blacklist_ips(
 struct BlacklistEntryMeta {
     #[serde(default)]
     expire_at_unix_ms: Option<i64>,
-}
-
-/// 业务作用：判断动态封禁是否已经失效，过期条目不能继续阻断请求。
-fn entry_expired(value: Option<&[u8]>, now_ms: i64) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    let Ok(meta) = serde_json::from_slice::<BlacklistEntryMeta>(value) else {
-        return false;
-    };
-    meta.expire_at_unix_ms
-        .map(|expire_at| expire_at <= now_ms)
-        .unwrap_or(false)
 }
 
 /// 业务作用：提供动态封禁有效期使用的 Unix 毫秒时间，时钟异常采用保守零值。
