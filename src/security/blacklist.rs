@@ -352,7 +352,8 @@ impl BlacklistCache {
     /// - `store`: 动态存储事实源。
     /// - `collection`: 要读取的集合名。
     ///
-    /// 返回：成功时返回当前缓存条目数；读取失败保留原快照，失去发布权时保留后续快照。
+    /// 返回：成功时返回调用结束时的缓存条目数，不证明本次读取已发布；
+    /// 读取失败保留原快照，失去发布权时保留当时缓存，不恢复旧读取。
     pub async fn refresh_from_store(
         &self,
         store: &dyn DynamicStore,

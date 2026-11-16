@@ -291,7 +291,8 @@ impl DynamicInterfaceGuardCache {
     /// - `store`: 当前动态事实源。
     /// - `collection`: collection 名。
     ///
-    /// 返回：当前已发布规则数；读取失败保留原快照，迟到读取失去发布权后也保留后续决定。
+    /// 返回：调用结束时的已发布规则数，不证明本次读取已发布；
+    /// 读取失败保留原快照，失去发布权时保留当时缓存，不恢复旧读取。
     pub async fn refresh_from_store(
         &self,
         store: &dyn DynamicStore,

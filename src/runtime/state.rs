@@ -289,7 +289,8 @@ impl FileDynamicStore {
     /// 参数说明：
     /// - `root`：本机文件事实源的根目录。
     ///
-    /// 返回：共享同一写入锁和有界进程内订阅目录的后端；构造时不访问磁盘。
+    /// 返回：在本实例内串行受管写入并持有有界订阅目录的后端；
+    /// 不提供多写者事务，构造时不访问磁盘。
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
