@@ -165,7 +165,8 @@ impl GatewayProxy {
                     .get::<crate::control::ownership::Owner>()
                     .is_none_or(|owner| owner.workspace == crate::control::ownership::PLATFORM)
                 {
-                    self.maybe_auto_ban(client_ip).await;
+                    self.maybe_auto_ban(parts, generation, client_ip, auto_ban::Signal::Rate)
+                        .await;
                 }
                 return Some(rate_limited_response(decision.remaining));
             }

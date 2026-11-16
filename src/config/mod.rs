@@ -1082,8 +1082,8 @@ impl Eq for TlsRuntimeCfg {}
 
 /// 缺省配置 schema 保持为 1，显式安全策略不能因省略兼容门而被当作已启用。
 const DEFAULT_SCHEMA_VERSION: u32 = 1;
-/// 主配置支持显式访问与来源策略；独立 Sentinel 和接口守卫文档仍只接受各自的 schema 1。
-const SUPPORTED_GATEWAY_SCHEMA_VERSION: u32 = 2;
+/// 主配置支持显式访问、来源与多信号封禁策略；独立保护文档仍只接受各自的 schema 1。
+const SUPPORTED_GATEWAY_SCHEMA_VERSION: u32 = 3;
 /// reload 指纹单文件硬上限。它覆盖主配置、OpenAPI/schema、WASM 与 SecretSource 依赖；
 /// 各构建器仍执行更严格的业务上限，这里先防 watcher 因敌意大文件产生无界分配。
 const MAX_FINGERPRINT_FILE_BYTES: usize = 32 * 1024 * 1024;
@@ -1217,6 +1217,14 @@ fn build_snapshot_from_config(
         "gateway.yml",
         SUPPORTED_GATEWAY_SCHEMA_VERSION,
     )?;
+    // 原生拒绝信号会产生全局封禁副作用，必须让不能执行该合同的旧制品先拒绝整份声明。
+    anyhow::ensure!(
+        schema_version >= 3
+            || (cfg.runtime_state.blacklist.auto_ban.waf_rejections == 0
+                && cfg.runtime_state.blacklist.auto_ban.authentication_failures == 0
+                && cfg.runtime_state.blacklist.auto_ban.abnormal_rejections == 0),
+        "additional auto-ban signals require schema_version: 3"
+    );
     // 新安全声明要求新的配置合同；旧制品会拒绝该版本，不能忽略字段后报告发布成功。
     anyhow::ensure!(
         schema_version >= 2 || (cfg.acl.is_none() && cfg.client_ip_policy.is_none()),

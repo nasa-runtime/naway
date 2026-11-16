@@ -294,6 +294,8 @@ impl BlacklistCache {
 ///
 /// 参数说明：
 /// - `cfg`: 待校验配置。
+///
+/// 返回：启用依赖、至少一个拒绝门槛与所有期限合法时成功；非法声明拒绝候选，保留活动策略。
 pub fn validate_config(cfg: &BlacklistCfg) -> Result<()> {
     validate_component(&cfg.collection, "blacklist.collection")?;
     if cfg.enabled && cfg.refresh_interval_ms == 0 {
@@ -308,12 +310,15 @@ pub fn validate_config(cfg: &BlacklistCfg) -> Result<()> {
         anyhow::bail!("runtime_state.blacklist.enabled must be true when auto_ban is enabled");
     }
     if cfg.auto_ban.enabled
-        && (cfg.auto_ban.limit_req_rejections == 0
+        && ((cfg.auto_ban.limit_req_rejections == 0
+            && cfg.auto_ban.waf_rejections == 0
+            && cfg.auto_ban.authentication_failures == 0
+            && cfg.auto_ban.abnormal_rejections == 0)
             || cfg.auto_ban.window_ms == 0
             || cfg.auto_ban.ban_ttl_ms == 0)
     {
         anyhow::bail!(
-            "runtime_state.blacklist.auto_ban limit_req_rejections/window_ms/ban_ttl_ms must be positive when enabled"
+            "runtime_state.blacklist.auto_ban requires a positive signal threshold, window_ms and ban_ttl_ms when enabled"
         );
     }
     if cfg.auto_ban.window_ms > MAX_BLACKLIST_DURATION_MS

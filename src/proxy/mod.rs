@@ -5,6 +5,7 @@
 
 #[cfg(feature = "ai-governance")]
 mod agent;
+mod auto_ban;
 mod circuit;
 pub(crate) mod forward;
 mod grpc_browser;
@@ -578,14 +579,18 @@ pub struct GatewayProxy {
     telemetry: Arc<crate::observability::telemetry::SwappableTelemetryRuntime>,
     /// model 成功 TTFB EWMA。route/model 都来自有界配置；热更历史仍设 4096 项硬上限。
     llm_model_latency: Mutex<HashMap<String, HashMap<Arc<str>, u64>>>,
-    /// auto-ban 本地计数:IP -> 当前窗口内被 limit_req 拒绝次数。
-    auto_ban_counts: Mutex<HashMap<IpAddr, AutoBanState>>,
+    /// 同配置代、同信号的有界 IP 拒绝计数与低频动作容量。
+    auto_ban_counts: auto_ban::Counters,
+    /// 自动封禁与配置提交共用的唯一发布权威。
+    apply_coordinator: Arc<crate::control::reload::SnapshotApplyCoordinator>,
     /// 主动健康探测器:后台任务写不健康集合,选实例时并入 excluded。常驻,不随快照换版。
     pub(super) active_health: Arc<crate::upstream::health::ActiveHealthChecker>,
 }
 
 /// 可由 reload worker 原子替换或长期复用的数据面运行态依赖。
 pub struct ProxyRuntimeState {
+    /// 运行态副作用与配置换代共用的发布权威。
+    pub apply_coordinator: Arc<crate::control::reload::SnapshotApplyCoordinator>,
     /// 与管理端持有同一代际切换器的持久审计。
     #[cfg(feature = "webdav")]
     pub webdav_audit: crate::admin::audit::AdminAuditLog,
@@ -676,26 +681,35 @@ struct AutoBanState {
     rejections: u64,
 }
 
-/// 业务作用：记录一次 429 并判断是否达到自动封禁阈值。
+/// 业务作用：按已经隔离信号与配置代的业务键累计拒绝，并保持计数状态硬上限。
 ///
 /// 新 IP 只有在计数表仍有容量时才会获得 entry；这使 distinct-IP 洪泛下的内存占用具有
 /// 真正的硬上界。已有 IP 仍可继续累计并触发封禁，过期 entry 会在表满时被回收。
-fn record_auto_ban_rejection(
-    counts: &mut HashMap<IpAddr, AutoBanState>,
-    client_ip: IpAddr,
+/// 参数说明：
+/// - `counts`：当前配置代的独立计数集合。
+/// - `client_key`：客户端地址与原生拒绝信号组成的业务键。
+/// - `now`：本次拒绝的单调时刻。
+/// - `threshold`：触发临时封禁的拒绝次数。
+/// - `window`：每个计数窗口的最大年龄。
+/// - `max_entries`：所有信号共用的状态容量。
+///
+/// 返回：达到门槛时撤下该计数并返回真；容量不足或尚未达到门槛返回假。
+fn record_auto_ban_rejection<K: Eq + std::hash::Hash + Copy>(
+    counts: &mut HashMap<K, AutoBanState>,
+    client_key: K,
     now: Instant,
     threshold: u64,
     window: Duration,
     max_entries: usize,
 ) -> bool {
-    if !counts.contains_key(&client_ip) && counts.len() >= max_entries {
+    if !counts.contains_key(&client_key) && counts.len() >= max_entries {
         counts.retain(|_, state| now.saturating_duration_since(state.window_start) <= window);
         if counts.len() >= max_entries {
             return false;
         }
     }
 
-    let state = counts.entry(client_ip).or_insert(AutoBanState {
+    let state = counts.entry(client_key).or_insert(AutoBanState {
         window_start: now,
         rejections: 0,
     });
@@ -705,7 +719,7 @@ fn record_auto_ban_rejection(
     }
     state.rejections = state.rejections.saturating_add(1);
     if state.rejections >= threshold {
-        counts.remove(&client_ip);
+        counts.remove(&client_key);
         true
     } else {
         false
@@ -854,6 +868,16 @@ impl GatewayProxy {
     }
 
     /// 业务作用：组装共享数据面；构造过程不启动 listener，所有依赖均已在 build 阶段验证。
+    ///
+    /// 参数说明：
+    /// - `snap`：唯一配置发布者维护的活动快照。
+    /// - `metrics`：请求与治理结果共用的进程观测所有者。
+    /// - `access_log`：已受配置与容量限制的访问日志出口。
+    /// - `conn_registry`：各协议共用的长连接控制目录。
+    /// - `runtime_state`：与管理面共用发布权、动态事实源和治理缓存的运行依赖。
+    /// - `active_health`：当前进程共用的原生活动健康观察器。
+    ///
+    /// 返回：供 listener 共享的代理所有者；只组装依赖，不开放业务监听。
     pub fn new(
         snap: Arc<ArcSwap<GatewaySnapshot>>,
         metrics: Arc<Metrics>,
@@ -920,7 +944,8 @@ impl GatewayProxy {
             usage_meter: runtime_state.usage_meter,
             traffic_meter: runtime_state.traffic_meter,
             llm_model_latency: Mutex::new(HashMap::new()),
-            auto_ban_counts: Mutex::new(HashMap::new()),
+            auto_ban_counts: auto_ban::Counters::default(),
+            apply_coordinator: runtime_state.apply_coordinator,
             active_health,
         })
     }
@@ -1630,10 +1655,16 @@ impl GatewayProxy {
             } else if !route.permits_method(&parts) {
                 text_status(405, "method not allowed")
             } else if let Some(resp) = enforce_waf_head(&route, &parts, self.metrics.as_ref()) {
+                // 原生WAF拒绝分支才有计数资格，普通上游403不提供自动封禁证据。
+                self.maybe_auto_ban(&parts, snap.version, client_ip, auto_ban::Signal::Waf)
+                    .await;
                 resp
             } else if let Some(resp) = enforce_geoip(&route, client_ip, self.metrics.as_ref()) {
                 resp
             } else if let Some(resp) = self.enforce_bot(&parts, &route, client_ip).await {
+                // monitor不产生挑战响应，只有强制拒绝才参与显式异常信号策略。
+                self.maybe_auto_ban(&parts, snap.version, client_ip, auto_ban::Signal::Abnormal)
+                    .await;
                 resp
             } else if let Some(resp) =
                 enforce_csrf(&route, &parts, downstream_proto, self.metrics.as_ref())
@@ -1770,6 +1801,11 @@ impl GatewayProxy {
             } else if let Some(resp) =
                 enforce_waf_body(&route, &parts, &mut forward_body, self.metrics.as_ref()).await
             {
+                // 正文超限或读取失败不证明命中WAF规则，不能借它们扩大自动封禁范围。
+                if resp.status() == StatusCode::FORBIDDEN {
+                    self.maybe_auto_ban(&parts, snap.version, client_ip, auto_ban::Signal::Waf)
+                        .await;
+                }
                 resp
             } else if let Some(resp) = enforce_dlp_request_body(
                 &route,
@@ -5178,7 +5214,8 @@ impl GatewayProxy {
     /// - `identity`：接收冻结身份
     /// - `long_connection_consumer`：可接收长流主体。
     ///
-    /// 返回：认证链放行返回 None 并完成身份头清洗/可信注入；凭据、重放或外部依赖失败返回拒绝响应。
+    /// 返回：放行时完成可信身份注入；拒绝保留原响应，明确的认证失败可按平台策略累计自动封禁。
+    /// 依赖故障和普通授权拒绝不作为认证失败信号。
     #[allow(clippy::too_many_arguments)]
     async fn enforce_auth_chain(
         &self,
@@ -5206,6 +5243,14 @@ impl GatewayProxy {
                 .hmac_replay_detected(parts, auth_body.as_deref(), self.replay_guard.as_ref())
                 .await
         {
+            // 只有已经验证有效签名的重放才提供攻击证据，垃圾签名不能占用重放或封禁计数。
+            self.maybe_auto_ban(
+                parts,
+                snap.version,
+                client_ip,
+                auto_ban::Signal::Authentication,
+            )
+            .await;
             return Some(text_status(401, "hmac replay detected"));
         }
         if let Some(policy) = &route.digest_auth {
@@ -5224,6 +5269,16 @@ impl GatewayProxy {
                     parts.headers.remove(http::header::AUTHORIZATION);
                 }
                 Err(crate::security::digest::Failure::Challenge(challenge)) => {
+                    // 首次无凭据挑战是正常协议协商；只有客户端已经提交凭据时才累计失败。
+                    if parts.headers.contains_key(http::header::AUTHORIZATION) {
+                        self.maybe_auto_ban(
+                            parts,
+                            snap.version,
+                            client_ip,
+                            auto_ban::Signal::Authentication,
+                        )
+                        .await;
+                    }
                     let mut response = text_status(401, "digest authentication required");
                     response.headers_mut().insert(WWW_AUTHENTICATE, challenge);
                     response.headers_mut().insert(
@@ -5284,6 +5339,13 @@ impl GatewayProxy {
         generated_identity_headers.extend(oidc_identity_headers);
         if !route.has_ext_authz() {
             if !local_ok {
+                self.maybe_auto_ban(
+                    parts,
+                    snap.version,
+                    client_ip,
+                    auto_ban::Signal::Authentication,
+                )
+                .await;
                 return Some(auth_failed_response(route.auth_challenge(parts).as_deref()));
             }
             route.apply_identity_headers(parts, &generated_identity_headers);
@@ -5296,6 +5358,13 @@ impl GatewayProxy {
         match route.satisfy {
             SatisfyMode::All if local_configured && !local_ok => {
                 // `all` 语义不能通过发起外呼掩盖本地凭据失败，先拒绝也避免无意义依赖流量。
+                self.maybe_auto_ban(
+                    parts,
+                    snap.version,
+                    client_ip,
+                    auto_ban::Signal::Authentication,
+                )
+                .await;
                 return Some(auth_failed_response(route.auth_challenge(parts).as_deref()));
             }
             SatisfyMode::Any if local_configured && local_ok => {
@@ -5336,7 +5405,18 @@ impl GatewayProxy {
             forward::ExtAuthzDecision::Denied {
                 status,
                 challenge,
-            } => Some(auth_denied_response(status, challenge.as_ref())),
+            } => {
+                if status == StatusCode::UNAUTHORIZED {
+                    self.maybe_auto_ban(
+                        parts,
+                        snap.version,
+                        client_ip,
+                        auto_ban::Signal::Authentication,
+                    )
+                    .await;
+                }
+                Some(auth_denied_response(status, challenge.as_ref()))
+            }
             forward::ExtAuthzDecision::Unavailable => {
                 Some(text_status(503, "ext authz unavailable"))
             }
@@ -8060,71 +8140,6 @@ impl GatewayProxy {
             self.metrics.inc_rate_limited();
             Some(rate_limited_response(decision.remaining))
         }
-    }
-
-    /// 业务作用：按声明策略累计已验证身份的拒绝事实，达到门槛后写入有期限的动态封禁。
-    async fn maybe_auto_ban(&self, client_ip: IpAddr) {
-        let cfg = {
-            let snap = self.snap.load();
-            snap.runtime_state.blacklist.clone()
-        };
-        if !cfg.enabled || !cfg.auto_ban.enabled {
-            return;
-        }
-        //  解封豁免:刚被手工解封的 IP 在豁免窗口内不再自动拉黑,避免 ban/unban 抖动。
-        if self.blacklist.is_exempt(client_ip) {
-            return;
-        }
-        let now = Instant::now();
-        let threshold = cfg.auto_ban.limit_req_rejections;
-        let window = Duration::from_millis(cfg.auto_ban.window_ms);
-        let should_ban = {
-            let mut counts = self.auto_ban_counts.lock();
-            record_auto_ban_rejection(
-                &mut counts,
-                client_ip,
-                now,
-                threshold,
-                window,
-                AUTO_BAN_COUNTS_MAX_ENTRIES,
-            )
-        };
-        if !should_ban {
-            return;
-        }
-        let expire_at_unix_ms =
-            unix_now_ms().saturating_add(cfg.auto_ban.ban_ttl_ms.min(i64::MAX as u64) as i64);
-        let value = serde_json::json!({
-            "source": "auto_limit_req",
-            "expire_at_unix_ms": expire_at_unix_ms,
-        })
-        .to_string();
-        let key = client_ip.to_string();
-        if let Err(e) = self
-            .dynamic_store
-            .put(&cfg.collection, &key, value.as_bytes())
-            .await
-        {
-            tracing::warn!(ip = %client_ip, error = %e, "auto-ban dynamic store write failed");
-            return;
-        }
-        if let Err(e) = self
-            .blacklist
-            .refresh_from_store(self.dynamic_store.as_ref(), &cfg.collection)
-            .await
-        {
-            tracing::warn!(ip = %client_ip, error = %e, "auto-ban blacklist refresh failed");
-        }
-        let closed = self.conn_registry.close_by_ip(client_ip);
-        //  审计:记录自动拉黑事件(who/when/why/source),供 /admin/blacklist/audit 查询。
-        self.blacklist
-            .record_ban(client_ip, "auto_limit_req", cfg.auto_ban.ban_ttl_ms);
-        tracing::warn!(
-            ip = %client_ip,
-            ttl_ms = cfg.auto_ban.ban_ttl_ms,
-            closed,
-            "client auto-banned after limit_req rejections"
-        );
     }
 
     /// 业务作用：在进入业务转发前申请并发额度，拒绝时不创建无预算上游请求。

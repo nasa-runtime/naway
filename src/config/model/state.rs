@@ -371,6 +371,7 @@ impl Default for RedisStoreCfg {
 
 /// IP 黑名单本地缓存与自动拉黑配置。
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct BlacklistCfg {
     /// 是否启用 IP 黑名单缓存。
     #[serde(default)]
@@ -425,6 +426,7 @@ impl Default for InterfaceDisableCfg {
 
 /// 由限流拒绝信号驱动的临时 IP 自动拉黑策略。
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AutoBanCfg {
     /// 是否启用自动拉黑。
     #[serde(default)]
@@ -432,6 +434,15 @@ pub struct AutoBanCfg {
     /// 同一 IP 在窗口内被 limit_req 拒绝达到该次数后拉黑。
     #[serde(default = "default_auto_ban_limit_req_rejections")]
     pub limit_req_rejections: u64,
+    /// 同一 IP 在窗口内的 WAF 强制拒绝门槛；0 表示不使用该信号。
+    #[serde(default)]
+    pub waf_rejections: u64,
+    /// 同一 IP 在窗口内的原生认证失败门槛；0 表示不使用该信号。
+    #[serde(default)]
+    pub authentication_failures: u64,
+    /// 同一 IP 在窗口内的 Bot 强制拒绝门槛；0 表示不使用该信号。
+    #[serde(default)]
+    pub abnormal_rejections: u64,
     /// 统计窗口(ms)。
     #[serde(default = "default_auto_ban_window_ms")]
     pub window_ms: u64,
@@ -446,10 +457,17 @@ pub struct AutoBanCfg {
 
 impl Default for AutoBanCfg {
     /// 业务作用：构造 `AutoBanCfg` 的缺省配置，统一各字段的省略语义与显式默认值。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：默认关闭的策略；仅保留原请求限流门槛，其它原生拒绝信号必须显式启用。
     fn default() -> Self {
         Self {
             enabled: false,
             limit_req_rejections: default_auto_ban_limit_req_rejections(),
+            waf_rejections: 0,
+            authentication_failures: 0,
+            abnormal_rejections: 0,
             window_ms: default_auto_ban_window_ms(),
             ban_ttl_ms: default_auto_ban_ttl_ms(),
             unban_exempt_ms: 0,

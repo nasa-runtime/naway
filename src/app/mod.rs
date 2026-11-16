@@ -352,6 +352,7 @@ pub(super) async fn run() -> Result<()> {
         access_log,
         conn_registry.clone(),
         ProxyRuntimeState {
+            apply_coordinator: apply_coordinator.clone(),
             #[cfg(feature = "webdav")]
             webdav_audit: admin_audit.clone(),
             usage_meter: usage_meter.clone(),
