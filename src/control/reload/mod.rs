@@ -1244,6 +1244,11 @@ async fn apply_reload_input(
                     .management
                     .as_ref()
                     .map(|manager| manager.publication_guard());
+                // 外发操作绑定原目的地；先撤销旧通知资格，再把新平台配置开放给动作节点。
+                runtime
+                    .blacklist
+                    .notifications
+                    .apply(new_snap.acl_notifications.clone());
                 snap.store(new_snap.clone());
                 // 新快照已经对请求可见；收据提交失败只能保留未知，不能走候选未发布的监听补偿分支。
                 if let Err(error) = history.confirm_action_publication(&new_snap) {

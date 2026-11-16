@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
+mod acl_notification;
 mod admin;
 mod contracts;
 mod defaults;
@@ -27,6 +28,7 @@ mod tls;
 mod upstream;
 mod websocket;
 
+pub use acl_notification::*;
 pub use admin::*;
 pub use contracts::*;
 use defaults::*;

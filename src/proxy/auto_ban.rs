@@ -44,6 +44,21 @@ impl Signal {
             Self::Abnormal => "auto_abnormal",
         }
     }
+
+    /// 业务作用：让通知类型与实际原生拒绝保持同一固定来源，不从外部状态或请求头推断。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：与当前信号对应的通知来源。
+    fn notification_source(self) -> crate::security::blacklist::notification::Source {
+        use crate::security::blacklist::notification::Source;
+        match self {
+            Self::Rate => Source::AutoLimitReq,
+            Self::Waf => Source::AutoWaf,
+            Self::Authentication => Source::AutoAuthentication,
+            Self::Abnormal => Source::AutoAbnormal,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -183,10 +198,28 @@ impl GatewayProxy {
                 return;
             }
             let source = signal.source();
+            let notification_plan = blacklist.notifications.plan();
+            let expires_at =
+                unix_now_ms().saturating_add(cfg.auto_ban.ban_ttl_ms.min(i64::MAX as u64) as i64);
+            let event = match blacklist.create_event(
+                crate::security::blacklist::notification::Action::Ban,
+                client_ip,
+                "gateway",
+                signal.notification_source(),
+                Some(expires_at),
+            ) {
+                Ok(event) => event,
+                Err(_) => {
+                    tracing::warn!(source, "auto-ban event identity unavailable");
+                    return;
+                }
+            };
             let value = serde_json::json!({
                 "source": source,
-                "expire_at_unix_ms": unix_now_ms().saturating_add(cfg.auto_ban.ban_ttl_ms.min(i64::MAX as u64) as i64),
-            }).to_string();
+                "expire_at_unix_ms": expires_at,
+                "notification": &event,
+            })
+            .to_string();
             if let Err(error) = store
                 .put(&cfg.collection, &client_ip.to_string(), value.as_bytes())
                 .await
@@ -194,6 +227,8 @@ impl GatewayProxy {
                 tracing::warn!(%error, source, "auto-ban dynamic store write failed");
                 return;
             }
+            blacklist.record_event(&event, Some(cfg.auto_ban.ban_ttl_ms));
+            blacklist.notifications.publish(&event, notification_plan);
             // 已确认写入后才刷新和关闭；期限已耗尽时不再向无当前封禁的连接发送关闭信号。
             if let Err(error) = blacklist
                 .refresh_from_store(store.as_ref(), &cfg.collection)
@@ -206,7 +241,6 @@ impl GatewayProxy {
             } else {
                 0
             };
-            blacklist.record_ban(client_ip, source, cfg.auto_ban.ban_ttl_ms);
             tracing::warn!(ip = %client_ip, source, ttl_ms = cfg.auto_ban.ban_ttl_ms, closed, "client auto-banned after native rejections");
         });
         let _ = tokio::time::timeout(Duration::from_secs(6), work).await;

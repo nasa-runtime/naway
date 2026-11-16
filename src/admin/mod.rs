@@ -863,15 +863,18 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
             close_long_connections(&request, &state)
         }
         (&Method::PUT, "/admin/blacklist") | (&Method::POST, "/admin/blacklist") => {
-            set_blacklist_ip(&request, &state, true).await
+            set_blacklist_ip(&request, &state, &identity, true).await
         }
-        (&Method::DELETE, "/admin/blacklist") => set_blacklist_ip(&request, &state, false).await,
+        (&Method::DELETE, "/admin/blacklist") => {
+            set_blacklist_ip(&request, &state, &identity, false).await
+        }
         //  黑名单 ban/unban 审计流(本节点最近事件)。
         (&Method::GET, "/admin/blacklist/audit") => json(
             StatusCode::OK,
             serde_json::json!({
                 "ok": true,
-                "events": state.blacklist.audit_snapshot()
+                "events": state.blacklist.audit_snapshot(),
+                "notifications": state.blacklist.notifications.status()
             }),
         ),
         (&Method::GET, "/api/audit") => json(
@@ -8915,6 +8918,7 @@ fn close_long_connections(req: &AdminRequestParts, state: &AdminState) -> Respon
 /// 参数说明：
 /// - `req`：原查询参数或进程内类型化输入，正文原文不进入审计。
 /// - `state`：当前动态事实源、黑名单缓存与长连接注册表。
+/// - `identity`：本次动作已经认证的实际管理主体。
 /// - `blocked`：发布封禁时为真，撤销时为假。
 ///
 /// 返回：事实源写入及本机刷新结果；成功封禁会同时发出本机匹配IP的连接关闭信号。
@@ -8922,6 +8926,7 @@ fn close_long_connections(req: &AdminRequestParts, state: &AdminState) -> Respon
 async fn set_blacklist_ip(
     req: &AdminRequestParts,
     state: &AdminState,
+    identity: &AdminIdentity,
     blocked: bool,
 ) -> Response<BoxBody> {
     let Some(raw_ip) = runtime_actions::parameter(req, "ip") else {
@@ -8937,7 +8942,8 @@ async fn set_blacklist_ip(
         return plain(StatusCode::CONFLICT, "blacklist disabled\n");
     }
     let key = ip.to_string();
-    let result = if blocked {
+    let notification_plan = state.blacklist.notifications.plan();
+    let value = if blocked {
         // 只有已验证的进程内输入可绕过原始query解释；不把JSON值重新拼成URI改变IP或TTL语义。
         let value = match req.extensions.get::<runtime_actions::Inputs>() {
             Some(input) => match input.native_value() {
@@ -8949,10 +8955,50 @@ async fn set_blacklist_ip(
                 Err(msg) => return plain(StatusCode::BAD_REQUEST, msg),
             },
         };
-        state
-            .dynamic_store
-            .put(&cfg.collection, &key, value.as_bytes())
-            .await
+        Some(value)
+    } else {
+        None
+    };
+    let mut value = match value {
+        Some(value) => match serde_json::from_str::<serde_json::Value>(&value) {
+            Ok(value) if value.is_object() => Some(value),
+            _ => return plain(StatusCode::BAD_REQUEST, "invalid blacklist value\n"),
+        },
+        None => None,
+    };
+    let expires_at = value
+        .as_ref()
+        .and_then(|value| value.get("expire_at_unix_ms"))
+        .and_then(serde_json::Value::as_i64);
+    let event = match state.blacklist.create_event(
+        if blocked {
+            crate::security::blacklist::notification::Action::Ban
+        } else {
+            crate::security::blacklist::notification::Action::Unban
+        },
+        ip,
+        identity.principal_id.as_ref(),
+        crate::security::blacklist::notification::Source::Admin,
+        expires_at,
+    ) {
+        Ok(event) => event,
+        Err(_) => {
+            return plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "blacklist event identity unavailable\n",
+            )
+        }
+    };
+    let result = if let Some(value) = value.as_mut() {
+        value
+            .as_object_mut()
+            .expect("validated blacklist object")
+            .insert(
+                "notification".to_owned(),
+                serde_json::to_value(&event).expect("fixed ACL event"),
+            );
+        let bytes = serde_json::to_vec(value).expect("fixed blacklist value");
+        state.dynamic_store.put(&cfg.collection, &key, &bytes).await
     } else {
         crate::security::blacklist::revoke_ip(state.dynamic_store.as_ref(), &cfg.collection, ip)
             .await
@@ -8964,6 +9010,17 @@ async fn set_blacklist_ip(
             "blacklist store update failed\n",
         );
     }
+    let ttl_ms = blocked.then(|| {
+        runtime_actions::parameter(req, "ttl_ms")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+    // 事实已确认后就登记原动作；后面的刷新失败不能抹掉已提交操作的主体与身份。
+    state.blacklist.record_event(&event, ttl_ms);
+    state
+        .blacklist
+        .notifications
+        .publish(&event, notification_plan);
     if let Err(e) = state
         .blacklist
         .refresh_from_store(state.dynamic_store.as_ref(), &cfg.collection)
@@ -8977,18 +9034,11 @@ async fn set_blacklist_ip(
     }
     if blocked {
         let closed = state.conn_registry.close_by_ip(ip);
-        //  审计:手工拉黑记 who/why/source + TTL。
-        let ttl_ms = runtime_actions::parameter(req, "ttl_ms")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-        state.blacklist.record_ban(ip, "admin", ttl_ms);
         plain(
             StatusCode::OK,
             &format!("blocked ip={ip} closed_long_connections={closed}\n"),
         )
     } else {
-        //  审计 + 解封豁免:手工解封记审计,并在本节点开启解封豁免窗口(防抖)。
-        state.blacklist.record_unban(ip, "admin");
         plain(StatusCode::OK, &format!("unblocked ip={ip}\n"))
     }
 }

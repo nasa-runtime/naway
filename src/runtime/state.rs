@@ -183,6 +183,28 @@ pub struct DynamicStoreChange {
     pub key: String,
     /// 写入或删除事件。
     pub kind: DynamicStoreChangeKind,
+    /// 写入者明确保存的有界业务通知；普通提示和删除不推断已经不存在的操作内容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<serde_json::Value>,
+}
+
+/// 业务作用：只从小型事实的保留字段提取显式通知，普通值与大文档不进入变更总线。
+///
+/// 参数说明：
+/// - `value`：已经由事实写入者选择的完整原文字节。
+///
+/// 返回：最多2048字节的JSON对象；缺失、非法或超限时只保留原来的失效提示。
+/// 接收业务仍须验证领域协议与存储来源，此层不把通知解释成授权或当前状态。
+fn notification_from_value(value: &[u8]) -> Option<serde_json::Value> {
+    if value.len() > 4096 {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(value).ok()?;
+    let notification = value.as_object_mut()?.remove("notification")?;
+    if !notification.is_object() || serde_json::to_vec(&notification).ok()?.len() > 2048 {
+        return None;
+    }
+    Some(notification)
 }
 
 /// 持有后端订阅生命周期的有界变更接收器。
@@ -343,8 +365,12 @@ impl FileDynamicStore {
             });
         }
         // 完整文件已在原集合中决定，订阅方才可据此重读；提示失败不撤销已完成写入。
-        self.subscriptions
-            .publish(collection, key, DynamicStoreChangeKind::Put);
+        self.subscriptions.publish(
+            collection,
+            key,
+            DynamicStoreChangeKind::Put,
+            notification_from_value(value),
+        );
         Ok(())
     }
 
@@ -438,8 +464,12 @@ impl DynamicStore for FileDynamicStore {
             match fs::remove_file(&path) {
                 Ok(()) => {
                     // 提示跟随已完成的事实撤销，不能让读者把未决定的删除当成解封。
-                    self.subscriptions
-                        .publish(collection, key, DynamicStoreChangeKind::Delete);
+                    self.subscriptions.publish(
+                        collection,
+                        key,
+                        DynamicStoreChangeKind::Delete,
+                        None,
+                    );
                     Ok(())
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -479,8 +509,12 @@ impl DynamicStore for FileDynamicStore {
             match fs::remove_file(&path) {
                 Ok(()) => {
                     // 回收确实删除了原值后才通知；比较失败不会撤销后来的续期事实。
-                    self.subscriptions
-                        .publish(collection, key, DynamicStoreChangeKind::Delete);
+                    self.subscriptions.publish(
+                        collection,
+                        key,
+                        DynamicStoreChangeKind::Delete,
+                        None,
+                    );
                     Ok(true)
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -595,11 +629,20 @@ impl RedisDynamicStore {
     }
 
     /// 业务作用：发布动态事实变更通知，接收方仍需从事实源重新读取完整状态。
+    ///
+    /// 参数说明：
+    /// - `collection`：写入已确认的事实集合。
+    /// - `key`：本次改变的业务键。
+    /// - `kind`：已确认的写入或删除类型。
+    /// - `notification`：写入者明确选择的小型通知，删除不沿用旧操作。
+    ///
+    /// 返回：Stream接受类型化提示时成功；失败不撤销前面已经确认的事实写入。
     async fn publish_change(
         &self,
         collection: &str,
         key: &str,
         kind: DynamicStoreChangeKind,
+        notification: Option<serde_json::Value>,
     ) -> Result<()> {
         let stream = self.events_key(collection)?;
         let event = match kind {
@@ -610,6 +653,7 @@ impl RedisDynamicStore {
             collection: collection.to_string(),
             key: key.to_string(),
             kind,
+            notification,
         };
         self.client.publish(&stream, event, &change).await?;
         let _ = self
@@ -757,7 +801,12 @@ impl DynamicStore for RedisDynamicStore {
             let redis_key = self.collection_key(collection)?;
             self.client.h_set(&redis_key, key, value.to_vec()).await?;
             if let Err(e) = self
-                .publish_change(collection, key, DynamicStoreChangeKind::Put)
+                .publish_change(
+                    collection,
+                    key,
+                    DynamicStoreChangeKind::Put,
+                    notification_from_value(value),
+                )
                 .await
             {
                 tracing::warn!(collection, key, error = %e, "publish dynamic store put event failed");
@@ -773,7 +822,7 @@ impl DynamicStore for RedisDynamicStore {
             let redis_key = self.collection_key(collection)?;
             self.client.h_del(&redis_key, &[key]).await?;
             if let Err(e) = self
-                .publish_change(collection, key, DynamicStoreChangeKind::Delete)
+                .publish_change(collection, key, DynamicStoreChangeKind::Delete, None)
                 .await
             {
                 tracing::warn!(collection, key, error = %e, "publish dynamic store delete event failed");
@@ -811,7 +860,7 @@ impl DynamicStore for RedisDynamicStore {
             let deleted: u64 = self.client.execute_raw(&command).await?;
             if deleted != 0 {
                 if let Err(error) = self
-                    .publish_change(collection, key, DynamicStoreChangeKind::Delete)
+                    .publish_change(collection, key, DynamicStoreChangeKind::Delete, None)
                     .await
                 {
                     tracing::warn!(collection, key, error = %error, "publish conditional dynamic store delete event failed");
@@ -856,6 +905,7 @@ impl DynamicStore for RedisDynamicStore {
             );
             // nasa 当前 EVAL 门面只接收 &str。十六进制是这里唯一的必要控制面拷贝；Lua 在
             // 同一原子命令内还原原始字节，因而 file/Redis 后端保持完全相同的二进制契约。
+            let notification = notification_from_value(value);
             let value = encode_redis_lua_hex(value)?;
             let redis_key = self.collection_key(collection)?;
             let capacity = max_entries.to_string();
@@ -872,7 +922,7 @@ impl DynamicStore for RedisDynamicStore {
                 return Ok(StoreCapacityOutcome::CapacityReached);
             }
             if let Err(error) = self
-                .publish_change(collection, key, DynamicStoreChangeKind::Put)
+                .publish_change(collection, key, DynamicStoreChangeKind::Put, notification)
                 .await
             {
                 tracing::warn!(collection, key, error = %error, "publish bounded dynamic store put event failed");
@@ -1853,7 +1903,7 @@ fn encode_nacos_dynamic_document(
 /// - `previous`：是连续合法快照。
 /// - `next`：是连续合法快照。
 ///
-/// 返回：按 key 排序的 Put/Delete 事件；值变化也归一化为 Put，不携带敏感 value。
+/// 返回：按 key 排序的Put/Delete提示；仅Put附带写入者明确选择的小型通知，不复制完整事实值。
 fn diff_nacos_dynamic_snapshots(
     collection: &str,
     previous: &NacosDynamicSnapshot,
@@ -1866,6 +1916,7 @@ fn diff_nacos_dynamic_snapshots(
                 collection: collection.to_string(),
                 key: key.clone(),
                 kind: DynamicStoreChangeKind::Put,
+                notification: notification_from_value(value),
             });
         }
     }
@@ -1875,6 +1926,7 @@ fn diff_nacos_dynamic_snapshots(
                 collection: collection.to_string(),
                 key: key.clone(),
                 kind: DynamicStoreChangeKind::Delete,
+                notification: None,
             });
         }
     }

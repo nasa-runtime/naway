@@ -385,6 +385,9 @@ pub struct BlacklistCfg {
     /// 自动拉黑策略。默认关闭;启用后由数据面在限流拒绝等信号上写入临时黑名单。
     #[serde(default)]
     pub auto_ban: AutoBanCfg,
+    /// 已确认操作的业务通知；省略时只有原DynamicStore watch，不创建外部投递资源。
+    #[serde(default)]
+    pub notifications: Option<super::AclNotificationsCfg>,
 }
 
 impl Default for BlacklistCfg {
@@ -395,6 +398,7 @@ impl Default for BlacklistCfg {
             collection: default_blacklist_collection(),
             refresh_interval_ms: default_blacklist_refresh_interval_ms(),
             auto_ban: AutoBanCfg::default(),
+            notifications: None,
         }
     }
 }

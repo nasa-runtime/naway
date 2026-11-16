@@ -37,9 +37,16 @@ impl Subscriptions {
     /// - `collection`：事实所属集合。
     /// - `key`：已完成写入或删除的业务键。
     /// - `kind`：文件决定的操作类型。
+    /// - `notification`：写入者明确提供的有界通知；删除不沿用旧封禁事件。
     ///
     /// 返回：无返回值；满队列仍保留已排队提示并由周期全量对账兜底，不回滚事实。
-    pub(super) fn publish(&self, collection: &str, key: &str, kind: DynamicStoreChangeKind) {
+    pub(super) fn publish(
+        &self,
+        collection: &str,
+        key: &str,
+        kind: DynamicStoreChangeKind,
+        notification: Option<serde_json::Value>,
+    ) {
         self.entries.lock().retain(|entry| {
             let Some(sender) = entry.sender.upgrade() else {
                 return false;
@@ -49,6 +56,7 @@ impl Subscriptions {
                     collection: collection.to_owned(),
                     key: key.to_owned(),
                     kind,
+                    notification: notification.clone(),
                 });
             }
             true
@@ -112,6 +120,7 @@ impl Subscriptions {
                     collection: name.clone(),
                     key,
                     kind,
+                    notification: None,
                 });
             }
         })

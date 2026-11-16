@@ -166,6 +166,8 @@ pub struct GatewaySnapshot {
     pub control_plane: ControlPlaneCfg,
     /// 运行态共享后端配置。启动装配读取它创建 RateLimiter/DynamicStore 后端。
     pub runtime_state: RuntimeStateCfg,
+    /// 与平台快照同代的封禁通知目的地和材料；候选不会启动投递任务。
+    pub acl_notifications: Arc<crate::security::blacklist::notification::Plan>,
     /// access log 运行参数。构建期已编译格式/条件表达式。
     pub access_log: AccessLogRuntime,
     /// OpenTelemetry bootstrap 配置。运行期 exporter 常驻，不在请求热路径重建。
@@ -1082,8 +1084,8 @@ impl Eq for TlsRuntimeCfg {}
 
 /// 缺省配置 schema 保持为 1，显式安全策略不能因省略兼容门而被当作已启用。
 const DEFAULT_SCHEMA_VERSION: u32 = 1;
-/// 主配置支持显式访问、来源与多信号封禁策略；独立保护文档仍只接受各自的 schema 1。
-const SUPPORTED_GATEWAY_SCHEMA_VERSION: u32 = 3;
+/// 主配置支持显式访问、来源、多信号封禁与通知策略；独立保护文档仍只接受各自的 schema 1。
+const SUPPORTED_GATEWAY_SCHEMA_VERSION: u32 = 4;
 /// reload 指纹单文件硬上限。它覆盖主配置、OpenAPI/schema、WASM 与 SecretSource 依赖；
 /// 各构建器仍执行更严格的业务上限，这里先防 watcher 因敌意大文件产生无界分配。
 const MAX_FINGERPRINT_FILE_BYTES: usize = 32 * 1024 * 1024;
@@ -1217,6 +1219,11 @@ fn build_snapshot_from_config(
         "gateway.yml",
         SUPPORTED_GATEWAY_SCHEMA_VERSION,
     )?;
+    // 通知会向外部系统交付安全操作事实，旧制品必须拒绝不能执行的目的地与签名合同。
+    anyhow::ensure!(
+        schema_version >= 4 || cfg.runtime_state.blacklist.notifications.is_none(),
+        "blacklist notifications require schema_version: 4"
+    );
     // 原生拒绝信号会产生全局封禁副作用，必须让不能执行该合同的旧制品先拒绝整份声明。
     anyhow::ensure!(
         schema_version >= 3
@@ -1502,6 +1509,12 @@ fn build_snapshot_from_config(
     }
     crate::cache::http::validate_runtime_config(&cfg.runtime_state.http_cache)
         .context("validate runtime_state.http_cache")?;
+    crate::security::blacklist::validate_config(&cfg.runtime_state.blacklist)
+        .context("validate runtime_state.blacklist")?;
+    let acl_notifications = crate::security::blacklist::notification::Plan::build(
+        cfg.runtime_state.blacklist.notifications.as_ref(),
+        config_dir,
+    )?;
     validate_early_data_runtime(&proxies, &cfg.runtime_state)
         .context("validate HTTP/3 early-data runtime state")?;
     if proxies
@@ -1599,6 +1612,7 @@ fn build_snapshot_from_config(
         config_source: cfg.config_source,
         control_plane: cfg.control_plane,
         runtime_state: cfg.runtime_state,
+        acl_notifications,
         access_log,
         telemetry: cfg.telemetry,
         #[cfg(feature = "telemetry-otlp")]
@@ -5568,6 +5582,10 @@ fn config_watch_dependencies<'a>(
 /// 返回：去重前的依赖路径集合；调用方按各自需要排序去重，函数不读取文件内容。
 fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) -> Vec<PathBuf> {
     let mut paths = crate::security::upstream_credential::dependency_paths(cfg, config_dir);
+    paths.extend(crate::security::blacklist::notification::dependencies(
+        cfg.runtime_state.blacklist.notifications.as_ref(),
+        config_dir,
+    ));
     paths.extend(management::dependencies(&cfg.admin.management, config_dir));
     if cfg.admin.operations.enabled {
         paths.extend(crate::security::secret::dependency_path(

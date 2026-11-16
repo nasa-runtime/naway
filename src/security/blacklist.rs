@@ -2,6 +2,8 @@
 //!
 //! DynamicStore 是低频事实源；数据面只读本地地址与期限快照，避免请求期访问 Redis/文件。
 
+pub mod notification;
+
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,6 +39,10 @@ pub struct BlacklistAuditEvent {
     pub ip: String,
     /// 来源:`auto_limit_req`(自动拉黑)/ `admin`(手工)等。
     pub source: String,
+    /// 实际管理主体或网关原生动作主体，不包含认证凭据。
+    pub actor: String,
+    /// 已确认动作的完整跨传输身份；兼容没有领域通知的本机审计调用。
+    pub event_id: Option<String>,
     /// ban 事件的 TTL(ms);unban 无。
     pub ttl_ms: Option<u64>,
 }
@@ -101,6 +107,9 @@ pub struct BlacklistCache {
     audit: Mutex<VecDeque<BlacklistAuditEvent>>,
     /// 审计事件单调号。
     audit_seq: AtomicU64,
+    notification_factory: notification::EventFactory,
+    /// 只由确认事实写入的动作节点投递；watch刷新不持有外发入口。
+    pub notifications: notification::Runtime,
 }
 
 impl BlacklistCache {
@@ -108,6 +117,8 @@ impl BlacklistCache {
     ///
     /// 参数说明：
     /// - `cfg`: 黑名单及自动封禁配置。
+    ///
+    /// 返回：合法配置、空缓存和独立通知身份；随机源不可用或配置非法时拒绝构造。
     pub fn new(cfg: &BlacklistCfg) -> Result<Self> {
         validate_config(cfg)?;
         Ok(Self {
@@ -120,6 +131,8 @@ impl BlacklistCache {
             exemptions: Mutex::new(HashMap::new()),
             audit: Mutex::new(VecDeque::new()),
             audit_seq: AtomicU64::new(0),
+            notification_factory: notification::EventFactory::new()?,
+            notifications: notification::Runtime::default(),
         })
     }
 
@@ -173,7 +186,7 @@ impl BlacklistCache {
     /// - `source`: 来源(`auto_limit_req` / `admin`)。
     /// - `ttl_ms`: 拉黑 TTL。
     pub fn record_ban(&self, ip: IpAddr, source: &str, ttl_ms: u64) {
-        self.push_audit("ban", ip, source, Some(ttl_ms));
+        self.push_audit("ban", ip, source, source, None, Some(ttl_ms));
     }
 
     /// 业务作用：记录一次解封审计,并(若配置了 `unban_exempt_ms`)对该 IP 设置本节点解封豁免窗口。
@@ -182,6 +195,17 @@ impl BlacklistCache {
     /// - `ip`: 被解封 IP。
     /// - `source`: 来源(通常 `admin`)。
     pub fn record_unban(&self, ip: IpAddr, source: &str) {
+        self.exempt_after_unban(ip);
+        self.push_audit("unban", ip, source, source, None, None);
+    }
+
+    /// 业务作用：在明确解封后提供本节点有限豁免，避免同一原生拒绝立即重新封禁。
+    ///
+    /// 参数说明：
+    /// - `ip`：已经确认解封的客户端地址。
+    ///
+    /// 返回：配置的窗口内暂停本机自动封禁；零窗口或不可表示的截止时刻不创建豁免。
+    fn exempt_after_unban(&self, ip: IpAddr) {
         let ip = crate::io::net::canonical_ip(ip);
         let exempt_ms = self.unban_exempt_ms.load(Ordering::Relaxed);
         if exempt_ms > 0 {
@@ -190,11 +214,81 @@ impl BlacklistCache {
                 self.exemptions.lock().insert(ip, until);
             }
         }
-        self.push_audit("unban", ip, source, None);
+    }
+
+    /// 业务作用：给即将执行的事实写入分配固定操作身份，写入未确认前不得外发或登记成功。
+    ///
+    /// 参数说明：
+    /// - `action`：本次期望执行的封禁或撤销。
+    /// - `ip`：真实连接或已授权管理输入确定的地址。
+    /// - `actor`：认证主体或固定网关动作主体。
+    /// - `source`：提供动作证据的固定来源。
+    /// - `expires_at`：封禁事实的原始绝对期限，永久封禁与解封省略。
+    ///
+    /// 返回：完整规范事件；身份或输入不可用时返回错误，不执行事实副作用。
+    pub fn create_event(
+        &self,
+        action: notification::Action,
+        ip: IpAddr,
+        actor: &str,
+        source: notification::Source,
+        expires_at: Option<i64>,
+    ) -> Result<notification::Event> {
+        self.notification_factory
+            .create(action, ip, actor, source, expires_at)
+    }
+
+    /// 业务作用：仅由已经确认事实写入的动作节点记录完整审计，共享watch读者不得调用此入口再次外发。
+    ///
+    /// 参数说明：
+    /// - `event`：本次事实写入绑定的有效原事件。
+    /// - `ttl_ms`：封禁请求的原始TTL；永久封禁为零，解封省略。
+    ///
+    /// 返回：追加有限审计并在解封时建立本机豁免；不把后续缓存刷新失败当作事实未写入。
+    pub fn record_event(&self, event: &notification::Event, ttl_ms: Option<u64>) {
+        if event.validate().is_err() {
+            return;
+        }
+        let Ok(ip) = event.ip.parse::<IpAddr>() else {
+            return;
+        };
+        let kind = match event.action {
+            notification::Action::Ban => "ban",
+            notification::Action::Unban => {
+                self.exempt_after_unban(ip);
+                "unban"
+            }
+        };
+        self.push_audit(
+            kind,
+            ip,
+            event.source.as_str(),
+            &event.actor,
+            Some(&event.event_id),
+            ttl_ms,
+        );
     }
 
     /// 业务作用：把封禁或撤销事件加入有界审计读面，保留原因与期限而不无限积累记录。
-    fn push_audit(&self, kind: &'static str, ip: IpAddr, source: &str, ttl_ms: Option<u64>) {
+    ///
+    /// 参数说明：
+    /// - `kind`：已经确认的操作类型。
+    /// - `ip`：规范客户端地址。
+    /// - `source`：固定来源名称。
+    /// - `actor`：实际执行动作的主体。
+    /// - `event_id`：可跨传输关联的完整事件身份。
+    /// - `ttl_ms`：封禁原始期限，解封省略。
+    ///
+    /// 返回：仅保留最近256条低敏审计，旧条目按发生顺序释放。
+    fn push_audit(
+        &self,
+        kind: &'static str,
+        ip: IpAddr,
+        source: &str,
+        actor: &str,
+        event_id: Option<&str>,
+        ttl_ms: Option<u64>,
+    ) {
         let id = self.audit_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let mut audit = self.audit.lock();
         audit.push_back(BlacklistAuditEvent {
@@ -203,6 +297,8 @@ impl BlacklistCache {
             kind,
             ip: ip.to_string(),
             source: source.to_string(),
+            actor: actor.to_string(),
+            event_id: event_id.map(str::to_owned),
             ttl_ms,
         });
         while audit.len() > AUDIT_MAX_EVENTS {
@@ -298,6 +394,10 @@ impl BlacklistCache {
 /// 返回：启用依赖、至少一个拒绝门槛与所有期限合法时成功；非法声明拒绝候选，保留活动策略。
 pub fn validate_config(cfg: &BlacklistCfg) -> Result<()> {
     validate_component(&cfg.collection, "blacklist.collection")?;
+    if cfg.notifications.is_some() && !cfg.enabled {
+        // 没有启用对应事实权威时不能承诺通知合同，避免只配置出口却从未执行封禁。
+        anyhow::bail!("blacklist notifications require runtime_state.blacklist.enabled");
+    }
     if cfg.enabled && cfg.refresh_interval_ms == 0 {
         anyhow::bail!("runtime_state.blacklist.refresh_interval_ms must be positive when enabled");
     }

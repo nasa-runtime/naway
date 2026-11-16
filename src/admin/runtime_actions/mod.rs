@@ -264,7 +264,7 @@ async fn execute(
         );
     }
     let response = match kind {
-        Kind::Blacklist(blocked) => set_blacklist_ip(&parts, &state, blocked).await,
+        Kind::Blacklist(blocked) => set_blacklist_ip(&parts, &state, &identity, blocked).await,
         Kind::InterfaceDisable(disabled) => set_interface_disable(&parts, &state, disabled).await,
         Kind::Connections => close_long_connections(&parts, &state),
         Kind::CacheInvalidate => purge_http_cache(&parts, &state).await,

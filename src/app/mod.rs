@@ -212,6 +212,9 @@ pub(super) async fn run() -> Result<()> {
         gateway::security::blacklist::BlacklistCache::new(&runtime_state_cfg.blacklist)
             .context("build runtime blacklist cache")?,
     );
+    blacklist
+        .notifications
+        .apply(snapshot.acl_notifications.clone());
     if blacklist.is_enabled() {
         let collection = blacklist.collection();
         blacklist
