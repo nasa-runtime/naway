@@ -40,6 +40,7 @@ fn index(guard: &InterfaceGuard) -> BTreeMap<&str, Entry<'_>> {
                 path,
                 methods,
                 response,
+                ..
             } = rule;
             let order = enabled.then(|| {
                 order += 1;

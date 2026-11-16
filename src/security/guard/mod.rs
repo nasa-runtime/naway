@@ -17,7 +17,7 @@ use globset::{Glob, GlobMatcher};
 use http::request::Parts;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use hyper::Response;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 
 use crate::config::model::{
@@ -104,6 +104,8 @@ struct GuardRule {
     path: GuardPathMatcher,
     methods: Vec<Method>, // 空 = 所有方法
     response: RespTemplate,
+    /// 动态事实的绝对失效时刻；静态声明不附加期限。
+    expire_at_unix_ms: Option<i64>,
 }
 
 /// 接口守卫:命中任一 enabled 规则 → 返回它的直接响应。
@@ -170,6 +172,7 @@ impl InterfaceGuard {
                 path,
                 methods,
                 response,
+                expire_at_unix_ms: None,
             });
         }
         Ok(Self {
@@ -177,13 +180,25 @@ impl InterfaceGuard {
         })
     }
 
-    /// 业务作用：命中任一 enabled 规则 → Some(直接响应,附命中规则 id);否则 None(继续正常管线)。
+    /// 业务作用：按声明顺序执行仍有效的启用规则，让动态期限独立于后台刷新生效。
+    ///
+    /// 参数说明：
+    /// - `parts`：下游请求头与待匹配的方法、路径。
+    ///
+    /// 返回：首个有效命中的直接响应和规则身份；未命中或已过期时继续正常请求管线。
     pub fn check(&self, parts: &Parts) -> Option<(Response<BoxBody>, &str)> {
         let path = parts.uri.path();
+        let mut now_ms = None;
         // 配置书写顺序决定覆盖关系，只执行首个启用且匹配的规则，不按路径匹配类型重排。
         for r in &self.rules {
             if !r.enabled {
                 continue;
+            }
+            // 期限属于规则本身；事实源不可用或周期较长也不能延长已到期的接口关闭。
+            if let Some(expire_at) = r.expire_at_unix_ms {
+                if expire_at <= *now_ms.get_or_insert_with(unix_now_ms) {
+                    continue;
+                }
             }
             let method_ok = r.methods.is_empty() || r.methods.contains(&parts.method);
             if method_ok && r.path.is_match(path) {
@@ -211,6 +226,8 @@ pub struct DynamicInterfaceGuardCache {
     refresh_interval_ms: AtomicU64,
     /// 已编译的动态守卫规则。
     guard: ArcSwap<InterfaceGuard>,
+    /// 配置、显式发布与刷新共用的发布权，阻止迟到读取覆盖后续决定。
+    publication: Mutex<Arc<()>>,
 }
 
 impl DynamicInterfaceGuardCache {
@@ -218,6 +235,8 @@ impl DynamicInterfaceGuardCache {
     ///
     /// 参数说明：
     /// - `cfg`: `runtime_state.interface_disable` 配置。
+    ///
+    /// 返回：合法配置下的空缓存与独立发布权；配置非法时不创建缓存。
     pub fn new(cfg: &InterfaceDisableCfg) -> Result<Self> {
         validate_interface_disable_config(cfg)?;
         Ok(Self {
@@ -225,20 +244,27 @@ impl DynamicInterfaceGuardCache {
             collection: RwLock::new(cfg.collection.clone()),
             refresh_interval_ms: AtomicU64::new(cfg.refresh_interval_ms),
             guard: ArcSwap::from_pointee(InterfaceGuard::empty()),
+            publication: Mutex::new(Arc::new(())),
         })
     }
 
-    /// 业务作用：应用新配置。已编译规则由调用方随后按新 collection 刷新。
+    /// 业务作用：应用接口禁用配置并撤销旧读取的发布权，避免集合换代后重现旧规则。
     ///
     /// 参数说明：
     /// - `cfg`: 新的动态接口禁用配置。
+    ///
+    /// 返回：合法配置立即生效；禁用或更换集合清空旧规则，非法配置保留原状态。
     pub fn apply_config(&self, cfg: &InterfaceDisableCfg) -> Result<()> {
         validate_interface_disable_config(cfg)?;
+        // 先失效旧令牌再改配置，即使集合名称经过往返，旧 I/O 也不能重新取得发布资格。
+        let mut publication = self.publication.lock();
+        *publication = Arc::new(());
+        let changed_collection = *self.collection.read() != cfg.collection;
         self.enabled.store(cfg.enabled, Ordering::Relaxed);
         *self.collection.write() = cfg.collection.clone();
         self.refresh_interval_ms
             .store(cfg.refresh_interval_ms, Ordering::Relaxed);
-        if !cfg.enabled {
+        if !cfg.enabled || changed_collection {
             self.guard.store(Arc::new(InterfaceGuard::empty()));
         }
         Ok(())
@@ -264,28 +290,50 @@ impl DynamicInterfaceGuardCache {
     /// 参数说明：
     /// - `store`: 当前动态事实源。
     /// - `collection`: collection 名。
+    ///
+    /// 返回：当前已发布规则数；读取失败保留原快照，迟到读取失去发布权后也保留后续决定。
     pub async fn refresh_from_store(
         &self,
         store: &dyn DynamicStore,
         collection: &str,
     ) -> Result<usize> {
+        let ticket = {
+            let mut publication = self.publication.lock();
+            if !self.is_enabled() || *self.collection.read() != collection {
+                // 旧集合不再具有当前配置的发布资格，不能把另一来源的关闭带入当前管线。
+                return Ok(self.guard.load().rule_count());
+            }
+            *publication = Arc::new(());
+            publication.clone()
+        };
         let guard = load_dynamic_interface_guard(store, collection).await?;
-        let count = guard.rule_count();
-        self.guard.store(Arc::new(guard));
-        Ok(count)
+        let publication = self.publication.lock();
+        if Arc::ptr_eq(&publication, &ticket) {
+            // 新刷新、清空和配置发布都会撤销令牌；只允许最后仍有权的完整读取替换快照。
+            self.guard.store(Arc::new(guard));
+        }
+        Ok(self.guard.load().rule_count())
     }
 
     /// 业务作用：直接替换已编译规则。
     ///
     /// 参数说明：
     /// - `guard`: 已编译动态守卫。
+    ///
+    /// 返回：发布完整快照并撤销先前读取的发布权，不允许旧响应覆盖当前决定。
     pub fn replace_guard(&self, guard: InterfaceGuard) {
+        let mut publication = self.publication.lock();
+        *publication = Arc::new(());
         self.guard.store(Arc::new(guard));
     }
 
     /// 业务作用：清空动态规则。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：撤销进行中读取的发布权并发布空规则，迟到响应不能恢复已撤销的关闭。
     pub fn clear(&self) {
-        self.guard.store(Arc::new(InterfaceGuard::empty()));
+        self.replace_guard(InterfaceGuard::empty());
     }
 
     /// 业务作用：按当前动态规则检查请求。
@@ -326,6 +374,8 @@ pub fn validate_interface_disable_config(cfg: &InterfaceDisableCfg) -> Result<()
 /// 参数说明：
 /// - `store`: 当前动态事实源。
 /// - `collection`: collection 名。
+///
+/// 返回：编译后的完整有效规则及其绝对期限；无法枚举集合时失败，非法条目单独忽略。
 pub async fn load_dynamic_interface_guard(
     store: &dyn DynamicStore,
     collection: &str,
@@ -337,9 +387,13 @@ pub async fn load_dynamic_interface_guard(
         .with_context(|| format!("load interface disable collection `{collection}`"))?;
     let now_ms = unix_now_ms();
     let mut rules = Vec::new();
+    let mut expirations = Vec::new();
     for key in keys {
         match load_dynamic_interface_rule(store, collection, &key, now_ms).await {
-            Ok(Some(rule)) => rules.push(rule),
+            Ok(Some((rule, expire_at))) => {
+                rules.push(rule);
+                expirations.push(expire_at);
+            }
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(
@@ -351,11 +405,15 @@ pub async fn load_dynamic_interface_guard(
             }
         }
     }
-    InterfaceGuard::build(GuardFile {
+    let mut guard = InterfaceGuard::build(GuardFile {
         schema_version: Some(1),
         default_response: None,
         rules,
-    })
+    })?;
+    for (rule, expire_at) in guard.rules.iter_mut().zip(expirations) {
+        rule.expire_at_unix_ms = expire_at;
+    }
+    Ok(guard)
 }
 
 /// 业务作用：启动动态接口禁用后台刷新任务。
@@ -475,12 +533,20 @@ struct DynamicInterfaceRuleCfg {
 }
 
 /// 业务作用：把持久化接口关闭事实转换为守卫规则，非法或过期声明不能扩张拦截范围。
+///
+/// 参数说明：
+/// - `store`：当前动态事实源。
+/// - `collection`：需要读取的接口禁用集合。
+/// - `key`：规则事实的持久化身份。
+/// - `now_ms`：本次读取采用的 Unix 毫秒时刻。
+///
+/// 返回：合法未到期规则及期限；缺失或过期返回空值，解析或读取失败返回错误。
 async fn load_dynamic_interface_rule(
     store: &dyn DynamicStore,
     collection: &str,
     key: &str,
     now_ms: i64,
-) -> Result<Option<GuardRuleCfg>> {
+) -> Result<Option<(GuardRuleCfg, Option<i64>)>> {
     validate_component(key, "interface_disable.key")?;
     let Some(value) = store
         .get(collection, key)
@@ -496,7 +562,8 @@ async fn load_dynamic_interface_rule(
         .map(|expire_at| expire_at <= now_ms)
         .unwrap_or(false)
     {
-        if let Err(e) = store.delete(collection, key).await {
+        // 只回收实际读取的原值；续期或替换后的事实不能被较早的过期判断删除。
+        if let Err(e) = store.delete_if_value(collection, key, &value).await {
             tracing::warn!(
                 collection,
                 key = %key,
@@ -506,16 +573,19 @@ async fn load_dynamic_interface_rule(
         }
         return Ok(None);
     }
-    Ok(Some(GuardRuleCfg {
-        id: if cfg.id.is_empty() {
-            key.to_string()
-        } else {
-            cfg.id
+    Ok(Some((
+        GuardRuleCfg {
+            id: if cfg.id.is_empty() {
+                key.to_string()
+            } else {
+                cfg.id
+            },
+            enabled: cfg.enabled,
+            matcher: cfg.matcher,
+            response: cfg.response,
         },
-        enabled: cfg.enabled,
-        matcher: cfg.matcher,
-        response: cfg.response,
-    }))
+        cfg.expire_at_unix_ms,
+    )))
 }
 
 /// 业务作用：为未显式声明的 `enabled` 提供统一缺省策略，使配置反序列化与手动构造使用相同初值。
