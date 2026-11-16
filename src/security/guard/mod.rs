@@ -363,6 +363,8 @@ pub async fn load_dynamic_interface_guard(
 /// 参数说明：
 /// - `cache`: 动态接口禁用本地缓存。
 /// - `store`: 可热替换动态事实源。
+///
+/// 返回：后台任务句柄；订阅先于完整重读，配置或后端通知触发重新订阅，失败保留周期对账。
 pub fn spawn_interface_disable_refresh(
     cache: Arc<DynamicInterfaceGuardCache>,
     store: Arc<SwappableDynamicStore>,
@@ -371,19 +373,27 @@ pub fn spawn_interface_disable_refresh(
         let mut watcher = None;
         let mut watched_collection = String::new();
         let mut watched_generation = 0;
+        let mut registered = false;
+        let mut refreshes = store.subscribe_refresh();
         loop {
             if !cache.is_enabled() {
                 watcher = None;
-                tokio::time::sleep(cache.refresh_interval()).await;
+                registered = false;
+                tokio::select! {
+                    _ = refreshes.changed() => {}
+                    _ = tokio::time::sleep(cache.refresh_interval()) => {}
+                }
                 continue;
             }
 
             let collection = cache.collection();
             let generation = store.generation();
-            if watcher.is_none()
+            let reason = if !registered
                 || watched_collection != collection
                 || watched_generation != generation
             {
+                // 旧集合和旧后端不能继续占用当前订阅容量，注册前先结束原观察。
+                drop(watcher.take());
                 watcher = match store.watch(&collection).await {
                     Ok(next) => next,
                     Err(e) => {
@@ -393,10 +403,12 @@ pub fn spawn_interface_disable_refresh(
                 };
                 watched_collection = collection.clone();
                 watched_generation = generation;
-            }
-
-            let reason = if let Some(watcher) = watcher.as_mut() {
+                registered = true;
+                // 订阅先于重读，避免把注册前的接口关闭留给较晚的周期对账。
+                "watch-started"
+            } else if let Some(watcher) = watcher.as_mut() {
                 tokio::select! {
+                    _ = refreshes.changed() => "configuration",
                     changed = watcher.recv() => {
                         match changed {
                             Some(change) => {
@@ -414,12 +426,20 @@ pub fn spawn_interface_disable_refresh(
                     _ = tokio::time::sleep(cache.refresh_interval()) => "interval",
                 }
             } else {
-                tokio::time::sleep(cache.refresh_interval()).await;
-                "interval"
+                tokio::select! {
+                    _ = refreshes.changed() => "configuration",
+                    _ = tokio::time::sleep(cache.refresh_interval()) => "interval",
+                }
             };
 
-            if reason == "watch-ended" {
+            if reason == "watch-ended" || reason == "configuration" {
+                // 旧来源的提示不再提供当前订阅资格，先释放再按新来源建立观察。
                 watcher = None;
+                registered = false;
+                continue;
+            }
+            if watcher.is_none() && reason == "interval" {
+                registered = false;
                 continue;
             }
 

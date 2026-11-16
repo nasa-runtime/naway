@@ -2,6 +2,7 @@
 //! 所有远端 I/O 都在请求转发契约之外保持有界并显式失败。
 
 mod buckets;
+mod file_watch;
 
 #[cfg(feature = "nacos-sdk")]
 use std::collections::BTreeMap;
@@ -202,6 +203,9 @@ impl DynamicStoreWatcher {
 }
 
 enum DynamicStoreWatchGuard {
+    File {
+        _guard: file_watch::Guard,
+    },
     #[cfg(feature = "redis-runtime")]
     Redis {
         _subscription: nasa::redis::StreamSubscription,
@@ -213,11 +217,11 @@ enum DynamicStoreWatchGuard {
 }
 
 impl Drop for DynamicStoreWatchGuard {
-    /// 业务作用：在 watcher 生命周期结束时撤销 Nacos 远端监听，避免热换或调用方退出后泄漏控制面任务。
+    /// 业务作用：在 watcher 结束时撤销远端或文件观察，避免热换和调用方退出后遗留订阅。
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：无返回值；取消信号是幂等尽力发送，接收端已经退出时无需升级为进程错误。
+    /// 返回：无返回值；Nacos 取消信号尽力发送，文件观察器与发送端随字段所有权释放。
     fn drop(&mut self) {
         #[allow(unreachable_patterns)]
         match self {
@@ -243,6 +247,7 @@ pub struct FileDynamicStore {
     root: PathBuf,
     /// file backend 的写/枚举事务锁；只服务低频控制面，不进入请求转发热路径。
     write_lock: Mutex<()>,
+    subscriptions: file_watch::Subscriptions,
 }
 
 /// 含 `/` 等文件名不安全字符的业务 key 存入该保留子目录，并以 UTF-8 字节十六进制编码。
@@ -258,10 +263,16 @@ const MAX_DYNAMIC_KEYS: usize = 100_000;
 
 impl FileDynamicStore {
     /// 业务作用：构造以指定目录为根的持久化动态集合后端。
+    ///
+    /// 参数说明：
+    /// - `root`：本机文件事实源的根目录。
+    ///
+    /// 返回：共享同一写入锁和有界进程内订阅目录的后端；构造时不访问磁盘。
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             write_lock: Mutex::new(()),
+            subscriptions: file_watch::Subscriptions::default(),
         }
     }
 
@@ -280,6 +291,13 @@ impl FileDynamicStore {
     }
 
     /// 业务作用：在文件后端持久化完整动态事实，使用受控写入路径避免读到半份内容。
+    ///
+    /// 参数说明：
+    /// - `collection`：事实所属集合。
+    /// - `key`：需要校验并定位的业务身份。
+    /// - `value`：需要完整替换的有界事实原文。
+    ///
+    /// 返回：完整文件替换后提供失效提示；写入失败不把在途内容发布为集合事实。
     fn put_sync(&self, collection: &str, key: &str, value: &[u8]) -> Result<()> {
         anyhow::ensure!(
             value.len() <= MAX_DYNAMIC_VALUE_BYTES,
@@ -290,9 +308,30 @@ impl FileDynamicStore {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create dynamic store dir {}", parent.display()))?;
         }
-        let tmp = temp_path_for(&path);
-        fs::write(&tmp, value)
-            .with_context(|| format!("write dynamic store temp {}", tmp.display()))?;
+        // 在途内容不属于事实目录；编码保留目录内的子目录不会被普通键或编码键枚举。
+        let pending = self
+            .root
+            .join(collection)
+            .join(ENCODED_DYNAMIC_KEYS_DIR)
+            .join(".pending");
+        fs::create_dir_all(&pending).context("create dynamic store pending directory")?;
+        let tmp = temp_path_for(&pending.join("value"));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .context("create dynamic store pending value")?;
+        if let Err(error) = std::io::Write::write_all(&mut file, value) {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(error).context("write dynamic store pending value");
+        }
+        drop(file);
         if let Err(error) = fs::rename(&tmp, &path) {
             let _ = fs::remove_file(&tmp);
             return Err(error).with_context(|| {
@@ -303,6 +342,9 @@ impl FileDynamicStore {
                 )
             });
         }
+        // 完整文件已在原集合中决定，订阅方才可据此重读；提示失败不撤销已完成写入。
+        self.subscriptions
+            .publish(collection, key, DynamicStoreChangeKind::Put);
         Ok(())
     }
 
@@ -382,13 +424,24 @@ impl DynamicStore for FileDynamicStore {
         })
     }
 
-    /// 业务作用：撤销指定集合中的事实键，使后续治理判定不再使用已删除声明。
+    /// 业务作用：撤销指定集合中的事实键，并提示订阅读者重新核对治理状态。
+    ///
+    /// 参数说明：
+    /// - `collection`：事实所属集合。
+    /// - `key`：需要撤销的业务键。
+    ///
+    /// 返回：删除或原键缺失时成功；实际删除完成后才提供有界失效提示。
     fn delete<'a>(&'a self, collection: &'a str, key: &'a str) -> StoreFuture<'a, Result<()>> {
         Box::pin(async move {
             let _guard = self.write_lock.lock();
             let path = self.path_for(collection, key)?;
             match fs::remove_file(&path) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    // 提示跟随已完成的事实撤销，不能让读者把未决定的删除当成解封。
+                    self.subscriptions
+                        .publish(collection, key, DynamicStoreChangeKind::Delete);
+                    Ok(())
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => {
                     Err(e).with_context(|| format!("delete dynamic store {}", path.display()))
@@ -404,7 +457,7 @@ impl DynamicStore for FileDynamicStore {
     /// - `key`：待回收的事实键。
     /// - `expected`：清理方读取的完整原值。
     ///
-    /// 返回：原值匹配且文件删除成功返回 true；缺失或变化返回 false，读写错误返回失败。
+    /// 返回：匹配并删除后发出提示并返回 true；缺失或变化返回 false，读写错误返回失败。
     fn delete_if_value<'a>(
         &'a self,
         collection: &'a str,
@@ -424,7 +477,12 @@ impl DynamicStore for FileDynamicStore {
                 return Ok(false);
             }
             match fs::remove_file(&path) {
-                Ok(()) => Ok(true),
+                Ok(()) => {
+                    // 回收确实删除了原值后才通知；比较失败不会撤销后来的续期事实。
+                    self.subscriptions
+                        .publish(collection, key, DynamicStoreChangeKind::Delete);
+                    Ok(true)
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Err(error) => Err(error).context("delete matching dynamic store value"),
             }
@@ -456,6 +514,21 @@ impl DynamicStore for FileDynamicStore {
             }
             self.put_sync(collection, key, value)?;
             Ok(StoreCapacityOutcome::Stored)
+        })
+    }
+
+    /// 业务作用：订阅本机动态集合的受管写入与外部文件变更，缩短周期对账前的可见窗口。
+    ///
+    /// 参数说明：
+    /// - `collection`：需要观察的合法集合名称。
+    ///
+    /// 返回：有界键级提示接收器；文件观察或订阅容量不可用时返回错误，调用方保留周期对账。
+    fn watch<'a>(
+        &'a self,
+        collection: &'a str,
+    ) -> StoreFuture<'a, Result<Option<DynamicStoreWatcher>>> {
+        Box::pin(async move {
+            self.subscriptions.watch(&self.root, collection).map(Some)
         })
     }
 }
@@ -1834,14 +1907,22 @@ fn validate_nacos_data_id_prefix(prefix: &str) -> Result<()> {
 pub struct SwappableDynamicStore {
     inner: RwLock<Arc<dyn DynamicStore>>,
     generation: AtomicU64,
+    refreshes: tokio::sync::watch::Sender<()>,
 }
 
 impl SwappableDynamicStore {
     /// 业务作用：以一个已经初始化的后端构造热替换容器。
+    ///
+    /// 参数说明：
+    /// - `inner`：当前已经完成初始化的事实后端。
+    ///
+    /// 返回：持有同一事实后端及控制面重读通知的热替换容器。
     pub fn new(inner: Arc<dyn DynamicStore>) -> Self {
+        let (refreshes, _) = tokio::sync::watch::channel(());
         Self {
             inner: RwLock::new(inner),
             generation: AtomicU64::new(0),
+            refreshes,
         }
     }
 
@@ -1850,10 +1931,37 @@ impl SwappableDynamicStore {
         self.inner.read().clone()
     }
 
-    /// 业务作用：原子语义替换后端并递增 generation。
+    /// 业务作用：替换当前事实后端并唤醒旧订阅读者，避免等待旧后端事件才发现新来源。
+    ///
+    /// 参数说明：
+    /// - `next`：已经通过候选资源构建的新后端。
+    ///
+    /// 返回：更新后端与 generation，并发出失效提示；读者仍须重验当前配置并重新订阅。
     pub fn replace(&self, next: Arc<dyn DynamicStore>) {
-        *self.inner.write() = next;
+        let mut inner = self.inner.write();
+        *inner = next;
         self.generation.fetch_add(1, Ordering::Relaxed);
+        drop(inner);
+        // 通知只发生在新指针与代际决定之后，不能让旧订阅继续决定新事实的可见时间。
+        self.request_refresh();
+    }
+
+    /// 业务作用：让后台缓存感知后端或已发布集合配置的变化，不靠旧集合事件唤醒。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：新接收器从当前通知位置开始；通知仅要求重读，不携带可直接发布的数据。
+    pub(crate) fn subscribe_refresh(&self) -> tokio::sync::watch::Receiver<()> {
+        self.refreshes.subscribe()
+    }
+
+    /// 业务作用：在事实源或缓存配置发布后要求所有后台读者复验当前来源。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：合并唤醒当前订阅者；没有订阅者时也不影响已经决定的配置。
+    pub(crate) fn request_refresh(&self) {
+        self.refreshes.send_replace(());
     }
 
     /// 业务作用：返回最近一次成功替换对应的单调 generation。

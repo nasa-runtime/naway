@@ -478,7 +478,7 @@ pub fn spawn_blacklist_refresh_with_connections(
 /// - `store`：运行期可切换的事实源。
 /// - `connections`：可选弱连接注册表，不延长数据面生命周期。
 ///
-/// 返回：后台任务句柄；只有完整读取成功后才触发本机连接关闭。
+/// 返回：后台任务句柄；新订阅先重读，配置通知撤销旧订阅，完整读取成功后才触发连接关闭。
 fn spawn_blacklist_refresh_worker(
     cache: Arc<BlacklistCache>,
     store: Arc<SwappableDynamicStore>,
@@ -488,19 +488,27 @@ fn spawn_blacklist_refresh_worker(
         let mut watcher = None;
         let mut watched_collection = String::new();
         let mut watched_generation = 0;
+        let mut registered = false;
+        let mut refreshes = store.subscribe_refresh();
         loop {
             if !cache.is_enabled() {
                 watcher = None;
-                tokio::time::sleep(cache.refresh_interval()).await;
+                registered = false;
+                tokio::select! {
+                    _ = refreshes.changed() => {}
+                    _ = tokio::time::sleep(cache.refresh_interval()) => {}
+                }
                 continue;
             }
 
             let collection = cache.collection();
             let generation = store.generation();
-            if watcher.is_none()
+            let reason = if !registered
                 || watched_collection != collection
                 || watched_generation != generation
             {
+                // 原来源已不再提供当前订阅资格，先释放其句柄和容量再建立新观察。
+                drop(watcher.take());
                 watcher = match store.watch(&collection).await {
                     Ok(next) => next,
                     Err(e) => {
@@ -510,10 +518,12 @@ fn spawn_blacklist_refresh_worker(
                 };
                 watched_collection = collection.clone();
                 watched_generation = generation;
-            }
-
-            let reason = if let Some(watcher) = watcher.as_mut() {
+                registered = true;
+                // 先建立订阅再完整重读，注册前已经发生的变更也不能漏到下一次对账。
+                "watch-started"
+            } else if let Some(watcher) = watcher.as_mut() {
                 tokio::select! {
+                    _ = refreshes.changed() => "configuration",
                     changed = watcher.recv() => {
                         match changed {
                             Some(change) => {
@@ -531,12 +541,20 @@ fn spawn_blacklist_refresh_worker(
                     _ = tokio::time::sleep(cache.refresh_interval()) => "interval",
                 }
             } else {
-                tokio::time::sleep(cache.refresh_interval()).await;
-                "interval"
+                tokio::select! {
+                    _ = refreshes.changed() => "configuration",
+                    _ = tokio::time::sleep(cache.refresh_interval()) => "interval",
+                }
             };
 
-            if reason == "watch-ended" {
+            if reason == "watch-ended" || reason == "configuration" {
+                // 原观察已经结束或失去来源身份，释放其句柄后再为当前配置建立新订阅。
                 watcher = None;
+                registered = false;
+                continue;
+            }
+            if watcher.is_none() && reason == "interval" {
+                registered = false;
                 continue;
             }
 

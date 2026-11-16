@@ -149,7 +149,7 @@ naoutbox-core = "2.0.0"              # 用量事件身份与至少一次外部�
 naoutbox-pgsql = { version = "2.0.1", optional = true } # 共享执行经 NASA 门面使用有界聚合根轮转的公开合同
 naauthz = { version = "2.0.0", optional = true } # 已验证 Agent 身份的 scope 授权
 nabudget = "2.0.0"                   # 显式协议与消息处理共用绝对 deadline 与取消树
-notify = "8.2"                        # TLS 证书文件观察；YAML 配置观察由 naml 负责
+notify = "8.2"                        # TLS 与动态集合文件观察；YAML 配置观察由 naml 负责
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] } # W3C context + server/client span API
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] } # head sampling + bounded batch processor
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] } # OTLP/HTTP protobuf exporter

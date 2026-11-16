@@ -1353,6 +1353,8 @@ async fn apply_reload_input(
             } else {
                 runtime.interface_disable.clear();
             }
+            // 集合和预载缓存均已决定后再唤醒，读者先订阅当前来源并重读，封住换代期间漏事件的窗口。
+            runtime.dynamic_store.request_refresh();
             runtime.discovery.reconcile(&new_snap);
             if let Some(proxy) = &runtime.proxy {
                 proxy.reconcile_runtime_identities(&new_snap);
