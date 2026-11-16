@@ -1472,7 +1472,13 @@ Mesh Profile 接受 HTTPRoute/GRPCRoute 的 Service 或 ServiceImport parent。p
 在完成 parent/Route 选择后立即删除该 header，不能把客户端自报值转发给后端。Mesh listener 只允许
 绑定 loopback，且 `gateway_mesh_interception_ready` 是部署方对透明捕获链已就绪的明确声明；未声明时
 controller 只发布未接纳状态，不开放该 listener。Service 使用 `*.svc.cluster.local` authority，
-ServiceImport 使用 `*.svc.clusterset.local` authority。
+ServiceImport 使用 `*.svc.clusterset.local` authority。捕获组件同时覆盖
+`x-naway-mesh-destination-port` 为原目标数字端口，Naway 在路由选择后删除该内部 header；
+producer Route 未匹配请求保留 404；consumer Route 未匹配请求在其源 namespace 内保留 404，
+其它来源仅回落到当前 parent 的原端口。Service 端口声明 `appProtocol: grpc` 时使用
+`grpc_backend_protocol` 指定的 HTTP/2 传输，`kubernetes.io/h2c` 则要求明文 HTTP/2。
+consumer Route 引用其精确 parent 后端
+沿用已附着 parent 的访问权，引用其它跨 namespace 后端仍须 ReferenceGrant。
 
 `gateway.networking.x-k8s.io/v1alpha1` 的 `XBackendTrafficPolicy` 支持 Service/ServiceImport
 `targetRefs`、确定性冲突裁决、逐目标 status、RetryConstraint 和 SessionPersistence。重试百分比、

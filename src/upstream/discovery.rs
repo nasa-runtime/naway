@@ -1268,18 +1268,15 @@ async fn fetch_kubernetes(
     let port_selector = match (spec.port_name.as_deref(), spec.port) {
         (Some(name), _) => KubernetesEndpointPortSelector::Name(name.to_owned()),
         (None, Some(port)) => {
-            if spec.service_import {
-                KubernetesEndpointPortSelector::Number(port)
-            } else {
-                resolve_kubernetes_service_port(
-                    client,
-                    cfg,
-                    namespace,
-                    &spec.registry_service,
-                    port,
-                )
-                .await?
-            }
+            resolve_kubernetes_service_port(
+                client,
+                cfg,
+                namespace,
+                &spec.registry_service,
+                port,
+                spec.service_import,
+            )
+            .await?
         }
         (None, None) => KubernetesEndpointPortSelector::Single,
     };
@@ -1530,8 +1527,7 @@ enum KubernetesEndpointPortSelector {
     Single,
 }
 
-/// 业务作用：将 Gateway/Ingress 引用的 Service port 编号解析为 Endpoints 中的
-/// port name 或 Pod targetPort，避免把虚拟 Service port 与实际端点端口误作相等。
+/// 业务作用：将 Service 或 ServiceImport 的虚拟端口解析为端点选择条件，避免把对外端口与 Pod 端口误作相等。
 ///
 /// 参数说明：
 /// - `client`：固定传输与身份的 Kubernetes API 客户端。
@@ -1539,24 +1535,30 @@ enum KubernetesEndpointPortSelector {
 /// - `namespace`：已经验证的后端 namespace。
 /// - `service_name`：已经验证的后端 Service 名称。
 /// - `service_port`：Route backendRef 声明的数字端口。
+/// - `service_import`：是否从 ServiceImport 解析端口名称而非 core Service 的 targetPort。
 ///
 /// 返回：Service port 存在时优先返回稳定 port name，无 name 时返回数字或命名
-/// targetPort；Service 缺失、结构坏或端口不存在时保留上游 LKG。
+/// targetPort；单端口无名 ServiceImport 使用唯一端点端口。目标缺失、结构异常或端口不存在时拒绝更新。
 async fn resolve_kubernetes_service_port(
     client: &reqwest::Client,
     cfg: &KubernetesDiscoveryCfg,
     namespace: &str,
     service_name: &str,
     service_port: u16,
+    service_import: bool,
 ) -> anyhow::Result<KubernetesEndpointPortSelector> {
     let encoded_namespace =
         percent_encoding::utf8_percent_encode(namespace, percent_encoding::NON_ALPHANUMERIC);
     let service =
         percent_encoding::utf8_percent_encode(service_name, percent_encoding::NON_ALPHANUMERIC);
-    let url = format!(
-        "{}/api/v1/namespaces/{encoded_namespace}/services/{service}",
-        cfg.api_server
-    );
+    let url = if service_import {
+        format!("{}/apis/multicluster.x-k8s.io/v1alpha1/namespaces/{encoded_namespace}/serviceimports/{service}", cfg.api_server)
+    } else {
+        format!(
+            "{}/api/v1/namespaces/{encoded_namespace}/services/{service}",
+            cfg.api_server
+        )
+    };
     let value = fetch_kubernetes_object(client, cfg, url).await?;
     anyhow::ensure!(!value.is_null(), "Kubernetes Service does not exist");
     let ports = value
@@ -1569,6 +1571,14 @@ async fn resolve_kubernetes_service_port(
         .with_context(|| format!("Kubernetes Service has no port `{service_port}`"))?;
     if let Some(name) = string_field(port, "name").filter(|name| !name.is_empty()) {
         return Ok(KubernetesEndpointPortSelector::Name(name));
+    }
+    if service_import {
+        // ServiceImport 不声明 targetPort；只有唯一无名端口时才可无歧义地采用远端端点端口。
+        anyhow::ensure!(
+            ports.len() == 1,
+            "Kubernetes ServiceImport requires named ports when multiple ports exist"
+        );
+        return Ok(KubernetesEndpointPortSelector::Single);
     }
     match port.get("targetPort") {
         Some(Value::String(name)) if !name.is_empty() => {

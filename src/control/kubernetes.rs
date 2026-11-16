@@ -837,28 +837,22 @@ pub fn spawn_controller(
                                     "Gateway API deletion drain did not observe snapshot publish; retaining finalizer"
                                 );
                             }
-                            if route_cfg.status_updates_enabled {
-                                if let Err(error) = publish_route_statuses(
+                            if route_cfg.status_updates_enabled
+                                && published
+                                && infrastructure_published
+                            {
+                                // 子 Route 的接纳状态只在数据面、基础设施与全部父状态可见后发布，
+                                // 避免观察者把旧 ListenerSet generation 当成已接纳路由的权威。
+                                if let Err(error) = publish_gateway_api_statuses(
                                     client,
                                     &discovery,
                                     &route_cfg,
+                                    &control_statuses,
                                     &diagnostics,
                                 )
                                 .await
                                 {
-                                    tracing::warn!(%error, "publish Gateway API Route status failed");
-                                }
-                                if published && infrastructure_published {
-                                    if let Err(error) = publish_control_statuses(
-                                        client,
-                                        &discovery,
-                                        &route_cfg,
-                                        &control_statuses,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(%error, "publish Gateway API Gateway status failed");
-                                    }
+                                    tracing::warn!(%error, "publish Gateway API status bundle failed");
                                 }
                             }
                             watch_resources = compiled_watch_resources;
@@ -1279,7 +1273,7 @@ async fn fetch_and_compile(
             cfg,
         )?;
         let gateway_backend_clients =
-            build_gateway_backend_client_catalog(&gateways, &secrets, cfg)?;
+            build_gateway_backend_client_catalog(&gateways, &reference_grants, &secrets, cfg)?;
         let service_objects = fetch_resource(
             client,
             discovery,
@@ -1735,7 +1729,27 @@ async fn fetch_gateway_secrets(
                     .and_then(Value::as_str)
                     .context("Gateway backend clientCertificateRef missing name")?;
                 validate_kubernetes_name("Gateway backend client certificate Secret", name)?;
-                references.insert((gateway_namespace.to_owned(), name.to_owned()));
+                let namespace = reference
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or(gateway_namespace);
+                validate_kubernetes_name(
+                    "Gateway backend client certificate namespace",
+                    namespace,
+                )?;
+                // 跨 namespace 身份必须先取得目标授权，不能通过 Secret GET 泄露其它租户材料。
+                if namespace != gateway_namespace
+                    && !grants.permits_reference(
+                        gateway_namespace,
+                        "Gateway",
+                        namespace,
+                        "Secret",
+                        name,
+                    )?
+                {
+                    continue;
+                }
+                references.insert((namespace.to_owned(), name.to_owned()));
             }
         }
     }
@@ -2518,7 +2532,7 @@ fn build_control_status_intents_with_listener_sets(
             ("AddressNotAssigned", "no listener is programmed")
         };
         let backend_client_reference =
-            gateway_backend_client_reference_condition(gateway, namespace, secrets)?;
+            gateway_backend_client_reference_condition(gateway, namespace, secrets, &grants)?;
         let mut gateway_conditions = vec![
             gateway_condition(
                 "Accepted",
@@ -2756,15 +2770,17 @@ fn build_control_status_intents_with_listener_sets(
 /// 业务作用：复验 Gateway 上游客户端证书引用，避免状态宣称引用已解析而数据面没有可用 mTLS 身份。
 ///
 /// 参数说明：
-/// - `gateway`：来自同轮
-/// - `secrets`：来自同轮
+/// - `gateway`：同一观察轮中的 Gateway 对象。
+/// - `secrets`：同轮取得的 Secret 材料目录。
 /// - `namespace`：是 Gateway 的可信 namespace。
+/// - `grants`：限定跨 namespace 客户端身份引用的目标授权。
 ///
 /// 返回：未声明或 Secret 身份完整时为 ResolvedRefs；类型、缺失或证书错误返回失败条件而不泄露材料。
 fn gateway_backend_client_reference_condition(
     gateway: &Value,
     namespace: &str,
     secrets: &SecretCatalog,
+    grants: &ReferenceGrantCatalog<'_>,
 ) -> anyhow::Result<ListenerReferenceCondition> {
     let Some(reference) = gateway.pointer("/spec/tls/backend/clientCertificateRef") else {
         return Ok(ListenerReferenceCondition {
@@ -2786,7 +2802,7 @@ fn gateway_backend_client_reference_condition(
     {
         return Ok(ListenerReferenceCondition {
             resolved: false,
-            reason: "InvalidKind",
+            reason: "InvalidClientCertificateRef",
             message: "Gateway backend client certificate must reference a core Secret",
         });
     }
@@ -2794,8 +2810,27 @@ fn gateway_backend_client_reference_condition(
         .get("name")
         .and_then(Value::as_str)
         .context("Gateway backend clientCertificateRef missing name")?;
+    let target_namespace = reference
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(namespace);
+    validate_kubernetes_name(
+        "Gateway backend client certificate namespace",
+        target_namespace,
+    )?;
+    validate_kubernetes_name("Gateway backend client certificate Secret", name)?;
+    // 先检查引用权威再读取身份，撤权时状态与数据面均不得继续使用原材料。
+    if target_namespace != namespace
+        && !grants.permits_reference(namespace, "Gateway", target_namespace, "Secret", name)?
+    {
+        return Ok(ListenerReferenceCondition {
+            resolved: false,
+            reason: "RefNotPermitted",
+            message: "Gateway backend client certificate reference is not permitted",
+        });
+    }
     let resolved = secrets
-        .tls_material(namespace, name)
+        .tls_material(target_namespace, name)
         .ok()
         .flatten()
         .is_some();
@@ -2804,7 +2839,7 @@ fn gateway_backend_client_reference_condition(
         reason: if resolved {
             "ResolvedRefs"
         } else {
-            "InvalidCertificateRef"
+            "InvalidClientCertificateRef"
         },
         message: if resolved {
             "Gateway backend client certificate reference is resolved"
@@ -3235,6 +3270,28 @@ fn build_inference_pool_status_intents(
         });
     }
     Ok(output)
+}
+
+/// 业务作用：按父对象先于子 Route 的顺序发布同一观察轮状态，避免子对象接纳状态领先父权威。
+///
+/// 参数说明：
+/// - `client`：使用固定身份与传输策略的 Kubernetes API 客户端。
+/// - `discovery`：固定 API endpoint、凭据与响应读取预算。
+/// - `cfg`：提供控制器身份与外部写入预算。
+/// - `controls`：同轮 Gateway、ListenerSet 与关联策略的状态意图。
+/// - `diagnostics`：同轮 Route 的接纳与引用结论。
+///
+/// 返回：父状态全部写入后才写 Route 状态；任一父写入失败时不推进子状态，等待重新观察。
+async fn publish_gateway_api_statuses(
+    client: &reqwest::Client,
+    discovery: &KubernetesDiscoveryCfg,
+    cfg: &KubernetesRouteSourceCfg,
+    controls: &[ControlStatusIntent],
+    diagnostics: &[RouteDiagnostic],
+) -> anyhow::Result<()> {
+    // 父状态尚未成功发布时不得暴露新的子接纳事实，重试必须从新一轮观察开始。
+    publish_control_statuses(client, discovery, cfg, controls).await?;
+    publish_route_statuses(client, discovery, cfg, diagnostics).await
 }
 
 /// 业务作用：以独立 field manager 发布本 controller 拥有的 Route parent conditions，
@@ -4005,6 +4062,7 @@ struct BackendTlsCatalog {
 #[derive(Default)]
 struct GatewayBackendClientCatalog {
     materials: HashMap<(String, String), TlsSecretMaterial>,
+    invalid: HashSet<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -4951,18 +5009,20 @@ fn bounded_status_message(mut message: String) -> String {
     message
 }
 
-/// 业务作用：把编译错误归一为 Gateway API condition reason，避免把高基数内部错误当协议枚举。
+/// 业务作用：把 Route 编译原因映射为 Gateway API 引用状态，区分目标类型无效与配置取值不受支持。
 ///
 /// 参数说明：
-/// - `message`：是构建期错误文本。
+/// - `message`：Route 候选编译阶段产生的错误说明。
 ///
-/// 返回：返回标准 RefNotPermitted、BackendNotFound、InvalidKind 或 UnsupportedValue。
+/// 返回：引用未获授权、后端缺失、目标类型无效时分别返回 RefNotPermitted、BackendNotFound、
+/// InvalidKind；其它配置拒绝返回 UnsupportedValue。
 fn diagnostic_reason(message: &str) -> &'static str {
     if message.contains("ReferenceGrant") || message.contains("not permitted") {
         "RefNotPermitted"
     } else if message.contains("does not exist") || message.contains("has no port") {
         "BackendNotFound"
-    } else if message.contains("must target core Service") {
+    } else if message.contains("backendRef must target ") {
+        // 目标类型门禁覆盖所有后端资源，状态分类不能依赖受支持种类名单的具体措辞。
         "InvalidKind"
     } else {
         "UnsupportedValue"
@@ -5109,12 +5169,14 @@ fn compile_gateway_api_full_with_listener_sets(
         services,
         diagnostics,
     )?;
-    apply_backend_tls_policies(services, &backend_tls, &service_catalog)?;
-    apply_gateway_backend_client_certificates(
+    append_mesh_parent_fallbacks(
         http_listener_routes,
         services,
         &gateways,
-        gateway_backend_clients,
+        &service_catalog,
+        &service_import_catalog,
+        &backend_traffic,
+        cfg,
     )?;
     let mut l4 = BTreeMap::new();
     compile_l4_routes(
@@ -5162,6 +5224,13 @@ fn compile_gateway_api_full_with_listener_sets(
     // L4 Service 只有在 Route 后端解析后才进入候选；此处必须复用同轮策略快照完成
     // TLS 升级，避免终止后的明文误发到要求加密的后端端口。
     apply_backend_tls_policies(services, &backend_tls, &service_catalog)?;
+    // 全部协议的 TLS 信任策略完成后再派生 Gateway 客户端身份，后续不得覆盖已授权证书。
+    apply_gateway_backend_client_certificates(
+        http_listener_routes,
+        services,
+        &gateways,
+        gateway_backend_clients,
+    )?;
     for plan in l4.into_values() {
         let mut listener = json!({
             "id": plan.id,
@@ -6936,16 +7005,21 @@ fn apply_backend_tls_policies(
 ///
 /// 参数说明：
 /// - `gateways_value`：同一观察轮的 Gateway LIST。
+/// - `reference_grants_value`：同轮跨 namespace 身份引用授权。
 /// - `secrets`：同一观察轮获取并验证的 Secret 材料目录。
 /// - `cfg`：固定控制器身份、namespace 接管范围、绑定地址与资源预算的配置。
 ///
-/// 返回：返回 Gateway 到客户端证书材料的有界映射；未声明或引用失效时不产生材料。
+/// 返回：有效身份进入材料目录，失效引用进入拒绝集合；单个 Secret 错误不阻断其它对象状态收敛。
 fn build_gateway_backend_client_catalog(
     gateways_value: &Value,
+    reference_grants_value: &Value,
     secrets: &SecretCatalog,
     cfg: &KubernetesRouteSourceCfg,
 ) -> anyhow::Result<GatewayBackendClientCatalog> {
     let mut catalog = GatewayBackendClientCatalog::default();
+    let grants = ReferenceGrantCatalog {
+        grants: resource_items(reference_grants_value, cfg.max_objects, "ReferenceGrant")?,
+    };
     for gateway in resource_items(gateways_value, cfg.max_objects, "Gateway")? {
         let (namespace, name) = object_identity(gateway, "Gateway")?;
         if !namespace_allowed(cfg, namespace)
@@ -6956,24 +7030,24 @@ fn build_gateway_backend_client_catalog(
         let Some(reference) = gateway.pointer("/spec/tls/backend/clientCertificateRef") else {
             continue;
         };
-        if !reference
-            .get("group")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .is_empty()
-            || reference
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("Secret")
-                != "Secret"
+        // 引用失效只关闭该 Gateway 的 TLS 后端，不能让坏材料阻止无关 Gateway 发布状态。
+        if !gateway_backend_client_reference_condition(gateway, namespace, secrets, &grants)?
+            .resolved
         {
+            catalog
+                .invalid
+                .insert((namespace.to_owned(), name.to_owned()));
             continue;
         }
         let secret_name = reference
             .get("name")
             .and_then(Value::as_str)
             .context("Gateway backend clientCertificateRef missing name")?;
-        if let Some(material) = secrets.tls_material(namespace, secret_name)? {
+        let secret_namespace = reference
+            .get("namespace")
+            .and_then(Value::as_str)
+            .unwrap_or(namespace);
+        if let Some(material) = secrets.tls_material(secret_namespace, secret_name)? {
             catalog
                 .materials
                 .insert((namespace.to_owned(), name.to_owned()), material);
@@ -6991,14 +7065,14 @@ fn build_gateway_backend_client_catalog(
 /// - `gateways`：同一观察轮构建的 Gateway 与有效 listener 目录。
 /// - `clients`：已经复验证书身份的 Gateway 后端客户端证书目录。
 ///
-/// 返回：成功时原子改写 Route 的逻辑 Service 引用并加入内容寻址副本；结构异常时拒绝候选。
+/// 返回：有效身份派生内容寻址服务，失效身份在本地拒绝 TLS 后端请求；结构异常时拒绝候选。
 fn apply_gateway_backend_client_certificates(
     listener_routes: &mut BTreeMap<HttpListenerKey, Vec<Value>>,
     services: &mut BTreeMap<String, Value>,
     gateways: &GatewayCatalog,
     clients: &GatewayBackendClientCatalog,
 ) -> anyhow::Result<()> {
-    if clients.materials.is_empty() {
+    if clients.materials.is_empty() && clients.invalid.is_empty() {
         return Ok(());
     }
     let listener_gateways = gateways
@@ -7022,9 +7096,6 @@ fn apply_gateway_backend_client_certificates(
         let Some(gateway) = listener_gateways.get(listener_id) else {
             continue;
         };
-        let Some(material) = clients.materials.get(gateway) else {
-            continue;
-        };
         let Some(logical) = route
             .get("uri")
             .and_then(Value::as_str)
@@ -7038,6 +7109,21 @@ fn apply_gateway_backend_client_certificates(
         if base.get("scheme").and_then(Value::as_str) != Some("https") {
             continue;
         }
+        // 显式声明的客户端身份不可降级为匿名 TLS；失效时保留匹配面并在本地拒绝。
+        if clients.invalid.contains(gateway) {
+            route
+                .as_object_mut()
+                .expect("generated route is an object")
+                .remove("uri");
+            route["mock_response"] = json!({
+                "status": 500,
+                "body": ""
+            });
+            continue;
+        }
+        let Some(material) = clients.materials.get(gateway) else {
+            continue;
+        };
         let digest = tls_identity_digest(material);
         let derived = stable_id(
             "k8s-mtls-svc",
@@ -8536,6 +8622,154 @@ fn is_mesh_listener(listener: &GatewayListener) -> bool {
             && listener.parent_kind == "ServiceImport")
 }
 
+/// 业务作用：为 consumer Route 读取其已选 parent 的固有访问权，避免把该授权扩散到其它后端。
+///
+/// 参数说明：
+/// - `grants`：同轮显式 ReferenceGrant 目录。
+/// - `listener`：已完成 parent 接纳的 Mesh listener。
+/// - `namespace`：当前 Route 所属 namespace。
+/// - `kind`：当前 Route 的 HTTPRoute 或 GRPCRoute 身份。
+///
+/// 返回：保留全部显式授权；仅为跨 namespace 的 Mesh parent 加入精确目标授权。
+fn mesh_parent_reference_grants(
+    grants: &ReferenceGrantCatalog<'_>,
+    listener: &GatewayListener,
+    namespace: &str,
+    kind: &str,
+) -> Vec<Value> {
+    let mut values = grants.grants.to_vec();
+    if is_mesh_listener(listener) && namespace != listener.parent_namespace {
+        // consumer 只能回到已经附着的 parent；其它 Service、Secret 或推理池仍须显式目标授权。
+        values.push(json!({
+            "metadata": {
+                "namespace": listener.parent_namespace,
+                "name": "mesh-parent-reference"
+            },
+            "spec": {
+                "from": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": kind,
+                    "namespace": namespace
+                }],
+                "to": [{
+                    "group": listener.parent_group,
+                    "kind": listener.parent_kind,
+                    "name": listener.parent_name
+                }]
+            }
+        }));
+    }
+    values
+}
+
+/// 业务作用：在 Mesh Route 未命中时保持原 Service 的端口转发，防止 consumer 规则关闭其它来源的正常流量。
+///
+/// 参数说明：
+/// - `listener_routes`：按受保护 socket 分区的路由候选。
+/// - `services`：当前事务中的后端服务目录。
+/// - `gateways`：同轮接纳的 Mesh parent 与真实 Gateway listener。
+/// - `service_catalog`：core Service 的端口与传输声明。
+/// - `service_import_catalog`：ServiceImport 的端口与传输声明。
+/// - `backend_traffic`：同轮后端流量策略。
+/// - `cfg`：固定 Mesh 绑定与 gRPC 传输语义。
+///
+/// 返回：为每个受管 parent 的 HTTP/gRPC 端口加入最低优先级原目标路由；不扩大 parent 的地址授权面。
+#[allow(clippy::too_many_arguments)]
+fn append_mesh_parent_fallbacks(
+    listener_routes: &mut BTreeMap<HttpListenerKey, Vec<Value>>,
+    services: &mut BTreeMap<String, Value>,
+    gateways: &GatewayCatalog,
+    service_catalog: &ServiceCatalog,
+    service_import_catalog: &ServiceImportCatalog,
+    backend_traffic: &BackendTrafficCatalog,
+    cfg: &KubernetesRouteSourceCfg,
+) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for listener in gateways
+        .listeners
+        .iter()
+        .filter(|listener| is_mesh_listener(listener))
+    {
+        let imported = listener.parent_kind == "ServiceImport";
+        let catalog = if imported {
+            &service_import_catalog.ports
+        } else {
+            &service_catalog.ports
+        };
+        let identity = (
+            listener.parent_namespace.clone(),
+            listener.parent_name.clone(),
+        );
+        let Some(ports) = catalog.get(&identity) else {
+            continue;
+        };
+        for ((port, transport), app_protocol) in ports {
+            if transport != "TCP" || (listener.parent_port != 0 && listener.parent_port != *port) {
+                continue;
+            }
+            let key = (listener.parent_group.clone(), identity.clone(), *port);
+            if !seen.insert(key) {
+                continue;
+            }
+            let grpc = app_protocol.as_deref() == Some("grpc");
+            let (scheme, protocol) = backend_transport(
+                if grpc {
+                    "GRPCRoute"
+                } else {
+                    "HTTPRoute"
+                },
+                if grpc && cfg.grpc_backend_protocol == "h2" {
+                    "https"
+                } else {
+                    "http"
+                },
+                grpc.then_some(cfg.grpc_backend_protocol.as_str()),
+                app_protocol.as_deref(),
+            )?;
+            let policy_key = BackendTrafficTargetKey {
+                group: listener.parent_group.clone(),
+                kind: listener.parent_kind.clone(),
+                namespace: identity.0.clone(),
+                name: identity.1.clone(),
+            };
+            let policy = backend_traffic
+                .selected
+                .get(&policy_key)
+                .and_then(|index| backend_traffic.policies[*index].config.as_ref());
+            let logical = insert_generated_service_with_protocol_and_kind(
+                services,
+                &identity.0,
+                &identity.1,
+                &BackendPort::Number(*port),
+                scheme,
+                protocol,
+                imported,
+                policy,
+            )?;
+            let host = listener
+                .hostname
+                .as_deref()
+                .context("Mesh parent missing canonical hostname")?;
+            // 捕获组件提供原目标端口；只在该 parent 的端口范围回落，不能把共享 listener 当开放代理。
+            listener_routes.entry(HttpListenerKey {
+                protocol: "HTTP".to_owned(),
+                bind_address: listener.bind_address.clone(),
+                port: listener.port,
+            }).or_default().push(json!({
+                "id": stable_id("mesh-parent-default", &[&listener.parent_group, &identity.0, &identity.1, &port.to_string()]),
+                "uri": format!("lb://{logical}"),
+                "preserve_host": true,
+                "predicates": [
+                    format!("Host={host}"),
+                    format!("Header=x-naway-mesh-destination-port,exact,{port}")
+                ],
+                "order": i32::MAX
+            }));
+        }
+    }
+    Ok(())
+}
+
 /// 业务作用：把 Mesh Route 限定到目标 Service，并为 consumer Route 增加受信源 namespace
 /// 门禁，防止其它 namespace 借同一透明 listener 越权使用规则。
 ///
@@ -8545,14 +8779,38 @@ fn is_mesh_listener(listener: &GatewayListener) -> bool {
 /// - `route_namespace`：区分 producer/consumer
 /// - `source_header`：只在受保护 listener 上可信。
 ///
-/// 返回：所有 Route 结构完整时写入稳定 parent 身份；consumer 额外写入 namespace predicate。
+/// 返回：写入稳定 parent 与端口范围；consumer 额外限定来源，未匹配规则时在相同作用域保留 404。
 fn scope_routes_to_mesh_parent(
-    routes: &mut [Value],
+    routes: &mut Vec<Value>,
     listener: &GatewayListener,
     route_namespace: &str,
     source_header: &str,
 ) -> anyhow::Result<()> {
-    for route in routes {
+    let Some(first_id) = routes
+        .first()
+        .and_then(|route| route.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(());
+    };
+    let mut scope = vec![format!(
+        "Host={}",
+        listener
+            .hostname
+            .as_deref()
+            .context("Mesh parent missing hostname")?
+    )];
+    if listener.parent_port != 0 {
+        scope.push(format!(
+            "Header=x-naway-mesh-destination-port,exact,{}",
+            listener.parent_port
+        ));
+    }
+    if route_namespace != listener.parent_namespace {
+        scope.push(format!("Header={source_header},exact,{route_namespace}"));
+    }
+    for route in routes.iter_mut() {
         let original_id = route
             .get("id")
             .and_then(Value::as_str)
@@ -8578,7 +8836,27 @@ fn scope_routes_to_mesh_parent(
                     "Header={source_header},exact,{route_namespace}"
                 )));
         }
+        if listener.parent_port != 0 {
+            route
+                .get_mut("predicates")
+                .and_then(Value::as_array_mut)
+                .context("generated Mesh route missing predicates")?
+                .push(Value::String(format!(
+                    "Header=x-naway-mesh-destination-port,exact,{}",
+                    listener.parent_port
+                )));
+        }
     }
+    // 已应用 Route 的来源必须保留未匹配语义；只有作用域之外的流量才能回到原 Service。
+    routes.push(json!({
+        "id": stable_id("mesh-unmatched", &[&first_id, &listener.parent_group, &listener.parent_namespace, &listener.parent_name, &listener.parent_port.to_string()]),
+        "predicates": scope,
+        "mock_response": {
+            "status": 404,
+            "body": ""
+        },
+        "order": i32::MAX - 1
+    }));
     Ok(())
 }
 
@@ -8706,6 +8984,15 @@ fn compile_http_routes(
                     let (hostnames, unrestricted_hostname) =
                         intersect_route_hostnames(route, std::slice::from_ref(&attached_listener))?;
                     let listener_id = gateway_listener_id(&attached_listener.listener);
+                    let effective_grant_values = mesh_parent_reference_grants(
+                        grants,
+                        &attached_listener.listener,
+                        namespace,
+                        "HTTPRoute",
+                    );
+                    let effective_grants = ReferenceGrantCatalog {
+                        grants: &effective_grant_values,
+                    };
                     // 一个 Route 可通过多个 parentRef 附着到网络层等价的 listener；重复
                     // 编译会制造同 ID route，并使选择顺序依赖 Kubernetes LIST 顺序。
                     if !compiled_listener_ids.insert(listener_id.clone()) {
@@ -8726,7 +9013,7 @@ fn compile_http_routes(
                             service_import_catalog,
                             inference_pools,
                             backend_traffic,
-                            grants,
+                            &effective_grants,
                             &mut rule_routes,
                             &mut rule_services,
                         ) {
@@ -9777,6 +10064,8 @@ fn compile_backend_refs(
     );
     let targets = backends
         .iter()
+        // 零权重后端不取得转发权威，也不应因未部署的备用目标阻断其它有效份额。
+        .filter(|backend| backend.get("weight").and_then(Value::as_u64) != Some(0))
         .map(|backend| {
             compile_backend_ref(
                 backend,
@@ -10043,7 +10332,7 @@ fn compile_backend_ref(
 /// - `app_protocol`：同轮 Service port 中声明的应用协议。
 ///
 /// 返回：缺省 appProtocol 时保留调用方设置；GRPCRoute 接受与其明文 HTTP/2 transport
-/// 一致的 `kubernetes.io/h2c`；HTTPRoute 的标准 HTTP/HTTPS/h2c/WS/WSS 返回对应 transport；
+/// 一致的 `kubernetes.io/h2c`，或使用配置传输的 `grpc`；HTTPRoute 的标准 HTTP/HTTPS/h2c/WS/WSS 返回对应 transport；
 /// 未知值或与 Route transport 冲突时失败闭合。
 fn backend_transport<'a>(
     route_kind: &str,
@@ -10055,6 +10344,17 @@ fn backend_transport<'a>(
         return Ok((default_scheme, default_protocol));
     };
     if route_kind == "GRPCRoute" {
+        if app_protocol.eq_ignore_ascii_case("grpc") {
+            // grpc 描述应用协议，是否启用 TLS 仍由当前声明的后端传输决定，不能隐式降级。
+            anyhow::ensure!(
+                matches!(
+                    (default_scheme, default_protocol),
+                    ("http", Some("h2c")) | ("https", Some("h2"))
+                ),
+                "GRPCRoute grpc appProtocol requires configured HTTP/2 transport"
+            );
+            return Ok((default_scheme, default_protocol));
+        }
         anyhow::ensure!(
             app_protocol.eq_ignore_ascii_case("kubernetes.io/h2c")
                 && default_scheme == "http"
@@ -10395,6 +10695,15 @@ fn compile_grpc_routes(
                     if !compiled_listener_ids.insert(listener_id.clone()) {
                         continue;
                     }
+                    let effective_grant_values = mesh_parent_reference_grants(
+                        grants,
+                        &attached_listener.listener,
+                        namespace,
+                        "GRPCRoute",
+                    );
+                    let effective_grants = ReferenceGrantCatalog {
+                        grants: &effective_grant_values,
+                    };
                     let mut object_routes = Vec::new();
                     for (rule_index, rule) in rules.iter().enumerate() {
                         let filter_plan = compile_http_filters(
@@ -10407,7 +10716,7 @@ fn compile_grpc_routes(
                             service_catalog,
                             service_import_catalog,
                             backend_traffic,
-                            grants,
+                            &effective_grants,
                             &mut object_services,
                         )?;
                         anyhow::ensure!(
@@ -10434,7 +10743,7 @@ fn compile_grpc_routes(
                             service_import_catalog,
                             None,
                             backend_traffic,
-                            grants,
+                            &effective_grants,
                             &mut object_services,
                         )?;
                         apply_inline_session_persistence(
@@ -11201,6 +11510,8 @@ fn insert_generated_service_with_protocol_and_kind(
         "registry_namespace": namespace,
         "scheme": scheme
     });
+    // EndpointSlice readiness 决定 Kubernetes 端点资格；单条 Route 的短期限不能摘除共享服务端点。
+    value["max_fails"] = json!(0);
     match port {
         BackendPort::Name(name) => value["registry_port_name"] = json!(name),
         BackendPort::Number(number) => value["registry_port"] = json!(number),

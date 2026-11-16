@@ -103,6 +103,8 @@ const MAX_INTERNAL_REROUTES: usize = 3;
 const GATEWAY_LISTENER_HEADER: HeaderName = HeaderName::from_static("x-naway-gateway-listener");
 const MESH_SOURCE_NAMESPACE_HEADER: HeaderName =
     HeaderName::from_static("x-naway-mesh-source-namespace");
+const MESH_DESTINATION_PORT_HEADER: HeaderName =
+    HeaderName::from_static("x-naway-mesh-destination-port");
 const LIMIT_CONN_TTL: Duration = Duration::from_secs(120);
 const LIMIT_CONN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// auto-ban 计数表的硬上限。到达上限时先清理过期项；若仍满，则不再为新 IP 分配状态。
@@ -1451,6 +1453,8 @@ impl GatewayProxy {
             // 源 namespace 只由受保护的 Mesh listener 用于 consumer Route 选择；命中后立即
             // 清除，避免该控制身份被转发给后端或被后续业务插件当作普通用户输入。
             parts.headers.remove(&MESH_SOURCE_NAMESPACE_HEADER);
+            // 原目标端口同样只服务于受保护 Mesh 路由选择，不能泄露到业务后端。
+            parts.headers.remove(&MESH_DESTINATION_PORT_HEADER);
             #[cfg(feature = "webdav")]
             if route.webdav.is_some() || route.layer.is_some() {
                 let head = crate::io::webdav::RequestHead::capture(&parts);
