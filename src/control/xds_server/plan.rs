@@ -66,9 +66,12 @@ impl Plan {
             ownership.enabled(),
             "xDS server requires explicit workspace ownership"
         );
-        // 下游的执行引擎不是 Naway；任何隐含私有门禁都必须先拒绝，不能把投影宣称为完整安全复制。
+        // 下游不执行Naway动态缓存；即使集合当前为空，已启用的全局门禁也不能在投影中被忽略。
         ensure!(
-            !has_private_guard && !cfg.control_plane.xds.enabled,
+            !has_private_guard
+                && !cfg.runtime_state.blacklist.enabled
+                && !cfg.runtime_state.interface_disable.enabled
+                && !cfg.control_plane.xds.enabled,
             "xDS server projection rejects private global guards and xDS-client ownership"
         );
         ensure!(

@@ -4343,6 +4343,8 @@ LDS/RDS/CDS/EDS/SDS，通过 ADS SotW 或 Delta 向获授权的数据面分发�
 必须显式选择 `http_routing` 合同：它只生成固定 HTTP 路由及静态 TLS 身份，**不是完整 Naway
 执行管线的复制**，不复制进程内配额、运行期封禁、连接池状态或运维动作。已有原生路由包含
 鉴权、Sentinel、接口守卫、插件、正文处理等私有策略时，不能省略策略后继续发布。
+启用 `runtime_state.blacklist` 或 `runtime_state.interface_disable` 时同样拒绝整个候选，
+不会因当前动态集合为空而忽略已经启用的安全声明。
 
 ```yaml
 xds_server:
