@@ -176,6 +176,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/schema.js"),
         ),
+        "/ui/views/operations/draft/ip_policy.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("assets/views/operations/draft/ip_policy.js"),
+        ),
         "/ui/views/operations/draft/mqtt.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("assets/views/operations/draft/mqtt.js"),

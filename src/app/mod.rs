@@ -219,7 +219,6 @@ pub(super) async fn run() -> Result<()> {
             .await
             .context("load initial runtime blacklist")?;
     }
-    gateway::security::blacklist::spawn_blacklist_refresh(blacklist.clone(), dynamic_store.clone());
     let interface_disable = Arc::new(
         gateway::security::guard::DynamicInterfaceGuardCache::new(
             &runtime_state_cfg.interface_disable,
@@ -278,7 +277,13 @@ pub(super) async fn run() -> Result<()> {
         config_history.record_initial(&cfg_path, &initial);
     }
     // 常驻长连接表必须早于 reload worker 创建，使成功换版可以按全局策略安排 stale drain。
-    let conn_registry = gateway::runtime::connections::ConnectionRegistry::new();
+    let conn_registry =
+        gateway::runtime::connections::ConnectionRegistry::new_with_blacklist(blacklist.clone());
+    gateway::security::blacklist::spawn_blacklist_refresh_with_connections(
+        blacklist.clone(),
+        dynamic_store.clone(),
+        conn_registry.clone(),
+    );
 
     // 就绪标志:数据面监听绑定后置 true;停机时置 false → /readyz 转 503,供前置 LB 摘流。
     let ready = Arc::new(AtomicBool::new(false));
@@ -489,6 +494,8 @@ pub(super) async fn run() -> Result<()> {
     let stream_plane = StreamPlaneState {
         snap: snap.clone(),
         workspace_proxy: proxy.clone(),
+        blacklist: blacklist.clone(),
+        conn_registry: conn_registry.clone(),
         active_health: active_health.clone(),
         lb: stream_lb,
         active_connections: active_connections.clone(),

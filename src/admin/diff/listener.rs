@@ -22,6 +22,8 @@ pub(super) fn changes(
     current: &GatewaySnapshot,
     candidate: &GatewaySnapshot,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let same_http_access = current.ip_policy.same_policy(&candidate.ip_policy);
+    let same_stream_access = current.ip_policy.same_access(&candidate.ip_policy);
     let current = index(current);
     let candidate = index(candidate);
     let mut added: Vec<_> = candidate
@@ -39,8 +41,12 @@ pub(super) fn changes(
         .filter_map(|(key, current)| {
             let next = candidate.get(key)?;
             let same = match (current, next) {
-                (Listener::Proxy(current), Listener::Proxy(next)) => same_proxy(current, next),
-                (Listener::Stream(current), Listener::Stream(next)) => current == next,
+                (Listener::Proxy(current), Listener::Proxy(next)) => {
+                    same_http_access && same_proxy(current, next)
+                }
+                (Listener::Stream(current), Listener::Stream(next)) => {
+                    same_stream_access && current == next
+                }
                 _ => false,
             };
             (!same).then(|| name(key))

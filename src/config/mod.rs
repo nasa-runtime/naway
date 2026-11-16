@@ -9,6 +9,7 @@ pub use candidate::load_candidate_snapshot;
 pub(crate) mod centers;
 pub mod cgi;
 pub(crate) mod document;
+pub mod ip_policy;
 pub mod layers;
 pub mod management;
 pub mod media;
@@ -101,6 +102,8 @@ impl ConfigWatchPlan {
 /// 一次请求要读的全部配置的不可变快照；换版通过构建新值并由 `ArcSwap` 原子替换指针完成。
 #[derive(Clone)]
 pub struct GatewaySnapshot {
+    /// 全局静态 ACL 与真实来源策略，与所有业务路由原子换代。
+    pub ip_policy: crate::security::ip_policy::Plan,
     /// 与路由同代的实际 Sentinel 规则，只供控制面比较，不在请求路径重新求值。
     pub(crate) sentinel_rules: Arc<model::SentinelFile>,
     /// 已验证的进程日志启动声明；候选构建不打开日志文件。
@@ -214,6 +217,8 @@ pub struct GatewaySnapshot {
 /// 字段保持低基数,避免把路由 id、服务名等高基数明细直接塞进 metrics 或默认响应。
 #[derive(Clone, Serialize)]
 pub struct GatewaySnapshotSummary {
+    /// 当前全局静态访问与来源解析策略，不包含地址原文。
+    pub ip_policy: crate::security::ip_policy::Summary,
     /// 配置快照版本。
     pub version: u64,
     /// 配置 schema 版本。
@@ -910,6 +915,7 @@ impl GatewaySnapshot {
                 (routes + current.0, methods + current.1)
             });
         GatewaySnapshotSummary {
+            ip_policy: self.ip_policy.summary(),
             version: self.version,
             schema_version: self.schema_version,
             routes: self.proxies.iter().map(|proxy| proxy.router.len()).sum(),
@@ -1074,12 +1080,10 @@ impl PartialEq for TlsRuntimeCfg {
 
 impl Eq for TlsRuntimeCfg {}
 
-/// 缺省 schema 版本:配置缺 `schema_version` / 写了 `0` 时按此处理。
-/// 与 `SUPPORTED` 分开：未来 `SUPPORTED` 升到 2 后，缺省的老配置仍按 **v1** 走 v1→v2 迁移，
-/// 而不是被误当成最新版绕过迁移逻辑。
+/// 缺省配置 schema 保持为 1，显式安全策略不能因省略兼容门而被当作已启用。
 const DEFAULT_SCHEMA_VERSION: u32 = 1;
-/// 当前支持的最高配置 schema 版本。新增破坏性配置格式时 +1,并在 `resolve_schema_version` 里实现迁移/拒绝。
-const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+/// 主配置支持显式访问与来源策略；独立 Sentinel 和接口守卫文档仍只接受各自的 schema 1。
+const SUPPORTED_GATEWAY_SCHEMA_VERSION: u32 = 2;
 /// reload 指纹单文件硬上限。它覆盖主配置、OpenAPI/schema、WASM 与 SecretSource 依赖；
 /// 各构建器仍执行更严格的业务上限，这里先防 watcher 因敌意大文件产生无界分配。
 const MAX_FINGERPRINT_FILE_BYTES: usize = 32 * 1024 * 1024;
@@ -1208,7 +1212,23 @@ fn build_snapshot_from_config(
     #[cfg(feature = "config-providers")] provider_input: crate::control::providers::Input,
 ) -> Result<GatewaySnapshot> {
     centers::apply(&mut cfg)?;
-    let schema_version = resolve_schema_version(cfg.schema_version, "gateway.yml")?;
+    let schema_version = resolve_schema_version_with_limit(
+        cfg.schema_version,
+        "gateway.yml",
+        SUPPORTED_GATEWAY_SCHEMA_VERSION,
+    )?;
+    // 新安全声明要求新的配置合同；旧制品会拒绝该版本，不能忽略字段后报告发布成功。
+    anyhow::ensure!(
+        schema_version >= 2 || (cfg.acl.is_none() && cfg.client_ip_policy.is_none()),
+        "acl and client_ip_policy require schema_version: 2"
+    );
+    #[cfg(feature = "xds-server")]
+    anyhow::ensure!(
+        cfg.xds_server.is_none() || (cfg.acl.is_none() && cfg.client_ip_policy.is_none()),
+        "xds_server http_routing does not project acl or client_ip_policy"
+    );
+    let ip_policy =
+        crate::security::ip_policy::Plan::build(cfg.acl.as_ref(), cfg.client_ip_policy.as_ref())?;
     let process_log = crate::observability::logging::LogPlan::build(cfg.log.take())?;
     let config_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
     #[cfg(feature = "scg-compat")]
@@ -1530,6 +1550,7 @@ fn build_snapshot_from_config(
     let discovery = crate::upstream::discovery::build_runtime_config(cfg.discovery, config_dir)
         .context("build discovery runtime config")?;
     Ok(GatewaySnapshot {
+        ip_policy,
         sentinel_rules: sentinel.rules,
         process_log,
         #[cfg(feature = "xds-server")]
@@ -4999,11 +5020,26 @@ fn ensure_unique_proxy_topology(proxies: &[ProxyRuntime]) -> Result<()> {
     Ok(())
 }
 
-/// 业务作用：解析并校验配置 schema 版本:
-/// - 缺省 / `0` → 视作 **`DEFAULT_SCHEMA_VERSION`(v1)** 并告警(不阻塞老配置,但提醒显式声明,便于长期迁移);
-/// - 高于当前支持版本 → **拒绝**(不带病解析未知格式,交由调用方保留旧快照);
-/// - 其它显式低版本原样返回,后续由迁移逻辑处理。
+/// 业务作用：保持独立规则文档的兼容门，不因主配置支持新字段而放行未知保护规则格式。
+///
+/// 参数说明：
+/// - `raw`：规则文档显式声明的 schema 版本。
+/// - `file`：用于低敏拒绝说明的规则文档类型。
+///
+/// 返回：省略或零值按 schema 1 处理；显式未知版本拒绝，调用方保留活动规则。
 fn resolve_schema_version(raw: Option<u32>, file: &str) -> Result<u32> {
+    resolve_schema_version_with_limit(raw, file, DEFAULT_SCHEMA_VERSION)
+}
+
+/// 业务作用：按调用领域独立声明的兼容上限校验配置，不把主配置能力扩散到其它文档。
+///
+/// 参数说明：
+/// - `raw`：文档显式声明的 schema 版本。
+/// - `file`：用于低敏拒绝说明的文档类型。
+/// - `supported`：该文档构建器实际支持的最高 schema。
+///
+/// 返回：合法版本原样返回，缺失或零值告警并按 schema 1 处理；过新版本拒绝完整候选。
+fn resolve_schema_version_with_limit(raw: Option<u32>, file: &str, supported: u32) -> Result<u32> {
     match raw {
         None => {
             tracing::warn!(
@@ -5016,8 +5052,8 @@ fn resolve_schema_version(raw: Option<u32>, file: &str) -> Result<u32> {
             tracing::warn!(file, "`schema_version: 0` invalid; assuming {DEFAULT_SCHEMA_VERSION}");
             Ok(DEFAULT_SCHEMA_VERSION)
         }
-        Some(v) if v > SUPPORTED_SCHEMA_VERSION => anyhow::bail!(
-            "{file}: schema_version {v} is newer than supported {SUPPORTED_SCHEMA_VERSION}; upgrade gateway"
+        Some(v) if v > supported => anyhow::bail!(
+            "{file}: schema_version {v} is newer than supported {supported}; upgrade gateway"
         ),
         Some(v) => Ok(v),
     }

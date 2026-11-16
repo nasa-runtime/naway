@@ -13,6 +13,7 @@ import { upstreamLocalityFieldGroups } from "./upstream_locality.js";
 import { upstreamFeedbackFieldGroups } from "./upstream_feedback.js";
 import { http3FieldGroups } from "./http3.js";
 import { listenerFieldGroups } from "./listener.js";
+import { ipPolicyFieldGroups } from "./ip_policy.js";
 import { streamTransportFieldGroups } from "./stream.js";
 import { mqttFieldGroups } from "./mqtt.js";
 import { kafkaFieldGroups } from "./kafka.js";
@@ -706,6 +707,7 @@ export function nestedFields(kind, values, capacity) {
     ...routeWebdavFieldGroups(kind),
     ...routeMediaFieldGroups(kind),
     ...listenerFieldGroups(kind),
+    ...ipPolicyFieldGroups(kind),
     ...streamTransportFieldGroups(kind),
     ...mqttFieldGroups(kind),
     ...kafkaFieldGroups(kind),
@@ -835,6 +837,7 @@ export function fieldAction(object, patch, creating) {
         "portal_management",
         "portal_settings",
         "portal_key_applications",
+        "ip_policy",
       ].includes(object.kind)
     ) {
       throw new Error("此设置只能编辑既有声明。");

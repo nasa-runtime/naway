@@ -305,6 +305,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
         "portal_management",
         "portal_settings",
         "portal_key_applications",
+        "ip_policy",
       ].includes(object.kind);
     notice.textContent =
       "仅显式设置或移除的字段进入候选，最终合法性由目标完整构建器判断。";
@@ -413,6 +414,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
         "portal_management",
         "portal_settings",
         "portal_key_applications",
+        "ip_policy",
       ].includes(selected.kind);
   });
   remove.addEventListener("click", () => {
@@ -422,6 +424,7 @@ export function draftEditor(candidate, capacity, domain, requestDraft) {
         "portal_management",
         "portal_settings",
         "portal_key_applications",
+        "ip_policy",
       ].includes(selected.kind) &&
       !creating &&
       agreement.checked

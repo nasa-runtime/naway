@@ -9,6 +9,12 @@
 [持久管理提案](admin-operations.md)保存，并由冻结的各原目标执行预检和应用。
 接入 Admin 的编辑成功不代表其它节点已经接受配置。
 
+`ip_policy` 是根文档的固定选择器，只能编辑 `schema_version`、`acl` 与 `client_ip_policy`，
+不允许新建或删除整个根对象，也不能通过字段、嵌套或列表动作修改其它根声明。
+全局 ACL 与来源策略提供独立子字段，ACL 地址列表支持按原位置编辑；可信前置 CIDR
+继续在各 HTTP 入口对象的 `trusted_proxies` 中维护。显式安全声明要求配置 schema 2，
+页面不会自动升级兼容门；完整合同见[全局 IP 与客户端来源策略](ip-access-policy.md)。
+
 服务端使用 NAML 读取原始 YAML，不执行环境插值、profile、imports 或 SecretSource。
 编辑范围是文档中的显式声明；profile 或导入内容对运行配置的影响，仍由目标完整构建器验证。
 候选、字段和结果只驻留本次请求，响应使用 `no-store`。输入不应包含无需编辑的秘密明文。

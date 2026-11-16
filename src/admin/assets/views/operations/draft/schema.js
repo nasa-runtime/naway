@@ -36,6 +36,15 @@ import {
 } from "./route_body_transform.js";
 
 const definitions = {
+  ip_policy: [
+    ["schema_version", "配置兼容门（显式 IP 策略要求 2）", "number"],
+    ["acl", "完整全局 ACL 声明（替换模式和全部条目）", "json"],
+    [
+      "client_ip_policy",
+      "完整客户端来源声明（替换解析模式、头和上限）",
+      "json",
+    ],
+  ],
   product_version: productVersionFields.filter(([name]) => name !== "id"),
   product_version_new: productVersionFields,
   product_document: productDocumentFields.filter(([name]) => name !== "id"),
@@ -391,6 +400,9 @@ export function namedObject(kind) {
  * 返回：可作为纯文本显示的名称，不用于解析或还原对象身份。
  */
 export function objectLabel(object) {
+  if (object.kind === "ip_policy") {
+    return "ip_policy · 全局 IP 与客户端来源策略";
+  }
   if (object.kind === "portal_key_applications") {
     return "portal_key_applications · 待审批 key 申请设置";
   }

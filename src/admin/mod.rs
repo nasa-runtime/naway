@@ -8930,6 +8930,8 @@ async fn set_blacklist_ip(
     let Ok(ip) = raw_ip.parse::<IpAddr>() else {
         return plain(StatusCode::BAD_REQUEST, "invalid ip\n");
     };
+    // 两种地址表示属于同一来源，事实写入、撤销、审计和连接关闭必须使用同一规范身份。
+    let ip = crate::io::net::canonical_ip(ip);
     let cfg = state.snap.load().runtime_state.blacklist.clone();
     if !cfg.enabled {
         return plain(StatusCode::CONFLICT, "blacklist disabled\n");
@@ -8952,7 +8954,8 @@ async fn set_blacklist_ip(
             .put(&cfg.collection, &key, value.as_bytes())
             .await
     } else {
-        state.dynamic_store.delete(&cfg.collection, &key).await
+        crate::security::blacklist::revoke_ip(state.dynamic_store.as_ref(), &cfg.collection, ip)
+            .await
     };
     if let Err(e) = result {
         tracing::warn!(ip = %ip, error = %e, "admin blacklist store update failed");

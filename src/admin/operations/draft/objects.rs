@@ -27,6 +27,7 @@ pub(super) enum Object {
         id: String,
     },
     PortalSettings {},
+    IpPolicy {},
     PortalManagement {},
     PortalKeyApplications {},
     PortalTeam {
@@ -80,6 +81,7 @@ impl Object {
     /// 返回：名称有界且领域一致时成功；分隔符按普通身份字符保留，不做路径解码。
     pub(super) fn validate(&self, domain: Domain) -> Result<(), Error> {
         let (expected, id, parent): (Domain, &str, Option<&str>) = match self {
+            Self::IpPolicy {} => (Domain::Gateway, "ip_policy", None),
             Self::PortalSettings {} => (Domain::Gateway, "developer_portal", None),
             Self::PortalKeyApplications {} => (Domain::Gateway, "key_applications", None),
             Self::PortalManagement {} => (Domain::Gateway, "management", None),
@@ -153,6 +155,7 @@ impl Object {
     /// 返回：借用成员业务身份；门户与管理单例只使用固定内部名称，不向声明注入身份字段。
     fn id(&self) -> &str {
         match self {
+            Self::IpPolicy {} => "ip_policy",
             Self::PortalSettings {} => "developer_portal",
             Self::PortalKeyApplications {} => "key_applications",
             Self::PortalManagement {} => "management",
@@ -239,6 +242,7 @@ impl Object {
             }
             | Self::PortalManagement {}
             | Self::PortalSettings {}
+            | Self::IpPolicy {}
             | Self::PortalKeyApplications {} => None,
             Self::Credential {
                 ..
@@ -282,6 +286,16 @@ impl Object {
         matches!(self, Self::ConsumerBinding { .. })
     }
 
+    /// 业务作用：限定全局来源与访问策略编辑面，不把根文档的其它控制权交给单例编辑器。
+    ///
+    /// 参数说明：
+    /// - `field`：根文档的第一段字段。
+    ///
+    /// 返回：仅配置兼容门、静态 ACL 与来源解析声明可由此入口读取和修改。
+    pub(super) fn ip_policy_field(field: &str) -> bool {
+        matches!(field, "schema_version" | "acl" | "client_ip_policy")
+    }
+
     /// 业务作用：按完整原文身份命中一个数组对象，复合绑定不能误选其它入口的同名路由。
     ///
     /// 参数说明：
@@ -315,7 +329,8 @@ impl Object {
         fields: impl Iterator<Item = &'a str>,
     ) -> Result<(), Error> {
         for field in fields {
-            if Some(field) == self.identity_field()
+            if (matches!(self, Self::IpPolicy {}) && !Self::ip_policy_field(field))
+                || Some(field) == self.identity_field()
                 || (matches!(self, Self::PortalBinding { .. })
                     && matches!(field, "proxy" | "route"))
                 || (matches!(self, Self::PortalManagement {})
@@ -364,6 +379,8 @@ pub(super) fn catalog(document: &Value, domain: Domain) -> Result<BTreeSet<Objec
     };
     match domain {
         Domain::Gateway => {
+            // 根策略始终可选择；新增声明必须由用户显式填写，不借目录读取升级配置兼容门。
+            insert(Object::IpPolicy {})?;
             let proxies = array(document.get("proxies"))?;
             let root_routes = array(document.get("routes"))?;
             if !proxies.is_empty() && !root_routes.is_empty() {
@@ -608,6 +625,13 @@ pub(super) fn find_mut<'a>(
     document: &'a mut Value,
     object: &Object,
 ) -> Result<&'a mut Value, Error> {
+    if matches!(object, Object::IpPolicy {}) {
+        // 只有固定字段白名单能修改根策略，禁止新建或移除根文档本身。
+        if !document.is_object() {
+            return Err(Error::Invalid);
+        }
+        return Ok(document);
+    }
     if matches!(object, Object::PortalSettings {}) {
         // 门户设置只属于既有门户声明，不能借选择器补齐或替换整个授权配置树。
         return child(document, "developer_portal", None);
@@ -834,6 +858,7 @@ fn collection_mut<'a>(
         }
         | Object::PortalManagement {}
         | Object::PortalSettings {}
+        | Object::IpPolicy {}
         | Object::PortalKeyApplications {} => return Err(Error::Invalid),
     };
     child(parent, key, create.then(|| Value::Array(Vec::new())))?
@@ -856,7 +881,10 @@ pub(super) fn create(
 ) -> Result<(), Error> {
     if matches!(
         object,
-        Object::PortalManagement {} | Object::PortalSettings {} | Object::PortalKeyApplications {}
+        Object::PortalManagement {}
+            | Object::PortalSettings {}
+            | Object::PortalKeyApplications {}
+            | Object::IpPolicy {}
     ) {
         // 门户单例承载独立授权声明，不能通过通用新建动作生成不完整配置。
         return Err(Error::Invalid);
@@ -903,7 +931,10 @@ pub(super) fn create(
 pub(super) fn delete(document: &mut Value, object: &Object) -> Result<(), Error> {
     if matches!(
         object,
-        Object::PortalManagement {} | Object::PortalSettings {} | Object::PortalKeyApplications {}
+        Object::PortalManagement {}
+            | Object::PortalSettings {}
+            | Object::PortalKeyApplications {}
+            | Object::IpPolicy {}
     ) {
         // 单例设置入口不承担整体移除语义，不能连带删除门户目录、团队和应用授权。
         return Err(Error::Invalid);

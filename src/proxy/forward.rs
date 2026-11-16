@@ -7332,7 +7332,17 @@ fn poll_lazy_idle_timer(
     timer.as_mut().poll(cx).is_ready()
 }
 
-/// 业务作用：按可信连接身份重建转发与追踪头，防止客户端自报来源越过信任边界。
+/// 业务作用：按冻结的真实身份重建转发头，显式来源策略不向业务上游保留客户端的另一种来源声明。
+///
+/// 参数说明：
+/// - `parts`：已经完成认证与路由治理的当次上游 head。
+/// - `client_ip`：入口已冻结的真实地址。
+/// - `cached_client_ip_header`：连接内可共享的规范地址字节。
+/// - `trusted_inbound`：兼容配置是否允许保留原 XFF 链。
+/// - `downstream_proto`：当前数据面真实协议。
+/// - `request_id`：本次请求的网关关联标识。
+///
+/// 返回：成功时更新 XFF、X-Real-IP、协议与请求关联头；头编码失败时拒绝当次上游发送。
 fn inject_forward_headers(
     parts: &mut Parts,
     client_ip: IpAddr,
@@ -7341,6 +7351,15 @@ fn inject_forward_headers(
     downstream_proto: &'static str,
     request_id: &str,
 ) -> Result<(), ForwardError> {
+    if parts
+        .extensions
+        .get::<crate::security::ip_policy::CanonicalSourceHeaders>()
+        .is_some()
+    {
+        // 认证已经结束，才可撤去原始签名输入；移除两种入站链，再用冻结地址生成转发头，防止上游重新信任伪造声明。
+        parts.headers.remove("forwarded");
+        parts.headers.remove(X_FORWARDED_FOR);
+    }
     // 命中连接缓存时不再执行 IP Display、HeaderValue parse/owned buffer 构造；clone 只共享
     // 不可变 header 字节。无缓存（trusted XFF 改写了 client_ip、后台内部请求或旧嵌入 API）
     // 仍使用 39-byte 栈缓冲，绝不为了 head 优化触碰/聚合 payload frame。

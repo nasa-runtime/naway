@@ -5,6 +5,12 @@ use super::*;
 #[derive(Debug, Deserialize)]
 /// `gateway.yml` 顶层 serde 模型；只表达声明式配置，运行期热路径使用构建后的 `GatewaySnapshot`。
 pub struct GatewayConfig {
+    /// 路由前执行的全局静态访问集合，独立于动态封禁和各路由 allow/deny。
+    #[serde(default)]
+    pub acl: Option<crate::config::ip_policy::AccessCfg>,
+    /// 来源头的显式使用方式与回溯预算，代理信任仍由各入口 trusted_proxies 授予。
+    #[serde(default)]
+    pub client_ip_policy: Option<crate::config::ip_policy::ClientIpCfg>,
     /// NASA 进程日志配置；naml 展开目录占位符，文件输出与进程同寿命。
     #[serde(default)]
     pub log: Option<nasa::log::LogConfig>,

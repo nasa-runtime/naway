@@ -71,6 +71,7 @@ impl BlacklistEntries {
     ///
     /// 返回：存在永久或未到期的精确地址或网段封禁时为 true；重叠条目独立生效。
     fn contains(&self, ip: IpAddr) -> bool {
+        let ip = crate::io::net::canonical_ip(ip);
         if self.is_empty() {
             return false;
         }
@@ -152,6 +153,7 @@ impl BlacklistCache {
     /// 参数说明：
     /// - `ip`: 待判定的客户端 IP。
     pub fn is_exempt(&self, ip: IpAddr) -> bool {
+        let ip = crate::io::net::canonical_ip(ip);
         let now = Instant::now();
         let mut exemptions = self.exemptions.lock();
         match exemptions.get(&ip) {
@@ -180,6 +182,7 @@ impl BlacklistCache {
     /// - `ip`: 被解封 IP。
     /// - `source`: 来源(通常 `admin`)。
     pub fn record_unban(&self, ip: IpAddr, source: &str) {
+        let ip = crate::io::net::canonical_ip(ip);
         let exempt_ms = self.unban_exempt_ms.load(Ordering::Relaxed);
         if exempt_ms > 0 {
             // validate_config 已限制时长；checked_add 继续防御不同平台 Instant 范围差异。
@@ -374,7 +377,17 @@ pub async fn load_blacklist_ips(
                     // 精确单 IP 进哈希表(O(1) 命中),真正的网段进 CIDR 表(线性扫描)。
                     match cidr {
                         crate::io::net::Cidr::Single(ip) => {
-                            entries.ips.insert(ip, expiry);
+                            // 等价地址声明叠加；另一条较短期限不能缩短永久或仍有效的封禁。
+                            entries
+                                .ips
+                                .entry(ip)
+                                .and_modify(|current| {
+                                    *current = match (*current, expiry) {
+                                        (Some(left), Some(right)) => Some(left.max(right)),
+                                        _ => None,
+                                    };
+                                })
+                                .or_insert(expiry);
                         }
                         cidr => entries.cidrs.push((cidr, expiry)),
                     }
@@ -399,6 +412,27 @@ struct BlacklistEntryMeta {
     expire_at_unix_ms: Option<i64>,
 }
 
+/// 业务作用：撤销一个规范客户端地址的精确封禁，同时兼容已经持久化的 IPv4 映射地址键。
+///
+/// 参数说明：
+/// - `store`：当前动态事实源。
+/// - `collection`：封禁集合名称。
+/// - `ip`：需要撤销的客户端地址，IPv4 与其映射 IPv6 表示等价。
+///
+/// 返回：相关精确键全部删除时成功；存储失败返回错误，前面的删除可能已提交，不自动回滚或重试。
+/// 重叠 CIDR 是独立声明，不随单地址撤销删除。
+pub async fn revoke_ip(store: &dyn DynamicStore, collection: &str, ip: IpAddr) -> Result<()> {
+    let ip = crate::io::net::canonical_ip(ip);
+    store.delete(collection, &ip.to_string()).await?;
+    if let IpAddr::V4(address) = ip {
+        // 既有节点曾使用映射地址的文本键，明确撤销同一来源时不能让该键继续阻断业务。
+        store
+            .delete(collection, &address.to_ipv6_mapped().to_string())
+            .await?;
+    }
+    Ok(())
+}
+
 /// 业务作用：提供动态封禁有效期使用的 Unix 毫秒时间，时钟异常采用保守零值。
 fn unix_now_ms() -> i64 {
     SystemTime::now()
@@ -412,9 +446,43 @@ fn unix_now_ms() -> i64 {
 /// 参数说明：
 /// - `cache`: 数据面黑名单缓存。
 /// - `store`: 可热切换的动态存储句柄。
+///
+/// 返回：后台任务句柄；完整刷新后发布缓存，读取失败保留原快照；此入口不关联连接注册表。
 pub fn spawn_blacklist_refresh(
     cache: Arc<BlacklistCache>,
     store: Arc<SwappableDynamicStore>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_blacklist_refresh_worker(cache, store, None)
+}
+
+/// 业务作用：同步动态封禁事实，并让共享事实源中的封禁关闭本机已有长连接。
+///
+/// 参数说明：
+/// - `cache`：HTTP 和 stream 共用的本地封禁快照。
+/// - `store`：可热切换的动态事实源。
+/// - `connections`：本机受控连接注册表。
+///
+/// 返回：后台任务句柄；读取失败保留原快照，完整刷新后按当前有效封禁发出关闭信号。
+pub fn spawn_blacklist_refresh_with_connections(
+    cache: Arc<BlacklistCache>,
+    store: Arc<SwappableDynamicStore>,
+    connections: Arc<crate::runtime::connections::ConnectionRegistry>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_blacklist_refresh_worker(cache, store, Some(Arc::downgrade(&connections)))
+}
+
+/// 业务作用：驱动订阅与定期对账，避免漏事件或更换事实源后残留旧封禁。
+///
+/// 参数说明：
+/// - `cache`：本地完整封禁快照。
+/// - `store`：运行期可切换的事实源。
+/// - `connections`：可选弱连接注册表，不延长数据面生命周期。
+///
+/// 返回：后台任务句柄；只有完整读取成功后才触发本机连接关闭。
+fn spawn_blacklist_refresh_worker(
+    cache: Arc<BlacklistCache>,
+    store: Arc<SwappableDynamicStore>,
+    connections: Option<std::sync::Weak<crate::runtime::connections::ConnectionRegistry>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut watcher = None;
@@ -474,6 +542,12 @@ pub fn spawn_blacklist_refresh(
 
             match cache.refresh_from_store(store.as_ref(), &collection).await {
                 Ok(count) => {
+                    // 外部发布和 CIDR 规则也必须影响既有会话；按当前缓存复验，不重放旧事件值。
+                    if let Some(connections) =
+                        connections.as_ref().and_then(|value| value.upgrade())
+                    {
+                        connections.close_blocked(&cache);
+                    }
                     tracing::debug!(collection, count, reason, "blacklist cache refreshed");
                 }
                 Err(e) => {

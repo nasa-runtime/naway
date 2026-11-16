@@ -1,8 +1,8 @@
 //! 长连接注册表。
 //!
-//! WS / gRPC-stream 可能持续数小时、一直持有【旧配置快照】,导致「接口禁用 / 应急封杀 / ACL 生效」
-//! 只作用于新请求、不影响既有长连接。本注册表登记每条长连接的元信息,支持按 **route / ip / consumer / 快照版本**
-//! 触发【优雅关闭】(WS 发标准 Close 帧,而非裸 drop TCP),让应急开关对既有长连接也成立。
+//! WS / gRPC-stream 与 TCP / UDP 会话可长期持有旧配置。注册表登记受控连接的元信息，
+//! 支持按 route / ip / consumer / 配置版本发出关闭信号，让应急封禁影响既有连接。
+//! WS 发送标准 Close 帧，gRPC 结束流；不透明 TCP 与 UDP 会话释放对应 socket，不伪造应用控制帧。
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -31,6 +31,10 @@ pub enum LongProto {
     ConnectUdp,
     /// WebTransport session：关闭时停止新 stream/datagram 并关闭上下游 QUIC 会话。
     WebTransport,
+    /// TCP stream：关闭时停止双向字节转发并释放上下游 socket。
+    Tcp,
+    /// UDP stream：关闭时撤销会话映射和上游 socket，不发送 TCP 或 WS 控制帧。
+    Udp,
 }
 
 /// 一条长连接的登记项(内部)。
@@ -72,17 +76,46 @@ pub struct ConnectionRegistry {
     // DashMap 按 hash shard，只锁命中的桶，同时仍让管理面获得逐项一致的安全访问。
     conns: DashMap<u64, Arc<ConnEntry>>,
     next_id: AtomicU64,
+    /// 与数据面共用的稳定缓存；登记完成后复验，避免迟到握手错过已经结束的封禁扫描。
+    blacklist: Option<Arc<crate::security::blacklist::BlacklistCache>>,
     /// reload 控制面的有界 drain 调度器。只在确有 stale 连接且 grace>0 时惰性启动一个
     /// watch worker；请求注册/注销/关闭通知的热路径不读取这把锁。
     stale_drain_schedule: Mutex<Option<watch::Sender<Option<ScheduledStaleDrain>>>>,
 }
 
 impl ConnectionRegistry {
-    /// 业务作用：新建一个空注册表。
+    /// 业务作用：新建仅接收显式关闭信号的空注册表，不隐式取得进程的动态封禁事实。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：共享空目录；需要登记时复验封禁的数据面应使用带缓存的构造入口。
     pub fn new() -> Arc<Self> {
+        Self::build(None)
+    }
+
+    /// 业务作用：为进程长连接绑定同一动态封禁缓存，使迟到登记也受已发布封禁约束。
+    ///
+    /// 参数说明：
+    /// - `blacklist`：与 HTTP 和 stream 共用且在配置切换时原位更新的缓存。
+    ///
+    /// 返回：空注册表；后续登记在进入目录后复验当前有效封禁，不等待下一轮后台刷新。
+    pub fn new_with_blacklist(
+        blacklist: Arc<crate::security::blacklist::BlacklistCache>,
+    ) -> Arc<Self> {
+        Self::build(Some(blacklist))
+    }
+
+    /// 业务作用：创建常驻注册表及可选封禁门，不复制缓存或引入第二个事实源。
+    ///
+    /// 参数说明：
+    /// - `blacklist`：可选数据面缓存；缺省构造仅接收显式关闭信号。
+    ///
+    /// 返回：共享的空目录，后续关闭和登记共用该实例。
+    fn build(blacklist: Option<Arc<crate::security::blacklist::BlacklistCache>>) -> Arc<Self> {
         Arc::new(Self {
             conns: DashMap::new(),
             next_id: AtomicU64::new(1),
+            blacklist,
             stale_drain_schedule: Mutex::new(None),
         })
     }
@@ -96,6 +129,8 @@ impl ConnectionRegistry {
     /// - `consumer`: 已认证 consumer；按租户 drain 用，不能放原始 API key/secret。
     /// - `snapshot_version`: 建连时配置版本(判 current/stale、按版本清旧用)。
     /// - `proto`: 长连接协议(决定关闭语义)。
+    ///
+    /// 返回：自动注销的连接守卫；若绑定的缓存已经封禁该地址，守卫从返回时即持有关闭信号。
     pub fn register(
         self: &Arc<Self>,
         route_id: Arc<str>,
@@ -117,6 +152,19 @@ impl ConnectionRegistry {
             ws_close_code: AtomicU16::new(0),
         });
         self.conns.insert(conn_id, entry.clone());
+        // 先登记再复验：先到的封禁扫描可能没有看见本连接；后到的扫描则能命中已登记项。
+        // 首个关闭原因仍由 CAS 决定，不能覆盖已经并发到达的 drain 或其它策略信号。
+        if self
+            .blacklist
+            .as_ref()
+            .is_some_and(|cache| cache.is_blocked(peer_ip))
+            && entry
+                .ws_close_code
+                .compare_exchange(0, 1008, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+        {
+            entry.close_waker.wake();
+        }
         ConnGuard {
             registry: self.clone(),
             conn_id,
@@ -134,9 +182,25 @@ impl ConnectionRegistry {
         self.notify_matching(1001, |e| e.route_id.as_ref() == route_id)
     }
 
-    /// 业务作用：优雅关闭某 IP 的所有长连接(应急封杀 / ACL 黑名单时用)。返回触发数。
+    /// 业务作用：按同一真实地址关闭长连接，避免 IPv4-mapped IPv6 的等价表示遗漏应急信号。
+    ///
+    /// 参数说明：
+    /// - `ip`：需要关闭的真实客户端地址。
+    ///
+    /// 返回：首次发出关闭信号的连接数；对应 IPv4 与映射 IPv6 一并匹配，不表示对端已关闭。
     pub fn close_by_ip(&self, ip: IpAddr) -> usize {
-        self.notify_matching(1008, |e| e.peer_ip == ip)
+        let ip = crate::io::net::canonical_ip(ip);
+        self.notify_matching(1008, |e| crate::io::net::canonical_ip(e.peer_ip) == ip)
+    }
+
+    /// 业务作用：按当前动态封禁事实关闭本机已有会话，传播其它节点发布的 IP 与 CIDR 封禁。
+    ///
+    /// 参数说明：
+    /// - `blacklist`：已完成完整发布的数据面封禁缓存，命中时仍复验期限。
+    ///
+    /// 返回：首次发出关闭信号的连接数；撤销和已到期条目不产生关闭信号。
+    pub fn close_blocked(&self, blacklist: &crate::security::blacklist::BlacklistCache) -> usize {
+        self.notify_matching(1008, |entry| blacklist.is_blocked(entry.peer_ip))
     }
 
     /// 业务作用：优雅关闭某个已认证 consumer 的全部长连接。返回触发数。
@@ -301,7 +365,7 @@ async fn run_stale_drain_scheduler(
 
 /// 长连接观测统计(低基数:只出数值,不出高基数 label)。
 pub struct LongConnStats {
-    /// 当前登记的 WS + gRPC streaming 总数。
+    /// 当前登记的所有受控长连接与 stream 会话总数。
     pub total: usize,
     /// 建连版本不早于当前快照版本的连接数。
     pub current: usize,

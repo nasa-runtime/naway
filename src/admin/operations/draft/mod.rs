@@ -160,7 +160,14 @@ fn process(domain: Domain, bytes: &[u8], max_bytes: usize) -> Result<Value, Erro
                 if !catalog.contains(object) {
                     return Err(Error::Missing);
                 }
-                let value = objects::find_mut(&mut document, object)?.take();
+                let mut value = objects::find_mut(&mut document, object)?.take();
+                if matches!(object, Object::IpPolicy {}) {
+                    // 此选择器只展示可编辑的三个根字段，避免其它控制声明进入通用扩展控件。
+                    value
+                        .as_object_mut()
+                        .ok_or(Error::Invalid)?
+                        .retain(|key, _| Object::ip_policy_field(key));
+                }
                 if object.is_binding() {
                     binding::fields(value)
                 } else {

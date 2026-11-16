@@ -1235,18 +1235,26 @@ impl GatewayProxy {
         let request_origin = parts.headers.get(http::header::ORIGIN).cloned();
         // 计算真实客户端 IP 与审计 peer：
         // - PROXY protocol 已解析出 real_peer → 直接可信;
-        // - 否则直连对端在 trusted_proxies 内 → 信任其 XFF,取链上真实客户端;
-        // - 都不满足 → 用 socket 对端(忽略可伪造的 XFF)。
+        // - 否则可信直连前置按显式策略读取唯一选定的来源头，未声明策略时保持既有 XFF 合同；
+        // - 不可信直连使用 socket 对端，客户端提交的两种来源头都不能改变权限身份。
         let trusted_inbound =
             conn.via_proxy_protocol || proxy_runtime.is_trusted_peer(conn.tcp_peer.ip());
-        let client_ip = if conn.via_proxy_protocol {
-            conn.real_peer.ip()
+        let (client_ip, client_ip_valid) = if conn.via_proxy_protocol {
+            (conn.real_peer.ip(), true)
         } else if trusted_inbound {
-            client_ip_from_forwarded(&parts, proxy_runtime.trusted_proxies.as_slice())
-                .unwrap_or_else(|| conn.tcp_peer.ip())
+            match snap
+                .ip_policy
+                .forwarded_ip(&parts, proxy_runtime.trusted_proxies.as_slice())
+            {
+                Ok(ip) => (ip.unwrap_or_else(|| conn.tcp_peer.ip()), true),
+                // 坏链不能借回退到受信代理地址取得更宽的 ACL 或额度权限。
+                Err(_) => (conn.tcp_peer.ip(), false),
+            }
         } else {
-            conn.tcp_peer.ip()
+            (conn.tcp_peer.ip(), true)
         };
+        let client_ip = crate::io::net::canonical_ip(client_ip);
+        snap.ip_policy.bind_request(&mut parts);
         // trusted XFF 可使同一 H2 connection 的每个 stream 拥有不同 client_ip；只有最终
         // 权威地址仍等于 connection real_peer 时才移动预编码值进入转发上下文。普通直连与
         // PROXY protocol 命中该快路，代理 multiplex 不同租户时自动回退逐请求构造。
@@ -1360,6 +1368,8 @@ impl GatewayProxy {
             *challenge
         } else if let Some(redirect) = https_redirect {
             *redirect
+        } else if !client_ip_valid {
+            text_status(400, "invalid client source")
         } else if !authority_host_valid {
             text_status(400, "invalid authority")
         } else if gateway_misdirected {
@@ -1381,6 +1391,10 @@ impl GatewayProxy {
                 .ingress_protection
                 .reject(crate::observability::ingress_protection::Rejection::Static);
             resp
+        } else if !snap.ip_policy.is_allowed(client_ip) {
+            // 静态全局访问规则先于任何路由、缓存或鉴权旁路，子路由不能降低此门。
+            self.metrics.inc_acl_denied();
+            text_status(403, "forbidden")
         } else if !host_allowed(&parts, proxy_runtime.server_names.as_slice()) {
             self.metrics.inc_no_route();
             text_status(404, "no matching host")
@@ -10287,27 +10301,6 @@ fn dedupe_response_header(resp: &mut Response<BoxBody>, rule: &DedupeResponseHea
             }
         }
     }
-}
-
-/// 业务作用：从 `X-Forwarded-For` 取真实客户端 IP(仅当直连对端可信时调用):
-/// 从右往左跳过 `trusted_proxies` 内的地址,取第一个非可信地址为真实客户端;
-/// 无法解析 / 全是可信代理 → `None`(调用方回退到 socket 对端)。
-fn client_ip_from_forwarded(
-    parts: &http::request::Parts,
-    trusted: &[crate::io::net::Cidr],
-) -> Option<IpAddr> {
-    let xff = parts
-        .headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())?;
-    for entry in xff.rsplit(',') {
-        if let Ok(ip) = entry.trim().parse::<IpAddr>() {
-            if !crate::io::net::any_contains(trusted, ip) {
-                return Some(ip);
-            }
-        }
-    }
-    None
 }
 
 /// 业务作用：为访问审计选择实际连接对端，区分网络来源与经信任链解析的客户端地址。

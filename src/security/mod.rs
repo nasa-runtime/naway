@@ -12,6 +12,7 @@ pub(crate) mod enterprise_identity;
 pub mod external_crypto;
 pub(crate) mod geoip;
 pub mod guard;
+pub mod ip_policy;
 pub(crate) mod opa;
 pub(crate) mod remote_secret;
 pub mod scopes;

@@ -13,6 +13,8 @@ import { nestedFields } from "./nested.js";
 export function identityField(kind, name) {
   return (
     name === "id" ||
+    (kind === "ip_policy" &&
+      !["schema_version", "acl", "client_ip_policy"].includes(name)) ||
     (kind === "portal_settings" &&
       ["catalogs", "products", "management", "key_applications"].includes(
         name,
@@ -43,6 +45,15 @@ export function draftFieldPanel(kind, values, capacity) {
   const node = element("div", "", "draft-fields");
   const rows = new Map();
   const known = draftFields(kind);
+  if (kind === "ip_policy") {
+    node.append(
+      element(
+        "p",
+        "全局 ACL 同时约束 HTTP、TCP 和 UDP；空 whitelist 拒绝全部业务来源，Admin 使用独立权限。显式 ACL 或客户端来源声明要求 schema_version 为 2，旧制品会拒绝该候选，须核对全部原目标。forwarded 模式只读取选定的一个头，并要求直连前置在对应入口的 trusted_proxies 中；可信链缺失、格式不合法或超限时拒绝请求。移除 client_ip_policy 会恢复既有 XFF 兼容行为；关闭来源头解析请显式选择 socket_addr。这里只生成声明，不授予前置信任或发布配置，全部修改仍须原目标完整预检。",
+        "subtle",
+      ),
+    );
+  }
   if (kind === "portal_key_applications") {
     node.append(
       element(

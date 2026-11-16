@@ -10,6 +10,7 @@ import {
 } from "./portal_application.js";
 import { tlsDraftLists } from "./tls.js";
 import { listenerDraftLists } from "./listener.js";
+import { ipPolicyDraftLists } from "./ip_policy.js";
 import { mqttDraftLists } from "./mqtt.js";
 import { kafkaDraftLists } from "./kafka.js";
 import { upstreamTlsDraftLists } from "./upstream_tls.js";
@@ -88,6 +89,7 @@ function lists(kind, values) {
     });
   }
   result.push(...productDraftLists(kind, values));
+  result.push(...ipPolicyDraftLists(kind));
   result.push(...portalApplicationDraftLists(kind));
   result.push(...routeExternalPluginDraftLists(kind));
   result.push(...routeWasmDraftLists(kind));

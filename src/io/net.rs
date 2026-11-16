@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use anyhow::{Context, Result};
 
 /// 一个网段或单 IP。构建期解析定型,运行期只读匹配。
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Cidr {
     /// 精确单 IP(无 `/prefix`)。
     Single(IpAddr),
@@ -30,10 +30,12 @@ pub enum Cidr {
 }
 
 impl Cidr {
-    /// 业务作用：解析 `"10.0.0.0/8"` / `"192.168.1.1"` / `"::1"` / `"fd00::/8"`。构建期调用,非法即 `Err`(fail-fast)。
+    /// 业务作用：在构建期解析地址或网段，并将 IPv4-mapped 精确地址归并到对应 IPv4 身份。
     ///
     /// 参数说明：
     /// - `spec`: CIDR 或单 IP 字面量;含 `/` 时按前缀网段,否则按精确 IP。
+    ///
+    /// 返回：合法地址得到规范匹配结构；地址、前缀或地址族长度非法时拒绝候选。
     pub fn parse(spec: &str) -> Result<Self> {
         if let Some((base, prefix)) = spec.split_once('/') {
             let base: IpAddr = base
@@ -76,14 +78,19 @@ impl Cidr {
                 .trim()
                 .parse()
                 .with_context(|| format!("invalid IP `{spec}`"))?;
-            Ok(Cidr::Single(ip))
+            Ok(Cidr::Single(canonical_ip(ip)))
         }
     }
 
-    /// 业务作用：该网段是否包含 `ip`。运行期热路径:纯位比较、零分配。v4/v6 交叉一律不匹配。
+    /// 业务作用：按真实地址匹配网段，IPv4-mapped IPv6 与对应 IPv4 同判，避免等价写法绕过访问限制。
+    ///
+    /// 参数说明：
+    /// - `ip`：待判定地址。
+    ///
+    /// 返回：地址属于当前精确项或网段时为 true；其它跨地址族组合不匹配，不分配或解析字符串。
     pub fn contains(&self, ip: IpAddr) -> bool {
-        match (self, ip) {
-            (Cidr::Single(expected), ip) => *expected == ip,
+        match (self, canonical_ip(ip)) {
+            (Cidr::Single(expected), ip) => canonical_ip(*expected) == ip,
             (
                 Cidr::V4 {
                     base,
@@ -91,6 +98,17 @@ impl Cidr {
                 },
                 IpAddr::V4(ip),
             ) => (u32::from(ip) & mask) == *base,
+            (
+                Cidr::V6 {
+                    base,
+                    mask,
+                },
+                IpAddr::V4(ip),
+            ) if *mask & (u128::MAX << 32) == (u128::MAX << 32)
+                && *base & (u128::MAX << 32) == 0xffff_0000_0000 =>
+            {
+                ((0xffff_0000_0000 | u32::from(ip) as u128) & mask) == *base
+            }
             (
                 Cidr::V6 {
                     base,
@@ -116,6 +134,19 @@ impl Cidr {
                 ..
             } => mask.count_ones(),
         }
+    }
+}
+
+/// 业务作用：把 IPv4-mapped IPv6 归并到唯一 IPv4 身份，统一 ACL、封禁、额度和连接选择。
+///
+/// 参数说明：
+/// - `ip`：连接或已验证来源头提供的地址。
+///
+/// 返回：映射地址返回对应 IPv4，其它 IPv4/IPv6 保持原值。
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(value) => value.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        IpAddr::V4(_) => ip,
     }
 }
 
