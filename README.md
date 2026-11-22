@@ -2052,7 +2052,7 @@ redact、rate_limit 和 external 的全部声明字段，支持按原始位置�
 routes:
   - id: notifications
     uri: http://notification-service:8080
-    predicates: ["PathPrefix=/events"]
+    predicates: ["PathElementPrefix=/events"]
     ws_frame:
       permessage_deflate: true
       max_frame_bytes: 65536
