@@ -5,6 +5,9 @@ use super::*;
 #[derive(Debug, Deserialize)]
 /// `gateway.yml` 顶层 serde 模型；只表达声明式配置，运行期热路径使用构建后的 `GatewaySnapshot`。
 pub struct GatewayConfig {
+    /// 捕获误置的监听证书声明，使启动和热加载在开放监听前给出同一条错误。
+    #[serde(rename = "tls", default, deserialize_with = "reject_top_level_tls")]
+    _misplaced_tls: (),
     /// 路由前执行的全局静态访问集合，独立于动态封禁和各路由 allow/deny。
     #[serde(default)]
     pub acl: Option<crate::config::ip_policy::AccessCfg>,
@@ -109,6 +112,18 @@ pub struct GatewayConfig {
     /// Sentinel 流量防护独立规则文件路径(相对主配置目录或绝对);缺省 `sentinel-rules.yml`。
     #[serde(default = "default_sentinel_rules_file")]
     pub sentinel_rules_file: String,
+}
+
+/// 业务作用：拒绝根级 TLS 声明，避免明文监听就绪掩盖 TLS 未绑定。
+///
+/// 参数说明：
+/// - `_field`：出现了根级 `tls` 时由 serde 传入的字段。
+///
+/// 返回：始终拒绝该位置，并指出两个实际承载 TLS 的字段。
+fn reject_top_level_tls<'de, D: serde::Deserializer<'de>>(_field: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom(
+        "top-level `tls` is unsupported; use `server.tls` or `proxies[].tls`",
+    ))
 }
 
 /// 业务作用：为未显式声明的 `interface_guard_file` 提供统一缺省策略，使配置反序列化与手动构造使用相同初值。
