@@ -485,7 +485,8 @@ pub struct RedisRuntimeCfg {
     /// Redis URL,如 `redis://:password@127.0.0.1:6379`。
     #[serde(default)]
     pub url: String,
-    /// nadis 协议命名空间,隔离协议 marker 与运行态 key。
+    /// nadis 协议 marker 及支持命名空间的运行态键前缀。
+    /// 平台域 Sentinel 与 limit_req 保留不含 namespace 的兼容桶键；独立部署须隔离 Redis 实例或数据库。
     #[serde(default = "default_runtime_redis_namespace")]
     pub namespace: String,
     /// nadis 兼容 profile:`RustV2` 或 `LegacyV1`。新部署默认 RustV2。
@@ -574,11 +575,11 @@ pub(super) fn default_auto_ban_ttl_ms() -> u64 {
     300_000
 }
 
-/// 业务作用：提供共享运行态 Redis key 的默认品牌 namespace，隔离不同网关产品的状态。
+/// 业务作用：提供协议 marker 及支持命名空间的运行态键的默认前缀；平台限流兼容键不使用该前缀。
 ///
 /// 参数说明: 无。
 ///
-/// 返回：返回 `naway`；部署可通过显式配置覆盖。
+/// 返回：返回 `naway`；显式配置可覆盖，但不能据此隔离同一 Redis 数据库中的平台限流桶。
 pub(super) fn default_runtime_redis_namespace() -> String {
     "naway".to_string()
 }
