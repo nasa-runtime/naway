@@ -148,11 +148,19 @@ impl GatewayProxy {
             {
                 return Some(response);
             }
+            let matched_sentinel = sentinel::MatchedRules::find(
+                &input.snap.sentinel_requests,
+                parts,
+                route,
+                input.client_ip,
+                false,
+            );
             if let Some(response) = self
                 .enforce_limit_req(
                     parts,
                     route,
                     input.client_ip,
+                    &matched_sentinel,
                     sentinel::AdmissionContext {
                         generation: input.snap.version,
                         body_upper: body
@@ -166,7 +174,7 @@ impl GatewayProxy {
                 return Some(response);
             }
             if let Some(response) = self
-                .enforce_limit_conn(parts, route, input.client_ip, guards)
+                .enforce_limit_conn(parts, route, input.client_ip, &matched_sentinel, guards)
                 .await
             {
                 return Some(response);

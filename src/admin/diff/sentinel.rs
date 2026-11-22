@@ -15,7 +15,7 @@ struct Entry<'a> {
     rule: Rule<'a>,
 }
 
-/// 业务作用：借用实际规则建立稳定身份索引，并保留同一路由内的生效顺序。
+/// 业务作用：借用实际规则建立稳定身份索引，同时检查可能重叠的请求规则及原有精确规则的生效顺序。
 ///
 /// 参数说明：
 /// - `rules`：构建时已经验证唯一身份且归一缺省值的同代规则。
@@ -23,10 +23,14 @@ struct Entry<'a> {
 /// 返回：不复制规则或正文的索引，禁用规则仍可比较声明变化，但不占执行次序。
 fn index(rules: &SentinelFile) -> BTreeMap<(bool, &str), Entry<'_>> {
     let mut index = BTreeMap::new();
-    let mut orders = HashMap::<&str, usize>::new();
+    let mut orders = HashMap::<Option<&str>, usize>::new();
     for rule in &rules.flow {
         let order = rule.enabled.then(|| {
-            let order = orders.entry(&rule.route).or_default();
+            let exact =
+                !crate::config::sentinel::request::is_path(&rule.route) && rule.selector.is_none();
+            let order = orders
+                .entry(exact.then_some(rule.route.as_str()))
+                .or_default();
             *order += 1;
             *order
         });
@@ -40,7 +44,11 @@ fn index(rules: &SentinelFile) -> BTreeMap<(bool, &str), Entry<'_>> {
     }
     for rule in &rules.degrade {
         let order = rule.enabled.then(|| {
-            let order = orders.entry(&rule.route).or_default();
+            let exact =
+                !crate::config::sentinel::request::is_path(&rule.route) && rule.selector.is_none();
+            let order = orders
+                .entry(exact.then_some(rule.route.as_str()))
+                .or_default();
             *order += 1;
             *order
         });

@@ -99,7 +99,7 @@ impl std::fmt::Display for Criterion {
 /// - `spec`：完整的 circuit_breaker 指令。
 ///
 /// 返回：所有参数唯一且策略组合有效时返回冻结计划，否则拒绝整个候选。
-pub(super) fn parse_circuit_breaker(spec: &str) -> Result<CircuitBreakerPolicy> {
+pub(crate) fn parse_circuit_breaker(spec: &str) -> Result<CircuitBreakerPolicy> {
     let rest = filter_args(spec, "circuit_breaker");
     if rest.is_empty() {
         bail!("circuit_breaker requires `id=<id> failure_threshold=<N>`");
@@ -123,7 +123,7 @@ pub(super) fn parse_circuit_breaker(spec: &str) -> Result<CircuitBreakerPolicy> 
             "failures" | "threshold" => "failure_threshold",
             "open_ms" => "break_ms",
             "status" => "fallback_status",
-            "body" => "fallback_body",
+            "body" | "fallback_body_base64" => "fallback_body",
             other => other,
         };
         // 重复字段不能通过声明顺序覆盖保护参数，别名也必须指向同一个唯一字段。
@@ -184,6 +184,14 @@ pub(super) fn parse_circuit_breaker(spec: &str) -> Result<CircuitBreakerPolicy> 
             "fallback_body" | "body" => {
                 fallback_body = value.replace('_', " ");
             }
+            "fallback_body_base64" => {
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(value)
+                    .context("invalid circuit_breaker fallback body encoding")?;
+                fallback_body = String::from_utf8(bytes)
+                    .context("circuit_breaker fallback body must be UTF-8")?;
+            }
             other => bail!("unsupported circuit_breaker option `{other}`"),
         }
     }
@@ -207,6 +215,15 @@ pub(super) fn parse_circuit_breaker(spec: &str) -> Result<CircuitBreakerPolicy> 
             "circuit_breaker window_ms/break_ms must be within 1..={MAX_LONG_STREAM_DURATION_MS} and min_requests must be positive"
         );
     }
+    anyhow::ensure!(
+        (200..=599).contains(&fallback_status.as_u16()),
+        "circuit_breaker fallback_status must be a final HTTP status (200..=599)"
+    );
+    // 禁止产生 HTTP 状态与实体边界矛盾的响应，避免连接编解码器替换整条降级结果。
+    anyhow::ensure!(
+        !matches!(fallback_status.as_u16(), 204 | 205 | 304) || fallback_body.is_empty(),
+        "circuit_breaker fallback status 204, 205 or 304 requires an empty body"
+    );
     Ok(CircuitBreakerPolicy {
         id: id.unwrap_or_else(|| "default".to_string()),
         criterion,

@@ -39,9 +39,12 @@ pub struct SentinelFlowRuleCfg {
     /// false 时忽略该规则,保留配置但不生效。
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 绑定的 route id。按 route 精确绑定,后续可扩展 path/resource 维度。
+    /// 精确路由 ID，或以 `/` 开始的请求路径模式。
     pub route: String,
-    /// 限制维度,同 `limit_req`/`limit_conn`:`global|ip|route|header:<name>|query:<name>`。
+    /// 请求属性值匹配，在路径或路由命中的基础上收窄规则。
+    #[serde(default, rename = "match")]
+    pub selector: Option<SentinelValueMatch>,
+    /// 限制维度，例如 `global`、`ip`、`header:<name>` 或 `cookie:<name>`。
     #[serde(default = "default_sentinel_key")]
     pub key: String,
     /// QPS/QPM 等速率,存在时编译为 `limit_req`。
@@ -69,11 +72,11 @@ pub struct SentinelFlowRuleCfg {
     #[serde(default)]
     pub max_wait_ms: Option<u64>,
     /// 同一规则最多保留的活跃维度桶，防高基数维度爆破。
-    #[serde(default = "default_sentinel_max_active_keys")]
-    pub max_active_keys: usize,
+    #[serde(default)]
+    pub max_active_keys: Option<usize>,
     /// 达到维度上限时 `open` 放行或 `closed` 拒绝；两者都不再创建新桶。
-    #[serde(default = "default_sentinel_active_keys_fail")]
-    pub active_keys_fail: String,
+    #[serde(default)]
+    pub active_keys_fail: Option<String>,
     /// 并发上限,存在时编译为 `limit_conn`。
     #[serde(default)]
     pub limit: Option<u64>,
@@ -89,12 +92,12 @@ pub(super) fn default_sentinel_behavior() -> String {
 }
 
 /// 业务作用：为未显式声明的 `max_active_keys` 提供统一缺省策略，使配置反序列化与手动构造使用相同初值。
-pub(super) fn default_sentinel_max_active_keys() -> usize {
+pub(crate) fn default_sentinel_max_active_keys() -> usize {
     100_000
 }
 
 /// 业务作用：为未显式声明的 `active_keys_fail` 提供统一缺省策略，使配置反序列化与手动构造使用相同初值。
-pub(super) fn default_sentinel_active_keys_fail() -> String {
+pub(crate) fn default_sentinel_active_keys_fail() -> String {
     "open".to_string()
 }
 
@@ -107,8 +110,11 @@ pub struct SentinelDegradeRuleCfg {
     /// false 时忽略该规则,保留配置但不生效。
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 绑定的 route id。
+    /// 精确路由 ID，或以 `/` 开始的请求路径模式。
     pub route: String,
+    /// 请求属性值匹配，在路径或路由命中的基础上收窄规则。
+    #[serde(default, rename = "match")]
+    pub selector: Option<SentinelValueMatch>,
     /// 统计依据；默认按失败次数保护。
     #[serde(default)]
     pub strategy: SentinelDegradeStrategy,
@@ -133,9 +139,17 @@ pub struct SentinelDegradeRuleCfg {
     /// fallback HTTP 状态码,默认 503。
     #[serde(default = "default_circuit_fallback_status")]
     pub fallback_status: u16,
-    /// fallback 短文本 body。空则用 `circuit open`。
+    /// 降级短文本正文，保留 YAML 字符串值；无正文状态须明确声明空值。
     #[serde(default = "default_circuit_fallback_body")]
     pub fallback_body: String,
+}
+
+/// 规则适用的请求属性及字面匹配值；尾随星号表示前缀。
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SentinelValueMatch {
+    pub key: String,
+    pub value: String,
 }
 
 /// 熔断窗口的观测依据；每条规则只启用一种策略。

@@ -6,7 +6,7 @@ mod file_watch;
 
 #[cfg(feature = "nacos-sdk")]
 use std::collections::BTreeMap;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -2967,19 +2967,55 @@ fn active_key_overflow_decision(fail_open: bool) -> RateLimitDecision {
 
 /// 可释放的并发连接限制接口。Redis 后端用于跨节点 `limit_conn`,local 后端用于单机/降级。
 pub trait ConnLimiter: Send + Sync {
+    /// 业务作用：冻结可替换后端的当前实例，让释放与续期始终使用实际授予名额的权威。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：包装器返回当前后端；实体后端返回空，调用方持有原实例。
+    fn active_backend(&self) -> Option<Arc<dyn ConnLimiter>> {
+        None
+    }
+
     /// 业务作用：尝试占用一个并发槽。
     ///
     /// 参数说明：
     /// - `key`: 已 hash 的规则维度 key,不得包含原始 token/header 明文。
+    /// - `lease`：本次申请独有的租约身份，重试沿用原身份。
     /// - `limit`: 同一 key 最大并发数;0 表示规则禁用。
     /// - `ttl`: Redis 崩溃泄漏兜底 TTL;local 后端忽略。
-    fn acquire<'a>(&'a self, key: &'a str, limit: u64, ttl: Duration) -> ConnLimitFuture<'a>;
+    ///
+    /// 返回：本次准入裁决及是否持有租约；未取得名额的请求不拥有释放权。
+    fn acquire<'a>(
+        &'a self,
+        key: &'a str,
+        lease: &'a str,
+        limit: u64,
+        ttl: Duration,
+    ) -> ConnLimitFuture<'a>;
 
-    /// 业务作用：释放一个并发槽。必须幂等处理异常状态。
-    fn release<'a>(&'a self, key: &'a str) -> ConnLimitReleaseFuture<'a>;
+    /// 业务作用：幂等释放指定持有者的并发槽，重复或迟到释放不影响其它请求。
+    ///
+    /// 参数说明：
+    /// - `key`：限额维度的稳定共享键。
+    /// - `lease`：由该请求持有的精确租约身份。
+    ///
+    /// 返回：只移除仍存在的本租约；缺失时无副作用。
+    fn release<'a>(&'a self, key: &'a str, lease: &'a str) -> ConnLimitReleaseFuture<'a>;
 
-    /// 业务作用：刷新并发槽 TTL。local 后端可为空操作。
-    fn refresh<'a>(&'a self, key: &'a str, ttl: Duration) -> ConnLimitReleaseFuture<'a>;
+    /// 业务作用：只为仍有效的精确租约续期，已过期或丢失的占位不能复活。
+    ///
+    /// 参数说明：
+    /// - `key`：限额维度的稳定共享键。
+    /// - `lease`：由该请求持有的精确租约身份。
+    /// - `ttl`：从 Redis 服务端时间起保留的期限。
+    ///
+    /// 返回：只延长存在的活跃租约；本地后端由请求生命周期直接管理。
+    fn refresh<'a>(
+        &'a self,
+        key: &'a str,
+        lease: &'a str,
+        ttl: Duration,
+    ) -> ConnLimitReleaseFuture<'a>;
 }
 
 /// 并发限制 acquire future。
@@ -3002,12 +3038,25 @@ pub struct ConnLimitDecision {
 /// 单进程本地并发限制器。
 #[derive(Default)]
 pub struct LocalConnLimiter {
-    counts: Mutex<HashMap<String, u64>>,
+    leases: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl ConnLimiter for LocalConnLimiter {
     /// 业务作用：按维度申请并发额度，只有成功获得名额的请求才能进入受保护工作。
-    fn acquire<'a>(&'a self, key: &'a str, limit: u64, _ttl: Duration) -> ConnLimitFuture<'a> {
+    ///
+    /// 参数说明：
+    /// - `key`：限额作用域及维度的共享键。
+    /// - `lease`：当前请求的唯一租约身份。
+    /// - `limit`：该维度的并发上限。
+    ///
+    /// 返回：新名额可用或原租约仍在时允许，容量不足时不登记新租约。
+    fn acquire<'a>(
+        &'a self,
+        key: &'a str,
+        lease: &'a str,
+        limit: u64,
+        _ttl: Duration,
+    ) -> ConnLimitFuture<'a> {
         Box::pin(async move {
             if limit == 0 {
                 return ConnLimitDecision {
@@ -3016,42 +3065,51 @@ impl ConnLimiter for LocalConnLimiter {
                     release_required: false,
                 };
             }
-            let mut counts = self.counts.lock();
-            let current = *counts.get(key).unwrap_or(&0);
-            if current >= limit {
-                return ConnLimitDecision {
-                    allowed: false,
-                    current,
-                    release_required: false,
-                };
+            let mut leases = self.leases.lock();
+            let active = leases.entry(key.to_owned()).or_default();
+            let allowed = active.contains(lease) || (active.len() as u64) < limit;
+            if allowed {
+                active.insert(lease.to_owned());
             }
-            let next = current + 1;
-            counts.insert(key.to_string(), next);
             ConnLimitDecision {
-                allowed: true,
-                current: next,
-                release_required: true,
+                allowed,
+                current: active.len() as u64,
+                release_required: allowed,
             }
         })
     }
 
     /// 业务作用：归还当前后端的并发占位，供请求结束与取消路径使用同一结算合同。
-    fn release<'a>(&'a self, key: &'a str) -> ConnLimitReleaseFuture<'a> {
+    ///
+    /// 参数说明：
+    /// - `key`：原来取得名额的规则维度。
+    /// - `lease`：原持有者的租约。
+    ///
+    /// 返回：只撤下原租约；维度再无持有者时回收空条目。
+    fn release<'a>(&'a self, key: &'a str, lease: &'a str) -> ConnLimitReleaseFuture<'a> {
         Box::pin(async move {
-            let mut counts = self.counts.lock();
-            let Some(current) = counts.get_mut(key) else {
+            let mut leases = self.leases.lock();
+            let Some(active) = leases.get_mut(key) else {
                 return;
             };
-            if *current <= 1 {
-                counts.remove(key);
-            } else {
-                *current -= 1;
+            active.remove(lease);
+            if active.is_empty() {
+                leases.remove(key);
             }
         })
     }
 
     /// 业务作用：满足并发租约接口的续期合同；本地占位由生命周期管理，不依赖远端 TTL。
-    fn refresh<'a>(&'a self, _key: &'a str, _ttl: Duration) -> ConnLimitReleaseFuture<'a> {
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：已完成的空操作。
+    fn refresh<'a>(
+        &'a self,
+        _key: &'a str,
+        _lease: &'a str,
+        _ttl: Duration,
+    ) -> ConnLimitReleaseFuture<'a> {
         Box::pin(async {})
     }
 }
@@ -3076,28 +3134,42 @@ impl SwappableConnLimiter {
 }
 
 impl ConnLimiter for SwappableConnLimiter {
+    /// 业务作用：返回当前实例的共享句柄，换代后在途租约仍由取得额度的实例处理。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：当前实例的稳定引用。
+    fn active_backend(&self) -> Option<Arc<dyn ConnLimiter>> {
+        Some(self.inner.read().clone())
+    }
+
     /// 业务作用：按维度申请并发额度，只有成功获得名额的请求才能进入受保护工作。
-    fn acquire<'a>(&'a self, key: &'a str, limit: u64, ttl: Duration) -> ConnLimitFuture<'a> {
+    fn acquire<'a>(
+        &'a self,
+        key: &'a str,
+        lease: &'a str,
+        limit: u64,
+        ttl: Duration,
+    ) -> ConnLimitFuture<'a> {
         let inner = self.inner.read().clone();
-        Box::pin(async move {
-            inner.acquire(key, limit, ttl).await
-        })
+        Box::pin(async move { inner.acquire(key, lease, limit, ttl).await })
     }
 
     /// 业务作用：归还当前后端的并发占位，供请求结束与取消路径使用同一结算合同。
-    fn release<'a>(&'a self, key: &'a str) -> ConnLimitReleaseFuture<'a> {
+    fn release<'a>(&'a self, key: &'a str, lease: &'a str) -> ConnLimitReleaseFuture<'a> {
         let inner = self.inner.read().clone();
-        Box::pin(async move {
-            inner.release(key).await
-        })
+        Box::pin(async move { inner.release(key, lease).await })
     }
 
     /// 业务作用：将租约续期转发到当前选定后端，维持并发额度的有效期合同。
-    fn refresh<'a>(&'a self, key: &'a str, ttl: Duration) -> ConnLimitReleaseFuture<'a> {
+    fn refresh<'a>(
+        &'a self,
+        key: &'a str,
+        lease: &'a str,
+        ttl: Duration,
+    ) -> ConnLimitReleaseFuture<'a> {
         let inner = self.inner.read().clone();
-        Box::pin(async move {
-            inner.refresh(key, ttl).await
-        })
+        Box::pin(async move { inner.refresh(key, lease, ttl).await })
     }
 }
 
@@ -4141,6 +4213,8 @@ const CONN_ACQUIRE_LUA: &str = include_str!("redis/connection_acquire.lua");
 
 #[cfg(feature = "redis-runtime")]
 const CONN_RELEASE_LUA: &str = include_str!("redis/connection_release.lua");
+#[cfg(feature = "redis-runtime")]
+const CONN_REFRESH_LUA: &str = include_str!("redis/connection_refresh.lua");
 
 /// Redis Lua 令牌桶。所有节点对同一 key 执行原子 EVAL,实现集群共享 QPS。
 #[cfg(feature = "redis-runtime")]
@@ -4479,7 +4553,7 @@ fn redis_rate_limit_keys(scope: &str, key: &str) -> (String, String, String) {
 /// - `scope`：固定限流规则域。
 /// - `key`：规则内的请求维度键。
 /// - `budget`：来自路由归属权威的预算，平台域为空。
-/// - `namespace`：Redis 状态键使用的固定命名空间。
+/// - `namespace`：工作区预算键使用的固定命名空间；平台域保留不含该前缀的兼容键。
 ///
 /// 返回：桶、规则索引、结算前缀和工作区容量索引；平台键布局保持不变。
 pub(super) fn redis_scoped_rate_limit_keys(
@@ -4488,6 +4562,7 @@ pub(super) fn redis_scoped_rate_limit_keys(
     budget: Option<&crate::control::ownership::state::Budget>,
     namespace: &str,
 ) -> (String, String, String, String) {
+    // 平台桶保留既有布局，保证同作用域节点及热更前后继续共享额度；连接 namespace 不能隔离这些桶。
     let Some(budget) = budget else {
         let (bucket, active, settlement) = redis_rate_limit_keys(scope, key);
         return (bucket, active.clone(), settlement, active);
@@ -4521,7 +4596,7 @@ impl RedisRateLimiter {
     }
 }
 
-/// Redis Lua 并发连接限制器。所有节点对同一 key 执行原子 INCR/DECR。
+/// Redis 并发限制器；每个维度保有独立到期的持有者租约。
 #[cfg(feature = "redis-runtime")]
 pub struct RedisConnLimiter {
     client: Arc<nasa::redis::RedisClient>,
@@ -4538,7 +4613,12 @@ impl RedisConnLimiter {
         }
     }
 
-    /// 业务作用：为受保护的并发或防重放维度编码共享键，保持命名空间隔离。
+    /// 业务作用：保持现有并发共享键边界，由 Redis 数据库及规则作用域决定共享范围。
+    ///
+    /// 参数说明：
+    /// - `key`：由路由或独立规则计算的维度键。
+    ///
+    /// 返回：并发租约使用的唯一 Redis 键，连接 namespace 不参与编码。
     fn redis_key(key: &str) -> String {
         format!("gw:limitconn:{key}")
     }
@@ -4563,7 +4643,21 @@ impl RedisConnLimiter {
 #[cfg(feature = "redis-runtime")]
 impl ConnLimiter for RedisConnLimiter {
     /// 业务作用：按维度申请并发额度，只有成功获得名额的请求才能进入受保护工作。
-    fn acquire<'a>(&'a self, key: &'a str, limit: u64, ttl: Duration) -> ConnLimitFuture<'a> {
+    ///
+    /// 参数说明：
+    /// - `key`：规则及维度的共享键。
+    /// - `lease`：当前请求的唯一租约，依赖侧重试继续使用同一身份。
+    /// - `limit`：该维度的并发上限。
+    /// - `ttl`：租约失去续期后保留的期限。
+    ///
+    /// 返回：原子申请的裁决；依赖异常按配置失败策略裁决，此时不授予续期和释放权。
+    fn acquire<'a>(
+        &'a self,
+        key: &'a str,
+        lease: &'a str,
+        limit: u64,
+        ttl: Duration,
+    ) -> ConnLimitFuture<'a> {
         Box::pin(async move {
             if limit == 0 {
                 return ConnLimitDecision {
@@ -4580,7 +4674,7 @@ impl ConnLimiter for RedisConnLimiter {
                 .eval::<Vec<i64>>(
                     CONN_ACQUIRE_LUA,
                     &[redis_key.as_str()],
-                    &[limit.as_str(), ttl_ms.as_str()],
+                    &[limit.as_str(), ttl_ms.as_str(), lease],
                 )
                 .await;
             match result {
@@ -4601,13 +4695,19 @@ impl ConnLimiter for RedisConnLimiter {
         })
     }
 
-    /// 业务作用：归还当前后端的并发占位，供请求结束与取消路径使用同一结算合同。
-    fn release<'a>(&'a self, key: &'a str) -> ConnLimitReleaseFuture<'a> {
+    /// 业务作用：归还原持有者的并发占位，迟到请求不能删除重建后同键的其它名额。
+    ///
+    /// 参数说明：
+    /// - `key`：申请时的规则维度。
+    /// - `lease`：原持有者的租约。
+    ///
+    /// 返回：完成释放尝试；网络失败后由租约到期收回。
+    fn release<'a>(&'a self, key: &'a str, lease: &'a str) -> ConnLimitReleaseFuture<'a> {
         Box::pin(async move {
             let redis_key = Self::redis_key(key);
             if let Err(err) = self
                 .client
-                .eval::<i64>(CONN_RELEASE_LUA, &[redis_key.as_str()], &[])
+                .eval::<i64>(CONN_RELEASE_LUA, &[redis_key.as_str()], &[lease])
                 .await
             {
                 tracing::warn!(error = %err, "redis conn limiter release failed");
@@ -4615,13 +4715,30 @@ impl ConnLimiter for RedisConnLimiter {
         })
     }
 
-    /// 业务作用：延长共享并发占位的存活期，避免长请求在仍执行时失去计数保护。
-    fn refresh<'a>(&'a self, key: &'a str, ttl: Duration) -> ConnLimitReleaseFuture<'a> {
+    /// 业务作用：只延长本请求仍有效的 Redis 租约，避免复活已回收占用。
+    ///
+    /// 参数说明：
+    /// - `key`：与原申请相同的共享键。
+    /// - `lease`：本请求持有的唯一租约。
+    /// - `ttl`：距 Redis 当前时间的续期期限。
+    ///
+    /// 返回：完成原租约的续期尝试；旧租约已经过期或丢失时保持现状。
+    fn refresh<'a>(
+        &'a self,
+        key: &'a str,
+        lease: &'a str,
+        ttl: Duration,
+    ) -> ConnLimitReleaseFuture<'a> {
         Box::pin(async move {
             let redis_key = Self::redis_key(key);
+            let ttl_ms = ttl.as_millis().clamp(1, u128::from(u64::MAX)).to_string();
             if let Err(err) = self
                 .client
-                .expire(&redis_key, ttl.max(Duration::from_millis(1)))
+                .eval::<i64>(
+                    CONN_REFRESH_LUA,
+                    &[redis_key.as_str()],
+                    &[ttl_ms.as_str(), lease],
+                )
                 .await
             {
                 tracing::warn!(error = %err, "redis conn limiter ttl refresh failed");

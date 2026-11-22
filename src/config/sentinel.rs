@@ -2,12 +2,16 @@
 
 use super::*;
 
+pub(crate) mod request;
+
 /// 业务作用：保存 Sentinel 文件编译后的 route→filter 索引，并在进入 Router 前校验引用完整性。
 pub(super) struct SentinelRouteFilters {
     /// route id 到按声明顺序编译出的限流和熔断 filter。
     pub(super) by_route: HashMap<String, Vec<String>>,
     /// 实际合并并验证的规则与过滤器一起发布，管理比较不得再读另一份 base 或环境。
     pub(super) rules: Arc<SentinelFile>,
+    /// 按请求实际路径和属性查找的规则，与精确路由过滤器共用准入和熔断实现。
+    pub(super) requests: request::RequestRules,
 }
 
 impl SentinelRouteFilters {
@@ -61,6 +65,12 @@ pub(super) fn load_sentinel_rules(
             rule.cold_factor = Some(rule.cold_factor.unwrap_or(3));
             rule.cold_after_ms = rule.cold_after_ms.or(rule.warmup_ms);
         }
+        if rule.rate.is_some() {
+            rule.max_active_keys
+                .get_or_insert_with(model::default_sentinel_max_active_keys);
+            rule.active_keys_fail
+                .get_or_insert_with(model::default_sentinel_active_keys_fail);
+        }
     }
     ids.clear();
     for rule in &rules.degrade {
@@ -71,6 +81,7 @@ pub(super) fn load_sentinel_rules(
         );
     }
     let mut by_route: HashMap<String, Vec<String>> = HashMap::new();
+    let mut requests = request::RequestRules::default();
     for rule in &rules.flow {
         if !rule.enabled {
             continue;
@@ -97,14 +108,17 @@ pub(super) fn load_sentinel_rules(
         let filter = match (rule.rate.as_ref(), rule.limit) {
             (Some(rate), None) => {
                 validate_sentinel_token("sentinel flow rate", rate)?;
-                if rule.max_active_keys == 0 {
+                let max_active_keys = rule
+                    .max_active_keys
+                    .unwrap_or_else(model::default_sentinel_max_active_keys);
+                if max_active_keys == 0 {
                     anyhow::bail!(
                         "sentinel flow `{}` max_active_keys must be positive",
                         rule.id
                     );
                 }
-                let active_keys_fail = match rule.active_keys_fail.as_str() {
-                    "open" | "closed" => rule.active_keys_fail.as_str(),
+                let active_keys_fail = match rule.active_keys_fail.as_deref().unwrap_or("open") {
+                    mode @ ("open" | "closed") => mode,
                     other => anyhow::bail!(
                         "sentinel flow `{}` active_keys_fail expects open|closed, got `{other}`",
                         rule.id
@@ -112,13 +126,21 @@ pub(super) fn load_sentinel_rules(
                 };
                 format!(
                     "limit_req key={} rate={} burst={} max_active_keys={} active_keys_fail={}{}",
-                    rule.key, rate, rule.burst, rule.max_active_keys, active_keys_fail, behavior
+                    rule.key, rate, rule.burst, max_active_keys, active_keys_fail, behavior
                 )
             }
             (None, Some(limit)) => {
                 if limit == 0 {
                     anyhow::bail!("sentinel flow `{}` limit must be positive", rule.id);
                 }
+                // 并发后端按在途租约计数；未接入的速率桶容量参数不能静默放行。
+                anyhow::ensure!(
+                    rule.max_active_keys.is_none()
+                        && rule.active_keys_fail.is_none()
+                        && rule.burst == 0,
+                    "sentinel flow `{}` max_active_keys, active_keys_fail and burst require rate",
+                    rule.id
+                );
                 format!("limit_conn key={} limit={limit}", rule.key)
             }
             (Some(_), Some(_)) => anyhow::bail!(
@@ -130,7 +152,22 @@ pub(super) fn load_sentinel_rules(
                 rule.id
             ),
         };
-        by_route.entry(rule.route.clone()).or_default().push(filter);
+        let path = request::is_path(&rule.route);
+        if path || rule.selector.is_some() {
+            let policy = if rule.limit.is_some() {
+                request::Policy::Concurrency(crate::routing::parse_limit_conn(&filter)?)
+            } else {
+                request::Policy::Rate(crate::routing::sentinel::parse_limit_req(&filter)?)
+            };
+            requests
+                .insert(&rule.route, &rule.id, rule.selector.as_ref(), policy)
+                .with_context(|| format!("sentinel flow `{}` request rule", rule.id))?;
+            if !path {
+                by_route.entry(rule.route.clone()).or_default();
+            }
+        } else {
+            by_route.entry(rule.route.clone()).or_default().push(filter);
+        }
     }
     for rule in &rules.degrade {
         if !rule.enabled {
@@ -144,32 +181,20 @@ pub(super) fn load_sentinel_rules(
                 rule.id
             );
         }
-        http::StatusCode::from_u16(rule.fallback_status).with_context(|| {
-            format!(
-                "sentinel degrade `{}` invalid fallback_status `{}`",
-                rule.id, rule.fallback_status
-            )
-        })?;
-        if rule.fallback_body.trim().is_empty() {
-            anyhow::bail!(
-                "sentinel degrade `{}` fallback_body must be non-empty",
-                rule.id
-            );
-        }
         let strategy = match rule.strategy {
             model::SentinelDegradeStrategy::ErrorCount => "error_count",
             model::SentinelDegradeStrategy::ErrorRatio => "error_ratio",
             model::SentinelDegradeStrategy::SlowRatio => "slow_ratio",
         };
         let mut filter = format!(
-            "circuit_breaker id={} strategy={} window_ms={} min_requests={} break_ms={} fallback_status={} fallback_body={}",
+            "circuit_breaker id={} strategy={} window_ms={} min_requests={} break_ms={} fallback_status={} fallback_body_base64={}",
             rule.id,
             strategy,
             rule.window_ms,
             rule.min_requests,
             rule.break_ms,
             rule.fallback_status,
-            rule.fallback_body.split_whitespace().collect::<Vec<_>>().join("_")
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&rule.fallback_body)
         );
         // 原生编译器统一验证参数互斥与数值硬门，不能因来源不同而产生两套保护语义。
         use std::fmt::Write as _;
@@ -182,12 +207,30 @@ pub(super) fn load_sentinel_rules(
         if let Some(slow) = rule.slow_ms {
             write!(filter, " slow_ms={slow}")?;
         }
-        by_route.entry(rule.route.clone()).or_default().push(filter);
+        let path = request::is_path(&rule.route);
+        if path || rule.selector.is_some() {
+            let policy = crate::routing::circuit::parse_circuit_breaker(&filter)
+                .with_context(|| format!("sentinel degrade `{}` fallback or strategy", rule.id))?;
+            requests
+                .insert(
+                    &rule.route,
+                    &rule.id,
+                    rule.selector.as_ref(),
+                    request::Policy::Circuit(policy),
+                )
+                .with_context(|| format!("sentinel degrade `{}` request rule", rule.id))?;
+            if !path {
+                by_route.entry(rule.route.clone()).or_default();
+            }
+        } else {
+            by_route.entry(rule.route.clone()).or_default().push(filter);
+        }
     }
     Ok((
         SentinelRouteFilters {
             by_route,
             rules: Arc::new(rules),
+            requests,
         },
         loaded.sources,
     ))

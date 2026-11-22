@@ -4496,10 +4496,65 @@ upstreams:
 Prometheus、OTLP 和内置实时页面使用相同口径。集群页面区分业务节点与控制节点，混合后端或
 缺席节点明确标为部分覆盖，不把未知当作零，也不沿用已失联节点的旧值。
 
+## Redis 平台限流的隔离边界
+
+`runtime_state.rate_limiter.redis.namespace` 隔离 nadis 协议 marker 和支持该前缀的运行态键，
+不隔离全部业务键。平台域的 Sentinel 与 `limit_req` 保留 `gw:ratelimit:{...}:...` 兼容布局，
+桶、活跃维度和结算键不包含 namespace；同一 Redis 数据库中，即使 namespace 不同，
+入口、路由、策略位置和维度形成相同作用域的请求仍会共享额度。只改 Sentinel 规则 id
+不能作为部署隔离保证。工作区预算分支使用包含 namespace 的归属预算键，不能将平台例外
+推断为所有 Redis 组件的行为。
+
+Redis `limit_conn` 的 `gw:limitconn:...` 键同样按规则和维度共享，连接 namespace 不参与键计算。
+并发槽由独立租约持有。结束或取消只归还本请求的租约，拒绝和其它请求续期不会延长失联租约。
+启用该租约格式前，应停止共用这些键的旧版节点并等待旧占用归还或过期。旧版计数和新版租约
+使用同一键名，仍存在的旧计数会使新版拒绝该维度的新申请。
+
+需要相互独立的网关部署时，应使用独立 Redis 实例，或在支持逻辑数据库的单机 Redis 上选择
+不同数据库；Redis Cluster 应使用独立集群。更改 namespace 不会迁移或清空已有平台限流桶。
+
+## Sentinel 路径和请求属性规则
+
+`flow` 与 `degrade` 可以绑定精确路由 ID 或 `/user/*` 形式的字面路径前缀。
+`/user/*` 匹配 `/user/info` 及更深路径，`/user`、`/users/info` 和查询串中的路径不命中。
+可用 `match.key` 和 `match.value` 进一步限定请求属性，例如下面的规则只保护指定租户前缀。
+
+```yaml
+schema_version: 1
+flow:
+  - id: user-hotspots
+    route: /user/*
+    match:
+      key: header:tag
+      value: tenant-*
+    key: header:tag
+    rate: 10r/s
+    burst: 0
+degrade: []
+```
+
+`match.key` 支持 `header:<name>`、`query:<name>`、`cookie:<name>`、`host`、`path`、`ip` 和
+`route`。属性值使用精确文本或非空字面值加一个尾随 `*`。路径不含查询串，Query 保留原始编码，
+Host 规范化为小写主机名。重复同名字段读取首值。缺失属性不命中模式，空值可用空字符串精确匹配。
+每种匹配在构建时放入 Trie；请求只查询实际路径及属性值。分桶继续使用完整值，所以匹配同一前缀
+的 `tenant-123` 和 `tenant-456` 有各自额度。未设匹配条件时，缺失值的桶与字面值 `<missing>` 分开。
+
+路径规则及带 `match` 的精确路由流控按计量属性类型和字段名隔离状态。相同计量字段的等价写法
+在其它状态条件一致时保留余额和在途占用，切换字段后使用独立额度。结束或取消的旧请求仍归还原租约。
+从只按匹配条件划分规则状态的制品升级时，这类流控规则会启用新的状态键，余额从新桶开始计量。
+共享 Redis 的节点应在排空原并发后统一切换。混跑期间同一规则会分别从两套键分配额度。
+
+同一执行阶段先执行原有路由保护规则，再按独立请求规则的声明顺序执行所有命中项，首个拒绝结束
+该阶段。路径规则只在终端路由执行，在同一工作区内跨匹配路由共享规则作用域。`key: route` 仍按
+路由分桶，`key: global` 共用整个规则的额度。熔断规则在同一作用域共享窗口，开启后的响应由首条
+拒绝规则决定。使用 Redis 时，速率与并发可跨节点共享，熔断节点各自判定开闭，可选择共享统计。
+
 ## Sentinel 速率预热
 
-独立 Sentinel 规则文档的 `flow` 支持普通快速拒绝和线性预热，按 route 绑定已有的
-IP/header/query 等维度。未声明 `behavior` 时保持 `reject`；预热使用同一套本地或 Redis
+独立 Sentinel 规则文档的 `flow` 支持普通快速拒绝和线性预热。速率必须为正，禁用规则使用
+`enabled: false`。令牌桶按速率连续补充，`burst: 0` 仍不保证任意滚动窗口内的硬上限。
+`max_active_keys`、`active_keys_fail` 和非零 `burst` 只适用于速率规则，与并发 `limit` 同时声明会拒绝。
+未声明 `behavior` 时使用 `reject`；预热使用同一套本地或 Redis
 令牌桶、活跃维度上限、工作区预算和依赖失败策略，无需外部控制器。
 
 ```yaml
@@ -4575,8 +4630,11 @@ Redis 断连、未知回执、类型或权限异常始终拒绝准入，不继�
 ## Sentinel 熔断与降级
 
 主配置的 `sentinel_rules_file` 指向独立规则文档，使用相同的 naml 加载、候选校验和原子热更链。
-`degrade` 按实际 route id 绑定，支持错误次数、错误比例和慢调用比例；不存在的路由、未知字段、
+`degrade` 使用相同的路由、路径及属性匹配，支持错误次数、错误比例和慢调用比例；不存在的路由、未知字段、
 重复 DSL 参数和互斥阈值组合会拒绝整个候选，继续使用上一份有效配置。
+
+独立 YAML 中的 `fallback_body` 保留原字符串值，包括换行、缩进和下划线。`fallback_status` 使用
+200–599 的最终 HTTP 状态。`204`、`205` 和 `304` 必须显式配置空正文。
 
 ```yaml
 schema_version: 1

@@ -5807,7 +5807,7 @@ impl ErrorPagePolicy {
 }
 
 /// `limit_req` 支持的低成本维度。`HeaderName` 在构建期校验,运行期零解析。
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum LimitReqKey {
     /// 所有请求共享同一桶,用于全局保护后端。
     Global,
@@ -5815,10 +5815,16 @@ pub enum LimitReqKey {
     Ip,
     /// 按当前 route id 分桶。
     Route,
-    /// 按指定请求头值分桶;缺失头落入 `<missing>` 桶。
+    /// 按指定请求头原值分桶，缺失拥有独立桶。
     Header(HeaderName),
-    /// 按指定 query 参数值分桶;缺失参数落入 `<missing>` 桶。
+    /// 按指定 query 参数原值分桶，缺失拥有独立桶。
     Query(String),
+    /// 按具名 Cookie 的值分桶。
+    Cookie(String),
+    /// 按规范化的请求主机分桶。
+    Host,
+    /// 按不含查询串的原始请求路径分桶。
+    Path,
 }
 
 /// 访问控制动作。
@@ -7303,7 +7309,7 @@ fn is_blocked_referer(raw: &str) -> bool {
 ///
 /// 参数说明：
 /// - `parts`: 下游请求 head。
-fn request_host(parts: &Parts) -> Option<String> {
+pub(crate) fn request_host(parts: &Parts) -> Option<String> {
     parts
         .headers
         .get(http::header::HOST)
@@ -7315,8 +7321,10 @@ fn request_host(parts: &Parts) -> Option<String> {
 ///
 /// 参数说明：
 /// - `raw`: Host 或 URI host 原始文本。
+///
+/// 返回：去除端口、尾点后的小写主机名；没有主机名时返回空值。
 fn normalize_host(raw: &str) -> Option<String> {
-    let raw = raw.trim().trim_end_matches('.');
+    let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
@@ -7326,6 +7334,7 @@ fn normalize_host(raw: &str) -> Option<String> {
     } else {
         raw.split_once(':').map(|(host, _)| host).unwrap_or(raw)
     };
+    let host = host.trim_end_matches('.');
     if host.is_empty() {
         None
     } else {
@@ -8765,7 +8774,7 @@ fn unquote_token(value: &str) -> &str {
 /// 参数说明：
 /// - `query`: URI 中 `?` 后的原始 query。
 /// - `name`: 待读取的参数名。
-fn query_param_raw<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn query_param_raw<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         if key == name {
@@ -8777,7 +8786,7 @@ fn query_param_raw<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// 业务作用：冻结并发上限与维度，释放责任由响应生命周期承担。
-fn parse_limit_conn(spec: &str) -> Result<LimitConnPolicy> {
+pub(crate) fn parse_limit_conn(spec: &str) -> Result<LimitConnPolicy> {
     let rest = filter_args(spec, "limit_conn");
     if rest.is_empty() {
         bail!("limit_conn requires `key=<dimension> limit=<N>`");
@@ -8863,12 +8872,19 @@ fn parse_limit_rate(spec: &str) -> Result<LimitRatePolicy> {
 }
 
 /// 业务作用：解析受支持的限额维度，拒绝任意表达式生成无界或不可信的身份键。
-fn parse_limit_key(raw: &str) -> Result<LimitReqKey> {
+///
+/// 参数说明：
+/// - `raw`：规则声明的固定取值方式及可选属性名。
+///
+/// 返回：编译后的维度。未知取值方式或非法字段名当作候选校验错误。
+pub(crate) fn parse_limit_key(raw: &str) -> Result<LimitReqKey> {
     let value = raw.trim();
     match value {
         "global" => Ok(LimitReqKey::Global),
         "ip" | "remote_addr" | "$remote_addr" | "${remote_addr}" => Ok(LimitReqKey::Ip),
         "route" => Ok(LimitReqKey::Route),
+        "host" => Ok(LimitReqKey::Host),
+        "path" => Ok(LimitReqKey::Path),
         _ => {
             if let Some(name) = value
                 .strip_prefix("header:")
@@ -8888,8 +8904,15 @@ fn parse_limit_key(raw: &str) -> Result<LimitReqKey> {
                 }
                 return Ok(LimitReqKey::Query(name.to_string()));
             }
+            if let Some(name) = value.strip_prefix("cookie:") {
+                anyhow::ensure!(
+                    !name.is_empty() && name.len() <= 128 && name.parse::<HeaderName>().is_ok(),
+                    "limit_req invalid cookie dimension"
+                );
+                return Ok(LimitReqKey::Cookie(name.to_owned()));
+            }
             bail!(
-                "unsupported limit_req key `{value}` (global|ip|route|header:<name>|query:<name>)"
+                "unsupported limit_req key `{value}` (global|ip|route|host|path|header:<name>|query:<name>|cookie:<name>)"
             )
         }
     }

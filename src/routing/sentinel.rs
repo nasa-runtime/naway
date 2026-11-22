@@ -29,7 +29,7 @@ pub struct LimitReqPolicy {
 /// - `spec`：完整的 limit_req 指令。
 ///
 /// 返回：合法且有界的令牌策略；未知字段、重复字段或不可执行的预热声明拒绝候选。
-pub(super) fn parse_limit_req(spec: &str) -> Result<LimitReqPolicy> {
+pub(crate) fn parse_limit_req(spec: &str) -> Result<LimitReqPolicy> {
     let rest = filter_args(spec, "limit_req");
     if rest.is_empty() {
         bail!("limit_req requires `key=<dimension> rate=<N>r/s`");

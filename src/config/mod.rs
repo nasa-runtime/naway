@@ -20,7 +20,7 @@ pub mod providers;
 pub mod scg;
 pub(crate) mod schema;
 pub mod scripts;
-mod sentinel;
+pub(crate) mod sentinel;
 use sentinel::{load_sentinel_rules, SentinelRouteFilters};
 pub mod telemetry;
 pub(crate) mod upstream_tls;
@@ -106,6 +106,8 @@ pub struct GatewaySnapshot {
     pub ip_policy: crate::security::ip_policy::Plan,
     /// 与路由同代的实际 Sentinel 规则，只供控制面比较，不在请求路径重新求值。
     pub(crate) sentinel_rules: Arc<model::SentinelFile>,
+    /// 路径及请求属性值索引随同代快照发布。
+    pub(crate) sentinel_requests: Arc<sentinel::request::RequestRules>,
     /// 已验证的进程日志启动声明；候选构建不打开日志文件。
     pub process_log: crate::observability::logging::LogPlan,
     /// 与原生路由原子发布的下游 xDS 投影，未启用制品时不存在该资源域。
@@ -1573,6 +1575,7 @@ fn build_snapshot_from_config(
     Ok(GatewaySnapshot {
         ip_policy,
         sentinel_rules: sentinel.rules,
+        sentinel_requests: Arc::new(sentinel.requests),
         process_log,
         #[cfg(feature = "xds-server")]
         xds_server,
@@ -4527,7 +4530,7 @@ fn build_proxy_from_parts(
     } else {
         None
     };
-    let routes = routes_with_sentinel(routes, sentinel, sentinel_matched_routes);
+    let routes = routes_with_sentinel(routes, sentinel, sentinel_matched_routes)?;
     let gateway_listeners = build_gateway_listener_runtime(id, gateway_listeners)?;
     let config_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
     let router = Router::build_with_usage_plans_and_self_addrs(
@@ -4973,21 +4976,35 @@ fn validate_optional_duration(field: &str, value: u64, max: u64) -> Result<()> {
     Ok(())
 }
 
-/// 业务作用：把 Sentinel 规则编译进候选路由，使独立规则文件仍受统一路由构建和发布约束。
+/// 业务作用：把精确 Sentinel 规则编译进候选路由，并拒绝不能产生上游样本的分支熔断规则。
+///
+/// 参数说明：
+/// - `routes`：入口候选声明。
+/// - `sentinel`：已经编译的精确规则及请求匹配索引。
+/// - `sentinel_matched_routes`：累计可验证的精确路由绑定。
+///
+/// 返回：可供统一构建的路由；发现父层无法执行的熔断动作时拒绝候选。
 fn routes_with_sentinel(
     routes: &[model::RouteCfg],
     sentinel: &SentinelRouteFilters,
     sentinel_matched_routes: &mut HashSet<String>,
-) -> Vec<model::RouteCfg> {
+) -> Result<Vec<model::RouteCfg>> {
     routes
         .iter()
         .map(|route| {
+            // 父层没有业务上游响应，不能让条件熔断规则通过构建却永远不计样本。
+            anyhow::ensure!(
+                !route.layer.as_ref().is_some_and(|layer| layer.branch)
+                    || !sentinel.requests.has_route_circuit(&route.id),
+                "sentinel circuit breaker requires a terminal route: `{}`",
+                route.id
+            );
             let mut route = route.clone();
             if let Some(extra) = sentinel.by_route.get(&route.id) {
                 route.filters.extend(extra.iter().cloned());
                 sentinel_matched_routes.insert(route.id.clone());
             }
-            route
+            Ok(route)
         })
         .collect()
 }

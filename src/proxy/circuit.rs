@@ -119,6 +119,7 @@ impl GatewayProxy {
     /// 参数说明：
     /// - `parts`：固定工作区上下文
     /// - `route`：提供策略
+    /// - `matched`：与原始头匹配的独立熔断策略。
     /// - `permits`：保存本次请求取得的许可。
     ///
     /// 返回：全部熔断器允许时继续；任一拒绝时撤销已取得许可并返回声明的降级响应。
@@ -126,12 +127,26 @@ impl GatewayProxy {
         &self,
         parts: &Parts,
         route: &Route,
+        matched: &sentinel::MatchedRules<'_>,
         permits: &mut Vec<CircuitPermit>,
     ) -> Option<Response<BoxBody>> {
-        for (idx, policy) in route.circuit_breakers.iter().enumerate() {
+        let native = route
+            .circuit_breakers
+            .iter()
+            .enumerate()
+            .map(|(index, policy)| (index, policy, None));
+        let request_rules = matched
+            .circuit
+            .iter()
+            .map(|&(rule, policy)| (0, policy, Some(rule)));
+        for (idx, policy, rule) in native.chain(request_rules) {
+            let scope = rule.map_or_else(
+                || std::borrow::Cow::Borrowed(route_state_scope(parts, route)),
+                |rule| std::borrow::Cow::Owned(sentinel::rule_scope(parts, route, rule)),
+            );
             let key = format!(
                 "circuit:{}:{}:{}:{}:{}:{}:{}",
-                route_state_scope(parts, route),
+                scope,
                 idx,
                 policy.id,
                 policy.window.as_nanos(),

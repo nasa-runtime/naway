@@ -1588,6 +1588,14 @@ impl GatewayProxy {
             for header in ["x-naway-workspace", "x-naway-tenant", "x-naway-environment"] {
                 parts.headers.remove(header);
             }
+            // 在终端过滤器变更路径或属性之前冻结规则；父层只执行自身绑定，路径规则全程只评估一次。
+            let matched_sentinel = sentinel::MatchedRules::find(
+                &snap.sentinel_requests,
+                &parts,
+                &route,
+                client_ip,
+                true,
+            );
             let workspace_rejected = if snap.ownership.enabled() && layer_execution.chain.is_none()
             {
                 match snap
@@ -1944,6 +1952,7 @@ impl GatewayProxy {
                     &mut parts,
                     &route,
                     client_ip,
+                    &matched_sentinel,
                     sentinel::AdmissionContext {
                         generation: snap.version,
                         body_upper: forward_body
@@ -1956,7 +1965,13 @@ impl GatewayProxy {
             {
                 resp
             } else if let Some(resp) = self
-                .enforce_limit_conn(&parts, &route, client_ip, &mut limit_conn_guards)
+                .enforce_limit_conn(
+                    &parts,
+                    &route,
+                    client_ip,
+                    &matched_sentinel,
+                    &mut limit_conn_guards,
+                )
                 .await
             {
                 resp
@@ -1976,7 +1991,11 @@ impl GatewayProxy {
                 .await
             {
                 resp
-            } else if route.limit_req.iter().any(|policy| policy.queue.is_some())
+            } else if (route.limit_req.iter().any(|policy| policy.queue.is_some())
+                || matched_sentinel
+                    .rate
+                    .iter()
+                    .any(|(_, policy, _)| policy.queue.is_some()))
                 && self.snap.load().version != snap.version
             {
                 // 队列之后仍可能有其它异步准入；终端分派前再次阻断已撤销配置的业务副作用。
@@ -2064,9 +2083,12 @@ impl GatewayProxy {
                     facts.no_upstream();
                 }
                 resp
-            } else if let Some(resp) =
-                self.enforce_circuit_breakers(&parts, &route, &mut circuit_permits)
-            {
+            } else if let Some(resp) = self.enforce_circuit_breakers(
+                &parts,
+                &route,
+                &matched_sentinel,
+                &mut circuit_permits,
+            ) {
                 resp
             } else if is_cors_preflight(&parts, &route) {
                 cors_preflight_response(route.cors.as_ref().expect("checked cors"), &parts)
@@ -8148,6 +8170,7 @@ impl GatewayProxy {
     /// - `parts`：含首次公开入口归属的请求头。
     /// - `route`：当前实际执行并发规则的已编译路由。
     /// - `client_ip`：权威客户端地址，只用于原规则维度。
+    /// - `matched`：原始请求匹配的独立并发规则。
     /// - `acquired`：本次请求已取得的并发占用，拒绝时一并释放。
     ///
     /// 返回：全部规则取得占用时继续；拒绝时归还已取得占用并记录原入口的明确裁决。
@@ -8156,16 +8179,31 @@ impl GatewayProxy {
         parts: &Parts,
         route: &Route,
         client_ip: IpAddr,
+        matched: &sentinel::MatchedRules<'_>,
         acquired: &mut Vec<LimitConnGuard>,
     ) -> Option<Response<BoxBody>> {
-        for (idx, policy) in route.limit_conn.iter().enumerate() {
-            let dimension = limit_dimension(parts, route, client_ip, &policy.key);
-            let key = format!(
-                "limit_conn:{}:{}:{:016x}",
-                route_state_scope(parts, route),
-                idx,
-                stable_hash64(dimension.as_bytes())
-            );
+        let native = route
+            .limit_conn
+            .iter()
+            .enumerate()
+            .map(|(index, policy)| (index, policy, None));
+        let request_rules = matched
+            .concurrency
+            .iter()
+            .map(|&(rule, policy, dimension)| (0, policy, Some((rule, dimension))));
+        for (idx, policy, indexed) in native.chain(request_rules) {
+            let key = if let Some((rule, dimension)) = indexed {
+                format!(
+                    "limit_conn:{}:{dimension:016x}",
+                    sentinel::rule_scope(parts, route, rule)
+                )
+            } else {
+                let dimension = sentinel::dimension_hash(parts, route, client_ip, &policy.key);
+                format!(
+                    "limit_conn:{}:{idx}:{dimension:016x}",
+                    route_state_scope(parts, route)
+                )
+            };
             let Some(guard) = self.acquire_limit_conn_slot(key, policy.limit).await else {
                 acquired.clear();
                 self.metrics.inc_conn_limited();
@@ -8482,23 +8520,39 @@ impl GatewayProxy {
         response
     }
 
-    /// 业务作用：取得当前限额维度的并发租约，归还责任绑定响应或连接的完整生命周期。
+    /// 业务作用：通过冻结的后端取得唯一并发租约，归还责任绑定响应或连接的完整生命周期。
+    ///
+    /// 参数说明：
+    /// - `key`：已绑定规则作用域和请求维度的共享键。
+    /// - `limit`：同一维度允许的在途请求数。
+    ///
+    /// 返回：授权时返回租约守卫；无额度或无法建立唯一身份时拒绝。
     async fn acquire_limit_conn_slot(&self, key: String, limit: u64) -> Option<LimitConnGuard> {
-        let decision = self.conn_limiter.acquire(&key, limit, LIMIT_CONN_TTL).await;
+        let mut token = [0_u8; 16];
+        getrandom::getrandom(&mut token).ok()?;
+        let lease = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token);
+        let limiter = self
+            .conn_limiter
+            .active_backend()
+            .unwrap_or_else(|| self.conn_limiter.clone());
+        // 获取、续期、归还共用同一个租约和后端，避免换代后旧连接操作新权威。
+        let decision = limiter.acquire(&key, &lease, limit, LIMIT_CONN_TTL).await;
         if !decision.allowed {
             return None;
         }
         let refresh_task = if decision.release_required {
             Some(spawn_limit_conn_refresh(
-                self.conn_limiter.clone(),
+                limiter.clone(),
                 key.clone(),
+                lease.clone(),
             ))
         } else {
             None
         };
         Some(LimitConnGuard {
             key,
-            limiter: self.conn_limiter.clone(),
+            lease,
+            limiter,
             release_required: decision.release_required,
             refresh_task,
         })
@@ -8568,35 +8622,24 @@ fn route_state_scope<'a>(parts: &'a Parts, route: &'a Route) -> &'a str {
         .map_or(route.id.as_str(), |scope| scope.0.as_str())
 }
 
-/// 业务作用：从已验证请求上下文解析速率规则维度，客户端不能自行选择受保护身份。
-fn limit_req_dimension(
-    parts: &Parts,
-    route: &Route,
-    client_ip: IpAddr,
-    key: &LimitReqKey,
-) -> String {
-    limit_dimension(parts, route, client_ip, key)
-}
-
-/// 业务作用：按规则确定限额键的请求维度，保证不同准入门对同一主体一致归因。
+/// 业务作用：按既有流量结算合同编码请求维度，保持已发出的回执能够继续结算。
+///
+/// 参数说明：
+/// - `parts`：提供请求头与原始查询串。
+/// - `route`：提供路由身份。
+/// - `client_ip`：网关确认的客户端地址。
+/// - `key`：已编译的取值方式。
+///
+/// 返回：流量结算用文本，空缺使用原有占位值。
 fn limit_dimension(parts: &Parts, route: &Route, client_ip: IpAddr, key: &LimitReqKey) -> String {
-    match key {
-        LimitReqKey::Global => "global".to_string(),
-        LimitReqKey::Ip => client_ip.to_string(),
-        LimitReqKey::Route => route.id.clone(),
-        LimitReqKey::Header(name) => parts
-            .headers
-            .get(name)
-            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
-            .unwrap_or_else(|| "<missing>".to_string()),
-        LimitReqKey::Query(name) => query_param_raw(parts.uri.query().unwrap_or_default(), name)
-            .unwrap_or("<missing>")
-            .to_string(),
-    }
+    crate::config::sentinel::request::value(parts, &route.id, client_ip, key)
+        .map(|value| String::from_utf8_lossy(&value).into_owned())
+        .unwrap_or_else(|| "<missing>".to_owned())
 }
 
 pub(super) struct LimitConnGuard {
     key: String,
+    lease: String,
     limiter: Arc<dyn ConnLimiter>,
     release_required: bool,
     refresh_task: Option<tokio::task::JoinHandle<()>>,
@@ -8613,10 +8656,11 @@ impl Drop for LimitConnGuard {
         }
         let limiter = self.limiter.clone();
         let key = self.key.clone();
+        let lease = self.lease.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    limiter.release(&key).await;
+                    limiter.release(&key, &lease).await;
                 });
             }
             Err(err) => {
@@ -8631,15 +8675,23 @@ impl Drop for LimitConnGuard {
 /// 参数说明：
 /// - `limiter`: 当前并发限制后端。
 /// - `key`: 已占用的并发限制 key。
+/// - `lease`：与该请求一一对应的租约身份。
+///
+/// 返回：周期续期任务；原守卫退出时取消，丢失的租约不可重建。
 fn spawn_limit_conn_refresh(
     limiter: Arc<dyn ConnLimiter>,
     key: String,
+    lease: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(LIMIT_CONN_REFRESH_INTERVAL);
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + LIMIT_CONN_REFRESH_INTERVAL,
+            LIMIT_CONN_REFRESH_INTERVAL,
+        );
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            limiter.refresh(&key, LIMIT_CONN_TTL).await;
+            limiter.refresh(&key, &lease, LIMIT_CONN_TTL).await;
         }
     })
 }
@@ -9392,18 +9444,6 @@ impl Body for SseDrainBody {
     fn size_hint(&self) -> SizeHint {
         SizeHint::default()
     }
-}
-
-/// 业务作用：读取未解码查询参数，供需要保留原始 URI 语义的策略使用。
-fn query_param_raw<'a>(query: &'a str, name: &str) -> Option<&'a str> {
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        if k == name {
-            Some(v)
-        } else {
-            None
-        }
-    })
 }
 
 /// 业务作用：计算稳定的请求采样摘要，使声明的比例策略不依赖进程随机哈希种子。
