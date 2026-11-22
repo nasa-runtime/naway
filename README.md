@@ -4,6 +4,7 @@
 
 - 数据面：基于 `hyper`/`tokio` 的流式反向代理，支持 h1/h2c、WebSocket/WSS、TLS/ALPN、SSE/gRPC、证书热换和慢连接 deadline。
 - 本地配置直接使用 `naml` 的分层加载、来源追踪和精确 watcher；Nacos、Redis、axum 等运行组件复用 nasa-runtime-rust 的 `nasa` 门面。
+- 集群可统一从Nacos读取三文档配置集。Admin编辑主配置、Sentinel或接口守卫后按CAS写入Nacos，各节点订阅推送、私有落盘并热加载；两空格YAML编辑、格式预览、审批与节点收敛分别显示，详见[管理配置说明](docs/admin-operations.md#yaml编辑辅助)。
 - 可选工作区把配置归属、委派权限、双人审批与资源预算绑定到同一权威快照；不同团队可管理各自对象，共享上游必须显式授权。
 - 内置管理监控提供本机与集群当前流量、保护、资源和节点状态，不保存监控历史；Prometheus 与外部历史监控可独立配置。
 
@@ -3202,10 +3203,16 @@ xDS client、Kubernetes 路由控制器和 Docker/Nomad/ECS 工作负载来源�
 切换并保留活动配置。路由、规则与静态上游的正常热更不受影响。`GET /api/config/current`
 的 `centers` 返回当前总开关及重启要求，不包含中心凭据。
 
+Nacos 配置订阅也绑定进程启动时的声明。启用、停用，或更换活动订阅的连接身份、凭据、
+文档集合、物化目录及重连策略，都需要重启；在线候选会被拒绝，保留活动快照和原订阅，不切换来源。
+订阅当前与候选均关闭时，可以预填新的连接参数，仍不会创建订阅任务。普通路由热更不受影响。
+
 新生成的 bootstrap 文件显式关闭两个总开关。为保持已有配置的后端启用语义，省略总开关时
 按 `true` 处理，但各后端仍默认 `false`，因此空配置不会自动连接中心。启用 Nacos 时，
 分别设置 `discovery.enabled` 与 `discovery.nacos.enabled`，或
 `config_source.enabled` 与 `config_source.nacos.enabled`；两组互不代替。
+启用 Nacos 配置订阅的制品必须包含 `nacos-sdk` feature；缺少该能力时，配置构建直接失败，
+不会先启动路由再反复尝试不可用的订阅。总开关关闭时，后端声明被裁剪，不要求该传输能力。
 
 动态服务的来源绑定在配置构建时冻结。物理服务、协议、TLS、后端凭据或有效期策略变化后，
 当前请求只采纳与新绑定一致的已确认目录；尚未取得新事实时不可选择旧端点，服务实时监控显示未知。

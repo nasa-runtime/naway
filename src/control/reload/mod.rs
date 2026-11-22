@@ -1491,23 +1491,17 @@ fn same_discovery_bootstrap(current: &GatewaySnapshot, candidate: &GatewaySnapsh
 }
 
 /// 业务作用：识别配置来源的启动期变化，避免活动 watcher 与已发布事实源不一致。
+///
+/// 参数说明：
+/// - `current`：当前本地权威绑定的配置订阅参数。
+/// - `candidate`：远端候选要求使用的配置订阅参数。
+///
+/// 返回：全部启动参数相同时为真；远端不能改写本机预填但未启用的参数。
 fn same_config_source_bootstrap(
     current: &NacosConfigSourceCfg,
     candidate: &NacosConfigSourceCfg,
 ) -> bool {
-    current.enabled == candidate.enabled
-        && current.server_addr == candidate.server_addr
-        && current.namespace == candidate.namespace
-        && current.group == candidate.group
-        && current.app_name == candidate.app_name
-        && current.username == candidate.username
-        && current.password == candidate.password
-        && current.gateway_data_id == candidate.gateway_data_id
-        && current.interface_guard_data_id == candidate.interface_guard_data_id
-        && current.sentinel_rules_data_id == candidate.sentinel_rules_data_id
-        && current.bundle_data_id == candidate.bundle_data_id
-        && current.materialized_dir == candidate.materialized_dir
-        && current.reconnect_backoff_ms == candidate.reconnect_backoff_ms
+    crate::config::centers::same_nacos_config_bootstrap(current, candidate)
 }
 
 /// 业务作用：比较证书秘密引用，使内容刷新与引用目标切换采用正确的重载路径。
