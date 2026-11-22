@@ -3770,9 +3770,9 @@ dependencies = [
 
 [[package]]
 name = "nadisc"
-version = "2.0.3"
+version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24f6e3dd0d2c583b7c16f76623af6634d9dc83de5619782ff653b2792448e43f"
+checksum = "e7a1dbcd5f5f087717a62460ce9251fb7fa95c0dfb1354a48df6425e9e7e06ca"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3969,9 +3969,9 @@ dependencies = [
 
 [[package]]
 name = "nanacos"
-version = "2.0.3"
+version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbaee11eb4e7ff7a94095ab29c2b91d618fbe7f0d793e64f38a670fe4d553eea"
+checksum = "2574a93f4c27691edf3e3f0354f7f8e5ebbdde6ca5642de53b360101b3898a15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3983,9 +3983,9 @@ dependencies = [
 
 [[package]]
 name = "nanacos-sdk"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "462a4105b6379b351aadb456714a0b1d6bfddcb6129c390d772d53aed47de5fd"
+checksum = "f3923b5d808759c65582f3b2128dbe914a9629681e188ed4df233d95fa9748eb"
 dependencies = [
  "arc-swap",
  "async-stream",
@@ -4002,6 +4002,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tonic",
@@ -4137,9 +4138,9 @@ dependencies = [
 
 [[package]]
 name = "nasa"
-version = "2.0.3"
+version = "2.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "866e3b59a1c5c34fe2ee201c0b933b582b6221fa1f43366e230ed1599ef32bd4"
+checksum = "27270a1f7eb97099464e323f0a669db40b4bcc08e4b3a0c47d46b844346538d7"
 dependencies = [
  "cacheable",
  "nabase",
@@ -4197,9 +4198,9 @@ dependencies = [
 
 [[package]]
 name = "nasaga-macro"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "613539f4d2b260521541ab8a5161d38ea8d281b62feec6f12fbad8ce26ef3fe2"
+checksum = "4b4e053aaed7e9e650fba73140cdbdf318413b704d6947275d8dcd9084d8fe68"
 dependencies = [
  "macro-support",
  "proc-macro2",
@@ -5915,9 +5916,9 @@ dependencies = [
 
 [[package]]
 name = "rest-discovery"
-version = "2.0.3"
+version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de6f49388eb4e0a3a0ecb6376dd33fb0cc60e1e5a02f64c7b3542087319bd6a6"
+checksum = "eee95d68c3d3f891c4f18b2f2f61a487030061320b55f5d28fb2eb1c46b2a637"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5942,9 +5943,9 @@ dependencies = [
 
 [[package]]
 name = "rest-discovery-nacos"
-version = "2.0.3"
+version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "587dc23f58c17e7af0dd520ac725d026c682c391a021b4a79e5d1fa791aa5855"
+checksum = "86532055e35b7be3bff5a8f4822810348b30d16a80c62d09d467138912d20902"
 dependencies = [
  "anyhow",
  "nanacos",

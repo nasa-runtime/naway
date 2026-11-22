@@ -150,15 +150,15 @@ maxminddb = "0.30"                    # route GeoIP/ASN/匿名网络只读本地
 josekit = { version = "0.10.3", optional = true } # JWE compact RSA-OAEP-256 + A256GCM；只用于嵌套签名 JWT 解密
 ldap3 = { version = "0.12.1", optional = true, default-features = false, features = ["tls-rustls-aws-lc-rs"] } # LDAPv3/LDAPS/StartTLS 企业目录认证
 libc = "0.2"                          # `-s reload` 向运行进程发 SIGHUP
-naml = { version = "2.0.2", features = ["watch"] } # 配置装配、外部 YAML 有界读写与精确热更新
-nagrpc = { version = "2.0.3", optional = true } # 受管预绑定与动态TLS能力，与nasa门面共享同一运行类型
-nasaga-runtime-core = { version = "2.0.1", optional = true, default-features = false } # 中性命令验真，不启用数据库或外部 transport
-nasaga-backend = { version = "2.0.0", optional = true, default-features = false } # 共享工作流的公开已提交投影，不引入第二套状态机
-nametrics-core = "2.0.0"             # 指标目录、结构化事实与公开序列预算
-naoutbox-core = "2.0.0"              # 用量事件身份与至少一次外部收据合同
+naml = { version = "2.0.3", features = ["watch"] } # 配置装配、外部 YAML 有界读写与精确热更新
+nagrpc = { version = "2.0.5", optional = true } # 受管预绑定与动态TLS能力，与nasa门面共享同一运行类型
+nasaga-runtime-core = { version = "2.0.2", optional = true, default-features = false } # 中性命令验真，不启用数据库或外部 transport
+nasaga-backend = { version = "2.0.1", optional = true, default-features = false } # 共享工作流的公开已提交投影，不引入第二套状态机
+nametrics-core = "2.0.1"             # 指标目录、结构化事实与公开序列预算
+naoutbox-core = "2.0.1"              # 用量事件身份与至少一次外部收据合同
 naoutbox-pgsql = { version = "2.0.1", optional = true } # 共享执行经 NASA 门面使用有界聚合根轮转的公开合同
-naauthz = { version = "2.0.0", optional = true } # 已验证 Agent 身份的 scope 授权
-nabudget = "2.0.0"                   # 显式协议与消息处理共用绝对 deadline 与取消树
+naauthz = { version = "2.0.1", optional = true } # 已验证 Agent 身份的 scope 授权
+nabudget = "2.0.1"                   # 显式协议与消息处理共用绝对 deadline 与取消树
 notify = "8.2"                        # TLS 与动态集合文件观察；YAML 配置观察由 naml 负责
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] } # W3C context + server/client span API
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] } # head sampling + bounded batch processor
@@ -211,7 +211,7 @@ wtransport = { version = "0.7.1", optional = true, default-features = false, fea
 
 # —— 复用 nasa-runtime-rust 生态（YAML 直接使用 naml，日志走 nasa::log）——
 # Nacos、日志、缓存和 Web 通过同一公开门面版本接入；HMAC/JWT 验签复用 nasa::crypto。
-nasa = { version = "2.0.3", features = ["log", "base", "nacos", "crypto", "cache", "web"] }
+nasa = { version = "2.0.7", features = ["log", "base", "nacos", "crypto", "cache", "web"] }
 
 [build-dependencies]
-nagrpc-build = { version = "2.0.0", optional = true }
+nagrpc-build = { version = "2.0.1", optional = true }
