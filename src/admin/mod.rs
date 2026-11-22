@@ -14,6 +14,7 @@ mod catalog;
 mod certificates;
 use certificates::local::{install_uploaded_certificate, read_certificates, upload_certificate};
 mod cluster;
+mod configuration;
 mod consumers;
 #[cfg(feature = "telemetry-otlp")]
 mod diagnostics;
@@ -650,6 +651,24 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
     if req.method() == Method::PUT && req.uri().path() == "/api/sentinel" {
         return publish_sentinel_config(req, state).await;
     }
+    if req.method() == Method::PUT && req.uri().path() == "/api/interface-guard" {
+        return configuration::publish(req, state, configuration::Document::InterfaceGuard).await;
+    }
+    if req.method() == Method::POST {
+        let document_action = match req.uri().path() {
+            "/api/config/format" => Some((configuration::Document::Gateway, true)),
+            "/api/sentinel/format" => Some((configuration::Document::Sentinel, true)),
+            "/api/interface-guard/format" => Some((configuration::Document::InterfaceGuard, true)),
+            "/api/sentinel/dry-run" => Some((configuration::Document::Sentinel, false)),
+            "/api/interface-guard/dry-run" => {
+                Some((configuration::Document::InterfaceGuard, false))
+            }
+            _ => None,
+        };
+        if let Some((document, format)) = document_action {
+            return configuration::inspect(req, state, document, format).await;
+        }
+    }
     if matches!(req.method(), &Method::POST | &Method::DELETE)
         && (req.uri().path() == "/api/consumers" || req.uri().path().starts_with("/api/consumers/"))
     {
@@ -891,7 +910,10 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
                 "changes": state.approvals.snapshot(&identity)
             }),
         ),
-        (&Method::GET, "/api/sentinel") => read_sentinel_config(&state),
+        (&Method::GET, "/api/sentinel") => read_sentinel_config(&state).await,
+        (&Method::GET, "/api/interface-guard") => {
+            configuration::read(&state, configuration::Document::InterfaceGuard).await
+        }
         (&Method::GET, path) if path == "/api/consumers" || path.starts_with("/api/consumers/") => {
             read_consumers(path, &state)
         }
@@ -1105,6 +1127,9 @@ fn admin_permission(method: &Method, path: &str) -> Option<(AdminResource, Admin
         (&Method::GET, "/api/audit") => Some((AdminResource::Audit, AdminAction::Read)),
         (&Method::GET, "/api/sentinel") => Some((AdminResource::Sentinel, AdminAction::Read)),
         (&Method::PUT, "/api/sentinel") => Some((AdminResource::Sentinel, AdminAction::Write)),
+        (&Method::GET, "/api/interface-guard") => {
+            Some((AdminResource::InterfaceGuard, AdminAction::Read))
+        }
         (&Method::GET, path) if path == "/api/consumers" || path.starts_with("/api/consumers/") => {
             Some((AdminResource::Consumers, AdminAction::Read))
         }
@@ -6297,7 +6322,7 @@ fn config_etag(fingerprint: u64) -> String {
 /// 参数说明：
 /// - `state`：提供已提交快照、归档和读取上限。
 ///
-/// 返回：一致在线文档返回 200；无控制面返回 404，缺失归档或换代竞争返回 409。
+/// 返回：一致在线文档、入口容量与同代 ETag 返回 200；无控制面返回 404，缺失归档或换代竞争返回 409。
 async fn read_current_config(state: &AdminState) -> Response<BoxBody> {
     if !state.mode.full_control_plane() {
         return plain(StatusCode::NOT_FOUND, "not found\n");
@@ -6343,6 +6368,7 @@ async fn read_current_config(state: &AdminState) -> Response<BoxBody> {
         "version": snapshot.version,
         "fingerprint": fingerprint,
         "etag": etag,
+        "max_config_body_bytes": limit,
         "centers": {
             "discovery_enabled": snapshot.discovery.enabled,
             "config_source_enabled": snapshot.config_source.enabled,
@@ -6369,41 +6395,8 @@ async fn read_current_config(state: &AdminState) -> Response<BoxBody> {
 /// - `state`：提供当前版本、归档和配置集指纹。
 ///
 /// 返回：归档可用时返回 200、YAML 原文、文档摘要与整体 ETag；归档缺失时返回 409，不退回未必与快照同版的磁盘文件。
-fn read_sentinel_config(state: &AdminState) -> Response<BoxBody> {
-    let snapshot = state.snap.load();
-    let version = snapshot.version;
-    let fingerprint = snapshot.config_fingerprint;
-    drop(snapshot);
-    let docs = match state.config_history.read_archived(version) {
-        Ok(docs) => docs,
-        Err(error) => {
-            return json(
-                StatusCode::CONFLICT,
-                serde_json::json!({
-                    "ok": false,
-                    "error": error.to_string()
-                }),
-            )
-        }
-    };
-    let etag = fingerprint.map(config_etag);
-    let document_etag = format!("\"sha256-{}\"", nasa::crypto::sha256(&docs.sentinel_rules));
-    let mut response = json(
-        StatusCode::OK,
-        serde_json::json!({
-            "ok": true,
-            "version": version,
-            "etag": etag.clone(),
-            "document_etag": document_etag,
-            "content": docs.sentinel_rules,
-        }),
-    );
-    if let Some(etag) = etag {
-        if let Ok(value) = hyper::header::HeaderValue::from_str(&etag) {
-            response.headers_mut().insert(hyper::header::ETAG, value);
-        }
-    }
-    response
+async fn read_sentinel_config(state: &Arc<AdminState>) -> Response<BoxBody> {
+    configuration::read(state, configuration::Document::Sentinel).await
 }
 
 /// 已通过身份、RBAC、持久审计和整体配置 CAS 的文档写入上下文。
@@ -6428,6 +6421,24 @@ async fn prepare_config_write(
     state: &Arc<AdminState>,
     resource: AdminResource,
 ) -> Result<PreparedConfigWrite, Box<Response<BoxBody>>> {
+    prepare_config_action(parts, state, resource, AdminAction::Write).await
+}
+
+/// 业务作用：为配置编辑的校验和写入建立同代完整基线，使不同文档共享身份、审计和配置集CAS。
+///
+/// 参数说明：
+/// - `parts`：尚未读取正文的请求元数据。
+/// - `state`：活动快照、归档和审计依赖。
+/// - `resource`：待编辑文档所属的固定权限域。
+/// - `action`：本次只校验或实际写入所需的明确动作。
+///
+/// 返回：全部门禁通过时返回主体和完整归档；拒绝时不读取候选正文或修改事实源。
+async fn prepare_config_action(
+    parts: &AdminRequestParts,
+    state: &Arc<AdminState>,
+    resource: AdminResource,
+    action: AdminAction,
+) -> Result<PreparedConfigWrite, Box<Response<BoxBody>>> {
     let identity = authenticate_admin_request(parts, state)?;
     if let Some(response) = reject_untrusted_admin_browser_origin(parts, state) {
         return Err(Box::new(response));
@@ -6435,13 +6446,13 @@ async fn prepare_config_write(
     if !state.mode.full_control_plane() {
         return Err(Box::new(plain(StatusCode::NOT_FOUND, "not found\n")));
     }
-    if !identity.allows(resource, AdminAction::Write) {
+    if !identity.allows(resource, action) {
         let _ = record_admin_audit(
             state,
             &identity,
             parts,
             resource,
-            AdminAction::Write,
+            action,
             "completed",
             Some(StatusCode::FORBIDDEN.as_u16()),
         )
@@ -6455,17 +6466,9 @@ async fn prepare_config_write(
         )));
     }
     // 持久 attempt 必须先于配置读取和任何写副作用；审计不可用时保持事实源不变。
-    if record_admin_audit(
-        state,
-        &identity,
-        parts,
-        resource,
-        AdminAction::Write,
-        "attempt",
-        None,
-    )
-    .await
-    .is_err()
+    if record_admin_audit(state, &identity, parts, resource, action, "attempt", None)
+        .await
+        .is_err()
     {
         return Err(Box::new(json(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -8051,21 +8054,14 @@ fn valid_consumer_id(consumer: &str) -> bool {
             .any(|byte| byte < 0x20 || byte == 0x7f || byte == b'/')
 }
 
-/// 业务作用：`PUT /api/config/current`:`If-Match` CAS + 候选校验 + 原子落盘 + **确认生效**。
+/// 业务作用：使用请求携带的配置集 ETag 校验候选主文档，并按活动来源发布到本地文件或 Nacos。
 ///
 /// 参数说明：
 /// - `req`：包含主体凭据、整体 If-Match 和有界主文档原文的请求。
 /// - `state`：当前事实源、活动快照、审计与发布入口。
 ///
-/// 返回：同一候选已经生效时返回成功；构建或基线不符时拒绝，结果未确认时不能推断已经还原。
-///
-/// 发布顺序：
-/// 1. 认证 → Origin → 平面边界 → RBAC(Config,Write);
-/// 2. `If-Match` 必填且必须等于当前配置集 ETag(缺失 428、失配 412);
-/// 3. Content-Type/有界 body → 临时文件 → **候选构建校验**(坏配置 400,线上文件不动);
-/// 4. 原子 rename 覆盖主 YML → SIGHUP 唤醒唯一 reload worker;
-/// 5. 等待 history 出现目标指纹的成功事件且 ArcSwap 版本前进,才回 `applied`;
-///    明确拒绝后仅在旧快照和本候选文件仍被持有时恢复基线；已发布或被其它写者替换的文件不得撤回。
+/// 返回：本地发布在确认目标指纹生效后返回 `applied`；Nacos 发布按原归档执行 CAS 并返回发布身份或
+/// 内容已一致的结果。缺失或过期的 ETag 分别返回 428 或 412；结果未知时需要按原请求核对活动配置。
 async fn publish_current_config(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody> {
     let (parts, body) = req.into_parts();
     let identity = match authenticate_admin_request(&parts, &state) {
@@ -8168,10 +8164,23 @@ async fn publish_current_config(req: AdminRequest, state: Arc<AdminState>) -> Re
             return *response;
         }
     };
-    // Nacos 是集群配置事实源:必须 CAS 写回远端并靠 config watch 收敛,
-    // 直接改本地物化文件会被下次 watch 覆盖，且不会在集群生效。
+    // 上传期间可能已经换版。Nacos 发布必须沿用 If-Match 验过的整套归档，
+    // 否则旧候选会被拼入新代规则并以新代作为远端 CAS 基线。
     let response = if baseline.config_source.nacos.enabled {
-        publish_cluster_config(&state, candidate_body, identity.principal_id.as_ref()).await
+        if !current_config_baseline_matches(&state, baseline.version, current_fingerprint).await {
+            deny(
+                StatusCode::PRECONDITION_FAILED,
+                "active configuration baseline changed while receiving candidate; rebase on the current version",
+            )
+        } else {
+            publish_cluster_config(
+                &state,
+                candidate_body,
+                baseline.version,
+                identity.principal_id.as_ref(),
+            )
+            .await
+        }
     } else {
         publish_validated_config(&state, candidate_body, current_fingerprint).await
     };
@@ -8179,17 +8188,19 @@ async fn publish_current_config(req: AdminRequest, state: Arc<AdminState>) -> Re
     response
 }
 
-/// 业务作用：Nacos 配置源的集群发布——原子 bundle CAS + 生成 rollout id。
+/// 业务作用：使用操作者读取的同代配置集，将主配置通过 CAS 发布到 Nacos，节点各自订阅生效。
 ///
-/// 与本地发布的关键差别:**本节点不自行换版**,发布只是把新配置 CAS 写回集群事实源,
-/// 各节点(含本节点)靠 config watch 各自收敛。因此这里返回 202 + `rollout_id`,
-/// 由 `GET /api/cluster/rollout` 判定"全部启用节点是否收敛到同一 (version, fingerprint)"。
+/// 参数说明：
+/// - `state`：管理运行态、归档和 Nacos 发布入口。
+/// - `candidate_body`：有界的主配置 YAML 原文。
+/// - `baseline_version`：请求 If-Match 对应的活动归档版本。
+/// - `initiator`：发起配置发布的主体。
 ///
-/// 只改 `gateway.yml` 文档:interface-guard/sentinel 取当前线上归档原文一起写回,
-/// 保证 bundle 始终是完整一致的三件套,watcher 不会读到新旧混合配置。
+/// 返回：原候选与远端一致时确认无须重复写入；创建发布时返回 rollout 身份；归档缺失、远端漂移或校验失败时拒绝。
 async fn publish_cluster_config(
     state: &Arc<AdminState>,
     candidate_body: Bytes,
+    baseline_version: u64,
     initiator: &str,
 ) -> Response<BoxBody> {
     let Ok(gateway_yaml) = String::from_utf8(candidate_body.to_vec()) else {
@@ -8201,16 +8212,15 @@ async fn publish_cluster_config(
             }),
         );
     };
-    let current_version = state.snap.load().version;
-    // 当前线上版本的归档三文件既是并发基线,也提供本次不改动的另外两份文档。
-    let baseline = match state.config_history.read_archived(current_version) {
+    // 读取原 ETag 所属归档；之后即使换版，远端 CAS 仍须对照原配置集。
+    let baseline = match state.config_history.read_archived(baseline_version) {
         Ok(docs) => docs,
         Err(error) => {
             return json(
                 StatusCode::CONFLICT,
                 serde_json::json!({
                     "ok": false,
-                    "error": format!("cannot verify publish base: current version {current_version} not archived: {error}; retry after next successful reload"),
+                    "error": format!("cannot verify publish base: version {baseline_version} not archived: {error}; rebase on the active version"),
                 }),
             )
         }

@@ -1,4 +1,11 @@
-"use strict";
+import { yamlEditor } from "/ui/core/yaml_editor.js";
+
+for (const id of ["candidate", "sentinel-candidate"]) {
+  const editor = document.getElementById(id);
+  if (editor) {
+    yamlEditor(editor);
+  }
+}
 
 /**
  * 业务作用：按页面固定标识取得控件，不解析服务端提供的选择器。

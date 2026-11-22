@@ -20,27 +20,161 @@
       </div>
     </header>
     <div class="layout">
-      <aside id="navigation" aria-label="管理导航">
-        <p class="nav-label">集群管理</p>
-        <button id="nodes-nav" type="button" data-view="nodes">集群节点</button>
-        <button id="catalog-nav" type="button" data-view="catalog">路由与入口</button>
-        <button id="operations-nav" type="button" data-view="operations">变更提案</button>
-        <button id="providers-nav" type="button" data-view="providers">配置来源</button>
-        <p class="nav-label">运行观测</p>
-        <button id="traffic-nav" type="button" data-view="traffic">路由实时流量</button>
-        <button id="ingress-nav" type="button" data-view="ingress">HTTP入口防护</button>
-        <button id="diagnostics-nav" type="button" data-view="diagnostics">限时诊断</button>
-        <button id="runtime-actions-nav" type="button" data-view="runtime-actions">运行态治理</button>
-        <button id="streams-nav" type="button" data-view="streams">监听器实时流量</button>
-        <button id="consumers-nav" type="button" data-view="consumers">集群消费者</button>
-        <button id="certificates-nav" type="button" data-view="certificates">集群活动证书</button>
-        <button id="materials-nav" type="button" data-view="materials">证书材料</button>
-        <button id="services-nav" type="button" data-view="services">服务实时状态</button>
-        <button id="monitor-nav" type="button" data-view="monitor">
-          实时监控 <span>LIVE</span>
-        </button>
-        <p class="nav-label">管理访问</p>
-        <button type="button" data-view="system">当前管理能力</button>
+      <aside id="navigation" aria-label="管理导航" inert>
+        <details class="nav-group" data-nav-group="monitoring" open>
+          <summary>集群监控</summary>
+          <div class="nav-items">
+            <button id="nodes-nav" type="button" data-view="nodes">
+              集群节点
+            </button>
+            <button id="monitor-nav" type="button" data-view="monitor">
+              实时监控 <span>LIVE</span>
+            </button>
+            <button id="services-nav" type="button" data-view="services">
+              服务实时状态
+            </button>
+            <button id="traffic-nav" type="button" data-view="traffic">
+              路由实时流量
+            </button>
+            <button id="streams-nav" type="button" data-view="streams">
+              监听器实时流量
+            </button>
+          </div>
+        </details>
+        <details class="nav-group" data-nav-group="system">
+          <summary>系统配置</summary>
+          <div class="nav-items">
+            <button
+              id="configuration-nav"
+              type="button"
+              data-view="configuration"
+            >
+              系统 YAML与Nacos发布
+            </button>
+            <button type="button" data-view="bootstrap-configuration">
+              启动依赖与配置中心
+            </button>
+            <button type="button" data-view="observability-configuration">
+              日志与遥测配置
+            </button>
+            <button id="providers-nav" type="button" data-view="providers">
+              配置来源
+            </button>
+            <button type="button" data-view="system">管理会话与权限</button>
+          </div>
+        </details>
+        <details class="nav-group" data-nav-group="sentinel">
+          <summary>Sentinel</summary>
+          <div class="nav-items">
+            <button id="sentinel-nav" type="button" data-view="sentinel">
+              流控、熔断与降级 YAML
+            </button>
+            <button type="button" data-view="sentinel-proposals">
+              规则变更提案
+            </button>
+          </div>
+        </details>
+        <details class="nav-group" data-nav-group="proxy">
+          <summary>代理配置</summary>
+          <div class="nav-items">
+            <button id="catalog-nav" type="button" data-view="catalog">
+              路由与入口
+            </button>
+            <button
+              id="proxy-configuration-nav"
+              type="button"
+              data-view="proxy-configuration"
+            >
+              路由、上游与监听 YAML
+            </button>
+            <button type="button" data-view="proxy-proposals">
+              代理变更提案
+            </button>
+          </div>
+        </details>
+        <details class="nav-group" data-nav-group="security">
+          <summary>安全与认证</summary>
+          <div class="nav-items">
+            <button type="button" data-view="interface-guard-configuration">
+              HTTP接口守卫 YAML
+            </button>
+            <button type="button" data-view="security-configuration">
+              安全与认证 YAML
+            </button>
+            <button id="ingress-nav" type="button" data-view="ingress">
+              HTTP入口防护
+            </button>
+            <button id="consumers-nav" type="button" data-view="consumers">
+              集群消费者
+            </button>
+          </div>
+        </details>
+        <details class="nav-group" data-nav-group="certificates">
+          <summary>证书与密钥</summary>
+          <div class="nav-items">
+            <button type="button" data-view="certificate-configuration">
+              证书与密钥来源 YAML
+            </button>
+            <button
+              id="certificates-nav"
+              type="button"
+              data-view="certificates"
+            >
+              集群活动证书
+            </button>
+            <button id="materials-nav" type="button" data-view="materials">
+              证书材料
+            </button>
+          </div>
+        </details>
+        <details class="nav-group" data-nav-group="workspaces">
+          <summary>工作区与租户</summary>
+          <div class="nav-items">
+            <button type="button" data-view="workspace-configuration">
+              工作区、归属与预算 YAML
+            </button>
+          </div>
+        </details>
+        <details class="nav-group" data-nav-group="portal">
+          <summary>API产品与门户</summary>
+          <div class="nav-items">
+            <button type="button" data-view="portal-configuration">
+              产品、团队与应用 YAML
+            </button>
+          </div>
+        </details>
+        <details class="nav-group" data-nav-group="ai">
+          <summary>AI与Agent</summary>
+          <div class="nav-items">
+            <button type="button" data-view="ai-configuration">
+              模型、路由与工具 YAML
+            </button>
+          </div>
+        </details>
+        <details class="nav-group" data-nav-group="changes">
+          <summary>变更与发布</summary>
+          <div class="nav-items">
+            <button type="button" data-view="approvals">配置审批队列</button>
+            <button id="operations-nav" type="button" data-view="operations">
+              变更提案
+            </button>
+            <button
+              id="runtime-actions-nav"
+              type="button"
+              data-view="runtime-actions"
+            >
+              运行态治理
+            </button>
+          </div>
+        </details>
+        <details class="nav-group" data-nav-group="diagnostics">
+          <summary>诊断与审计</summary>
+          <div class="nav-items">
+            <button id="diagnostics-nav" type="button" data-view="diagnostics">
+              限时诊断
+            </button>
+          </div>
+        </details>
         <p class="nav-foot">当前快照 · 有界采样<br />不保存监控历史</p>
       </aside>
       <main>

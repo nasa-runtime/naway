@@ -1,5 +1,6 @@
 import { request } from "../core/http.js";
 import { card, element } from "../core/dom.js";
+import { yamlEditor } from "../core/yaml_editor.js";
 
 const phases = {
   warming: "尚未观察",
@@ -134,7 +135,7 @@ export function mount(root, session) {
     option.value = value;
     format.append(option);
   }
-  const candidate = element("textarea");
+  const candidate = yamlEditor(element("textarea"));
   candidate.setAttribute("aria-label", "完整来源候选");
   candidate.autocomplete = "off";
   candidate.spellcheck = false;

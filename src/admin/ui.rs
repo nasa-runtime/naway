@@ -23,6 +23,20 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
         "/monitor"
         | "/cluster"
         | "/catalog"
+        | "/configuration"
+        | "/bootstrap-configuration"
+        | "/observability-configuration"
+        | "/interface-guard-configuration"
+        | "/security-configuration"
+        | "/certificate-configuration"
+        | "/workspace-configuration"
+        | "/portal-configuration"
+        | "/ai-configuration"
+        | "/sentinel-proposals"
+        | "/proxy-proposals"
+        | "/approvals"
+        | "/sentinel"
+        | "/proxy-configuration"
         | "/operations"
         | "/traffic"
         | "/ingress"
@@ -48,6 +62,10 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
             "application/javascript; charset=utf-8",
             include_bytes!("assets/core/dom.js"),
         ),
+        "/ui/core/yaml_editor.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/core/yaml_editor.js"),
+        ),
         "/ui/core/app.js" => (
             "application/javascript; charset=utf-8",
             include_bytes!("assets/core/app.js"),
@@ -59,6 +77,14 @@ pub(super) fn asset(path: &str, state: &AdminState) -> Option<Response<BoxBody>>
         "/ui/views/routes.js" => (
             "application/javascript; charset=utf-8",
             include_bytes!("assets/views/routes.js"),
+        ),
+        "/ui/views/approvals.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/approvals.js"),
+        ),
+        "/ui/views/configuration.js" => (
+            "application/javascript; charset=utf-8",
+            include_bytes!("assets/views/configuration.js"),
         ),
         "/ui/views/ingress.js" => (
             "application/javascript; charset=utf-8",

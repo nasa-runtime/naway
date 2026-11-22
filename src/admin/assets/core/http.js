@@ -122,7 +122,23 @@ export async function request(path, options = {}) {
     const chunks = [];
     let length = 0;
     // 来源正文原生预算为4MiB，导出外壳另留有界余量；路径与方法共同决定该额度。
-    const capacity =
+    // 配置原文与格式化预览允许16MiB输入，JSON转义另有有界外壳预算；不扩大普通管理响应。
+    const configCapacity =
+      (method === "GET" &&
+        [
+          "/api/config/current",
+          "/api/sentinel",
+          "/api/interface-guard",
+        ].includes(target.pathname)) ||
+      (method === "POST" &&
+        [
+          "/api/config/format",
+          "/api/sentinel/format",
+          "/api/interface-guard/format",
+        ].includes(target.pathname))
+        ? 6 * 16 * 1024 * 1024 + 16384
+        : null;
+    const regularCapacity =
       (method === "GET" &&
         /^\/api\/providers\/[A-Za-z0-9_-]{1,64}\/export$/.test(
           target.pathname,
@@ -163,6 +179,7 @@ export async function request(path, options = {}) {
                 target.pathname === "/api/operations/proposals/draft"
               ? 4 * 1024 * 1024
               : 1024 * 1024;
+    const capacity = configCapacity ?? regularCapacity;
     try {
       while (true) {
         const { value, done } = await reader.read();

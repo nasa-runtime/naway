@@ -3,16 +3,19 @@ const numberFormats = [0, 1, 2].map(
 );
 
 /**
- * 业务作用：构造纯文本UI节点，配置名称和远端错误不能成为HTML或脚本。
+ * 业务作用：构造纯文本UI节点并保留原文编辑器的行边界，配置名称和远端错误不能成为HTML或脚本。
  * 参数说明：
  * - `tag`：页面代码中的固定标签。
  * - `text`：不可信文本或当前数字。
  * - `className`：页面代码中的固定样式类。
- * 返回：未挂载的安全节点。
+ * 返回：未挂载的安全节点；textarea保留原始长行，不将自动折行当作配置换行。
  */
 export function element(tag, text = "", className = "") {
   const node = document.createElement(tag);
   node.textContent = text;
+  if (tag === "textarea") {
+    node.wrap = "off";
+  }
   if (className) {
     node.className = className;
   }

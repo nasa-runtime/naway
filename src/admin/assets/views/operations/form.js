@@ -1,4 +1,5 @@
 import { element } from "../../core/dom.js";
+import { yamlEditor, yamlEditingHelp } from "../../core/yaml_editor.js";
 import { baselineDescription, targetPicker } from "./targets.js";
 import { draftEditor } from "./draft/editor.js";
 
@@ -42,7 +43,7 @@ export function proposalForm(
       "subtle",
     ),
   );
-  const candidate = element("textarea");
+  const candidate = yamlEditor(element("textarea"));
   candidate.rows = 10;
   candidate.maxLength = capacity.max_candidate_bytes;
   candidate.spellcheck = false;
@@ -73,6 +74,7 @@ export function proposalForm(
   save.type = "submit";
   fields.append(
     field("候选 YAML", candidate),
+    element("p", yamlEditingHelp, "subtle"),
     draft.node,
     field("提案有效期（秒）", ttl),
     element(

@@ -88,6 +88,7 @@
         </div>
         <textarea
           id="candidate"
+          wrap="off"
           spellcheck="false"
           aria-label="候选 gateway.yml"
           placeholder="点击「载入当前配置」取回线上 gateway.yml 与 ETag；改完点「发布」走 If-Match CAS，网关确认真正生效后才报 applied。留空时顶部 Dry Run 校验当前本地配置"
@@ -147,6 +148,7 @@
           </div>
           <textarea
             id="sentinel-candidate"
+            wrap="off"
             spellcheck="false"
             aria-label="Sentinel YAML"
             placeholder="载入当前 Sentinel 文档"
@@ -250,6 +252,6 @@
         <div id="audit" class="list empty">暂无审计事件或无查看权限</div>
       </section>
     </main>
-    <script src="/ui/app.js" defer></script>
+    <script src="/ui/app.js" type="module"></script>
   </body>
 </html>

@@ -1,9 +1,14 @@
 import { authenticate, request, secureOrigin } from "./http.js";
 import { element } from "./dom.js";
+import { mount as approvals } from "../views/approvals.js";
 import { mount as monitor } from "../views/monitor.js";
 import { mount as nodes } from "../views/nodes.js";
 import { mount as catalog } from "../views/catalog.js";
 import { mount as operations } from "../views/operations.js";
+import {
+  mount as configuration,
+  configurationPages,
+} from "../views/configuration.js";
 import { mount as routeTraffic } from "../views/routes.js";
 import { mount as ingressProtection } from "../views/ingress.js";
 import { mount as providers } from "../views/providers.js";
@@ -34,7 +39,7 @@ function allowed(resource, action = "read") {
 }
 
 /**
- * 业务作用：撤销旧视图并按当前能力挂载选择的页面。
+ * 业务作用：撤销旧视图、展开所属一级菜单，并按当前能力挂载选择的页面。
  * 参数说明：
  * - `name`：导航中的固定页面标识。
  * - `service`：从当前集群目录选中的逻辑服务，其他页面忽略。
@@ -44,13 +49,64 @@ function navigate(name, service = "") {
   dispose?.();
   dispose = null;
   root.replaceChildren();
+  for (const group of document.querySelectorAll(".nav-group")) {
+    group.removeAttribute("data-current");
+  }
   for (const button of document.querySelectorAll("[data-view]")) {
     button.setAttribute(
       "aria-current",
       button.dataset.view === name ? "page" : "false",
     );
+    if (button.dataset.view === name) {
+      const group = button.closest(".nav-group");
+      if (group) {
+        group.open = true;
+        group.dataset.current = "true";
+      }
+    }
   }
-  if (name === "operations") {
+  if (
+    Object.hasOwn(configurationPages, name) &&
+    allowed(configurationPages[name].resource)
+  ) {
+    const page = configurationPages[name];
+    document.getElementById("title").textContent = page.title;
+    document.getElementById("subtitle").textContent =
+      "原文编辑 · Nacos统一发布 · 节点订阅与收敛";
+    dispose = configuration(root, session, name);
+  } else if (
+    (name === "sentinel-proposals" || name === "proxy-proposals") &&
+    session.operations?.enabled &&
+    (allowed(name === "sentinel-proposals" ? "sentinel" : "config") ||
+      session.workspaces?.length)
+  ) {
+    document.getElementById("title").textContent =
+      name === "sentinel-proposals" ? "Sentinel变更提案" : "代理变更提案";
+    document.getElementById("subtitle").textContent =
+      "完整原目标 · 双人审阅与共享执行";
+    dispose = operations(
+      root,
+      session,
+      name === "sentinel-proposals" ? "sentinel" : "gateway",
+    );
+  } else if (
+    name === "approvals" &&
+    ["config", "sentinel", "consumers", "certs"].some((resource) =>
+      allowed(resource, "write"),
+    )
+  ) {
+    document.getElementById("title").textContent = "配置审批队列";
+    document.getElementById("subtitle").textContent =
+      "固定候选摘要 · 独立复核 · 发布结果与集群收敛分开观察";
+    dispose = approvals(root, session);
+  } else if (
+    name === "operations" &&
+    session.operations?.enabled &&
+    (["config", "sentinel", "interface-guard"].some((resource) =>
+      allowed(resource),
+    ) ||
+      session.workspaces?.length)
+  ) {
     document.getElementById("title").textContent = "变更提案";
     document.getElementById("subtitle").textContent =
       "共享集群候选 · 双人审阅与集群执行";
@@ -206,6 +262,15 @@ function logout() {
   dispose?.();
   dispose = null;
   session = null;
+  document.getElementById("navigation").inert = true;
+  for (const button of document.querySelectorAll("[data-view]")) {
+    button.disabled = false;
+    button.hidden = false;
+  }
+  for (const group of document.querySelectorAll(".nav-group")) {
+    group.hidden = false;
+    group.removeAttribute("data-current");
+  }
   root.replaceChildren();
   loginForm.reset();
   loginForm.hidden = false;
@@ -269,6 +334,35 @@ async function login(event) {
       session.workspaces?.length
     );
     document.getElementById("nodes-nav").disabled = !allowed("cluster");
+    document.getElementById("configuration-nav").disabled = !allowed("config");
+    document.getElementById("sentinel-nav").disabled = !allowed("sentinel");
+    document.getElementById("proxy-configuration-nav").disabled =
+      !allowed("config");
+    for (const button of document.querySelectorAll("[data-view]")) {
+      if (Object.hasOwn(configurationPages, button.dataset.view)) {
+        button.disabled = !allowed(
+          configurationPages[button.dataset.view].resource,
+        );
+      }
+      if (
+        ["sentinel-proposals", "proxy-proposals"].includes(button.dataset.view)
+      ) {
+        button.disabled =
+          !session.operations?.enabled ||
+          !(
+            allowed(
+              button.dataset.view === "sentinel-proposals"
+                ? "sentinel"
+                : "config",
+            ) || session.workspaces?.length
+          );
+      }
+      if (button.dataset.view === "approvals") {
+        button.disabled = !["config", "sentinel", "consumers", "certs"].some(
+          (resource) => allowed(resource, "write"),
+        );
+      }
+    }
     document.getElementById("runtime-actions-nav").disabled = !(
       allowed("acl", "emergency-kill") ||
       allowed("interface-guard", "emergency-kill") ||
@@ -305,48 +399,39 @@ async function login(event) {
     document.getElementById("catalog-nav").disabled =
       !allowed("cluster") ||
       !["routes", "config", "upstreams"].some((resource) => allowed(resource));
+    document.getElementById("operations-nav").disabled = !(
+      session.operations?.enabled &&
+      (["config", "sentinel", "interface-guard"].some((resource) =>
+        allowed(resource),
+      ) ||
+        session.workspaces?.length)
+    );
+    // 服务器权限决定实际入口，整个一级分组无可用页面时一并撤下，避免导向无资格的空页。
+    for (const button of document.querySelectorAll("[data-view]")) {
+      button.hidden = button.disabled;
+    }
+    for (const group of document.querySelectorAll(".nav-group")) {
+      group.hidden = ![...group.querySelectorAll("[data-view]")].some(
+        (button) => !button.disabled,
+      );
+    }
+    document.getElementById("navigation").inert = false;
     notice.textContent = "";
+    const knownRoutes = {
+      "/cluster": "nodes",
+      "/catalog": "catalog",
+      "/runtime-actions": "runtime-actions",
+      "/certificate-proposals": "materials",
+      "/operations": "operations",
+      "/monitor": "monitor",
+    };
+    const requested =
+      knownRoutes[location.pathname] ?? location.pathname.slice(1);
+    const destination = [...document.querySelectorAll("[data-view]")].find(
+      (button) => button.dataset.view === requested && !button.disabled,
+    );
     navigate(
-      location.pathname === "/runtime-actions" &&
-        !document.getElementById("runtime-actions-nav").disabled
-        ? "runtime-actions"
-        : location.pathname === "/diagnostics" &&
-            !document.getElementById("diagnostics-nav").disabled
-          ? "diagnostics"
-          : location.pathname === "/providers" &&
-              !document.getElementById("providers-nav").disabled
-            ? "providers"
-            : location.pathname === "/ingress" &&
-                !document.getElementById("ingress-nav").disabled
-              ? "ingress"
-              : location.pathname === "/certificate-proposals" &&
-                  !document.getElementById("materials-nav").disabled
-                ? "materials"
-                : location.pathname === "/certificates" &&
-                    !document.getElementById("certificates-nav").disabled
-                  ? "certificates"
-                  : location.pathname === "/consumers" &&
-                      !document.getElementById("consumers-nav").disabled
-                    ? "consumers"
-                    : location.pathname === "/services" &&
-                        !document.getElementById("services-nav").disabled
-                      ? "services"
-                      : location.pathname === "/traffic" &&
-                          !document.getElementById("traffic-nav").disabled
-                        ? "traffic"
-                        : location.pathname === "/streams" &&
-                            !document.getElementById("streams-nav").disabled
-                          ? "streams"
-                          : location.pathname === "/operations"
-                            ? "operations"
-                            : allowed("cluster")
-                              ? location.pathname === "/catalog" &&
-                                !document.getElementById("catalog-nav").disabled
-                                ? "catalog"
-                                : location.pathname === "/cluster"
-                                  ? "nodes"
-                                  : "monitor"
-                              : "system",
+      destination ? requested : allowed("cluster") ? "monitor" : "system",
     );
   } catch (error) {
     if (attempt === epoch && error.name !== "AbortError") {

@@ -8,6 +8,9 @@
   --muted: #a1b2c5;
   --accent: #54ddc1;
   --warning: #ffcb7b;
+  --font-code:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
   font:
     14px/1.55 system-ui,
     -apple-system,
@@ -84,8 +87,9 @@
   overflow-wrap: anywhere;
 }
 .proposal-source {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
   max-height: 480px;
   overflow: auto;
   padding: 16px;
@@ -122,6 +126,24 @@ input,
 select,
 textarea {
   font: inherit;
+}
+textarea,
+pre,
+code {
+  font-family: var(--font-code);
+  font-variant-ligatures: none;
+  tab-size: 2;
+  letter-spacing: normal;
+}
+textarea {
+  line-height: 1.6;
+  resize: vertical;
+  max-width: 100%;
+  min-width: 0;
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
+  overflow: auto;
 }
 button,
 select,
@@ -207,6 +229,11 @@ button:disabled {
 aside {
   border-right: 1px solid var(--line);
   padding: 28px 16px;
+  align-self: start;
+  position: sticky;
+  top: 0;
+  max-height: 100dvh;
+  overflow-y: auto;
 }
 .nav-label,
 .nav-foot {
@@ -233,6 +260,93 @@ aside button span {
   float: right;
   color: var(--accent);
   margin-top: 4px;
+}
+.nav-group {
+  margin-bottom: 12px;
+  min-width: 0;
+}
+.nav-group > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px;
+  color: var(--text);
+  font-weight: 650;
+  cursor: pointer;
+  border-radius: 7px;
+  list-style: none;
+}
+.nav-group > summary::-webkit-details-marker {
+  display: none;
+}
+.nav-group > summary::after {
+  content: "›";
+  color: var(--muted);
+  transition: transform 120ms ease;
+}
+.nav-group[open] > summary::after {
+  transform: rotate(90deg);
+}
+.nav-group[data-current="true"] > summary {
+  color: var(--accent);
+}
+.nav-group > summary:hover {
+  background: var(--panel-raised);
+}
+.nav-items {
+  display: grid;
+  gap: 3px;
+  margin: 2px 0 0 10px;
+  padding-left: 8px;
+  border-left: 1px solid var(--line);
+}
+.nav-items button {
+  min-width: 0;
+  padding: 8px 9px;
+  overflow-wrap: anywhere;
+}
+.configuration-progress {
+  overflow-wrap: anywhere;
+}
+.configuration-editor {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+}
+.configuration-editor textarea {
+  width: 100%;
+  min-width: 0;
+  resize: vertical;
+  padding: 12px;
+  font-family: var(--font-code);
+}
+.configuration-sections {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+.yaml-editor-status {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.configuration-format-preview,
+.approval-record {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.configuration-format-preview > button {
+  margin: 8px 8px 0 0;
+}
+.configuration-format-preview pre {
+  max-height: 60dvh;
 }
 main {
   min-width: 0;
@@ -304,7 +418,7 @@ textarea {
   overflow-wrap: anywhere;
 }
 .provider-detail textarea {
-  font-family: ui-monospace, monospace;
+  font-family: var(--font-code);
   font-size: 13px;
 }
 .provider-object {
@@ -576,6 +690,8 @@ td:not(:first-child) {
     padding: 10px 16px;
     border-right: 0;
     border-bottom: 1px solid var(--line);
+    position: static;
+    max-height: none;
   }
   .nav-label,
   .nav-foot {
@@ -587,6 +703,20 @@ td:not(:first-child) {
   }
   aside button span {
     display: none;
+  }
+  .nav-group {
+    width: 100%;
+    margin-bottom: 0;
+  }
+  .nav-group > summary {
+    padding: 8px;
+  }
+  .nav-items {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-bottom: 8px;
+  }
+  .nav-items button {
+    width: 100%;
   }
   main {
     padding: 20px 16px;

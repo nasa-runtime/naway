@@ -270,6 +270,15 @@ select:focus {
   border-color: var(--cyan);
   box-shadow: 0 0 0 3px rgba(102, 227, 212, 0.08);
 }
+textarea {
+  tab-size: 2;
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
+  overflow: auto;
+  font-variant-ligatures: none;
+  letter-spacing: normal;
+}
 .form-grid {
   display: grid;
   grid-template-columns: 110px 1fr;

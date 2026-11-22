@@ -8,9 +8,10 @@ import { proposalDetail } from "./operations/detail.js";
  * 参数说明：
  * - `root`：统一管理壳交付的视图容器。
  * - `session`：当前主体、授权工作区和持久操作资源边界。
+ * - `fixedDomain`：菜单限定的领域；空值展示当前范围的全部已授权领域。
  * 返回：取消请求、实时进度刷新并清空敏感内容的退出函数，不使用持久浏览器存储。
  */
-export function mount(root, session) {
+export function mount(root, session, fixedDomain = "") {
   if (!session.operations?.enabled) {
     root.replaceChildren(
       element(
@@ -28,7 +29,7 @@ export function mount(root, session) {
     ["gateway", "网关配置", "config"],
     ["sentinel", "Sentinel", "sentinel"],
     ["interface-guard", "接口守卫", "interface-guard"],
-  ];
+  ].filter(([name]) => !fixedDomain || name === fixedDomain);
   const platform = domains.some(([, , resource]) =>
     session.permissions?.[resource]?.includes("read"),
   );
