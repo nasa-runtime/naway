@@ -402,7 +402,7 @@ pub(crate) fn value<'a>(
         LimitReqKey::Query(name) => routing::query_param_raw(parts.uri.query()?, name)
             .map(|value| Cow::Borrowed(value.as_bytes())),
         LimitReqKey::Cookie(name) => cookie_pairs(parts)
-            .find_map(|(key, value)| (key == name).then(|| Cow::Borrowed(value.as_bytes()))),
+            .find_map(|(key, value)| (key == name).then_some(Cow::Borrowed(value.as_bytes()))),
         LimitReqKey::Host => routing::request_host(parts).map(|host| Cow::Owned(host.into_bytes())),
         LimitReqKey::Path => Some(Cow::Borrowed(parts.uri.path().as_bytes())),
     }
