@@ -298,6 +298,8 @@ pub struct Route {
     pub limit_req: Vec<LimitReqPolicy>,
     /// `limit_conn` 并发规则。
     pub limit_conn: Vec<LimitConnPolicy>,
+    /// 按原执行顺序绑定独立 Sentinel 文档的流控身份，内联过滤器沿用自己的位置账本。
+    pub(crate) sentinel_flows: Option<Box<SentinelFlowScopes>>,
     /// `limit_rate` 响应字节限速规则。
     pub limit_rate: Option<LimitRatePolicy>,
     /// 熔断/降级规则。
@@ -463,6 +465,13 @@ struct WeightedRouteGroup {
     total_weight: u64,
 }
 
+/// 只记录独立文档生成的流控，其身份基于文档规则和规范计量字段。
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct SentinelFlowScopes {
+    pub(crate) rate: HashMap<usize, String>,
+    pub(crate) concurrency: HashMap<usize, String>,
+}
+
 impl Router {
     /// 业务作用：从 yml 路由声明构建使用默认套餐目录的有序数据面路由表。
     ///
@@ -499,7 +508,14 @@ impl Router {
         config_dir: &Path,
         usage_plans: Arc<UsagePlanCatalog>,
     ) -> Result<Router> {
-        Self::build_with_usage_plans_and_self_addrs(cfgs, variables, config_dir, usage_plans, &[])
+        Self::build_with_usage_plans_and_self_addrs(
+            cfgs,
+            variables,
+            config_dir,
+            usage_plans,
+            &[],
+            None,
+        )
     }
 
     /// 业务作用：使用完整本地 listener 拓扑构建路由表，使 CONNECT route 在放宽私网访问时
@@ -511,6 +527,7 @@ impl Router {
     /// - `config_dir`：是主配置目录
     /// - `usage_plans`：是套餐目录
     /// - `self_addrs`：是当前候选快照的全部本地监听地址。
+    /// - `sentinel_filters`：与候选路由尾部过滤器同序的 Sentinel 文档声明，普通调用可省略。
     ///
     /// 返回：构建成功返回带自访问门禁的路由表；配置矛盾或边界非法时返回错误。
     pub(crate) fn build_with_usage_plans_and_self_addrs(
@@ -519,6 +536,7 @@ impl Router {
         config_dir: &Path,
         usage_plans: Arc<UsagePlanCatalog>,
         self_addrs: &[std::net::SocketAddr],
+        sentinel_filters: Option<&HashMap<String, Vec<crate::config::sentinel::RouteFilter>>>,
     ) -> Result<Router> {
         let layer_topology = layers::Topology::build(cfgs)?;
         let mut ordered: Vec<(i32, Arc<Route>)> = Vec::with_capacity(cfgs.len());
@@ -817,6 +835,7 @@ impl Router {
             let mut conditional_returns = Vec::new();
             let mut limit_req = Vec::new();
             let mut limit_conn = Vec::new();
+            let mut sentinel_flows = None;
             let mut limit_rate = None;
             let mut circuit_breakers = Vec::new();
             let mut error_pages = Vec::new();
@@ -824,7 +843,19 @@ impl Router {
             let mut x_accel_redirect = false;
             let mut direct_response = None;
             let mut mirrors = Vec::new();
-            for f in &c.filters {
+            let standalone = sentinel_filters
+                .and_then(|filters| filters.get(&c.id))
+                .map_or(&[][..], Vec::as_slice);
+            let inline_count = c
+                .filters
+                .len()
+                .checked_sub(standalone.len())
+                .context("invalid Sentinel route filter binding")?;
+            for (index, f) in c.filters.iter().enumerate() {
+                let flow_id = index
+                    .checked_sub(inline_count)
+                    .and_then(|offset| standalone.get(offset))
+                    .and_then(|filter| filter.flow_id.as_deref());
                 if let Some(n) = parse_strip_prefix(f)? {
                     anyhow::ensure!(!branch, "route branch cannot rewrite request path");
                     strip_prefix = n;
@@ -919,8 +950,38 @@ impl Router {
                     ParsedFilter::ExtAuthz(policy) => ext_authz.push(policy),
                     ParsedFilter::Satisfy(mode) => satisfy = mode,
                     ParsedFilter::ConditionalReturn(rule) => conditional_returns.push(rule),
-                    ParsedFilter::LimitReq(policy) => limit_req.push(policy),
-                    ParsedFilter::LimitConn(policy) => limit_conn.push(policy),
+                    ParsedFilter::LimitReq(policy) => {
+                        if let Some(id) = flow_id {
+                            sentinel_flows
+                                .get_or_insert_with(Box::<SentinelFlowScopes>::default)
+                                .rate
+                                .insert(
+                                    limit_req.len(),
+                                    crate::config::sentinel::request::exact_flow_identity(
+                                        &c.id,
+                                        id,
+                                        &policy.key,
+                                    ),
+                                );
+                        }
+                        limit_req.push(policy);
+                    }
+                    ParsedFilter::LimitConn(policy) => {
+                        if let Some(id) = flow_id {
+                            sentinel_flows
+                                .get_or_insert_with(Box::<SentinelFlowScopes>::default)
+                                .concurrency
+                                .insert(
+                                    limit_conn.len(),
+                                    crate::config::sentinel::request::exact_flow_identity(
+                                        &c.id,
+                                        id,
+                                        &policy.key,
+                                    ),
+                                );
+                        }
+                        limit_conn.push(policy);
+                    }
                     ParsedFilter::LimitRate(policy) => limit_rate = Some(policy),
                     ParsedFilter::CircuitBreaker(policy) => circuit_breakers.push(policy),
                     ParsedFilter::ErrorPage(policy) => error_pages.push(policy),
@@ -2130,6 +2191,7 @@ impl Router {
                     conditional_returns,
                     limit_req,
                     limit_conn,
+                    sentinel_flows,
                     limit_rate,
                     traffic_limit,
                     forward_proxy,

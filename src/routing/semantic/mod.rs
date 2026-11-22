@@ -38,6 +38,7 @@ impl Route {
             && self.limit_except == candidate.limit_except
             && self.limit_req == candidate.limit_req
             && self.limit_conn == candidate.limit_conn
+            && self.sentinel_flows == candidate.sentinel_flows
             && self.limit_rate == candidate.limit_rate
             && self.circuit_breakers == candidate.circuit_breakers
             && self.error_pages == candidate.error_pages

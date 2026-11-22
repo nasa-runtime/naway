@@ -8199,10 +8199,18 @@ impl GatewayProxy {
                 )
             } else {
                 let dimension = sentinel::dimension_hash(parts, route, client_ip, &policy.key);
-                format!(
-                    "limit_conn:{}:{idx}:{dimension:016x}",
-                    route_state_scope(parts, route)
-                )
+                let scope = route_state_scope(parts, route);
+                // 在持有前选定计量身份，归还仍由取得的 guard 绑定原键和原持有者。
+                match route
+                    .sentinel_flows
+                    .as_ref()
+                    .and_then(|flows| flows.concurrency.get(&idx))
+                {
+                    Some(identity) => {
+                        format!("limit_conn:sentinel:{identity}:{scope}:{dimension:016x}")
+                    }
+                    None => format!("limit_conn:{scope}:{idx}:{dimension:016x}"),
+                }
             };
             let Some(guard) = self.acquire_limit_conn_slot(key, policy.limit).await else {
                 acquired.clear();

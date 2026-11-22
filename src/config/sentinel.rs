@@ -4,10 +4,16 @@ use super::*;
 
 pub(crate) mod request;
 
+/// 精确路由的独立配置过滤器。流控保留其文档身份，供构建期按已解析的计量字段绑定账本。
+pub(crate) struct RouteFilter {
+    pub(crate) spec: String,
+    pub(crate) flow_id: Option<String>,
+}
+
 /// 业务作用：保存 Sentinel 文件编译后的 route→filter 索引，并在进入 Router 前校验引用完整性。
 pub(super) struct SentinelRouteFilters {
     /// route id 到按声明顺序编译出的限流和熔断 filter。
-    pub(super) by_route: HashMap<String, Vec<String>>,
+    pub(super) by_route: HashMap<String, Vec<RouteFilter>>,
     /// 实际合并并验证的规则与过滤器一起发布，管理比较不得再读另一份 base 或环境。
     pub(super) rules: Arc<SentinelFile>,
     /// 按请求实际路径和属性查找的规则，与精确路由过滤器共用准入和熔断实现。
@@ -80,7 +86,7 @@ pub(super) fn load_sentinel_rules(
             "duplicate sentinel degrade id"
         );
     }
-    let mut by_route: HashMap<String, Vec<String>> = HashMap::new();
+    let mut by_route: HashMap<String, Vec<RouteFilter>> = HashMap::new();
     let mut requests = request::RequestRules::default();
     for rule in &rules.flow {
         if !rule.enabled {
@@ -166,7 +172,13 @@ pub(super) fn load_sentinel_rules(
                 by_route.entry(rule.route.clone()).or_default();
             }
         } else {
-            by_route.entry(rule.route.clone()).or_default().push(filter);
+            by_route
+                .entry(rule.route.clone())
+                .or_default()
+                .push(RouteFilter {
+                    spec: filter,
+                    flow_id: Some(rule.id.clone()),
+                });
         }
     }
     for rule in &rules.degrade {
@@ -223,7 +235,13 @@ pub(super) fn load_sentinel_rules(
                 by_route.entry(rule.route.clone()).or_default();
             }
         } else {
-            by_route.entry(rule.route.clone()).or_default().push(filter);
+            by_route
+                .entry(rule.route.clone())
+                .or_default()
+                .push(RouteFilter {
+                    spec: filter,
+                    flow_id: None,
+                });
         }
     }
     Ok((

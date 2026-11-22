@@ -4539,6 +4539,7 @@ fn build_proxy_from_parts(
         config_dir,
         usage_plans,
         self_addrs,
+        Some(&sentinel.by_route),
     )
     .with_context(|| format!("proxy `{id}` routes"))?;
     if http3.webtransport {
@@ -5001,7 +5002,10 @@ fn routes_with_sentinel(
             );
             let mut route = route.clone();
             if let Some(extra) = sentinel.by_route.get(&route.id) {
-                route.filters.extend(extra.iter().cloned());
+                // 层级校验必须看到完整过滤器顺序，才能拒绝父子间重复的保护策略。
+                route
+                    .filters
+                    .extend(extra.iter().map(|filter| filter.spec.clone()));
                 sentinel_matched_routes.insert(route.id.clone());
             }
             Ok(route)

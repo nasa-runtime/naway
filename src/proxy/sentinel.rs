@@ -173,10 +173,17 @@ impl GatewayProxy {
                     dimension,
                 )
             } else {
-                (
-                    format!("limit_req:{}:{idx}", route_state_scope(parts, route)),
-                    dimension_hash(parts, route, client_ip, &policy.key),
-                )
+                let route_scope = route_state_scope(parts, route);
+                // 独立规则以编译的计量身份归账，内联规则继续读取原位置的余额。
+                let scope = match route
+                    .sentinel_flows
+                    .as_ref()
+                    .and_then(|flows| flows.rate.get(&idx))
+                {
+                    Some(identity) => format!("limit_req:sentinel:{identity}:{route_scope}"),
+                    None => format!("limit_req:{route_scope}:{idx}"),
+                };
+                (scope, dimension_hash(parts, route, client_ip, &policy.key))
             };
             if let Some(warmup) = policy.warmup {
                 use std::fmt::Write as _;

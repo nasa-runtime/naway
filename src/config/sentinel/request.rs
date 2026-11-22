@@ -216,14 +216,45 @@ impl Policy {
     ///
     /// 参数说明: 无。
     ///
-    /// 返回：限速和并发策略的属性类型及规范字段名。熔断按规则统计，无计量字段。
-    fn metering_field(&self) -> Option<(&'static str, &str)> {
-        let key = match self {
-            Self::Rate(policy) => &policy.key,
-            Self::Concurrency(policy) => &policy.key,
-            Self::Circuit(_) => return None,
-        };
-        Some(match key {
+    /// 返回：限速和并发策略的规范计量属性。熔断按规则统计，无计量字段。
+    fn metering_key(&self) -> Option<&LimitReqKey> {
+        match self {
+            Self::Rate(policy) => Some(&policy.key),
+            Self::Concurrency(policy) => Some(&policy.key),
+            Self::Circuit(_) => None,
+        }
+    }
+}
+
+/// 业务作用：为无筛选的精确路由流控绑定与请求规则一致的配置身份。
+/// 参数说明：
+/// - `binding`：规则绑定的精确路由 ID。
+/// - `id`：独立流控文档中的唯一规则 ID。
+/// - `key`：原生编译器校验并规范化后的计量属性。
+///
+/// 返回：可跨兼容热更复用的身份；切换计量类型或字段时使用独立账本。
+pub(crate) fn exact_flow_identity(binding: &str, id: &str, key: &LimitReqKey) -> String {
+    rule_identity(binding, id, None, Some(key))
+}
+
+/// 业务作用：按规则、绑定、匹配条件及规范计量属性划分限流状态，使同文本的不同字段账本隔离。
+/// 参数说明：
+/// - `binding`：规则的路由 ID 或路径匹配范围。
+/// - `id`：独立规则文档中的唯一规则 ID。
+/// - `selector`：规则声明的筛选条件。
+/// - `key`：流控的规范计量属性，熔断规则为空。
+///
+/// 返回：用于分配状态的确定性摘要。
+fn rule_identity(
+    binding: &str,
+    id: &str,
+    selector: Option<&SentinelValueMatch>,
+    key: Option<&LimitReqKey>,
+) -> String {
+    let (field, pattern) =
+        selector.map_or(("", ""), |value| (value.key.as_str(), value.value.as_str()));
+    let metering = key.map_or_else(String::new, |key| {
+        let (kind, name) = match key {
             LimitReqKey::Global => ("global", ""),
             LimitReqKey::Ip => ("ip", ""),
             LimitReqKey::Route => ("route", ""),
@@ -232,8 +263,16 @@ impl Policy {
             LimitReqKey::Cookie(name) => ("cookie", name.as_str()),
             LimitReqKey::Host => ("host", ""),
             LimitReqKey::Path => ("path", ""),
-        })
-    }
+        };
+        format!(":meter:{kind}:{}:{name}", name.len())
+    });
+    nasa::crypto::sha256(&format!(
+        "{}:{id}{}:{binding}{}:{field}{}:{pattern}{metering}",
+        id.len(),
+        binding.len(),
+        field.len(),
+        pattern.len(),
+    ))
 }
 
 pub(crate) struct Rule {
@@ -313,20 +352,9 @@ impl RequestRules {
         } else {
             target.unconditional.push(index);
         }
-        let (field, pattern) = selector.map_or(("", ""), |s| (s.key.as_str(), s.value.as_str()));
         // 更换匹配范围或计量字段时使用独立状态，避免旧余额参与新规则裁决。
         // 运行中的请求持有原来的租约，归还时继续使用原作用域。
-        let metering = policy
-            .metering_field()
-            .map(|(kind, name)| format!(":meter:{kind}:{}:{name}", name.len()))
-            .unwrap_or_default();
-        let identity = nasa::crypto::sha256(&format!(
-            "{}:{id}{}:{binding}{}:{field}{}:{pattern}{metering}",
-            id.len(),
-            binding.len(),
-            field.len(),
-            pattern.len(),
-        ));
+        let identity = rule_identity(binding, id, selector, policy.metering_key());
         self.rules.push(Rule {
             identity,
             crosses_routes,
