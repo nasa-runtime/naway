@@ -24,6 +24,9 @@ pub(crate) static DESCRIPTORS: [MetricDescriptor; 2] = [
     },
 ];
 
+pub(super) const LOCAL_STATES: [&str; 6] =
+    ["total", "steady", "cold", "warming", "warm", "expired"];
+
 impl Metrics {
     /// 业务作用：启动时绑定唯一主限流器的弱引用，指标出口不能延长业务后端生命周期。
     ///
@@ -86,14 +89,14 @@ pub(crate) fn samples(metrics: &Metrics) -> Vec<MetricSample> {
         });
     }
     if let Observation::Local(counts) = observation {
-        for (state, value) in [
-            ("total", counts.total),
-            ("steady", counts.steady),
-            ("cold", counts.cold),
-            ("warming", counts.warming),
-            ("warm", counts.warm),
-            ("expired", counts.expired),
-        ] {
+        for (state, value) in LOCAL_STATES.into_iter().zip([
+            counts.total,
+            counts.steady,
+            counts.cold,
+            counts.warming,
+            counts.warm,
+            counts.expired,
+        ]) {
             samples.push(MetricSample {
                 name: DESCRIPTORS[1].name,
                 labels: vec![("state", state.into())],

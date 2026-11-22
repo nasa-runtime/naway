@@ -276,15 +276,68 @@ pub(crate) fn hub(
     snapshot: &Arc<ArcSwap<GatewaySnapshot>>,
 ) -> anyhow::Result<Arc<MetricHub>> {
     let hub = Arc::new(MetricHub::new());
+    // 出口激活前覆盖完整固定标签域，不能按当前非零值或当前限流后端缩小后续采集预算。
+    let budget = series_budget(metrics)?;
     hub.register_legacy_source_reserved(
         Arc::new(Source {
             metrics: Arc::downgrade(metrics),
             snapshot: Arc::downgrade(snapshot),
         }),
-        CORE_NAMES.len() + DURATION_BOUNDS.len() + 3 + 2 + 4 + 33 + 29 + 90 + 25 + 10 + 32,
+        budget,
     )
     .map_err(|error| anyhow::anyhow!("gateway metric catalog rejected: {error:?}"))?;
     Ok(hub)
+}
+
+/// 业务作用：按已登记描述符及全部有限标签组合预留最坏系列数，保持出口事实完整。
+///
+/// 参数说明：
+/// - `metrics`：提供固定目录的样本形状，计数值和当前后端不决定预算大小。
+///
+/// 返回：包含直方图展开成本的系列上界；目录遗漏、重复标签组合或算术溢出时拒绝激活出口。
+fn series_budget(metrics: &Metrics) -> anyhow::Result<usize> {
+    let catalog = descriptors();
+    let mut domain = samples(metrics, 0, 0);
+    // 本地桶数在后端未知时必须缺席，预算仍须覆盖之后切换到本地后端时的全部状态。
+    let local = &super::buckets::DESCRIPTORS[1];
+    domain.retain(|sample| sample.name != local.name);
+    domain.extend(
+        super::buckets::LOCAL_STATES
+            .into_iter()
+            .map(|state| MetricSample {
+                name: local.name,
+                labels: vec![(local.label_names[0], state.into())],
+                value: MetricValue::Gauge(0.0),
+            }),
+    );
+    let mut names = std::collections::BTreeSet::new();
+    let mut tuples = std::collections::BTreeSet::new();
+    let budget = domain.into_iter().try_fold(0usize, |total, sample| {
+        let descriptor = catalog
+            .iter()
+            .find(|descriptor| descriptor.name == sample.name)
+            .ok_or_else(|| anyhow::anyhow!("metric budget has no descriptor: {}", sample.name))?;
+        names.insert(sample.name);
+        anyhow::ensure!(
+            tuples.insert((sample.name, sample.labels)),
+            "metric budget has duplicate fixed label set: {}",
+            sample.name
+        );
+        let cost = match descriptor.kind {
+            MetricKind::Histogram => descriptor.histogram_bounds.len() + 3,
+            _ => 1,
+        };
+        total
+            .checked_add(cost)
+            .ok_or_else(|| anyhow::anyhow!("metric series budget overflow"))
+    })?;
+    anyhow::ensure!(
+        catalog
+            .iter()
+            .all(|descriptor| names.contains(descriptor.name)),
+        "metric descriptor has no fixed label domain"
+    );
+    Ok(budget)
 }
 
 /// 业务作用：读取已存在的累计计数、配置代和固定结果，不接受用户或 URL 标签。
