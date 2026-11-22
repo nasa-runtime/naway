@@ -132,6 +132,10 @@ pub(super) async fn run() -> Result<()> {
             .validate_sidecar_listeners()
             .context("validate sidecar listener isolation")?;
     }
+    // 监听就绪前登记停机信号。启动阶段收到的信号由接收器保留，进程仍经统一路径摘流并释放资源。
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     // 审计 hash-chain/client 是 bootstrap 资源；启动时完整验旧 spool，篡改或 endpoint 配置错误均 fail-fast。
     let admin_audit = gateway::admin::audit::AdminAuditLog::open(&snapshot.admin_audit)
         .context("open admin audit log")?;
@@ -677,10 +681,6 @@ pub(super) async fn run() -> Result<()> {
         mode = ?run_mode,
         "gateway started"
     );
-
-    // 优雅退出:Ctrl-C 停 accept、清 pidfile。
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     tokio::select! {
             // 停机:先置 /readyz=503(前置 LB 摘流)。
