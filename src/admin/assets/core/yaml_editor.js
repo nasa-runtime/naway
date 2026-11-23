@@ -296,7 +296,7 @@ export function yamlEdit(value, start, end, key, shift = false) {
  * 参数说明：
  * - `value`：当前编辑原文。
  * - `position`：当前无选区的光标位置。
- * 返回：唯一匹配时返回局部替换；歧义、引号、注释、没有前缀或全文键名扫描超限时不修改原文。
+ * 返回：唯一且尚未补齐时返回局部替换；歧义、引号、注释、块标量或键名扫描超限时保持原文。
  */
 export function yamlCompletion(value, position) {
   const lineStart =
@@ -311,7 +311,7 @@ export function yamlCompletion(value, position) {
     return null;
   }
   const key = line.match(/^ *(?:- )?([A-Za-z_][\w.-]*)$/)?.[1];
-  const literal = line.match(/:\s*(tr|fa|nu)$/)?.[1];
+  const literal = line.match(/:[ \t]+([a-z]{2,5})$/)?.[1];
   const prefix = key ?? literal;
   if (!prefix) {
     return null;
@@ -334,8 +334,13 @@ export function yamlCompletion(value, position) {
     return null;
   }
   const to = position + value.slice(position).match(/^[\w.-]*/)[0].length;
-  const text = matches[0] + (key && value[to] !== ":" ? ": " : "");
   const from = position - prefix.length;
+  const token = value.slice(from, to);
+  // 光标在已有值中间时，仅补齐仍属于同一常量的未完成文本。
+  if (literal && (token === matches[0] || !matches[0].startsWith(token))) {
+    return null;
+  }
+  const text = matches[0] + (key && value[to] !== ":" ? ": " : "");
   return {
     from,
     to,
