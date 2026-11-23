@@ -1622,7 +1622,17 @@ impl HttpCachePolicy {
             || state.finished.load(Ordering::Acquire)
     }
 
-    /// 业务作用：L2 route 的本地 leader 继续获取跨节点锁，并在锁内 double-check L2。
+    /// 业务作用：L2 路由的本地 leader 获取跨节点锁，等待结束后先确认其它节点有无完成回填。
+    ///
+    /// 参数说明：
+    /// - `key`：已绑定路由、归属和失效代的完整缓存键。
+    /// - `leader`：持有本节点合并名额的请求。
+    /// - `proxy_id`：当前代理标识。
+    /// - `route_id`：当前路由标识。
+    /// - `runtime`：当前共享缓存运行态。
+    /// - `metrics`：记录 L2 错误及等待后是否回源。
+    ///
+    /// 返回：已发布的 fresh 实体，或负责后续回源的本地 leader。
     #[allow(clippy::too_many_arguments)]
     async fn prepare_flight_leader(
         &self,
@@ -1657,8 +1667,19 @@ impl HttpCachePolicy {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    // 缓存锁/Redis 不能成为业务硬依赖；有界等待失败后本请求回源并保留本地合并。
                     metrics.inc_http_cache_l2_error();
+                    // Redis 争锁和读取是不同链路。等待失败时，远端仍可能已回填，
+                    // 用同一代键做一次有限复查，避免通知或争锁异常引起重复回源。
+                    let recheck =
+                        self.lookup_ready(key, proxy_id, route_id, runtime, metrics, false);
+                    let budget = self.singleflight_wait.min(Duration::from_millis(50));
+                    if let Ok(Some(CacheReady::Fresh(entry))) =
+                        tokio::time::timeout(budget, recheck).await
+                    {
+                        drop(leader);
+                        return PreparedFlight::Fresh(entry);
+                    }
+                    // 复查未确认有效实体时才透传，保留本地合并，缓存故障不阻塞业务。
                     metrics.inc_http_cache_singleflight_bypass();
                     tracing::warn!(proxy = proxy_id, route = route_id, %error, "HTTP cache distributed single-flight unavailable; fallback to local leader");
                 }
