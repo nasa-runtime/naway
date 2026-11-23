@@ -232,7 +232,7 @@ pub(super) fn validate(
             );
             // 这些扩展能在认证后改写任意请求头；没有父身份命名约束时不能引入层级执行链。
             ensure!(
-                current.wasm_plugins.is_none()
+                !current.has_wasm_plugins()
                     && current.external_plugins.is_none()
                     && current.ext_proc.is_none()
                     && current.opa_authorization.is_none(),

@@ -4,6 +4,7 @@ ARG NAWAY_SOURCE_FINGERPRINT=unknown
 FROM rust:1-bookworm AS builder
 
 WORKDIR /work/naway
+ARG NAWAY_CARGO_FEATURES=""
 COPY Cargo.toml Cargo.lock README.md LICENSE-APACHE LICENSE-MIT build.rs ./
 COPY src ./src
 COPY proto ./proto
@@ -14,8 +15,8 @@ COPY zcf ./zcf
 RUN --mount=type=cache,id=naway-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=naway-cargo-git,target=/usr/local/cargo/git/db,sharing=locked \
     --mount=type=cache,id=naway-release-target,target=/work/naway/target,sharing=locked \
-    cargo build --release --locked \
-    && install -m 0755 target/release/naway /work/naway-bin
+    cargo build --release --locked --features "$NAWAY_CARGO_FEATURES" \
+    && install -s -m 0755 target/release/naway /work/naway-bin
 
 FROM debian:bookworm-slim
 

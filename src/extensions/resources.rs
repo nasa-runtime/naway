@@ -108,6 +108,7 @@ impl Drop for Worker {
 /// - `error`：执行错误及上下文链。
 ///
 /// 返回：错误链包含本地共享资源拒绝时为 true。
+#[cfg(feature = "proxy-wasm")]
 pub(crate) fn denied(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<Denied>())
 }

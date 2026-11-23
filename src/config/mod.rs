@@ -5900,6 +5900,7 @@ fn collect_secret_dependencies(cfg: &model::GatewayConfig, config_dir: &Path) ->
                 config_dir, casbin,
             ));
         }
+        #[cfg(feature = "proxy-wasm")]
         for plugin in &route.wasm_plugins {
             paths.extend(crate::extensions::wasm::dependency_paths(
                 config_dir, plugin,

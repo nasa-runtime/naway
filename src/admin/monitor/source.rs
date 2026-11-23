@@ -116,6 +116,7 @@ pub(super) fn sample(
             ("config_providers", cfg!(feature = "config-providers")),
             ("telemetry", cfg!(feature = "telemetry-otlp")),
             ("lua", cfg!(feature = "lua-scripts")),
+            ("proxy_wasm", cfg!(feature = "proxy-wasm")),
             ("webdav", cfg!(feature = "webdav")),
             ("media", cfg!(feature = "media-streaming")),
             (

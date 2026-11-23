@@ -209,7 +209,7 @@ pub(super) fn collect(snapshot: &GatewaySnapshot) -> Catalog {
                     route.ws_frame.is_some(),
                     route.opa_authorization.is_some(),
                     route.casbin_authorization.is_some(),
-                    route.wasm_plugins.is_some(),
+                    route.has_wasm_plugins(),
                     route.external_plugins.is_some(),
                     route.forward_proxy.is_some(),
                     route.bff_aggregation.is_some(),

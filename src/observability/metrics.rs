@@ -98,6 +98,7 @@ pub(crate) enum CasbinDecisionMetric {
     InvalidInput,
 }
 
+#[cfg(feature = "proxy-wasm")]
 #[derive(Clone, Copy)]
 pub(crate) enum WasmExecutionMetric {
     Continue,
@@ -1372,6 +1373,12 @@ impl Metrics {
     }
 
     /// 业务作用：记录一条 Proxy-Wasm phase 链的固定结果。
+    ///
+    /// 参数说明：
+    /// - `result`：插件链结束时的固定终态。
+    ///
+    /// 返回：无；累计对应终态的计数。
+    #[cfg(feature = "proxy-wasm")]
     pub(crate) fn inc_wasm_execution(&self, result: WasmExecutionMetric) {
         let counter = match result {
             WasmExecutionMetric::Continue => &self.wasm_continue_total,

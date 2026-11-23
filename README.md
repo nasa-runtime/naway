@@ -1276,6 +1276,11 @@ upstreams:
         - uri: https://10.20.0.8:8443
 ```
 
+Proxy-Wasm 路由使用通过 `cargo build --release --features proxy-wasm` 构建的制品。默认制品
+在启动、预检或热更新时拒绝任何声明 `wasm_plugins` 的候选。已有插件路由的集群在滚动部署前
+须确认所有校验候选或运行数据面的节点都启用了该特性。使用仓库 Dockerfile 构建时传入
+`--build-arg NAWAY_CARGO_FEATURES=proxy-wasm`。
+
 Proxy-Wasm 模块可继续使用本地 `module_file`，也可在候选快照构建阶段从固定 HTTPS URL 或 OCI
 Distribution registry 获取。远程来源必须固定最终 wasm 的 SHA-256，并至少提供 detached Ed25519
 signature 或签名的 in-toto Statement；两者同时声明时全部验证。OCI tag 还必须固定 manifest SHA-256，

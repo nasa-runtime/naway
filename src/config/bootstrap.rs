@@ -567,7 +567,8 @@ upstreams:
 #       max_argument_bytes: 4096
 #       max_input_bytes: 16384
 #       fail_open: false
-#   # Proxy-Wasm ABI v0.2.1 HTTP 插件。替换 module_file 会触发 build-then-swap，
+#   # Proxy-Wasm ABI v0.2.1 HTTP 插件，使用 cargo build --features proxy-wasm 构建后可启用。
+#   # 替换 module_file 会触发 build-then-swap，
 #   # 无需重编/重启 gateway；旧 snapshot 继续服务在途请求。沙箱不挂 WASI，
 #   # 不提供文件或网络。request_body/response_body 是显式有界聚合慢路径；
 #   # PAUSE 必须注册 timer，并在统一 timeout 内由 proxy_on_tick 调用 continue_stream。

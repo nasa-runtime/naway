@@ -69,10 +69,12 @@ use crate::extensions::ext_proc::{
 use crate::extensions::graphql::{GraphqlGuardResult, GraphqlOutcome};
 use crate::io::compression::{apply_response_compression, AcceptedEncodings};
 use crate::observability::access_log::{AccessLogger, AccessMethod, AccessPath, AccessRecord};
+#[cfg(feature = "proxy-wasm")]
+use crate::observability::metrics::WasmExecutionMetric;
 use crate::observability::metrics::{
     CasbinDecisionMetric, DegraphqlMetric, DlpMetric, DubboMetric, ExternalPluginMetric,
     LlmModerationMetric, Metrics, OpaCacheMetric, OpaDecisionMetric, OpaRequestMetric,
-    UsagePlanMetric, WafMetric, WasmExecutionMetric,
+    UsagePlanMetric, WafMetric,
 };
 use crate::protocols::proxy_protocol::ConnInfo;
 use crate::proxy::request_validation::ValidationOutcome;
@@ -1231,7 +1233,7 @@ impl GatewayProxy {
                 conn.tls_server_name.as_deref(),
                 proxy_runtime.gateway_listeners.as_slice(),
             );
-        // Proxy-Wasm request_headers 的 end_of_stream 只从 Hyper 已知的 body 状态取值；
+        // 请求结束标记只从 Hyper 已知的 body 状态取值；
         // 未知/chunked 保守传 false，不为了判定空 body 去 poll 或聚合流。
         let request_end_of_stream = body.is_end_stream();
         // h1/h2/H3 都在 listener adapter 只做一次类型擦除，不读取、不聚合 body；只有命中
@@ -1347,6 +1349,7 @@ impl GatewayProxy {
         let mut response_filter_parts = None;
         // 仅 response Proxy-Wasm route 保留已经过 request plugin 的 head 快照。
         // body 始终留在 ForwardBody 流里，不被插件路径复制。
+        #[cfg(feature = "proxy-wasm")]
         let mut wasm_response_request = None;
         #[cfg(feature = "lua-scripts")]
         let mut script_response_request = None;
@@ -1824,27 +1827,37 @@ impl GatewayProxy {
             .await
             {
                 resp
-            } else if let Some(resp) = enforce_wasm_request_headers(
-                &route,
-                &mut parts,
-                downstream_proto,
-                request_end_of_stream,
-                &mut wasm_response_request,
-                self.metrics.as_ref(),
-            )
-            .await
-            {
-                resp
-            } else if let Some(resp) = enforce_wasm_request_body(
-                &route,
-                &mut parts,
-                &mut forward_body,
-                downstream_proto,
-                &mut wasm_response_request,
-                self.metrics.as_ref(),
-            )
-            .await
-            {
+            } else if let Some(resp) = {
+                #[cfg(feature = "proxy-wasm")]
+                {
+                    if let Some(response) = enforce_wasm_request_headers(
+                        &route,
+                        &mut parts,
+                        downstream_proto,
+                        request_end_of_stream,
+                        &mut wasm_response_request,
+                        self.metrics.as_ref(),
+                    )
+                    .await
+                    {
+                        Some(response)
+                    } else {
+                        enforce_wasm_request_body(
+                            &route,
+                            &mut parts,
+                            &mut forward_body,
+                            downstream_proto,
+                            &mut wasm_response_request,
+                            self.metrics.as_ref(),
+                        )
+                        .await
+                    }
+                }
+                #[cfg(not(feature = "proxy-wasm"))]
+                {
+                    None::<Response<BoxBody>>
+                }
+            } {
                 resp
             } else if let Some(resp) = {
                 #[cfg(feature = "lua-scripts")]
@@ -2607,6 +2620,7 @@ impl GatewayProxy {
                     )
                     .await;
             }
+            #[cfg(feature = "proxy-wasm")]
             if let (Some(matched), Some(request_head)) =
                 (matched_route.as_ref(), wasm_response_request.take())
             {
@@ -12265,6 +12279,7 @@ fn enforce_casbin_authorization(
 ///
 /// 失败模式是 plugin 级的：fail-open 已在沙箱链内丢弃该 plugin 的未提交变更；
 /// 能到达这里的 `Err` 必定是 fail-closed，因此返回 500，不让未执行的安全插件被绕过。
+#[cfg(feature = "proxy-wasm")]
 async fn enforce_wasm_request_headers(
     route: &Route,
     parts: &mut Parts,
@@ -12423,6 +12438,7 @@ enum WasmBodyError {
 /// - `metrics`：记录每 phase 结果。
 ///
 /// 返回：继续转发返回 `None` 并把 body 放回；local response、超限或 fail-closed 返回响应且不留半完成 body。
+#[cfg(feature = "proxy-wasm")]
 async fn enforce_wasm_request_body(
     route: &Route,
     parts: &mut Parts,

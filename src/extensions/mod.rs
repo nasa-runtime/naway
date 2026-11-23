@@ -7,4 +7,5 @@ pub(crate) mod graphql;
 pub(crate) mod resources;
 #[cfg(feature = "lua-scripts")]
 pub(crate) mod scripts;
+#[cfg(feature = "proxy-wasm")]
 pub(crate) mod wasm;

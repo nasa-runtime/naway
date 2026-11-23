@@ -10,7 +10,12 @@ impl Route {
     ///
     /// 返回：所有客体计划一致时为真；不读取连接池、共享目录或熔断锁。
     pub(crate) fn same_sandbox_configuration(&self, candidate: &Self) -> bool {
+        #[cfg(not(any(feature = "proxy-wasm", feature = "lua-scripts")))]
+        let _ = candidate;
+        #[cfg(feature = "proxy-wasm")]
         let same = self.wasm_plugins == candidate.wasm_plugins;
+        #[cfg(not(feature = "proxy-wasm"))]
+        let same = true;
         #[cfg(feature = "lua-scripts")]
         let same = same && self.script_plugins == candidate.script_plugins;
         same

@@ -105,6 +105,8 @@ scgi = []
 webdav = ["dep:dav-server", "dep:xattr", "dep:xmltree"]
 media-streaming = []
 lua-scripts = ["dep:mlua"]
+# 沙箱编译器仅进入明确启用 Proxy-Wasm 的制品，插件路由在默认制品的候选阶段拒绝。
+proxy-wasm = ["dep:wasmtime"]
 
 [dependencies]
 # —— 数据面(hyper 反向代理)——
@@ -205,7 +207,7 @@ regorus = { version = "0.10.1", optional = true, default-features = false, featu
 futures = "0.3"                       # 控制面异步构建与有界后台探测
 x509-cert = { version = "0.2", features = ["pem"] } # OCSP 目标和 issuer 的严格 DER 解析
 x509-parser = "0.18"                  # 控制面解析证书 notAfter，避免无条件重复下单
-wasmtime = { version = "46.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] } # Proxy-Wasm 沙箱；无 WASI/文件/网络权限
+wasmtime = { version = "46.0.1", optional = true, default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] } # Proxy-Wasm 沙箱；无 WASI/文件/网络权限
 mlua = { version = "0.12.2", optional = true, default-features = false, features = ["lua54", "vendored", "error-send"] } # 显式 Lua 沙箱；不提供系统 hostcall
 wtransport = { version = "0.7.1", optional = true, default-features = false, features = ["aws-lc-rs", "quinn"] } # WebTransport 真上游 client；关闭 http3 时不进入制品
 

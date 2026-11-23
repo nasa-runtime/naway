@@ -46,6 +46,7 @@ use crate::extensions::degraphql::DegraphqlPlan;
 use crate::extensions::ext_proc::ExtProcPlan;
 use crate::extensions::external_plugin::ExternalPluginChain;
 use crate::extensions::graphql::GraphqlGuardPolicy;
+#[cfg(feature = "proxy-wasm")]
 use crate::extensions::wasm::WasmPluginChain;
 use crate::io::net::Cidr;
 use crate::io::static_serve::StaticServe;
@@ -231,6 +232,7 @@ pub struct Route {
     /// 内嵌 Casbin RBAC/ABAC；快照内只读，请求期无文件 I/O。
     pub(crate) casbin_authorization: Option<Arc<CasbinPolicy>>,
     /// Proxy-Wasm request/response header 插件链；不存在时数据面无沙箱调度成本。
+    #[cfg(feature = "proxy-wasm")]
     pub(crate) wasm_plugins: Option<Arc<WasmPluginChain>>,
     /// 源码与预算已冻结的脚本链；关闭 feature 后不保留数据面字段。
     #[cfg(feature = "lua-scripts")]
@@ -542,6 +544,14 @@ impl Router {
         let mut ordered: Vec<(i32, Arc<Route>)> = Vec::with_capacity(cfgs.len());
         let mut geoip_catalog = GeoIpCatalog::default();
         for c in cfgs {
+            let has_wasm_plugins = !c.wasm_plugins.is_empty();
+            // 必须拒绝无法执行的策略，防止配置看似生效却在转发时绕过插件。
+            #[cfg(not(feature = "proxy-wasm"))]
+            anyhow::ensure!(
+                !has_wasm_plugins,
+                "route `{}` declares wasm_plugins but this binary requires the proxy-wasm feature",
+                c.id
+            );
             let branch = c.layer.as_ref().is_some_and(|layer| layer.branch);
             if c.long_stream_idle_timeout_ms
                 .is_some_and(|value| value > MAX_LONG_STREAM_DURATION_MS)
@@ -1263,7 +1273,8 @@ impl Router {
                 .transpose()
                 .with_context(|| format!("route `{}` casbin_authorization", c.id))?
                 .map(Arc::new);
-            let wasm_plugins = (!c.wasm_plugins.is_empty())
+            #[cfg(feature = "proxy-wasm")]
+            let wasm_plugins = has_wasm_plugins
                 .then(|| WasmPluginChain::build(&c.wasm_plugins, config_dir, c.id.as_str()))
                 .transpose()
                 .with_context(|| format!("route `{}` wasm_plugins", c.id))?
@@ -1485,13 +1496,13 @@ impl Router {
                     c.id
                 );
             }
-            if wasm_plugins.is_some() && internal {
+            if has_wasm_plugins && internal {
                 bail!(
                     "route `{}` internal route cannot declare wasm_plugins because internal reroutes do not execute the public pre chain",
                     c.id
                 );
             }
-            if wasm_plugins.is_some() && http_cache.is_some() {
+            if has_wasm_plugins && http_cache.is_some() {
                 bail!(
                     "route `{}` cannot combine wasm_plugins with public proxy_cache until plugin revision and mutations participate in cache scope",
                     c.id
@@ -1590,7 +1601,7 @@ impl Router {
                     && response_contract.is_none() && http_cache.is_none() && graphql_guard.is_none() && degraphql.is_none()
                     && direct_response.is_none() && conditional_returns.is_empty() && mirrors.is_empty() && hedge.is_none()
                     && !x_accel_redirect && error_pages.is_empty() && !internal && ext_proc.is_none()
-                    && wasm_plugins.is_none() && external_plugins.is_none() && pass_request_body && pass_request_headers
+                    && !has_wasm_plugins && external_plugins.is_none() && pass_request_body && pass_request_headers
                     && request_headers.is_empty() && response_headers.is_empty() && c.resolved_upstream_credentials.is_empty(),
                     "route `{}` agent cannot combine body-owning filters, cache, reroute, mirror, hedge or internal return", c.id);
                 anyhow::ensure!(
@@ -1608,7 +1619,7 @@ impl Router {
             }
             if c.llm.as_ref().is_some_and(|llm| llm.governance.is_some()) {
                 // 治理结果已经受身份、来源和输出策略裁决，后置内容改写或共享缓存不能改变其安全含义。
-                anyhow::ensure!(wasm_plugins.is_none() && external_plugins.is_none() && ext_proc.is_none()
+                anyhow::ensure!(!has_wasm_plugins && external_plugins.is_none() && ext_proc.is_none()
                     && http_cache.is_none() && mirrors.is_empty() && hedge.is_none() && !internal
                     && !x_accel_redirect && error_pages.is_empty() && pass_request_body && pass_request_headers
                     && request_headers.is_empty() && response_headers.is_empty() && c.resolved_upstream_credentials.is_empty(),
@@ -1891,7 +1902,7 @@ impl Router {
                         && response_contract.is_none()
                         && graphql_guard.is_none()
                         && degraphql.is_none()
-                        && wasm_plugins.is_none()
+                        && !has_wasm_plugins
                         && external_plugins.is_none()
                         && llm.is_none()
                         && grpc_edge.is_none()
@@ -1951,6 +1962,7 @@ impl Router {
                             | crate::config::scripts::Phase::ResponseBodyStream
                     )
                 });
+                #[cfg(feature = "proxy-wasm")]
                 anyhow::ensure!(
                     !wasm_plugins
                         .as_ref()
@@ -2005,7 +2017,7 @@ impl Router {
                     && early_data.is_none() && mirrors.is_empty() && hedge.is_none() && c.inference_pool.is_none()
                     && request_validation.is_none() && request_transform.is_none() && response_transform.is_none()
                     && response_contract.is_none() && degraphql.is_none() && graphql_guard.is_none()
-                    && c.ext_proc.is_none() && wasm_plugins.is_none() && external_plugins.is_none()
+                    && c.ext_proc.is_none() && !has_wasm_plugins && external_plugins.is_none()
                     && c.dlp.as_ref().is_none_or(|policy| policy.action != "redact")
                     && strip_prefix == 0 && rewrite_prefix.is_none() && gateway_rewrite_full_path.is_none()
                     && http_cache.is_none() && cache_invalidations.is_empty() && !x_accel_redirect && error_pages.is_empty()
@@ -2041,7 +2053,7 @@ impl Router {
                     && early_data.is_none() && mirrors.is_empty() && hedge.is_none() && c.inference_pool.is_none()
                     && request_validation.is_none() && request_transform.is_none() && response_transform.is_none()
                     && response_contract.is_none() && degraphql.is_none() && graphql_guard.is_none()
-                    && c.ext_proc.is_none() && wasm_plugins.is_none() && external_plugins.is_none()
+                    && c.ext_proc.is_none() && !has_wasm_plugins && external_plugins.is_none()
                     && c.dlp.as_ref().is_none_or(|policy| policy.action != "redact")
                     && strip_prefix == 0 && rewrite_prefix.is_none() && gateway_rewrite_full_path.is_none()
                     && http_cache.is_none() && cache_invalidations.is_empty() && !x_accel_redirect && error_pages.is_empty()
@@ -2158,6 +2170,7 @@ impl Router {
                     degraphql,
                     opa_authorization,
                     casbin_authorization,
+                    #[cfg(feature = "proxy-wasm")]
                     wasm_plugins,
                     #[cfg(feature = "lua-scripts")]
                     script_plugins,
@@ -2449,6 +2462,22 @@ impl Router {
 }
 
 impl Route {
+    /// 业务作用：标识当前路由是否装配了 Proxy-Wasm 插件链，保持目录中能力位的位置稳定。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：仅在启用 Proxy-Wasm 且路由含已编译插件链时为真。
+    pub(crate) fn has_wasm_plugins(&self) -> bool {
+        #[cfg(feature = "proxy-wasm")]
+        {
+            self.wasm_plugins.is_some()
+        }
+        #[cfg(not(feature = "proxy-wasm"))]
+        {
+            false
+        }
+    }
+
     /// 业务作用：为管理面展示路由结构、断言与过滤器信息，便于解释当前生效计划。
     ///
     /// 参数说明: 无。
@@ -2555,7 +2584,7 @@ impl Route {
         push(self.dlp.is_some(), "dlp");
         push(self.graphql_guard.is_some(), "graphql_guard");
         push(self.usage_plan.is_some(), "usage_plan");
-        push(self.wasm_plugins.is_some(), "wasm");
+        push(self.has_wasm_plugins(), "wasm");
         #[cfg(feature = "lua-scripts")]
         push(self.script_plugins.is_some(), "lua");
         push(self.external_plugins.is_some(), "external_plugin");
