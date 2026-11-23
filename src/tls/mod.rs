@@ -1490,14 +1490,16 @@ fn spawn_cert_material_watcher_inner<F>(
         // 无客户端认证的监听器保留初始会话缓存，避免仅启动观察就轮换 HTTP/3 early data 会话。
         let mut pending = tls.client_auth.is_some();
         loop {
-            let native_event = tokio::select! {
+            tokio::select! {
                 biased;
                 _ = listener_watcher_stopped(&mut shutdown) => return,
-                _ = interval.tick() => false,
-                _ = wake.notified() => true,
-            };
+                _ = interval.tick() => {}
+                _ = wake.notified() => {}
+            }
+            // 注册时积压的事件或复查后才送达的事件不代表新的材料代，
+            // 重复发布相同配置会清空 HTTP/3 会话缓存，让仍有效的票据无故失效。
             let changed = observations.changed();
-            if !(native_event || changed || pending) {
+            if !(changed || pending) {
                 continue;
             }
             pending = false;

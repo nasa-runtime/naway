@@ -1169,6 +1169,8 @@ allowlist 后，客户端叶证书必须只有一个合法 URI SAN，并命中�
 
 共享 session ticket key 使用 Base64 编码的 32-byte SecretSource。首项签发、后续项只解密，允许
 跨节点先发布 `[new, old]` 再删除 `old`；删除旧 key 会立即停止恢复对应 ticket，但不终止已建立连接。
+启用客户端 CRL 时，共享票据绑定签发时的客户端 CA、CRL 与验证策略。热更改变这些信任材料后，
+持有旧票据的客户端会执行完整握手，并按当前吊销规则校验。
 
 TLS 身份可以用 `private_key_provider` 代替 `key_file`。网关只从证书取得公开 SPKI；rustls 选定的
 握手算法与待签名消息经固定大小 worker pool 发送给外部 signer，provider 不可用、超时、队列满、
