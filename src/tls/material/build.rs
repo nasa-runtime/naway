@@ -49,12 +49,17 @@ fn build(tls: &TlsRuntimeCfg, prepared: Option<SniCertResolver>) -> Result<Serve
         return build_in_memory_material(material);
     }
     let builder = ServerConfig::builder();
+    let mut ticket_scope = None;
     let builder = match &tls.client_auth {
         Some(ca) => match &tls.spire {
             Some(source) => {
                 builder.with_client_cert_verifier(build_spire_client_verifier(source, ca)?)
             }
-            None => builder.with_client_cert_verifier(build_client_verifier(ca)?),
+            None => {
+                let trust = build_client_verifier(ca)?;
+                ticket_scope = trust.ticket_scope;
+                builder.with_client_cert_verifier(trust.verifier)
+            }
         },
         None => builder.with_no_client_auth(),
     };
@@ -84,7 +89,7 @@ fn build(tls: &TlsRuntimeCfg, prepared: Option<SniCertResolver>) -> Result<Serve
     let mut cfg = builder.with_cert_resolver(resolver);
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     if let Some(tickets) = &tls.session_tickets {
-        cfg.ticketer = build_session_ticket_producer(tickets)?;
+        cfg.ticketer = build_session_ticket_producer(tickets, ticket_scope.as_ref())?;
     }
     Ok(ServerMaterial {
         config: Arc::new(cfg),

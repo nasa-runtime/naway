@@ -1393,9 +1393,6 @@ fn spawn_cert_material_watcher_inner<F>(
         });
         return;
     }
-    // 去重 cert/key 的父目录(常同目录);notify 监听目录而非文件,兼容编辑器「写临时文件+rename」。
-    // 默认证书与所有 SNI 证书的目录都要监听，任一身份材料变化都必须热换整份 ServerConfig。
-    let mut dirs: Vec<PathBuf> = Vec::new();
     let mut files: Vec<PathBuf> = vec![tls.cert_file.clone()];
     if !tls.key_file.as_os_str().is_empty() {
         files.push(tls.key_file.clone());
@@ -1423,91 +1420,137 @@ fn spawn_cert_material_watcher_inner<F>(
             files.push(issuer.clone());
         }
     }
-    // macOS notify 可能把 `/var/...` 事件规范化成 `/private/var/...`；只做裸 PathBuf
-    // 相等会漏掉真实目标。规范化父目录但保留文件名，兼容尚不存在的 manifest 和 rename 写法。
-    files = files
-        .into_iter()
+    files.retain(|path| !path.as_os_str().is_empty());
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return;
+    }
+    // 原生事件路径可以来自规范化父目录；精确复查仍跟随声明路径，用于发现父目录链接换入。
+    let watched_files = files
+        .iter()
         .map(|path| {
             path.parent()
                 .and_then(|parent| std::fs::canonicalize(parent).ok())
                 .and_then(|parent| path.file_name().map(|name| parent.join(name)))
-                .unwrap_or(path)
+                .unwrap_or_else(|| path.clone())
         })
-        .collect();
-    files.sort();
-    files.dedup();
-    for f in &files {
-        if let Some(dir) = f.parent() {
-            let dir = dir.to_path_buf();
-            if !dirs.contains(&dir) {
-                dirs.push(dir);
-            }
-        }
-    }
+        .collect::<std::collections::HashSet<_>>();
+    let dirs = watched_files
+        .iter()
+        .filter_map(|path| path.parent())
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .collect::<std::collections::HashSet<_>>();
+
+    use crate::io::file_observation::{FileObservations, RECHECK_INTERVAL};
+
+    let mut observations = FileObservations::default();
+    observations.reconcile(files.iter().map(PathBuf::as_path));
     tokio::spawn(async move {
-        let watched_files = files;
-        let reload_tls = tls.clone();
-        let mut watcher = match RecommendedWatcher::new(
-            move |res: notify::Result<notify::Event>| {
-                let Ok(ev) = res else {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let file_wake = wake.clone();
+        let watcher = match RecommendedWatcher::new(
+            move |result: notify::Result<notify::Event>| {
+                let Ok(event) = result else {
                     return;
                 };
-                if !matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                    return;
-                }
-                // notify 必须监听父目录才能兼容 temp+rename，但同目录其它文件不应触发昂贵的
-                // PEM 解析和全量 ServerConfig 重建（证书目录常与其它控制面文件共存）。
-                if !ev
-                    .paths
-                    .iter()
-                    .any(|changed| watched_files.iter().any(|target| changed == target))
+                if matches!(
+                    event.kind,
+                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                ) && event.paths.iter().any(|path| watched_files.contains(path))
                 {
-                    return;
-                }
-                match material::build_server_material(&reload_tls) {
-                    Ok(cfg) => match publish(cfg) {
-                        Ok(()) => tracing::info!("tls certificate reloaded (hot swap)"),
-                        Err(error) => tracing::warn!(
-                            error = %format!("{error:#}"),
-                            "tls certificate transport publish failed; keeping previous config"
-                        ),
-                    },
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), "tls certificate reload failed; keeping previous config")
-                    }
+                    file_wake.notify_one();
                 }
             },
             notify::Config::default(),
         ) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!(error = %e, "tls cert watcher init failed; hot cert reload disabled");
-                return;
+            Ok(mut watcher) => {
+                for dir in &dirs {
+                    if let Err(error) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                        tracing::warn!(dir = %dir.display(), %error, "native TLS file watch failed; using path recheck");
+                    }
+                }
+                Some(watcher)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "native TLS file watcher unavailable; using path recheck");
+                None
             }
         };
-        for dir in &dirs {
-            if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
-                tracing::error!(dir = %dir.display(), error = %e, "watch tls cert dir failed");
-            }
-        }
         tracing::info!("watching tls certificate files for changes");
-        // 只有文件 watcher 已就绪后才启动主动获取，保证原子替换产生的首个事件不会落在监听空窗。
+        // 先建立复查基线，再启动主动获取，保证 OCSP 响应的首次原子换入也会被观察。
         spawn_ocsp_refreshers(tls.clone(), shutdown.clone());
-        // 持有 watcher 到进程退出或 listener generation 停止(drop 即停止监听)。
         let _keep_alive = watcher;
-        if let Some(mut shutdown) = shutdown {
-            loop {
-                if *shutdown.borrow() {
-                    return;
-                }
-                if shutdown.changed().await.is_err() {
-                    return;
+        let tls = Arc::new(tls);
+        let mut shutdown = shutdown;
+        let mut interval = tokio::time::interval(RECHECK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 客户端信任在启动期间也可能收紧；首次复验覆盖初始握手配置构建至注册的窗口。
+        // 无客户端认证的监听器保留初始会话缓存，避免仅启动观察就轮换 HTTP/3 early data 会话。
+        let mut pending = tls.client_auth.is_some();
+        loop {
+            let native_event = tokio::select! {
+                biased;
+                _ = listener_watcher_stopped(&mut shutdown) => return,
+                _ = interval.tick() => false,
+                _ = wake.notified() => true,
+            };
+            let changed = observations.changed();
+            if !(native_event || changed || pending) {
+                continue;
+            }
+            pending = false;
+            let reload_tls = tls.clone();
+            let candidate =
+                tokio::task::spawn_blocking(move || material::build_server_material(&reload_tls))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result);
+            // 构建期间材料再次变化时，跳过旧候选并重新读取整份材料，避免把旧授权重新发布。
+            if observations.changed() {
+                pending = true;
+                continue;
+            }
+            // 外部读取可能跨过 listener 停止时刻；停收后不再调用该代发布回调。
+            if shutdown
+                .as_ref()
+                .is_some_and(|receiver| *receiver.borrow() || receiver.has_changed().is_err())
+            {
+                return;
+            }
+            match candidate {
+                Ok(material) => match publish(material) {
+                    Ok(()) => tracing::info!("tls certificate reloaded (hot swap)"),
+                    Err(error) => tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "tls certificate transport publish failed; keeping previous config"
+                    ),
+                },
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "tls certificate reload failed; keeping previous config")
                 }
             }
-        } else {
-            std::future::pending::<()>().await;
         }
     });
+}
+
+/// 业务作用：等待监听代停止，供材料观察和主动 OCSP 刷新释放已失权代的后台任务。
+///
+/// 参数说明：
+/// - `shutdown`：监听代的停收通知；进程生命周期任务没有独立通知。
+///
+/// 返回：收到停收状态或发送端关闭时完成；进程生命周期任务持续挂起。
+async fn listener_watcher_stopped(shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    if let Some(receiver) = shutdown {
+        while !*receiver.borrow() {
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    } else {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// 业务作用：构建包含 SNI、OCSP 或 SPIRE 授权门的服务端配置，保留现有调用方的加载接口。
@@ -1780,15 +1823,29 @@ fn certificate_spiffe_identity(certificate: &CertificateDer<'_>) -> Result<(Stri
 ///
 /// 参数说明：
 /// - `runtime`：按配置顺序携带 1..=4 个 256-bit key 与 lifetime。
+/// - `scope`：启用 CRL 时取自当前客户端验证器的信任摘要。
 ///
 /// 返回：key id 唯一且 AEAD 可构造时返回 rustls producer；冲突或内部构造失败拒绝 TLS 候选。
 fn build_session_ticket_producer(
     runtime: &SessionTicketRuntime,
+    scope: Option<&[u8; 32]>,
 ) -> Result<Arc<dyn ProducesTickets>> {
+    use hmac::{Hmac, Mac as _};
+
     let mut ids = std::collections::HashSet::new();
     let mut keys = Vec::with_capacity(runtime.keys.len());
     for raw in runtime.keys.iter() {
-        let digest = sha2::Sha256::digest(raw);
+        // 恢复会话不会重走证书验证；以验证器信任摘要派生密钥，防止旧 CRL 代的票据绕过吊销。
+        let key = if let Some(scope) = scope {
+            let mut mac = <Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(raw)
+                .expect("HMAC accepts 256-bit TLS ticket keys");
+            mac.update(b"naway TLS session ticket client trust\0");
+            mac.update(scope);
+            mac.finalize().into_bytes().into()
+        } else {
+            *raw
+        };
+        let digest = sha2::Sha256::digest(key);
         let id: [u8; 8] = digest[..8]
             .try_into()
             .expect("SHA-256 prefix has a fixed length");
@@ -1798,7 +1855,7 @@ fn build_session_ticket_producer(
         );
         keys.push(SessionTicketKey {
             id,
-            cipher: Aes256Gcm::new_from_slice(raw)
+            cipher: Aes256Gcm::new_from_slice(&key)
                 .map_err(|_| anyhow::anyhow!("build TLS session ticket AEAD"))?,
         });
     }
@@ -1821,29 +1878,33 @@ pub(crate) fn build_in_memory_server_config(
     material::build_in_memory_material(material).map(|material| material.config)
 }
 
-/// 业务作用：从 CA PEM 构建客户端证书 verifier，并准确落实严格、可选或不安全兼容模式。
+struct FileClientTrust {
+    verifier: Arc<dyn ClientCertVerifier>,
+    ticket_scope: Option<[u8; 32]>,
+}
+
+/// 业务作用：从同批 CA 与 CRL 构建客户端验证器和票据信任域，落实严格、可选或兼容模式。
 ///
 /// 参数说明：
 /// - `ca`：包含已解析的认证模式和受信 CA 文件。
 ///
-/// 返回：严格模式校验信任链且要求证书；可选模式允许无证书但校验已出示证书；
-/// 不安全兼容模式接受任意证书或无证书，但仍校验已出示证书的握手签名。
-fn build_client_verifier(
-    ca: &ClientAuthRuntime,
-) -> Result<Arc<dyn tokio_rustls::rustls::server::danger::ClientCertVerifier>> {
+/// 返回：按认证模式构建完整验证器；启用 CRL 时附带跨节点一致的票据信任摘要，材料无效拒绝候选。
+fn build_client_verifier(ca: &ClientAuthRuntime) -> Result<FileClientTrust> {
     let ca_certs = load_certs_from(&ca.ca_file)?;
     let mut roots = RootCertStore::empty();
-    for cert in ca_certs {
+    for cert in &ca_certs {
         roots
-            .add(cert)
+            .add(cert.clone())
             .with_context(|| format!("add client CA cert from {}", ca.ca_file.display()))?;
     }
     let mut builder = WebPkiClientVerifier::builder(Arc::new(roots));
+    let mut ticket_scope = None;
     if !ca.crl_files.is_empty() {
         let mut crls = Vec::new();
         for path in &ca.crl_files {
             crls.extend(load_crls_from(path)?);
         }
+        ticket_scope = Some(client_trust_digest(ca, &ca_certs, &crls));
         builder = builder.with_crls(crls);
         if ca.allow_unknown_revocation_status {
             builder = builder.allow_unknown_revocation_status();
@@ -1858,15 +1919,53 @@ fn build_client_verifier(
         builder.allow_unauthenticated().build()
     }
     .with_context(|| format!("build client cert verifier from {}", ca.ca_file.display()))?;
-    if ca.allow_untrusted {
+    let verifier: Arc<dyn ClientCertVerifier> = if ca.allow_untrusted {
         // 兼容模式仍发送 CertificateRequest 并复用标准签名校验，只放宽 CA 信任门禁。
-        Ok(Arc::new(InsecureFallbackClientCertVerifier {
+        Arc::new(InsecureFallbackClientCertVerifier {
             signature_verifier: verifier,
             root_hints: Vec::new(),
-        }))
+        })
     } else {
-        Ok(verifier)
+        verifier
+    };
+    Ok(FileClientTrust {
+        verifier,
+        ticket_scope,
+    })
+}
+
+/// 业务作用：令共享票据只在相同 CA、吊销列表和验证策略下恢复。
+///
+/// 参数说明：
+/// - `policy`：验证器实际使用的认证及吊销开关。
+/// - `certificates`：本次加载的客户端信任锚。
+/// - `crls`：本次加载并交给验证器的吊销列表。
+///
+/// 返回：按材料类型分隔的摘要；仅调整同类材料顺序时保持一致。
+fn client_trust_digest(
+    policy: &ClientAuthRuntime,
+    certificates: &[CertificateDer<'_>],
+    crls: &[CertificateRevocationListDer<'_>],
+) -> [u8; 32] {
+    let mut digest = sha2::Sha256::new();
+    digest.update([
+        u8::from(policy.require),
+        u8::from(policy.allow_untrusted),
+        u8::from(policy.allow_unknown_revocation_status),
+        u8::from(policy.enforce_crl_expiration),
+    ]);
+    let mut ca_digests: Vec<_> = certificates.iter().map(sha2::Sha256::digest).collect();
+    let mut crl_digests: Vec<_> = crls.iter().map(sha2::Sha256::digest).collect();
+    ca_digests.sort_unstable();
+    crl_digests.sort_unstable();
+    digest.update((ca_digests.len() as u64).to_be_bytes());
+    for certificate in ca_digests {
+        digest.update(certificate);
     }
+    for crl in crl_digests {
+        digest.update(crl);
+    }
+    digest.finalize().into()
 }
 
 /// 业务作用：有界读取一个 PEM CRL bundle，供客户端证书握手期执行离线吊销复验。
@@ -2094,18 +2193,7 @@ fn spawn_ocsp_refresher(
                         ),
                     }
                 }
-                _ = async {
-                    match shutdown.as_mut() {
-                        Some(receiver) => {
-                            while !*receiver.borrow() {
-                                if receiver.changed().await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        None => std::future::pending::<()>().await,
-                    }
-                } => return,
+                _ = listener_watcher_stopped(&mut shutdown) => return,
             }
         }
     });
