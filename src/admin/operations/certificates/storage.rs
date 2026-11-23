@@ -1,6 +1,10 @@
 //! 材料与 NASA 幂等收据共用一份事务，未知提交保留原请求查询身份。
 
-use super::{crypto, model::Candidate, Error, Store};
+use super::{
+    crypto,
+    model::{Candidate, Record},
+    reading, Error, Store,
+};
 use crate::config::operations::certificates::Keyring;
 use nasa::idempotency::{
     ExecutionLease, IdempotencyKey, IdempotencyOutcome, IdempotencyStore, RequestFingerprint,
@@ -25,8 +29,8 @@ pub(super) struct Submission<'a> {
 /// - `store`：已登记材料 owner 的共享数据库资源。
 /// - `input`：已授权的固定意图、当前钥环和配置发布权。
 ///
-/// 返回：同事务提交的提案 id；超时或提交未知必须用原代际与原幂等键回读。
-pub(super) async fn submit(store: &Store, input: Submission<'_>) -> Result<String, Error> {
+/// 返回：同事务读取并确认提交的公开提案；超时或提交未知必须用原代际与原幂等键回读。
+pub(super) async fn submit(store: &Store, input: Submission<'_>) -> Result<Record, Error> {
     let workers = store
         .certificate_workers
         .as_ref()
@@ -49,7 +53,7 @@ pub(super) async fn submit(store: &Store, input: Submission<'_>) -> Result<Strin
                 if response.status != 201 || !super::model::valid_hex(&id, 32) {
                     return Err(Error::Unavailable);
                 }
-                return Ok(id);
+                return reading::in_transaction(store, input.scope, &id).await;
             }
             IdempotencyOutcome::FirstExecution => {}
             _ => return Err(Error::Conflict),
@@ -120,6 +124,6 @@ pub(super) async fn submit(store: &Store, input: Submission<'_>) -> Result<Strin
         }).await.map_err(|_| Error::Unavailable)? {
             return Err(Error::Conflict);
         }
-        Ok(id)
+        reading::in_transaction(store, input.scope, &id).await
     })).await
 }

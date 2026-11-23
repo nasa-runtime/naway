@@ -1,7 +1,7 @@
 //! 材料审阅只推进共享提案状态，批准不会向节点发送安装命令。
 
 pub(super) use super::super::model::Decision;
-use super::{crypto, Error, Store};
+use super::{crypto, model::Record, reading, Error, Store};
 use crate::config::operations::certificates::Keyring;
 use serde::Deserialize;
 use sqlx::Row;
@@ -31,8 +31,8 @@ pub(super) struct Request<'a> {
 /// - `store`：已经就绪的独立材料存储。
 /// - `request`：当前创建者及审阅者权限已复验的冻结审阅意图。
 ///
-/// 返回：确定审阅提交才成功；缺钥、篡改、撤权、重复或过期均不能批准。
-pub(super) async fn apply(store: &Store, request: Request<'_>) -> Result<(), Error> {
+/// 返回：确认提交的公开提案；缺钥、篡改、撤权、重复或过期均不能批准。
+pub(super) async fn apply(store: &Store, request: Request<'_>) -> Result<Record, Error> {
     store.transaction(Box::pin(async {
         let mut connection = nasa::tx::pgsql::mandatory_conn_for(super::super::store::DATASOURCE)
             .await.map_err(|_| Error::Unavailable)?;
@@ -103,6 +103,8 @@ pub(super) async fn apply(store: &Store, request: Request<'_>) -> Result<(), Err
         if changed.rows_affected() != 1 {
             return Err(Error::Conflict);
         }
-        Ok(())
+        // 释放 ambient 借用后在同一事务读取公开状态，响应随该审阅提交一起确定。
+        drop(connection);
+        reading::in_transaction(store, request.scope, request.id).await
     })).await
 }

@@ -273,7 +273,7 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Result<Response<
         return Err(Error::Conflict);
     }
     let keyring = plan.certificate_keys.clone().ok_or(Error::Unavailable)?;
-    let id = if suffix.is_empty() {
+    let record = if suffix.is_empty() {
         authorization::check(
             &query.scope,
             &snapshot,
@@ -335,12 +335,10 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Result<Response<
                 publication: publication.clone(),
             },
         )
-        .await?;
-        id.to_owned()
+        .await?
     };
-    // 已提交之后查询失败属于未知响应，不把读故障误报为未保存；调用者只按原请求身份恢复。
-    let record = exact(store, &query, Selection::Id(&id), &snapshot)
-        .await
+    // 原请求重放也必须通过当前快照的目标归属检查；配置发布权覆盖整个写入与响应过程。
+    authorization::targets(&query.scope, &snapshot, &record.targets)
         .map_err(|_| Error::OutcomeUnknown)?;
     response::encode(&response::Single {
         proposal: &record,
