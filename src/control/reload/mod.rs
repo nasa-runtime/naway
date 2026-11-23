@@ -24,6 +24,7 @@ use crate::config::load_snapshot_with_dynamic;
 use crate::config::model::{NacosConfigSourceCfg, ReloadCfg};
 use crate::config::{config_fingerprint, resolve_relative, ConfigWatchPlan, GatewaySnapshot};
 use crate::control::history::ConfigHistory;
+use crate::io::file_observation::{FileObservations, RECHECK_INTERVAL};
 use crate::runtime::connections::ConnectionRegistry;
 use crate::runtime::state::{
     build_circuit_stats, build_conn_limiter, build_dynamic_store, build_rate_limiter,
@@ -1716,7 +1717,7 @@ fn merge_reload_events(current: ReloadEvent, next: ReloadEvent) -> ReloadEvent {
     }
 }
 
-/// 业务作用：以当前活动快照的同源计划建立 naml watcher，并启动唯一可变 owner 处理后续对账。
+/// 业务作用：用同一配置计划建立 naml 通知与精确路径复查，避免首个 profile 创建遗漏后长期停留在旧版。
 ///
 /// 参数说明：
 /// - `initial_plan`：来自启动成功快照
@@ -1727,14 +1728,19 @@ fn spawn_file_watch(
     initial_plan: ConfigWatchPlan,
     tx: mpsc::Sender<ReloadEvent>,
 ) -> Option<ConfigWatchReconciler> {
+    // 原生监听注册期间可能错过通知，先为现有和缺失目标建立对照。
+    let mut sources = FileObservations::default();
+    let mut dependencies = FileObservations::default();
+    sources.reconcile(initial_plan.sources().watch_files());
+    dependencies.reconcile(initial_plan.dependencies().iter().map(PathBuf::as_path));
     let event_tx = tx.clone();
     let watcher = match YmlWatcher::new(
         initial_plan.sources(),
         initial_plan.dependencies(),
         move |event| {
-            // naml 已完成符号链接等价和精确目标过滤；这里仅执行来源映射与有界背压，
-            // 不能在同步回调中加载或发布配置。
-            let _ = event_tx.blocking_send(ReloadEvent::from_yml_watch(event));
+            // 同步回调不能等 reload worker 腾出队列，worker 发布前可能正在等 watcher 对账。
+            // 队列满时，由精确路径复查补发仍有变化的候选。
+            let _ = event_tx.try_send(ReloadEvent::from_yml_watch(event));
         },
     ) {
         Ok(watcher) => watcher,
@@ -1746,9 +1752,41 @@ fn spawn_file_watch(
     let (command_tx, mut command_rx) = mpsc::channel::<ConfigWatchCommand>(1);
     tokio::spawn(async move {
         let mut watcher = watcher;
-        while let Some(command) = command_rx.recv().await {
-            let result = watcher.reconcile(command.plan.sources(), command.plan.dependencies());
-            let _ = command.completed.send(result);
+        let mut interval = tokio::time::interval(RECHECK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut pending = None;
+        loop {
+            tokio::select! {
+                command = command_rx.recv() => {
+                    let Some(command) = command else {
+                        return;
+                    };
+                    let result = watcher.reconcile(command.plan.sources(), command.plan.dependencies());
+                    if result.is_ok() {
+                        // 只有原生 watcher 成功切换才更新复查范围；共有路径沿用原基线。
+                        sources.reconcile(command.plan.sources().watch_files());
+                        dependencies.reconcile(command.plan.dependencies().iter().map(PathBuf::as_path));
+                    }
+                    let _ = command.completed.send(result);
+                }
+                _ = interval.tick() => {
+                    let sources_changed = sources.changed();
+                    let dependencies_changed = dependencies.changed();
+                    if sources_changed {
+                        pending = Some(ReloadEvent::File);
+                    } else if dependencies_changed && pending.is_none() {
+                        pending = Some(ReloadEvent::Dependency);
+                    }
+                    if let Some(event) = pending.take() {
+                        match tx.try_send(event) {
+                            Ok(()) => {}
+                            // 复查基线已前进，保留提示直到队列有余量。
+                            Err(mpsc::error::TrySendError::Full(event)) => pending = Some(event),
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
+                        }
+                    }
+                }
+            }
         }
     });
     tracing::info!(
