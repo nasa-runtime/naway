@@ -4,8 +4,9 @@ ARG NAWAY_SOURCE_FINGERPRINT=unknown
 FROM rust:1-bookworm AS builder
 
 WORKDIR /work/naway
-COPY Cargo.toml Cargo.lock README.md LICENSE-APACHE LICENSE-MIT ./
+COPY Cargo.toml Cargo.lock README.md LICENSE-APACHE LICENSE-MIT build.rs ./
 COPY src ./src
+COPY proto ./proto
 COPY zcf ./zcf
 # 源码 COPY 会让这一层的普通 layer cache 失效；registry/git/target 改用 BuildKit 持久 cache，
 # 修改业务源码时只重编受影响 crate。target cache 不会进入最终镜像，因此同一 RUN 必须把最终
