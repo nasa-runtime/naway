@@ -41,7 +41,7 @@ impl<T> Default for Node<T> {
 }
 
 struct Pattern<'a> {
-    bytes: &'a [u8],
+    literal: &'a str,
     prefix: bool,
 }
 
@@ -63,7 +63,7 @@ impl<'a> Pattern<'a> {
             "invalid Sentinel pattern: expected a literal or a non-empty prefix followed by one *"
         );
         Ok(Self {
-            bytes: literal.as_bytes(),
+            literal,
             prefix,
         })
     }
@@ -81,7 +81,7 @@ impl<T: Default> Trie<T> {
             self.nodes.push(Node::default());
         }
         let mut at = 0;
-        for &byte in pattern.bytes {
+        for &byte in pattern.literal.as_bytes() {
             let next = self.nodes.len();
             let index = *self.nodes[at].children.entry(byte).or_insert(next);
             if index == next {
@@ -227,6 +227,7 @@ impl Policy {
 }
 
 /// 业务作用：为无筛选的精确路由流控绑定与请求规则一致的配置身份。
+///
 /// 参数说明：
 /// - `binding`：规则绑定的精确路由 ID。
 /// - `id`：独立流控文档中的唯一规则 ID。
@@ -237,41 +238,65 @@ pub(crate) fn exact_flow_identity(binding: &str, id: &str, key: &LimitReqKey) ->
     rule_identity(binding, id, None, Some(key))
 }
 
-/// 业务作用：按规则、绑定、匹配条件及规范计量属性划分限流状态，使同文本的不同字段账本隔离。
+/// 业务作用：为已编译的请求属性提供统一名称，保留 Query 和 Cookie 字段的大小写语义。
+///
+/// 参数说明：
+/// - `key`：请求筛选或计量使用的规范属性。
+///
+/// 返回：属性类型以及命名属性的字段名。
+fn key_identity(key: &LimitReqKey) -> (&'static str, Option<&str>) {
+    match key {
+        LimitReqKey::Global => ("global", None),
+        LimitReqKey::Ip => ("ip", None),
+        LimitReqKey::Route => ("route", None),
+        LimitReqKey::Header(name) => ("header", Some(name.as_str())),
+        LimitReqKey::Query(name) => ("query", Some(name)),
+        LimitReqKey::Cookie(name) => ("cookie", Some(name)),
+        LimitReqKey::Host => ("host", None),
+        LimitReqKey::Path => ("path", None),
+    }
+}
+
+/// 业务作用：用已编译的匹配和计量条件划分治理状态，等价声明沿用正在生效的状态。
+///
 /// 参数说明：
 /// - `binding`：规则的路由 ID 或路径匹配范围。
 /// - `id`：独立规则文档中的唯一规则 ID。
-/// - `selector`：规则声明的筛选条件。
+/// - `selector`：与 Trie 使用同一属性、字面值和匹配方式。
 /// - `key`：流控的规范计量属性，熔断规则为空。
 ///
 /// 返回：用于分配状态的确定性摘要。
 fn rule_identity(
     binding: &str,
     id: &str,
-    selector: Option<&SentinelValueMatch>,
+    selector: Option<(&LimitReqKey, &Pattern<'_>)>,
     key: Option<&LimitReqKey>,
 ) -> String {
-    let (field, pattern) =
-        selector.map_or(("", ""), |value| (value.key.as_str(), value.value.as_str()));
+    let (field, literal, suffix) =
+        selector.map_or((Cow::Borrowed(""), "", ""), |(key, pattern)| {
+            let (kind, name) = key_identity(key);
+            let field = name.map_or(Cow::Borrowed(kind), |name| {
+                Cow::Owned(format!("{kind}:{name}"))
+            });
+            let suffix = if pattern.prefix {
+                "*"
+            } else {
+                ""
+            };
+            (field, pattern.literal, suffix)
+        });
     let metering = key.map_or_else(String::new, |key| {
-        let (kind, name) = match key {
-            LimitReqKey::Global => ("global", ""),
-            LimitReqKey::Ip => ("ip", ""),
-            LimitReqKey::Route => ("route", ""),
-            LimitReqKey::Header(name) => ("header", name.as_str()),
-            LimitReqKey::Query(name) => ("query", name.as_str()),
-            LimitReqKey::Cookie(name) => ("cookie", name.as_str()),
-            LimitReqKey::Host => ("host", ""),
-            LimitReqKey::Path => ("path", ""),
-        };
+        let (kind, name) = key_identity(key);
+        let name = name.unwrap_or_default();
         format!(":meter:{kind}:{}:{name}", name.len())
     });
+    // 字面值不含星号，以原有尾随星号编码区分前缀，保留规范写法的现有共享账本。
     nasa::crypto::sha256(&format!(
-        "{}:{id}{}:{binding}{}:{field}{}:{pattern}{metering}",
+        "{}:{id}{}:{binding}{}:{field}{}:{literal}{suffix}{metering}",
         id.len(),
         binding.len(),
         field.len(),
-        pattern.len(),
+        literal.len() + suffix.len(),
     ))
 }
 
@@ -333,7 +358,8 @@ impl RequestRules {
         };
         target.has_circuit |= matches!(&policy, Policy::Circuit(_));
         let index = self.rules.len();
-        if let Some(selector) = selector {
+        // 更换匹配范围或计量字段时使用独立状态；在途请求仍向原作用域归还租约。
+        let identity = if let Some(selector) = selector {
             let key =
                 routing::parse_limit_key(&selector.key).context("invalid Sentinel match.key")?;
             ensure!(
@@ -345,16 +371,15 @@ impl RequestRules {
             } else {
                 Cow::Borrowed(selector.value.as_str())
             };
-            target
-                .attribute(key)
-                .entry(Pattern::parse(&pattern)?)
-                .push(index);
+            let pattern = Pattern::parse(&pattern)?;
+            let identity =
+                rule_identity(binding, id, Some((&key, &pattern)), policy.metering_key());
+            target.attribute(key).entry(pattern).push(index);
+            identity
         } else {
             target.unconditional.push(index);
-        }
-        // 更换匹配范围或计量字段时使用独立状态，避免旧余额参与新规则裁决。
-        // 运行中的请求持有原来的租约，归还时继续使用原作用域。
-        let identity = rule_identity(binding, id, selector, policy.metering_key());
+            rule_identity(binding, id, None, policy.metering_key())
+        };
         self.rules.push(Rule {
             identity,
             crosses_routes,
