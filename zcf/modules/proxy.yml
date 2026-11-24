@@ -1,0 +1,5 @@
+schema_version: 1
+proxies:
+  - id: default
+    listen: "0.0.0.0:8080"
+    routes: []

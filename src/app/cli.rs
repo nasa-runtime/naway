@@ -12,7 +12,7 @@ pub(super) struct Args {
     /// 运行形态；省略时兼容旧命令，按 `all-in-one` 启动。
     #[command(subcommand)]
     pub(super) command: Option<RunMode>,
-    /// 主配置文件路径（默认 `/data/naway/naway.yml`，或环境变量 `NAWAY_CONFIG`；兼容 `GW_CONFIG`）。
+    /// 配置入口路径（默认 `/etc/naway/application.yml`）；支持 `NAWAY_CONFIG` 和 `GW_CONFIG`。
     #[arg(long)]
     pub(super) config: Option<String>,
     /// 向运行中的进程发信号:`reload` = SIGHUP 热更(nginx `-s reload` 风格)。
@@ -128,15 +128,15 @@ impl RunMode {
 }
 
 /// Naway 外部配置固定目录(可 Docker 挂载)。`GW_*` 仅保留为旧迁移变量，不再提供旧品牌默认入口。
-pub(super) const DEFAULT_CONFIG_DIR: &str = "/data/naway";
-pub(super) const DEFAULT_CONFIG_FILE: &str = "naway.yml";
+pub(super) const DEFAULT_CONFIG_DIR: &str = "/etc/naway";
+pub(super) const DEFAULT_CONFIG_FILE: &str = "application.yml";
 /// 业务作用：解析 Naway 主配置路径，并保持显式参数、品牌环境变量与通用兼容变量的确定优先级。
 ///
 /// 参数说明：
 /// - `args`：提供命令行显式配置路径。
 ///
 /// 返回：依次选择 `--config`、`NAWAY_CONFIG`、`GW_CONFIG`、`NAWAY_CONFIG_DIR`、
-/// `GW_CONFIG_DIR` 或默认目录下的 `naway.yml`；接口守卫相对最终主配置目录解析。
+/// `GW_CONFIG_DIR` 或默认目录。目录选择优先使用 application.yml，已存在的旧入口可继续加载。
 pub(super) fn config_path(args: &Args) -> PathBuf {
     if let Some(c) = &args.config {
         return c.into();
@@ -148,14 +148,34 @@ pub(super) fn config_path(args: &Args) -> PathBuf {
         return c.into();
     }
     if let Ok(dir) = std::env::var("NAWAY_CONFIG_DIR") {
-        return PathBuf::from(dir).join(DEFAULT_CONFIG_FILE);
+        return directory_config(PathBuf::from(dir));
     }
     if let Ok(dir) = std::env::var("GW_CONFIG_DIR") {
-        let dir = PathBuf::from(dir);
-        let branded = dir.join(DEFAULT_CONFIG_FILE);
-        return branded;
+        return directory_config(PathBuf::from(dir));
     }
-    PathBuf::from(DEFAULT_CONFIG_DIR).join(DEFAULT_CONFIG_FILE)
+    let primary = directory_config(PathBuf::from(DEFAULT_CONFIG_DIR));
+    let legacy = PathBuf::from("/data/naway/naway.yml");
+    if primary.exists() || !legacy.exists() {
+        primary
+    } else {
+        legacy
+    }
+}
+
+/// 业务作用：让已挂载旧配置的节点平滑继续启动，并为新目录选择具名入口。
+///
+/// 参数说明：
+/// - `directory`：操作方显式提供的配置目录或默认目录。
+///
+/// 返回：已存在的 application.yml 优先，其次选择已存在的 naway.yml。空目录使用 application.yml。
+fn directory_config(directory: PathBuf) -> PathBuf {
+    let entry = directory.join(DEFAULT_CONFIG_FILE);
+    let legacy = directory.join("naway.yml");
+    if entry.exists() || !legacy.exists() {
+        entry
+    } else {
+        legacy
+    }
 }
 
 /// 业务作用：解析 Naway pidfile 路径，确保信号发送端与运行进程使用同一品牌配置入口。

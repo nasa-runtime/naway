@@ -22,7 +22,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
-    && mkdir -p /data/naway \
+    && mkdir -p /etc/naway \
     && rm -rf /var/lib/apt/lists/*
 
 # 指纹只描述业务构建上下文，不应让每次源码改动都击穿昂贵且无关的 apt layer cache。
@@ -31,13 +31,14 @@ LABEL org.opencontainers.image.title="Naway" \
       org.opencontainers.image.naway-source-fingerprint=$NAWAY_SOURCE_FINGERPRINT
 
 COPY --from=builder /work/naway-bin /usr/local/bin/naway
-# 把仓库示例配置作为镜像内置默认放进 /data/naway；挂载外部同名目录即整体覆盖。
-COPY --from=builder /work/naway/zcf/ /data/naway/
+# 默认入口及各业务 YAML 一同装配，外部目录挂载可提供同样布局。
+COPY --from=builder /work/naway/zcf/modules/ /etc/naway/
+COPY --from=builder /work/naway/zcf/interface-guard.yml /work/naway/zcf/sentinel-rules.yml /etc/naway/
 
 # 新部署使用 Naway 品牌变量；二进制仍接受旧 GW_* 变量，供滚动迁移。
-ENV NAWAY_CONFIG_DIR=/data/naway
+ENV NAWAY_CONFIG_DIR=/etc/naway
 ENV NAWAY_PIDFILE=/var/run/naway.pid
-VOLUME ["/data/naway"]
+VOLUME ["/etc/naway"]
 
 # 只暴露数据面端口;管理/观测面(/healthz /readyz /metrics)绑内网 18080,不对外暴露。
 EXPOSE 8080

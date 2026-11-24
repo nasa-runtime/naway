@@ -1,0 +1,18 @@
+application:
+  name: naway
+yml:
+  imports:
+    - file: naway.yml
+      optional: false
+    - file: proxy.yml
+      optional: false
+    - file: stream.yml
+      optional: false
+    - file: upstreams.yml
+      optional: false
+    - file: admin.yml
+      optional: false
+    - file: sentinel-rules.yml
+      optional: false
+    - file: interface-guard.yml
+      optional: false

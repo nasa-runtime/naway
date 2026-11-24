@@ -10,22 +10,35 @@
 
 行为边界以配置 schema、公开协议契约和下述能力说明为准。
 
-## 配置目录（固定 `/data/naway`，便于 Docker 挂载）
+## 配置入口与业务目录
 
-外部 yml **统一放一个固定目录**（默认 `/data/naway/`），做容器时整目录挂进去即可：
+默认入口是 `/etc/naway/application.yml`。它通过 `yml.imports` 按名称登记本地 YAML。
+镜像内置入口和示例文件，也可以把整个目录挂载到容器的 `/etc/naway`。
 
+```yaml
+application:
+  name: naway
+yml:
+  imports:
+    - { file: /etc/naway/naway.yml, optional: false }
+    - { file: /etc/naway/proxy.yml, optional: false }
+    - { file: /etc/naway/stream.yml, optional: false }
+    - { file: /etc/naway/upstreams.yml, optional: false }
+    - { file: /etc/naway/admin.yml, optional: false }
+    - { file: /etc/naway/sentinel-rules.yml, optional: false }
+    - { file: /etc/naway/interface-guard.yml, optional: false }
 ```
-/data/naway/
-├── naway.yml              # 监听 + SCG 风格路由(Path=/Method= 断言、StripPrefix= 过滤器)
-└── interface-guard.yml   # 接口级拦截(独立文件):某接口对外关闭 → 直接返回配置的 response
-```
 
-配置路径优先级：`--config <路径>` > `NAWAY_CONFIG=<路径>` > `GW_CONFIG=<路径>` > `${NAWAY_CONFIG_DIR:-/data/naway}/naway.yml`。
-`interface-guard.yml` 相对主配置目录解析，因此与 `naway.yml` 同目录、一起挂载和热更。
+相对导入路径以入口所在目录为基准。每个文件名必须唯一，每个业务字段只能有一个文件所有者。
+例如 `proxy.yml` 声明 `proxies`，`stream.yml` 声明 `stream`，`upstreams.yml` 声明
+`upstreams`，入口可用 `interface_guard_file` 和 `sentinel_rules_file` 声明自定义规则路径。
+单独修改已登记文件会启动整代校验和热更。必需文件缺失、同名文档、字段冲突或配置无效时保留
+上一份可用配置。现有三文档管理发布适用于传统配置入口。
 
-设置非空 `APP_PROFILE` 时，主配置、接口守卫和 Sentinel 规则分别加载同 stem 的
-`-{profile}` 文件；profile 不存在时保持可选，但其全部格式候选仍会被精确观察。每个本地 YAML、
-JSON 或 TOML 配置文件都有 32 MiB 单文件读取硬门，超限候选不会进入构建事务。
+路径优先取 `--config`、`NAWAY_CONFIG`、`GW_CONFIG`，再取 `NAWAY_CONFIG_DIR`、
+`GW_CONFIG_DIR` 或默认目录。目录没有 `application.yml` 时可继续读取已有的 `naway.yml`。
+设置非空 `APP_PROFILE` 后，每个模块单独加载同名的 `-{profile}` 文件，缺席的 profile 也会被
+观察。具名模块整组及单文件均受 32 MiB 读取预算约束。
 
 管理端的单文档与完整文档集校验直接读取候选原文，不为临时路径重编码 YAML。主配置与规则的
 profile 仍以真实部署路径派生，相对 SecretSource 与其它依赖保持真实配置根；主 profile 和
@@ -4297,7 +4310,7 @@ Properties 最多 8192 项、每逻辑行 16KiB、键 1024 字节、结构深度
 
 ```bash
 ./scripts/build.sh
-# 把 yml 放宿主 /data/naway，直接启动（挂载到容器同路径，修改 yml 即热更）：
+# 将入口和业务 YAML 放在宿主 /etc/naway，整个目录挂入容器：
 ./scripts/start.sh
 # 或指定别的宿主配置目录：NAWAY_CONFIG_DIR=/your/conf ./scripts/start.sh
 ```

@@ -14,6 +14,7 @@ pub mod layers;
 pub mod management;
 pub mod media;
 pub mod model;
+mod modules;
 pub(crate) mod monitor;
 pub mod operations;
 pub mod providers;
@@ -1183,6 +1184,7 @@ fn load_snapshot_input(
         documents,
         main,
     )?;
+    let module_sources = loaded.value.module_sources.clone();
     let snapshot = build_snapshot_from_config(
         cfg_path,
         documents,
@@ -1193,6 +1195,9 @@ fn load_snapshot_input(
         #[cfg(feature = "config-providers")]
         input,
     )?;
+    if let Some(sources) = module_sources {
+        sources.revalidate()?;
+    }
     identity.finish(snapshot)
 }
 
@@ -5122,14 +5127,39 @@ pub(crate) fn load_gateway_config(cfg_path: &Path) -> Result<GatewayConfig> {
 ///
 /// 返回：强类型配置和本轮实际来源同时成功时返回；失败时不暴露部分配置或部分来源。
 fn load_gateway_config_tracked(cfg_path: &Path) -> Result<LoadedYml<GatewayConfig>> {
+    load_gateway_documents(cfg_path, cfg_path)
+}
+
+/// 业务作用：统一在线配置和隔离候选的 YAML 装配，保持部署根、profile 与有效环境相同。
+///
+/// 参数说明：
+/// - `cfg_path`：真实部署入口与相对依赖根。
+/// - `physical`：本轮主文档原文的位置。
+///
+/// 返回：完整强类型配置和本地来源。模块读取、表达式或业务配置不合法时拒绝候选。
+fn load_gateway_documents(cfg_path: &Path, physical: &Path) -> Result<LoadedYml<GatewayConfig>> {
     // gateway.yml 内既允许普通配置占位符(`${GW_UPSTREAM:http://...}`),也允许 filter DSL 运行期变量
     // (`${remote_addr}` / `${request_id}`)。因此使用 naml 的宽松解析:能解析的配置占位符照常解析,
     // 未命中的运行期变量保留给 gateway 的变量系统解释。
-    let mut loaded: LoadedYml<GatewayConfig> = loader(cfg_path)
-        .preserve_unresolved_placeholders(true)
+    let loader = candidate::loader(cfg_path, Some(physical)).preserve_unresolved_placeholders(true);
+    let entry: LoadedYml<serde_json::Value> = loader
         .load_tracked()
-        .with_context(|| format!("load gateway config {}", cfg_path.display()))?;
-    expand_config_snippets(&mut loaded.value, cfg_path, cfg_path)?;
+        .with_context(|| format!("load gateway config {}", physical.display()))?;
+    let mut loaded = if let Some((overlay, sources)) = modules::load(cfg_path, physical, &entry.value)? {
+        let mut loaded: LoadedYml<GatewayConfig> = loader.load_tracked_with_overlays(&[overlay])?;
+        anyhow::ensure!(
+            !loaded.value.config_source.nacos.enabled,
+            "a local named configuration cannot enable legacy Nacos configuration"
+        );
+        loaded.value.module_sources = Some(sources);
+        loaded
+    } else {
+        LoadedYml {
+            value: serde_json::from_value(entry.value).context("decode gateway config")?,
+            sources: entry.sources,
+        }
+    };
+    expand_config_snippets(&mut loaded.value, cfg_path, physical)?;
     centers::apply(&mut loaded.value)?;
     Ok(loaded)
 }
@@ -5538,6 +5568,9 @@ pub(crate) fn config_fingerprint(main_cfg: &Path) -> Result<u64> {
     hash_yml_sources(&mut hasher, &loaded.sources)?;
 
     let cfg = loaded.value;
+    if let Some(sources) = &cfg.module_sources {
+        sources.hash(&mut hasher);
+    }
     let guard_path = resolve_relative(main_cfg, &cfg.interface_guard_file);
     hash_yml_sources(&mut hasher, &loader(&guard_path).local_sources()?)?;
     let sentinel_path = resolve_relative(main_cfg, &cfg.sentinel_rules_file);
@@ -5589,6 +5622,9 @@ fn config_watch_dependencies<'a>(
     paths.extend(collect_secret_dependencies(cfg, config_dir));
     paths.extend(collect_geoip_dependencies(cfg, config_dir));
     paths.extend(cfg.snippet_files.iter().cloned());
+    if let Some(sources) = &cfg.module_sources {
+        paths.extend_from_slice(sources.watch());
+    }
     for sources in auxiliary_sources {
         paths.extend(sources.watch_files().map(Path::to_path_buf));
     }

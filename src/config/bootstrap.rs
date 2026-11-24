@@ -1,6 +1,6 @@
 //! 启动自举(对标 Higress 首次启动生成默认配置)。
 //!
-//! 检测固定配置目录(默认 `/data/naway`)下的 yml 是否齐全:
+//! 检测配置目录下的启动入口与最低运行文件:
 //! - 目录不存在 → 创建;
 //! - `naway.yml` 不存在 → 写入**最低运行默认**(能监听、无路由,请求 404,可正常起);
 //! - `interface-guard.yml`(名取自主配置的 `interface_guard_file`)不存在 → 写入**空守卫默认**(不拦任何接口)。
@@ -740,6 +740,29 @@ pub fn ensure(cfg_path: &Path) -> Result<()> {
                 .with_context(|| format!("create config dir {}", dir.display()))?;
             tracing::info!(dir = %dir.display(), "config directory created");
         }
+    }
+
+    if super::modules::is_manifest(cfg_path) {
+        if !cfg_path.try_exists()? {
+            // 先落盘最低业务文件，再创建入口；现有入口中的缺失声明由加载器拒绝，不替操作方填空。
+            let dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
+            for (name, content) in [
+                ("naway.yml", include_str!("../../zcf/modules/naway.yml")),
+                ("proxy.yml", include_str!("../../zcf/modules/proxy.yml")),
+                ("stream.yml", include_str!("../../zcf/modules/stream.yml")),
+                (
+                    "upstreams.yml",
+                    include_str!("../../zcf/modules/upstreams.yml"),
+                ),
+                ("admin.yml", include_str!("../../zcf/modules/admin.yml")),
+                ("interface-guard.yml", DEFAULT_INTERFACE_GUARD_YML),
+                ("sentinel-rules.yml", DEFAULT_SENTINEL_RULES_YML),
+            ] {
+                write_new(&dir.join(name), content)?;
+            }
+            write_new(cfg_path, include_str!("../../zcf/modules/application.yml"))?;
+        }
+        return Ok(());
     }
 
     // 2. 主配置 gateway.yml 缺失 → 写最低运行默认。

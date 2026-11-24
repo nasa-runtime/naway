@@ -93,6 +93,11 @@ pub(crate) fn load_documents(
     version: u64,
     #[cfg(feature = "config-providers")] previous: Option<Arc<crate::control::providers::Snapshot>>,
 ) -> Result<GatewaySnapshot> {
+    // 三文档归档与回滚不拥有模块目录，不能把入口覆盖为单份配置或承诺未归档模块的回滚。
+    anyhow::ensure!(
+        !super::modules::is_manifest(cfg_path) && !super::modules::is_manifest(documents.gateway),
+        "named configuration requires a module-aware publication operation"
+    );
     let main = super::source_identity::Document::read(documents.gateway)?;
     let loaded: LoadedYml<GatewayConfig> = loader(cfg_path, Some(documents.gateway))
         .preserve_unresolved_placeholders(true)

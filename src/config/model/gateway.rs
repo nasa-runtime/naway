@@ -33,6 +33,9 @@ pub struct GatewayConfig {
     /// 缺省(`None`)按 v1 处理并告警,详见 `load_snapshot` 的 `resolve_schema_version`。
     #[serde(default)]
     pub schema_version: Option<u32>,
+    /// 已读取的具名业务文件及其精确观察目标，由加载器填充。
+    #[serde(skip)]
+    pub(in crate::config) module_sources: Option<std::sync::Arc<crate::config::modules::Sources>>,
     /// 旧版单入口配置。新版推荐 `proxies[]`;没有配置 `proxies[]` 时,该字段会兼容生成 default proxy。
     #[serde(default)]
     pub server: Option<ServerCfg>,
