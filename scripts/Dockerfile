@@ -33,7 +33,6 @@ LABEL org.opencontainers.image.title="Naway" \
 COPY --from=builder /work/naway-bin /usr/local/bin/naway
 # 默认入口及各业务 YAML 一同装配，外部目录挂载可提供同样布局。
 COPY --from=builder /work/naway/zcf/modules/ /etc/naway/
-COPY --from=builder /work/naway/zcf/interface-guard.yml /work/naway/zcf/sentinel-rules.yml /etc/naway/
 
 # 新部署使用 Naway 品牌变量；二进制仍接受旧 GW_* 变量，供滚动迁移。
 ENV NAWAY_CONFIG_DIR=/etc/naway
