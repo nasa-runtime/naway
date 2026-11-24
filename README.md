@@ -780,12 +780,12 @@ admin:
 ## 快速开始
 
 ```bash
-# 本地开发:用仓库示例配置目录 zcf/
-NAWAY_CONFIG_DIR=zcf cargo run
-# 或显式指定主配置
+# 本地开发使用仓库的具名配置示例
+NAWAY_CONFIG_DIR=zcf/modules cargo run
+# 加载传统入口时显式指定主配置
 cargo run -- --config zcf/naway.yml
 
-# 生产：把 yml 放宿主 /data/naway，直接运行（默认读 /data/naway/naway.yml）
+# 生产默认读取 /etc/naway/application.yml
 naway
 
 # 热更(nginx 风格,向运行进程发 SIGHUP);或直接改 yml,naml 自动热加载(无感、零抖动)
@@ -4376,7 +4376,7 @@ ADS 配置热更会撤销旧任务的状态和发布权；即使节点身份随�
 
 `xds-server` 是独立、默认关闭的 feature。它把已经发布的 Naway 配置快照投影为 Envoy v3
 LDS/RDS/CDS/EDS/SDS，通过 ADS SotW 或 Delta 向获授权的数据面分发。它不接收下游配置写入，
-也不引入另一份路由事实源。独立部署可运行 `naway --config /data/naway/naway.yml admin`，
+也不引入另一份路由事实源。独立部署可运行 `naway --config /etc/naway/application.yml admin`，
 不在管理进程绑定所投影的业务 listener。
 
 必须显式选择 `http_routing` 合同：它只生成固定 HTTP 路由及静态 TLS 身份，**不是完整 Naway
