@@ -117,6 +117,8 @@ struct ControlStatusIntent {
     plural: String,
     namespace: Option<String>,
     name: String,
+    /// ListenerSet 同轮依赖的 Gateway 命名空间及名称。
+    parent_gateway: Option<(String, String)>,
     status: Value,
 }
 
@@ -2271,6 +2273,7 @@ fn build_control_status_intents_with_listener_sets(
             plural: "gatewayclasses".to_owned(),
             namespace: None,
             name: name.to_owned(),
+            parent_gateway: None,
             status: json!({
                 "conditions":[gateway_condition(
                 "Accepted", true, "Accepted", "controller accepts this GatewayClass",
@@ -2578,6 +2581,7 @@ fn build_control_status_intents_with_listener_sets(
             plural: "gateways".to_owned(),
             namespace: Some(namespace.to_owned()),
             name: name.to_owned(),
+            parent_gateway: None,
             status: json!({
                 "addresses":addresses,
                 "conditions":gateway_conditions,
@@ -2751,6 +2755,10 @@ fn build_control_status_intents_with_listener_sets(
             plural: "listenersets".to_owned(),
             namespace: Some(namespace.to_owned()),
             name: name.to_owned(),
+            parent_gateway: Some((
+                decision.gateway_namespace.clone(),
+                decision.gateway_name.clone(),
+            )),
             status: json!({
                 "conditions":[
                     gateway_condition("Accepted", valid, accepted_reason, accepted_message, generation, &transition_time),
@@ -3264,6 +3272,7 @@ fn build_inference_pool_status_intents(
             plural: "inferencepools".to_owned(),
             namespace: Some(pool_namespace.to_owned()),
             name: pool_name.to_owned(),
+            parent_gateway: None,
             status: json!({
                 "parents": parent_statuses
             }),
@@ -3320,7 +3329,7 @@ async fn publish_route_statuses(
     Ok(())
 }
 
-/// 业务作用：用独立 field manager 发布 GatewayClass/Gateway status，不取得 spec 或其它 controller 字段所有权。
+/// 业务作用：逐个发布控制对象状态，使一个 Gateway 的写入失败只阻止其 ListenerSet 更新。
 ///
 /// 参数说明：
 /// - `client`：使用固定身份与传输策略的 Kubernetes API 客户端。
@@ -3328,7 +3337,7 @@ async fn publish_route_statuses(
 /// - `cfg`：固定控制器身份、namespace 接管范围、绑定地址与资源预算的配置。
 /// - `intents`：基于同一冻结观察轮生成的外部写入意图。
 ///
-/// 返回：全部 status apply 成功时返回成功；RBAC、冲突或 transport 失败等待下轮恢复。
+/// 返回：全部状态成功才允许后续 Route 状态发布；Gateway 或 ListenerSet 失败后继续提交独立状态，再返回首个失败。
 async fn publish_control_statuses(
     client: &reqwest::Client,
     discovery: &KubernetesDiscoveryCfg,
@@ -3339,56 +3348,102 @@ async fn publish_control_statuses(
         intents.len() <= cfg.max_status_updates,
         "Gateway control status updates exceed max_status_updates"
     );
+    let mut failed_gateways = HashSet::new();
+    let mut first_failure = None;
     for intent in intents {
-        let path = match intent.namespace.as_deref() {
-            Some(namespace) => format!(
-                "/apis/{}/namespaces/{}/{}/{}/status",
-                intent.api_version, namespace, intent.plural, intent.name
-            ),
-            None => format!(
-                "/apis/{}/{}/{}/status",
-                intent.api_version, intent.plural, intent.name
-            ),
-        };
-        let url = format!(
-            "{}{}?fieldManager=naway-gateway-controller",
-            discovery.api_server, path
-        );
-        let mut metadata = json!({
-            "name":intent.name
-        });
-        if let Some(namespace) = intent.namespace.as_deref() {
-            metadata["namespace"] = json!(namespace);
+        if intent
+            .parent_gateway
+            .as_ref()
+            .is_some_and(|(namespace, name)| {
+                failed_gateways.contains(&(namespace.as_str(), name.as_str()))
+            })
+        {
+            // 同一父 Gateway 的当前代次尚未确认，不能发布其 ListenerSet 的接纳状态。
+            continue;
         }
-        let mut request = client
-            .patch(url)
-            .timeout(Duration::from_millis(cfg.request_timeout_ms))
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/apply-patch+yaml",
-            )
-            .body(
-                serde_json::to_vec(&json!({
-                    "apiVersion":intent.api_version,
-                    "kind":intent.kind,
-                    "metadata":metadata,
-                    "status":intent.status
-                }))
-                .context("encode Gateway control status apply")?,
-            );
-        if !discovery.bearer_token.is_empty() {
-            request = request.bearer_auth(&discovery.bearer_token);
+        if let Err(error) = publish_control_status(client, discovery, cfg, intent).await {
+            match intent.kind.as_str() {
+                "Gateway" => {
+                    let namespace = intent
+                        .namespace
+                        .as_deref()
+                        .context("Gateway status requires namespace")?;
+                    failed_gateways.insert((namespace, intent.name.as_str()));
+                }
+                "ListenerSet" => {}
+                _ => return Err(error),
+            }
+            // 保留首个失败以阻止子 Route 状态前进；无依赖的对象仍可发布本轮结论。
+            first_failure.get_or_insert(error);
         }
-        let response = request
-            .send()
-            .await
-            .context("send Gateway control status apply")?;
-        anyhow::ensure!(
-            response.status().is_success(),
-            "Gateway control status apply returned HTTP {}",
-            response.status()
-        );
     }
+    first_failure.map_or(Ok(()), Err)
+}
+
+/// 业务作用：以独立 field manager 写入指定受管对象的 status 子资源。
+///
+/// 参数说明：
+/// - `client`：复用的 Kubernetes API 客户端。
+/// - `discovery`：固定 API endpoint 与当前认证凭据。
+/// - `cfg`：单次状态写入的请求时限。
+/// - `intent`：同轮已完成编译的状态意图。
+///
+/// 返回：API 确认状态写入时成功；传输或 HTTP 拒绝时附带对象身份供重试诊断。
+async fn publish_control_status(
+    client: &reqwest::Client,
+    discovery: &KubernetesDiscoveryCfg,
+    cfg: &KubernetesRouteSourceCfg,
+    intent: &ControlStatusIntent,
+) -> anyhow::Result<()> {
+    let path = match intent.namespace.as_deref() {
+        Some(namespace) => format!(
+            "/apis/{}/namespaces/{}/{}/{}/status",
+            intent.api_version, namespace, intent.plural, intent.name
+        ),
+        None => format!(
+            "/apis/{}/{}/{}/status",
+            intent.api_version, intent.plural, intent.name
+        ),
+    };
+    let url = format!(
+        "{}{}?fieldManager=naway-gateway-controller",
+        discovery.api_server, path
+    );
+    let mut metadata = json!({
+        "name":intent.name
+    });
+    if let Some(namespace) = intent.namespace.as_deref() {
+        metadata["namespace"] = json!(namespace);
+    }
+    let mut request = client
+        .patch(url)
+        .timeout(Duration::from_millis(cfg.request_timeout_ms))
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/apply-patch+yaml",
+        )
+        .body(
+            serde_json::to_vec(&json!({
+                "apiVersion":intent.api_version,
+                "kind":intent.kind,
+                "metadata":metadata,
+                "status":intent.status
+            }))
+            .context("encode Gateway control status apply")?,
+        );
+    if !discovery.bearer_token.is_empty() {
+        request = request.bearer_auth(&discovery.bearer_token);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("apply Gateway API status for {} {path}", intent.kind))?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "Gateway control status apply returned HTTP {} for {} {path}",
+        response.status(),
+        intent.kind
+    );
     Ok(())
 }
 
@@ -7276,6 +7331,7 @@ fn build_backend_tls_status_intents(
             plural: "backendtlspolicies".to_owned(),
             namespace: Some(namespace.to_owned()),
             name: name.to_owned(),
+            parent_gateway: None,
             status: json!({
                 "ancestors": ancestor_statuses
             }),
@@ -7357,6 +7413,7 @@ fn build_backend_traffic_status_intents(
             plural: "xbackendtrafficpolicies".to_owned(),
             namespace: Some(namespace.to_owned()),
             name: name.to_owned(),
+            parent_gateway: None,
             status: json!({
                 "ancestors": ancestors
             }),
