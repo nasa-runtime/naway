@@ -65,9 +65,15 @@ pub(super) fn read(state: &AdminState, identity: &AdminIdentity) -> Response<Box
         .admin_operations
         .as_ref()
         .filter(|_| state.mode.full_control_plane());
+    #[cfg(feature = "admin-operations-pgsql")]
+    let materials_enabled = state.operations.get().is_some()
+        && operations.is_some_and(|plan| plan.config.certificates.enabled);
+    #[cfg(not(feature = "admin-operations-pgsql"))]
+    let materials_enabled = false;
     let operations = match operations {
         Some(plan) => serde_json::json!({
             "enabled": true,
+            "materials_enabled": materials_enabled,
             "accept_proposals": plan.config.accept_proposals,
             "cluster_id": plan.config.cluster_id,
             "max_candidate_bytes": plan.config.max_candidate_bytes,
@@ -76,7 +82,8 @@ pub(super) fn read(state: &AdminState, identity: &AdminIdentity) -> Response<Box
             "max_ttl_seconds": 86400,
         }),
         None => serde_json::json!({
-            "enabled": false
+            "enabled": false,
+            "materials_enabled": false,
         }),
     };
     #[cfg(feature = "telemetry-otlp")]

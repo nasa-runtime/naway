@@ -39,6 +39,20 @@ function allowed(resource, action = "read") {
 }
 
 /**
+ * 业务作用：根据部署的材料存储能力和当前主体权限开放证书材料入口。
+ * 参数说明: 无。
+ * 返回：存储已启用且主体有平台读取权限或工作区范围时为真。
+ */
+function materialsAvailable() {
+  return (
+    session?.operations?.materials_enabled === true &&
+    (["certificate-proposals", "certs", "cluster"].every((resource) =>
+      allowed(resource),
+    ) || Boolean(session.workspaces?.length))
+  );
+}
+
+/**
  * 业务作用：撤销旧视图、展开所属一级菜单，并按当前能力挂载选择的页面。
  * 参数说明：
  * - `name`：导航中的固定页面标识。
@@ -111,14 +125,7 @@ function navigate(name, service = "") {
     document.getElementById("subtitle").textContent =
       "共享集群候选 · 双人审阅与集群执行";
     dispose = operations(root, session);
-  } else if (
-    name === "materials" &&
-    session.operations?.enabled &&
-    (["certificate-proposals", "certs", "cluster"].every((resource) =>
-      allowed(resource),
-    ) ||
-      session.workspaces?.length)
-  ) {
+  } else if (name === "materials" && materialsAvailable()) {
     document.getElementById("title").textContent = "证书材料";
     document.getElementById("subtitle").textContent =
       "完整原目标 · 双人审批、共享影响与实际交付";
@@ -389,13 +396,7 @@ async function login(event) {
       (allowed("cluster") && allowed("certs")) ||
       session.workspaces?.length
     );
-    document.getElementById("materials-nav").disabled = !(
-      session.operations?.enabled &&
-      (["certificate-proposals", "certs", "cluster"].every((resource) =>
-        allowed(resource),
-      ) ||
-        session.workspaces?.length)
-    );
+    document.getElementById("materials-nav").disabled = !materialsAvailable();
     document.getElementById("catalog-nav").disabled =
       !allowed("cluster") ||
       !["routes", "config", "upstreams"].some((resource) => allowed(resource));
