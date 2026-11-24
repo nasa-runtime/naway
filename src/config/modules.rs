@@ -206,6 +206,33 @@ pub(super) fn load(
             stem == "naway" || !module.contains_key("log"),
             "scoped log requires a log destination for module {name}"
         );
+        // 私有日志必须先获得独立输出，否则不能让配置看似生效却把记录写进全局目录。
+        let private_http = module
+            .get("proxies")
+            .and_then(Value::as_array)
+            .is_some_and(|proxies| proxies.iter().any(|proxy| proxy.get("log").is_some()));
+        let private_stream = module
+            .get("stream")
+            .and_then(|stream| stream.get("listeners"))
+            .and_then(Value::as_array)
+            .is_some_and(|listeners| {
+                listeners
+                    .iter()
+                    .any(|listener| listener.get("log").is_some())
+            });
+        ensure!(
+            !private_http
+                && !private_stream
+                && module
+                    .get("server")
+                    .and_then(|server| server.get("log"))
+                    .is_none()
+                && module
+                    .get("admin")
+                    .and_then(|admin| admin.get("log"))
+                    .is_none(),
+            "private log output is not supported for a listener in {name}"
+        );
         for (key, value) in module {
             // 每个业务字段只有一个文件所有者，冲突时拒绝，避免依赖导入顺序默默覆盖旧配置。
             ensure!(

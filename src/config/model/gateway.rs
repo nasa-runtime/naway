@@ -14,7 +14,7 @@ pub struct GatewayConfig {
     /// 来源头的显式使用方式与回溯预算，代理信任仍由各入口 trusted_proxies 授予。
     #[serde(default)]
     pub client_ip_policy: Option<crate::config::ip_policy::ClientIpCfg>,
-    /// NASA 进程日志配置；naml 展开目录占位符，文件输出与进程同寿命。
+    /// NASA 进程兜底日志配置，由 naml 展开占位符并随具名配置更新。
     #[serde(default)]
     pub log: Option<nasa::log::LogConfig>,
     /// 独立 xDS 管理端的传输身份、节点授权和已发布原生对象投影范围。

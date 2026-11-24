@@ -149,7 +149,7 @@ pub(super) async fn run() -> Result<()> {
         tracing_opentelemetry::layer().with_tracer(telemetry_generation.tracer()),
     );
     // 文件日志必须在开放路由前成功建立；守卫活到全部停机步骤结束，避免缓冲输出提前失去刷盘线程。
-    let _process_log_guard = snapshot.process_log.start()?;
+    let process_log = gateway::observability::logging::ProcessLog::open(&snapshot.process_log)?;
     let telemetry =
         gateway::observability::telemetry::SwappableTelemetryRuntime::new(telemetry_generation);
     // reload channel 容量和去抖窗口属 bootstrap 执行参数；worker 建立后不在热更时自重建。
@@ -619,6 +619,7 @@ pub(super) async fn run() -> Result<()> {
         version.clone(),
         reload::ReloadRuntime {
             apply_coordinator: apply_coordinator.clone(),
+            process_log: Some(process_log.clone()),
             dynamic_upstreams: dynamic_upstreams.clone(),
             discovery: discovery.clone(),
             rate_limiter: rate_limiter.clone(),
@@ -767,5 +768,6 @@ pub(super) async fn run() -> Result<()> {
         warn!(%error, "OpenTelemetry shutdown/flush failed");
     }
     info!("gateway stopped");
+    process_log.shutdown();
     Ok(())
 }

@@ -111,6 +111,8 @@ pub struct GatewaySnapshot {
     pub(crate) sentinel_requests: Arc<sentinel::request::RequestRules>,
     /// 已验证的进程日志启动声明；候选构建不打开日志文件。
     pub process_log: crate::observability::logging::LogPlan,
+    /// 具名入口随候选发布，用于约束与三文档写入协议之间的切换。
+    pub(crate) named_configuration: bool,
     /// 与原生路由原子发布的下游 xDS 投影，未启用制品时不存在该资源域。
     #[cfg(feature = "xds-server")]
     pub xds_server: Option<Arc<crate::control::xds_server::Plan>>,
@@ -1584,6 +1586,7 @@ fn build_snapshot_from_config(
         sentinel_rules: sentinel.rules,
         sentinel_requests: Arc::new(sentinel.requests),
         process_log,
+        named_configuration: cfg.module_sources.is_some(),
         #[cfg(feature = "xds-server")]
         xds_server,
         ownership,

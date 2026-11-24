@@ -33,7 +33,9 @@ yml:
 例如 `proxy.yml` 声明 `proxies`，`stream.yml` 声明 `stream`，`upstreams.yml` 声明
 `upstreams`，入口可用 `interface_guard_file` 和 `sentinel_rules_file` 声明自定义规则路径。
 单独修改已登记文件会启动整代校验和热更。必需文件缺失、同名文档、字段冲突或配置无效时保留
-上一份可用配置。现有三文档管理发布适用于传统配置入口。
+上一份可用配置。`naway.yml` 的 `log` 是进程全局配置。更改日志目录、级别或滚动参数会
+随具名配置热更。候选日志目录无法打开时，当前业务配置和文件日志继续服务。
+现有三文档管理发布适用于传统配置入口。
 
 路径优先取 `--config`、`NAWAY_CONFIG`、`GW_CONFIG`，再取 `NAWAY_CONFIG_DIR`、
 `GW_CONFIG_DIR` 或默认目录。目录没有 `application.yml` 时可继续读取已有的 `naway.yml`。

@@ -233,6 +233,8 @@ impl SnapshotApplyCoordinator {
 pub struct ReloadRuntime {
     /// file/Nacos/xDS 共享的唯一快照发布权威。
     pub apply_coordinator: Arc<SnapshotApplyCoordinator>,
+    /// 进程全局兜底日志的同代输出 owner。
+    pub process_log: Option<Arc<crate::observability::logging::ProcessLog>>,
     /// Nacos watch 写入的动态上游事实源。
     pub dynamic_upstreams: Arc<DynamicUpstreamStore>,
     /// 服务订阅与网关自注册协调器。
@@ -591,8 +593,19 @@ async fn apply_reload_input(
                 );
                 return false;
             }
-            // 文件 writer 由启动栈持有，拒绝声明与真实输出分离的配置换代。
-            if !old.process_log.same_bootstrap(&new_snap.process_log) {
+            if old.named_configuration != new_snap.named_configuration {
+                history.record_rejected(
+                    trigger,
+                    cfg_path,
+                    old_version,
+                    next,
+                    "named and legacy configuration entry changes require restart",
+                );
+                return false;
+            }
+            let change_log = !old.process_log.same_bootstrap(&new_snap.process_log);
+            // 旧三文档发布包含持久文件决定，无法协调其中途日志变更，继续走原启动配置约束。
+            if change_log && (!new_snap.named_configuration || runtime.process_log.is_none()) {
                 history.record_rejected(
                     trigger,
                     cfg_path,
@@ -1201,6 +1214,8 @@ async fn apply_reload_input(
                 }
             }
             let new_snap = Arc::new(new_snap);
+            let mut retired_log = None;
+            let mut publication_error = None;
             let published = history.with_stable_local_files(|| {
                 // 异步资源准备不能延续旧文件的写权；最终复验与快照发布共享文件事务，
                 // 防止并发审批在准备期间撤销成员或 grant 后仍让旧候选开放业务路由。
@@ -1227,6 +1242,24 @@ async fn apply_reload_input(
                 if let Err(error) = history.complete_local_publication(&new_snap) {
                     tracing::error!(%error, "local file publication completion was not confirmed");
                     return false;
+                }
+                if change_log {
+                    // 其它候选门禁已经完成，文件不可用时旧快照与旧日志继续服务。
+                    match runtime
+                        .process_log
+                        .as_ref()
+                        .expect("log owner checked before preparing resources")
+                        .install(&new_snap.process_log)
+                    {
+                        Ok(previous) => {
+                            retired_log = previous;
+                        }
+                        Err(error) => {
+                            publication_error =
+                                Some(format!("process log output rejected: {error:#}"));
+                            return false;
+                        }
+                    }
                 }
                 if next_admin_audit.is_some() {
                     // 先关闭旧审计追加，再发布新 owner，禁止在校验过的 spool 上迟到双写。
@@ -1275,7 +1308,9 @@ async fn apply_reload_input(
                     cfg_path,
                     old_version,
                     next,
-                    "configuration authority changed during resource preparation",
+                    publication_error.as_deref().unwrap_or(
+                        "configuration authority changed during resource preparation",
+                    ),
                 );
                 return false;
             }
@@ -1377,6 +1412,10 @@ async fn apply_reload_input(
             }
             version.store(next, Ordering::Relaxed);
             history.record_success(trigger, cfg_path, old_version, new_snap.as_ref());
+            if retired_log.is_some() {
+                // 文件发布锁外等待旧 writer 刷盘，由唯一重载任务限制同时待回收的日志代。
+                let _ = tokio::task::spawn_blocking(move || drop(retired_log)).await;
+            }
             tracing::info!(
                 trigger,
                 version = next,
