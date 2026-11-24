@@ -7,7 +7,7 @@ use super::{
 use anyhow::{Context, Result};
 use notify::Watcher as _;
 use parking_lot::Mutex;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
 
@@ -15,13 +15,17 @@ const MAX_SUBSCRIPTIONS: usize = 16;
 const MAX_PENDING_CHANGES: usize = 256;
 const MAX_EVENT_PATHS: usize = 32;
 
+static FILE_SUBSCRIPTIONS: Mutex<Vec<Subscription>> = parking_lot::const_mutex(Vec::new());
+
 #[derive(Default)]
 pub(super) struct Subscriptions {
-    entries: Mutex<Vec<Subscription>>,
+    owner: Arc<()>,
 }
 
 struct Subscription {
+    directory: PathBuf,
     collection: String,
+    owner: Weak<()>,
     sender: Weak<mpsc::Sender<DynamicStoreChange>>,
 }
 
@@ -30,39 +34,43 @@ pub(super) struct Guard {
     _sender: Arc<mpsc::Sender<DynamicStoreChange>>,
 }
 
-impl Subscriptions {
-    /// 业务作用：只向仍存活且同集合的读者提供已决定文件变更提示，不等待慢消费者。
-    ///
-    /// 参数说明：
-    /// - `collection`：事实所属集合。
-    /// - `key`：已完成写入或删除的业务键。
-    /// - `kind`：文件决定的操作类型。
-    /// - `notification`：写入者明确提供的有界通知；删除不沿用旧封禁事件。
-    ///
-    /// 返回：无返回值；满队列仍保留已排队提示并由周期全量对账兜底，不回滚事实。
-    pub(super) fn publish(
-        &self,
-        collection: &str,
-        key: &str,
-        kind: DynamicStoreChangeKind,
-        notification: Option<serde_json::Value>,
-    ) {
-        self.entries.lock().retain(|entry| {
-            let Some(sender) = entry.sender.upgrade() else {
-                return false;
-            };
-            if entry.collection == collection {
-                let _ = sender.try_send(DynamicStoreChange {
-                    collection: collection.to_owned(),
-                    key: key.to_owned(),
-                    kind,
-                    notification: notification.clone(),
-                });
-            }
-            true
-        });
-    }
+/// 业务作用：向进程内共享同一文件集合的订阅者发送已落盘的变更，避免依赖原生事件传递受管写入。
+///
+/// 参数说明：
+/// - `root`：写入者使用的动态事实根目录。
+/// - `collection`：事实所属集合。
+/// - `key`：已完成写入或删除的业务键。
+/// - `kind`：文件决定的操作类型。
+/// - `notification`：写入者明确提供的有界通知；删除不沿用旧通知。
+///
+/// 返回：无；目录不可定位或队列满时由原生观察与周期对账补偿，已落盘决定继续有效。
+pub(super) fn publish(
+    root: &Path,
+    collection: &str,
+    key: &str,
+    kind: DynamicStoreChangeKind,
+    notification: Option<serde_json::Value>,
+) {
+    let Ok(directory) = root.join(collection).canonicalize() else {
+        return;
+    };
+    FILE_SUBSCRIPTIONS.lock().retain(|entry| {
+        let Some(sender) = entry.sender.upgrade() else {
+            return false;
+        };
+        if entry.directory == directory && entry.collection == collection {
+            let _ = sender.try_send(DynamicStoreChange {
+                collection: collection.to_owned(),
+                key: key.to_owned(),
+                kind,
+                notification: notification.clone(),
+            });
+        }
+        true
+    });
+}
 
+impl Subscriptions {
     /// 业务作用：将受管文件决定和操作系统观察绑定到同一个有界订阅生命周期。
     ///
     /// 参数说明：
@@ -72,10 +80,15 @@ impl Subscriptions {
     /// 返回：完整注册后返回接收器；观察初始化或容量失败不保留发送端及原生观察器。
     pub(super) fn watch(&self, root: &Path, collection: &str) -> Result<DynamicStoreWatcher> {
         validate_component(collection, "collection")?;
-        let mut subscriptions = self.entries.lock();
+        let owner = Arc::downgrade(&self.owner);
+        let mut subscriptions = FILE_SUBSCRIPTIONS.lock();
         subscriptions.retain(|entry| entry.sender.strong_count() > 0);
         anyhow::ensure!(
-            subscriptions.len() < MAX_SUBSCRIPTIONS,
+            subscriptions
+                .iter()
+                .filter(|entry| entry.owner.ptr_eq(&owner))
+                .count()
+                < MAX_SUBSCRIPTIONS,
             "file dynamic subscriptions full"
         );
         let directory = root.join(collection);
@@ -129,7 +142,9 @@ impl Subscriptions {
             .watch(&directory, notify::RecursiveMode::Recursive)
             .context("watch dynamic collection")?;
         subscriptions.push(Subscription {
+            directory,
             collection: collection.to_owned(),
+            owner,
             sender: Arc::downgrade(&sender),
         });
         Ok(DynamicStoreWatcher {

@@ -366,7 +366,8 @@ impl FileDynamicStore {
             });
         }
         // 完整文件已在原集合中决定，订阅方才可据此重读；提示失败不撤销已完成写入。
-        self.subscriptions.publish(
+        file_watch::publish(
+            &self.root,
             collection,
             key,
             DynamicStoreChangeKind::Put,
@@ -465,7 +466,8 @@ impl DynamicStore for FileDynamicStore {
             match fs::remove_file(&path) {
                 Ok(()) => {
                     // 提示跟随已完成的事实撤销，不能让读者把未决定的删除当成解封。
-                    self.subscriptions.publish(
+                    file_watch::publish(
+                        &self.root,
                         collection,
                         key,
                         DynamicStoreChangeKind::Delete,
@@ -510,7 +512,8 @@ impl DynamicStore for FileDynamicStore {
             match fs::remove_file(&path) {
                 Ok(()) => {
                     // 回收确实删除了原值后才通知；比较失败不会撤销后来的续期事实。
-                    self.subscriptions.publish(
+                    file_watch::publish(
+                        &self.root,
                         collection,
                         key,
                         DynamicStoreChangeKind::Delete,
