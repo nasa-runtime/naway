@@ -1595,7 +1595,13 @@ impl super::GatewayProxy {
         });
         let dynamic_upstream =
             ctx.upstream_override.is_none() && matches!(upstream_target, Cow::Owned(_));
-        validate_upstream_target(ctx.snap, upstream_target.as_ref(), dynamic_upstream)?;
+        // 固定直连目标已随快照校验；请求覆盖、变量渲染及服务引用仍需复验。
+        if ctx.upstream_override.is_some()
+            || dynamic_upstream
+            || upstream_target.starts_with("lb://")
+        {
+            validate_upstream_target(ctx.snap, upstream_target.as_ref(), dynamic_upstream)?;
+        }
         // 一致性哈希键与会话亲和令牌在重试链开始前算一次:多次 attempt 必须共用同一键,
         // 否则换实例重试会把一致性哈希退化成随机选择,也会让会话在重试后漂移。
         let lb_hints = self.lb_select_hints(
@@ -6671,6 +6677,8 @@ fn route_upstream_target<'a>(
 /// - `snap`: 当前配置快照,用于校验服务是否已声明。
 /// - `target`: 静态或模板渲染后的 upstream target。
 /// - `dynamic`: target 是否来自运行期模板渲染。
+///
+/// 返回：已声明服务或合法直连覆盖可转发；未声明服务、非法目标及动态直连返回 BadGateway。
 fn validate_upstream_target(
     snap: &GatewaySnapshot,
     target: &str,
@@ -6689,21 +6697,7 @@ fn validate_upstream_target(
             "dynamic route upstream must resolve to lb://<declared-service>"
         )));
     }
-    let uri = target
-        .parse::<http::Uri>()
-        .map_err(|e| ForwardError::BadGateway(anyhow::anyhow!("bad route upstream uri: {e}")))?;
-    let scheme = uri.scheme_str().unwrap_or_default();
-    if scheme != "http" && scheme != "https" {
-        return Err(ForwardError::BadGateway(anyhow::anyhow!(
-            "unsupported route upstream scheme `{scheme}`"
-        )));
-    }
-    if uri.authority().is_none() {
-        return Err(ForwardError::BadGateway(anyhow::anyhow!(
-            "route upstream uri requires authority"
-        )));
-    }
-    Ok(())
+    crate::routing::validate_direct_upstream(target).map_err(ForwardError::BadGateway)
 }
 
 /// 固化在单次上游预留中的 Hyper 连接池策略。

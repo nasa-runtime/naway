@@ -612,6 +612,23 @@ impl Router {
             let upstream_template = variables
                 .compile_template(&c.uri)
                 .with_context(|| format!("route `{}` uri", c.id))?;
+            if let Some(target) = upstream_template
+                .static_literal()
+                .filter(|target| !target.trim().is_empty())
+            {
+                // 固定目标必须在候选发布前可用；服务成员和模板结果仍需在请求时核对当前目录。
+                let result = if let Some(service) = target.strip_prefix("lb://") {
+                    anyhow::ensure!(
+                        !service.is_empty(),
+                        "route `{}` requires an upstream service name",
+                        c.id
+                    );
+                    Ok(())
+                } else {
+                    validate_direct_upstream(target)
+                };
+                result.with_context(|| format!("route `{}` uri", c.id))?;
+            }
             let llm = c
                 .llm
                 .as_ref()
@@ -3726,6 +3743,28 @@ impl BffAggregationPolicy {
             total_timeout: Duration::from_millis(cfg.total_timeout_ms),
         })
     }
+}
+
+/// 业务作用：共享直连上游的 HTTP URI 边界，使固定配置和运行期上游覆盖使用相同的传输合同。
+///
+/// 参数说明：
+/// - `target`：直连上游完整 URI。
+///
+/// 返回：URI 可解析且包含 HTTP(S) scheme 与 authority 时成功；非法目标不得进入转发。
+pub(crate) fn validate_direct_upstream(target: &str) -> Result<()> {
+    let uri = target
+        .parse::<http::Uri>()
+        .context("bad route upstream uri")?;
+    let scheme = uri.scheme_str().unwrap_or_default();
+    anyhow::ensure!(
+        matches!(scheme, "http" | "https"),
+        "unsupported route upstream scheme `{scheme}`"
+    );
+    anyhow::ensure!(
+        uri.authority().is_some(),
+        "route upstream uri requires authority"
+    );
+    Ok(())
 }
 
 /// 业务作用：在候选构建时验证固定路径的 HTTP 表示，避免已发布计划到请求阶段才遇到不可解析的路径。
