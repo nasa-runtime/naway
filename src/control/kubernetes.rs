@@ -478,7 +478,21 @@ pub(crate) fn apply_generated_routes(
         }
     }
     if let Some(generated) = document.proxy_tls {
-        validate_generated_tls(&generated, &cfg.kubernetes_routes, config_dir)?;
+        let listen = generated
+            .listen
+            .parse::<std::net::SocketAddr>()
+            .context("generated Kubernetes TLS listen is invalid")?;
+        let expected_ip = cfg
+            .kubernetes_routes
+            .gateway_bind_address
+            .parse::<std::net::IpAddr>()
+            .context("configured Gateway bind address is invalid")?;
+        // 聚合 TLS 直接附着于 bootstrap proxy，只能使用已有的默认地址授权。
+        anyhow::ensure!(
+            listen.ip() == expected_ip && listen.port() > 0,
+            "generated Kubernetes TLS listen escapes configured bind address"
+        );
+        validate_generated_tls_identities(&generated, &cfg.kubernetes_routes, config_dir)?;
         let tls = TlsCfg {
             listen: generated.listen,
             cert_file: generated.cert_file,
@@ -602,11 +616,12 @@ fn validate_generated_http_proxy(
         );
     }
     if let Some(tls) = &proxy.tls {
+        // TLS 与外层 listener 使用同一个已授权 socket，防证书配置另开入口。
         anyhow::ensure!(
             tls.listen == proxy.listen,
             "generated Gateway TLS-only proxy listen mismatch"
         );
-        validate_generated_tls(tls, cfg, config_dir)?;
+        validate_generated_tls_identities(tls, cfg, config_dir)?;
     }
     Ok(())
 }
@@ -12155,33 +12170,19 @@ fn write_private_file_if_changed(path: &Path, bytes: &[u8]) -> anyhow::Result<()
     atomic_write(path, bytes)
 }
 
-/// 业务作用：复验物化 document 中的 TLS 路径和 socket 仍在 controller 所有权边界内，
-/// 防止被篡改的本地文档读取任意私钥或绑定额外地址。
+/// 业务作用：复验物化 TLS 证书身份和路径，防止本地候选读取控制器目录以外的私钥。
 ///
 /// 参数说明：
-/// - `tls`：生成文档声明的 TLS 配置。
-/// - `cfg`：固定 bind IP 与物化文件命名范围的控制器配置。
+/// - `tls`：调用方已完成监听地址授权的 TLS 配置。
+/// - `cfg`：提供身份数量上限及物化文件命名范围的控制器配置。
 /// - `config_dir`：主配置目录，限定文件解析边界。
 ///
-/// 返回：所有路径均是专属目录下的相对 cert/key 且 listen IP 一致时成功；
-/// 越界、结构过大或地址不一致时拒绝候选。
-fn validate_generated_tls(
+/// 返回：证书和私钥路径均在专属目录且 SNI 身份合法时成功；越界或超出数量上限时拒绝候选。
+fn validate_generated_tls_identities(
     tls: &GeneratedProxyTls,
     cfg: &KubernetesRouteSourceCfg,
     config_dir: &Path,
 ) -> anyhow::Result<()> {
-    let listen = tls
-        .listen
-        .parse::<std::net::SocketAddr>()
-        .context("generated Kubernetes TLS listen is invalid")?;
-    let expected_ip = cfg
-        .gateway_bind_address
-        .parse::<std::net::IpAddr>()
-        .context("configured Gateway bind address is invalid")?;
-    anyhow::ensure!(
-        listen.ip() == expected_ip && listen.port() > 0,
-        "generated Kubernetes TLS listen escapes configured bind address"
-    );
     anyhow::ensure!(
         tls.certs.len() <= cfg.max_objects,
         "generated Kubernetes TLS identities exceed max_objects"

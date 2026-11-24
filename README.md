@@ -1421,7 +1421,10 @@ RequestMirror，以及带 System/ConfigMap CA 和显式 DNS/URI SAN 的 BackendT
 裁决。未知 kind、ExtensionRef、TLS mode、跨 namespace 引用或冲突 policy 会通过 status 报告并失败
 闭合；无效 L4 backend 仍保留拒绝型 listener，避免其它进程接管本应保护的端口。
 
-HTTP/HTTPS listener 使用 `gateway_bind_address`。TLS/TCP/UDP listener 默认使用
+HTTP/HTTPS listener 默认使用 `gateway_bind_address`。通过 `spec.addresses` 显式请求静态 IP 时，
+Gateway 只能使用 `gateway_bind_address`、`gateway_stream_bind_address` 或
+`gateway_stream_bind_addresses` 中的一个地址。Gateway 的 `Programmed` 条件等待对应的活动数据面
+配置生效后发布。TLS/TCP/UDP listener 默认使用
 `gateway_stream_bind_address`；配置非空 `gateway_stream_bind_addresses` 后，控制器按稳定 Gateway
 对象顺序为每个包含 stream listener 的 Gateway 分配一个独立地址。同一 Gateway 的 stream listener
 共享该地址，地址池耗尽的 Gateway 不进入数据面并通过 status 报告未编程，避免同端口 listener 互相
