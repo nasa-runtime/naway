@@ -53,6 +53,13 @@ struct GeneratedDocument {
     http_proxies: Vec<GeneratedHttpProxy>,
 }
 
+/// 已通过内容摘要复验的 Kubernetes 路由集身份，随数据面快照原子切换。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MaterializedRevision {
+    source_fingerprint: String,
+    generation: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct GeneratedHttpProxy {
@@ -296,27 +303,32 @@ pub(crate) fn validate_config(
     Ok(())
 }
 
-/// 业务作用：将 controller 物化文件并入主配置候选。文件缺失/过期/来源签名不匹配都按“尚无远端
-/// 路由”处理；文件结构损坏则拒绝候选，防止半写内容悄悄删掉当前路由。
+/// 业务作用：校验并合并 Kubernetes 物化路由，使活动快照能证明实际加载了哪份路由集。
+///
+/// 参数说明：
+/// - `cfg`：本次尚未发布的主配置候选。
+/// - `config_dir`：限定物化文档及 TLS 材料的配置目录。
+///
+/// 返回：完整合并后返回已校验身份；禁用、缺失、过期或来源不一致时返回空，坏文档拒绝候选。
 pub(crate) fn apply_generated_routes(
     cfg: &mut GatewayConfig,
     config_dir: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<MaterializedRevision>> {
     validate_config(&cfg.kubernetes_routes, &cfg.discovery.kubernetes)?;
     if !cfg.kubernetes_routes.enabled {
-        return Ok(());
+        return Ok(None);
     }
     ensure_target_proxy(cfg)?;
     let path = materialized_path(config_dir, &cfg.kubernetes_routes)?;
     let heartbeat = heartbeat_path(&path);
     if !path.exists() {
-        return Ok(());
+        return Ok(None);
     }
     if cfg.kubernetes_routes.stale_ttl_ms > 0
         && !heartbeat_is_fresh(&heartbeat, cfg.kubernetes_routes.stale_ttl_ms)
     {
         tracing::warn!(file = %path.display(), "Kubernetes generated routes are stale; ignoring materialized LKG");
-        return Ok(());
+        return Ok(None);
     }
     let metadata = fs::symlink_metadata(&path)
         .with_context(|| format!("inspect Kubernetes generated routes {}", path.display()))?;
@@ -343,7 +355,7 @@ pub(crate) fn apply_generated_routes(
     let expected = source_fingerprint(&cfg.kubernetes_routes, &cfg.discovery.kubernetes);
     if document.source_fingerprint != expected {
         tracing::info!(file = %path.display(), "Kubernetes generated routes belong to an old source configuration; waiting for controller refresh");
-        return Ok(());
+        return Ok(None);
     }
     anyhow::ensure!(
         document
@@ -523,7 +535,10 @@ pub(crate) fn apply_generated_routes(
             .routes
             .extend(routes);
     }
-    Ok(())
+    Ok(Some(MaterializedRevision {
+        source_fingerprint: document.source_fingerprint,
+        generation: document.generation,
+    }))
 }
 
 /// 业务作用：复验物化的独立 HTTP/HTTPS proxy 没有越过 controller 地址、路由预算
@@ -549,16 +564,12 @@ fn validate_generated_http_proxy(
         .listen
         .parse::<std::net::SocketAddr>()
         .context("generated Gateway HTTP listen is invalid")?;
-    let expected_ip = cfg
-        .gateway_bind_address
-        .parse::<std::net::IpAddr>()
-        .context("configured Gateway bind address is invalid")?;
     let expected_mesh_ip = cfg
         .gateway_mesh_bind_address
         .parse::<std::net::IpAddr>()
         .context("configured Gateway mesh bind address is invalid")?;
     anyhow::ensure!(
-        (listen.ip() == expected_ip
+        (gateway_bind_address_allowed(cfg, listen.ip())
             || (listen.ip() == expected_mesh_ip && listen.port() == cfg.gateway_mesh_port))
             && listen.port() > 0,
         "generated Gateway HTTP listen escapes configured bind address"
@@ -771,7 +782,6 @@ pub fn spawn_controller(
                     }
                     failure_since = None;
                     expired_published = false;
-                    let previous_snapshot_version = snap.load().version;
                     match publish_document(
                         &config_dir,
                         &route_cfg,
@@ -784,20 +794,24 @@ pub fn spawn_controller(
                     )
                     .await
                     {
-                        Ok(changed) => {
-                            if changed && !reload.trigger_file().await {
-                                tracing::warn!(
-                                    "reload worker stopped after Kubernetes route publish"
-                                );
-                                return;
-                            }
-                            let published = !changed
-                                || wait_for_snapshot_advance(
+                        Ok(revision) => {
+                            // 磁盘上的重复候选可能被上一轮拒绝；其它来源的配置版本变化也不能证明这份路由已上线。
+                            let published = if snap.load().kubernetes_revision.as_ref()
+                                == Some(&revision)
+                            {
+                                true
+                            } else {
+                                if !reload.trigger_file().await {
+                                    tracing::warn!("reload worker stopped after Kubernetes route materialization");
+                                    return;
+                                }
+                                wait_for_materialized_revision(
                                     &snap,
-                                    previous_snapshot_version,
+                                    &revision,
                                     route_cfg.deletion_drain_timeout_ms,
                                 )
-                                .await;
+                                .await
+                            };
                             let infrastructure_published = if published {
                                 // 数据面 generation 已可见后再创建基础设施锚点；Gateway status
                                 // 必须等锚点传播成功才推进，避免 Accepted 已最新但用户 metadata
@@ -957,22 +971,22 @@ async fn mark_failure_and_maybe_expire(
     }
 }
 
-/// 业务作用：等待 reload worker 发布比物化前更新的快照，作为解除删除 finalizer 的最小证据。
+/// 业务作用：等待同一来源和内容的物化路由确实进入活动快照，才允许外部状态和 finalizer 前进。
 ///
 /// 参数说明：
-/// - `snap`：是唯一数据面快照指针
-/// - `previous_version`：是发布前版本
-/// - `timeout_ms`：限制 controller 等待时间。
+/// - `snap`：唯一的数据面快照指针。
+/// - `revision`：本轮写入的 Kubernetes 物化路由身份。
+/// - `timeout_ms`：控制器等待活动快照的时间上限。
 ///
-/// 返回：观察到严格递增版本时为 true；超时返回 false，调用方必须保留 finalizer。
-async fn wait_for_snapshot_advance(
+/// 返回：观察到精确身份时返回 true；超时返回 false，调用方不得推进外部状态。
+async fn wait_for_materialized_revision(
     snap: &Arc<ArcSwap<GatewaySnapshot>>,
-    previous_version: u64,
+    revision: &MaterializedRevision,
     timeout_ms: u64,
 ) -> bool {
     tokio::time::timeout(Duration::from_millis(timeout_ms), async {
         loop {
-            if snap.load().version > previous_version {
+            if snap.load().kubernetes_revision.as_ref() == Some(revision) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -7493,6 +7507,20 @@ fn is_gateway_stream_protocol(protocol: &str) -> bool {
     matches!(protocol, "TLS" | "TCP" | "UDP")
 }
 
+/// 业务作用：统一 Kubernetes 静态地址分配和物化监听的绑定权限，按实际 IP 比较等价文本。
+///
+/// 参数说明：
+/// - `cfg`：已经过启动校验的 Kubernetes 控制器地址声明。
+/// - `ip`：候选要求绑定的地址。
+///
+/// 返回：只有显式配置的 HTTP 地址、stream 地址或池成员才获准；Mesh 监听另受专属端口约束。
+fn gateway_bind_address_allowed(cfg: &KubernetesRouteSourceCfg, ip: std::net::IpAddr) -> bool {
+    [&cfg.gateway_bind_address, &cfg.gateway_stream_bind_address]
+        .into_iter()
+        .chain(&cfg.gateway_stream_bind_addresses)
+        .any(|address| address.parse::<std::net::IpAddr>().ok() == Some(ip))
+}
+
 /// 业务作用：在创建任何 listener socket 前裁决 Gateway `spec.addresses`，只允许控制器
 /// 明确配置的 IP 被静态占用，并为空 IPAddress 请求分配默认地址。
 ///
@@ -7532,11 +7560,6 @@ fn gateway_address_decision(
         "Gateway spec.addresses exceeds 16 entries"
     );
 
-    let mut allowed = BTreeSet::from([
-        cfg.gateway_bind_address.clone(),
-        cfg.gateway_stream_bind_address.clone(),
-    ]);
-    allowed.extend(cfg.gateway_stream_bind_addresses.iter().cloned());
     let mut assigned = BTreeSet::new();
     for address in addresses {
         let address_type = address
@@ -7560,18 +7583,22 @@ fn gateway_address_decision(
                 .context("Gateway IPAddress value must be a string")?,
             None => "",
         };
-        let value = if raw_value.trim().is_empty() {
-            cfg.gateway_bind_address.clone()
+        let value: &str = if raw_value.trim().is_empty() {
+            &cfg.gateway_bind_address
         } else {
             raw_value
-                .parse::<std::net::IpAddr>()
-                .context("Gateway IPAddress value is invalid")?
-                .to_string()
         };
-        assigned.insert(value);
+        assigned.insert(
+            value
+                .parse::<std::net::IpAddr>()
+                .context("Gateway IPAddress value is invalid")?,
+        );
     }
 
-    let usable = assigned.len() == 1 && assigned.iter().all(|value| allowed.contains(value));
+    let usable = assigned.len() == 1
+        && assigned
+            .iter()
+            .all(|address| gateway_bind_address_allowed(cfg, *address));
     if !usable {
         // 只有完整地址集合都能原子绑定时才可发布任何 listener；部分成功会让 status 地址与
         // 实际入口不一致，并在重启或节点差异下形成半完成数据面。
@@ -7586,7 +7613,8 @@ fn gateway_address_decision(
     let bind_address = assigned
         .into_iter()
         .next()
-        .context("usable Gateway address decision missing address")?;
+        .context("usable Gateway address decision missing address")?
+        .to_string();
     Ok(GatewayAddressDecision {
         static_requested: true,
         accepted: true,
@@ -11728,8 +11756,7 @@ fn stable_id(prefix: &str, parts: &[&str]) -> String {
 /// - `stream_tls_plans`：同一冻结快照中的 L4 TLS 材料计划。
 /// - `http_proxies`：同一冻结快照中的 HTTP 入口。
 ///
-/// 返回：生成内容变化并完成原子替换时返回 true；内容未变返回 false；证书物化、
-/// 路径校验或写入失败时返回错误，旧版本继续服务。
+/// 返回：内容与心跳均已落盘时返回物化身份；证书物化、路径校验或写入失败时返回错误。
 #[allow(clippy::too_many_arguments)]
 async fn publish_document(
     config_dir: &Path,
@@ -11740,12 +11767,11 @@ async fn publish_document(
     mut stream_listeners: Vec<Value>,
     mut stream_tls_plans: BTreeMap<String, GatewayTlsPlan>,
     http_proxies: Vec<GatewayHttpProxyPlan>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<MaterializedRevision> {
     let path = materialized_path(config_dir, cfg)?;
-    let heartbeat = heartbeat_path(&path);
     let fingerprint = source_fingerprint(cfg, discovery);
     let path_for_task = path.clone();
-    let changed = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+    let (revision, changed) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         // 证书与私钥必须先完整落盘，再发布引用它们的 document；反向顺序
         // 会让 reload worker 看见半完成 TLS 身份，导致新 listener 握手失败。
         for listener in &mut stream_listeners {
@@ -11821,14 +11847,18 @@ async fn publish_document(
             atomic_write(&path_for_task, &bytes)?;
         }
         atomic_write(&heartbeat_path(&path_for_task), b"fresh\n")?;
-        Ok(!unchanged)
+        Ok((
+            MaterializedRevision {
+                source_fingerprint: document.source_fingerprint,
+                generation: document.generation,
+            },
+            !unchanged,
+        ))
     })
     .await
     .context("join Kubernetes materialization task")??;
     tracing::debug!(file = %path.display(), changed, "Kubernetes route snapshot materialized");
-    // heartbeat 只通过元数据参与 freshness 判定；保留显式绑定以锁定“内容先发布、freshness 后发布”的顺序。
-    let _ = heartbeat;
-    Ok(changed)
+    Ok(revision)
 }
 
 /// 业务作用：计算同一生成配置集的内容身份，供心跳与原子物化一致性检查。
@@ -12193,23 +12223,8 @@ fn validate_generated_stream_listener(
         .listen
         .parse::<std::net::SocketAddr>()
         .context("generated Kubernetes stream listen is invalid")?;
-    let expected_ips = if cfg.gateway_stream_bind_addresses.is_empty() {
-        BTreeSet::from([cfg
-            .gateway_stream_bind_address
-            .parse::<std::net::IpAddr>()
-            .context("configured Gateway stream bind address is invalid")?])
-    } else {
-        cfg.gateway_stream_bind_addresses
-            .iter()
-            .map(|address| {
-                address
-                    .parse::<std::net::IpAddr>()
-                    .context("configured Gateway stream address pool contains an invalid IP")
-            })
-            .collect::<anyhow::Result<BTreeSet<_>>>()?
-    };
     anyhow::ensure!(
-        expected_ips.contains(&listen.ip()) && listen.port() > 0,
+        gateway_bind_address_allowed(cfg, listen.ip()) && listen.port() > 0,
         "generated Kubernetes stream listen escapes configured bind address"
     );
     let has_no_forward_target = listener.routes.is_empty() && listener.upstream.trim().is_empty();

@@ -162,6 +162,8 @@ pub struct GatewaySnapshot {
     pub discovery: DiscoveryCfg,
     /// Kubernetes Ingress/Gateway API 路由源；只供后台 controller，不进入请求热路径。
     pub kubernetes_routes: model::KubernetesRouteSourceCfg,
+    /// 当前快照实际合并的 Kubernetes 物化文档身份，用于状态发布和删除确认。
+    pub(crate) kubernetes_revision: Option<crate::control::kubernetes::MaterializedRevision>,
     /// 统一配置来源。热路径不用它,只供 reload/config source worker 与 admin 展示。
     pub config_source: ConfigSourceCfg,
     /// xDS bootstrap 与资源域 owner；请求热路径不读取。
@@ -1262,7 +1264,7 @@ fn build_snapshot_from_config(
     let crypto_catalog =
         crate::security::external_crypto::build_catalog(config_dir, &cfg.crypto_providers)
             .context("build external crypto providers")?;
-    crate::control::kubernetes::apply_generated_routes(&mut cfg, config_dir)
+    let kubernetes_revision = crate::control::kubernetes::apply_generated_routes(&mut cfg, config_dir)
         .context("merge Kubernetes generated routes")?;
     let developer_portal =
         crate::portal::DeveloperPortalRuntime::build_and_apply(&mut cfg, config_dir)
@@ -1612,6 +1614,7 @@ fn build_snapshot_from_config(
         admin_max_config_body_bytes: cfg.admin.max_config_body_bytes,
         discovery,
         kubernetes_routes: cfg.kubernetes_routes,
+        kubernetes_revision,
         config_source: cfg.config_source,
         control_plane: cfg.control_plane,
         runtime_state: cfg.runtime_state,
