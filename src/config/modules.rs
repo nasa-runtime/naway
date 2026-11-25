@@ -1,7 +1,9 @@
 //! 具名本地业务文档的装配与同代来源验证。
 
 use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,6 +11,7 @@ use anyhow::{ensure, Context, Result};
 use naml::strict::{ConfigLoader, FileEvidence, LoadPolicy};
 use naml::{ConfigFormat, YmlImport, YmlOverlay};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use super::{loader, resolve_relative, MAX_FINGERPRINT_FILE_BYTES};
 
@@ -20,6 +23,23 @@ pub(crate) struct Sources {
     files: Vec<FileEvidence>,
     missing: Vec<PathBuf>,
     watch: Vec<PathBuf>,
+    base_documents: Vec<FileEvidence>,
+}
+
+/// 归属决定 Admin 读取独立文档必须持有的业务权限。
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DocumentDomain {
+    Configuration,
+    InterfaceGuard,
+    Sentinel,
+}
+
+/// 与已校验快照关联的基础文档，保留原有 YAML 排版及占位符。
+pub(crate) struct ActiveDocument {
+    pub name: String,
+    pub domain: DocumentDomain,
+    pub content: Option<String>,
+    pub digest: [u8; 32],
 }
 
 impl Sources {
@@ -63,6 +83,64 @@ impl Sources {
             );
         }
         Ok(())
+    }
+
+    /// 业务作用：冻结与候选同代的模块原文，使磁盘编辑失败时也不会把坏文件显示为在线配置。
+    ///
+    /// 参数说明：
+    /// - `paths`：完整候选实际读取的规则路径，决定相应独立授权。
+    /// - `admin_limit`：管理端允许返回的单文档原文字节上限。
+    ///
+    /// 返回：按清单顺序返回有效模块。超出管理预算的文档保留目录项，任何摘要不符的候选拒绝。
+    pub(super) fn active_documents(
+        &self,
+        paths: &super::candidate::Paths,
+        admin_limit: usize,
+    ) -> Result<Arc<[ActiveDocument]>> {
+        let identity = |metadata: &fs::Metadata| (metadata.dev(), metadata.ino());
+        let guard = identity(&fs::metadata(&paths.guard)?);
+        let sentinel = identity(&fs::metadata(&paths.sentinel)?);
+        ensure!(guard != sentinel, "active rule documents must be distinct");
+        let mut documents = Vec::with_capacity(self.base_documents.len());
+        for evidence in &self.base_documents {
+            let path = evidence.path();
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)?;
+            let target = identity(&file.metadata()?);
+            let domain = if target == guard {
+                DocumentDomain::InterfaceGuard
+            } else if target == sentinel {
+                DocumentDomain::Sentinel
+            } else {
+                DocumentDomain::Configuration
+            };
+            let raw = crate::io::bounded_io::read_open_file(
+                file,
+                path,
+                MAX_FINGERPRINT_FILE_BYTES,
+                "named configuration",
+            )?;
+            let digest = Sha256::digest(&raw).into();
+            // 捕获原文前再次校验已编译字节。目录和原文必须和实际生效的候选一起发布。
+            ensure!(
+                &digest == evidence.content_digest(),
+                "named configuration content changed during compilation"
+            );
+            let content = if raw.len() <= admin_limit {
+                Some(String::from_utf8(raw).context("named configuration must be UTF-8")?)
+            } else {
+                None
+            };
+            documents.push(ActiveDocument {
+                name: yaml_name(path)?.to_owned(),
+                domain,
+                content,
+                digest,
+            });
+        }
+        Ok(documents.into())
     }
 }
 
@@ -112,6 +190,7 @@ pub(super) fn load(
         files: Vec::new(),
         missing: Vec::new(),
         watch: Vec::new(),
+        base_documents: Vec::new(),
     };
     let policy = document_policy();
     let mut names = HashSet::new();
@@ -176,6 +255,12 @@ pub(super) fn load(
         };
         let is_guard = path == guard;
         let is_sentinel = path == sentinel;
+        let source = sources
+            .files
+            .iter()
+            .find(|file| file.path() == path)
+            .context("named configuration base source is missing")?;
+        sources.base_documents.push(source.clone());
         if is_guard || is_sentinel {
             ensure!(
                 !module.contains_key("log"),

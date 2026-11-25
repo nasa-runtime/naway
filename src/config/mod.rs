@@ -15,6 +15,7 @@ pub mod management;
 pub mod media;
 pub mod model;
 mod modules;
+pub(crate) use modules::DocumentDomain;
 pub mod named_nacos;
 pub(crate) mod monitor;
 pub mod operations;
@@ -114,6 +115,8 @@ pub struct GatewaySnapshot {
     pub process_log: crate::observability::logging::LogPlan,
     /// 具名入口随候选发布，用于约束与三文档写入协议之间的切换。
     pub(crate) named_configuration: bool,
+    /// 与该代快照绑定的具名业务原文，仅用于管理面读取。
+    pub(crate) named_documents: Arc<[modules::ActiveDocument]>,
     /// 与原生路由原子发布的下游 xDS 投影，未启用制品时不存在该资源域。
     #[cfg(feature = "xds-server")]
     pub xds_server: Option<Arc<crate::control::xds_server::Plan>>,
@@ -1188,7 +1191,7 @@ fn load_snapshot_input(
         main,
     )?;
     let module_sources = loaded.value.module_sources.clone();
-    let snapshot = build_snapshot_from_config(
+    let mut snapshot = build_snapshot_from_config(
         cfg_path,
         documents,
         version,
@@ -1200,6 +1203,10 @@ fn load_snapshot_input(
     )?;
     if let Some(sources) = module_sources {
         sources.revalidate()?;
+        snapshot.named_documents = sources.active_documents(
+            &snapshot.document_paths,
+            snapshot.admin_max_config_body_bytes,
+        )?;
     }
     identity.finish(snapshot)
 }
@@ -1588,6 +1595,7 @@ fn build_snapshot_from_config(
         sentinel_requests: Arc::new(sentinel.requests),
         process_log,
         named_configuration: cfg.module_sources.is_some(),
+        named_documents: Arc::from([]),
         #[cfg(feature = "xds-server")]
         xds_server,
         ownership,

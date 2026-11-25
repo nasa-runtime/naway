@@ -862,6 +862,11 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
         }
         (&Method::GET, "/admin/config/dry-run") => dry_run_config(&state).await,
         (&Method::GET, "/api/config/current") => read_current_config(&state).await,
+        (&Method::GET, path)
+            if path == "/api/config/modules" || path.starts_with("/api/config/modules/") =>
+        {
+            configuration::read_modules(&state, &request, &identity).await
+        }
         (&Method::GET, "/admin/config/history") => config_history(&state),
         (&Method::GET, "/admin/config/rejections") => config_rejections(&state),
         (&Method::POST, "/admin/config/rollback") => rollback_config(&request, &state).await,

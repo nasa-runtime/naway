@@ -4,11 +4,132 @@ use super::{
     approval_required, build_cluster_candidate_snapshot, collect_bounded_admin_body, config_etag,
     finish_config_write, json, plain, prepare_config_action, prepare_config_write,
     publish_document_set, record_admin_audit, request_content_type, submit_approval_change,
-    AdminAction, AdminRequest, AdminResource, AdminState, ApprovalPayload, BoxBody,
+    AdminAction, AdminIdentity, AdminRequest, AdminRequestParts, AdminResource, AdminState,
+    ApprovalPayload, BoxBody,
 };
+use crate::config::DocumentDomain;
 use crate::control::history::ArchivedDocs;
 use hyper::{Response, StatusCode};
 use std::sync::Arc;
+
+/// 业务作用：读取已生效的模块目录或单文档原文，保持接口守卫和 Sentinel 各自的访问权限。
+///
+/// 参数说明：
+/// - `state`：含有当前活动快照与审计权威的管理状态。
+/// - `request`：通过一般认证的读取请求，URI 只能选择已登记名称。
+/// - `identity`：当前请求主体，限制可见业务域。
+///
+/// 返回：可读目录或活动原文。来源未知、不属于主体、超出预算时不返回正文。
+pub(super) async fn read_modules(
+    state: &Arc<AdminState>,
+    request: &AdminRequestParts,
+    identity: &AdminIdentity,
+) -> Response<BoxBody> {
+    if request.uri.query().is_some() {
+        return plain(
+            StatusCode::BAD_REQUEST,
+            "only active module documents are available\n",
+        );
+    }
+    let snapshot = state.snap.load_full();
+    if !snapshot.named_configuration {
+        return plain(StatusCode::NOT_FOUND, "not found\n");
+    }
+    let Some(fingerprint) = snapshot.config_fingerprint else {
+        return plain(
+            StatusCode::CONFLICT,
+            "configuration fingerprint unavailable\n",
+        );
+    };
+    let source = if snapshot.config_bundle_digest.is_some() {
+        "nacos"
+    } else {
+        "file"
+    };
+    let etag = config_etag(fingerprint);
+    let Some(name) = request.uri.path().strip_prefix("/api/config/modules/") else {
+        let documents = snapshot
+            .named_documents
+            .iter()
+            .filter(|document| identity.allows(module_resource(document.domain), AdminAction::Read))
+            .map(|document| {
+                serde_json::json!({
+                    "name": document.name,
+                    "readable": document.content.is_some(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if documents.is_empty() {
+            return plain(StatusCode::FORBIDDEN, "forbidden\n");
+        }
+        return json(
+            StatusCode::OK,
+            serde_json::json!({
+                "ok": true,
+                "source": source,
+                "version": snapshot.version,
+                "etag": etag,
+                "documents": documents,
+            }),
+        );
+    };
+    let Some(document) = snapshot
+        .named_documents
+        .iter()
+        .find(|document| document.name == name)
+    else {
+        return plain(StatusCode::NOT_FOUND, "not found\n");
+    };
+    let resource = module_resource(document.domain);
+    if !identity.allows(resource, AdminAction::Read) {
+        let _ = record_admin_audit(
+            state,
+            identity,
+            request,
+            resource,
+            AdminAction::Read,
+            "completed",
+            Some(StatusCode::FORBIDDEN.as_u16()),
+        )
+        .await;
+        return plain(StatusCode::FORBIDDEN, "forbidden\n");
+    }
+    let Some(content) = document.content.as_ref() else {
+        return plain(StatusCode::CONFLICT, "active document exceeds read limit\n");
+    };
+    let digest = sha2::digest::Output::<sha2::Sha256>::from(document.digest);
+    let mut response = json(
+        StatusCode::OK,
+        serde_json::json!({
+            "ok": true,
+            "document": document.name,
+            "source": source,
+            "version": snapshot.version,
+            "etag": etag,
+            "document_etag": format!("\"sha256-{digest:x}\""),
+            "max_config_body_bytes": snapshot.admin_max_config_body_bytes,
+            "content": content,
+        }),
+    );
+    if let Ok(value) = hyper::header::HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(hyper::header::ETAG, value);
+    }
+    response
+}
+
+/// 业务作用：把具名模块绑定到部署声明确定的权限域，文件名本身不能变更权限。
+///
+/// 参数说明：
+/// - `domain`：该文档在活动配置集合中承担的业务角色。
+///
+/// 返回：与既有原文端点一致的 Admin 资源。
+fn module_resource(domain: DocumentDomain) -> AdminResource {
+    match domain {
+        DocumentDomain::Configuration => AdminResource::Config,
+        DocumentDomain::InterfaceGuard => AdminResource::InterfaceGuard,
+        DocumentDomain::Sentinel => AdminResource::Sentinel,
+    }
+}
 
 /// 原子配置集中的固定文档，不能由请求指定磁盘路径或远端dataId。
 #[derive(Clone, Copy)]
