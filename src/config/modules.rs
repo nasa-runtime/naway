@@ -38,8 +38,15 @@ pub(crate) enum DocumentDomain {
 pub(crate) struct ActiveDocument {
     pub name: String,
     pub domain: DocumentDomain,
+    pub(crate) path: PathBuf,
     pub content: Option<String>,
     pub digest: [u8; 32],
+}
+
+/// 单模块候选的物理正文，模块及其 profile 仍按真实声明定位。
+pub(super) struct Replacement<'a> {
+    pub(super) target: &'a Path,
+    pub(super) input: &'a Path,
 }
 
 impl Sources {
@@ -136,6 +143,7 @@ impl Sources {
             documents.push(ActiveDocument {
                 name: yaml_name(path)?.to_owned(),
                 domain,
+                path: path.to_path_buf(),
                 content,
                 digest,
             });
@@ -164,12 +172,14 @@ pub(super) fn is_manifest(path: &Path) -> bool {
 /// - `entry`：真实部署入口及相对路径根。
 /// - `physical`：本轮实际读取的入口，决定最终 naml 叠加位置。
 /// - `tree`：入口和活动 profile 已经解析出的声明。
+/// - `replacement`：可选隔离输入，仅替换一个已存在的基础文档。
 ///
 /// 返回：入口无导入时为空。全部导入有效时返回 naml overlay 和来源计划，否则拒绝整代。
 pub(super) fn load(
     entry: &Path,
     physical: &Path,
     tree: &Value,
+    replacement: Option<&Replacement<'_>>,
 ) -> Result<Option<(YmlOverlay, Arc<Sources>)>> {
     if tree.pointer("/yml/imports").is_none() {
         ensure!(
@@ -198,6 +208,7 @@ pub(super) fn load(
     let mut total_bytes = 0usize;
     let guard = rule_path(tree, &entry, "interface_guard_file", "interface-guard.yml")?;
     let sentinel = rule_path(tree, &entry, "sentinel_rules_file", "sentinel-rules.yml")?;
+    let mut replaced = false;
     for import in imports {
         // Nacos 与本地文件分别由各自的来源权威读取，避免远端入口被误解为启动时的空配置。
         let YmlImport::File {
@@ -222,8 +233,14 @@ pub(super) fn load(
             .and_then(|stem| stem.to_str())
             .context("invalid YAML filename")?;
         let profile = path.with_file_name(format!("{stem}-{{profile}}"));
+        let input = if let Some(edit) = replacement.filter(|edit| edit.target == path) {
+            replaced = true;
+            edit.input
+        } else {
+            &path
+        };
         let loaded = ConfigLoader::standard()?
-            .base_file(&path)?
+            .base_file(input)?
             .profile_pattern(profile)?
             .policy(policy.clone())
             .local_imports(false)
@@ -258,7 +275,7 @@ pub(super) fn load(
         let source = sources
             .files
             .iter()
-            .find(|file| file.path() == path)
+            .find(|file| file.path() == input)
             .context("named configuration base source is missing")?;
         sources.base_documents.push(source.clone());
         if is_guard || is_sentinel {
@@ -327,6 +344,10 @@ pub(super) fn load(
             fields.insert(key, value);
         }
     }
+    ensure!(
+        replacement.is_none() || replaced,
+        "named configuration target is no longer declared"
+    );
     ensure!(
         guard != sentinel,
         "interface guard and Sentinel require distinct documents"

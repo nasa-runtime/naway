@@ -2,7 +2,9 @@
 
 mod documents;
 mod main;
+mod named;
 mod observation;
 
 pub(super) use documents::{publish_document_set, publish_scoped_document_set};
 pub(super) use main::publish_validated_config;
+pub(super) use named::publish_named;

@@ -146,6 +146,11 @@ export function mount(root, session, page = "configuration") {
     button.type = "button";
   }
   const source = element("p", "尚未读取配置来源。", "subtle");
+  const guidance = element("p", definition.guidance, "subtle");
+  const moduleChoice = element("select");
+  const modulePicker = element("label", "配置文件 ");
+  modulePicker.append(moduleChoice);
+  modulePicker.hidden = true;
   const status = element(
     "p",
     "请显式读取当前配置。原文可能包含敏感配置，仅保留在当前页面内存。",
@@ -197,13 +202,14 @@ export function mount(root, session, page = "configuration") {
   toolbar.append(load, validate, format, complete, publish, progress, clear);
   panel.append(
     element("h2", definition.title),
-    element("p", definition.guidance, "subtle"),
+    guidance,
     element(
       "p",
       "保存后由服务端完整校验并按当前发布策略处理。审批、灰度、Nacos 写入与全节点生效分别核对，节点接收推送后各自校验并热加载。",
       "subtle",
     ),
     source,
+    modulePicker,
     toolbar,
     status,
     sections,
@@ -218,6 +224,7 @@ export function mount(root, session, page = "configuration") {
   let generation = 0;
   let active = null;
   let baseline = null;
+  let target = definition;
   let rollout = "";
   let pendingChange = "";
   let formatPreview = null;
@@ -237,8 +244,7 @@ export function mount(root, session, page = "configuration") {
     const row = before.split("\n").length;
     const start = before.lastIndexOf("\n") + 1;
     const column = Array.from(before.slice(start)).length + 1;
-    const original =
-      baseline?.displayedContent === value ? baseline.content : value;
+    const original = originalLineEndings(value);
     const bytes = new TextEncoder().encode(original).length;
     position.textContent = `行 ${row} · 字符列 ${column} · ${bytes} / ${capacity} UTF-8字节 · 两空格缩进`;
   }
@@ -282,7 +288,7 @@ export function mount(root, session, page = "configuration") {
       const body = candidate();
       const before = editor.value;
       const etag = baseline.etag;
-      const { data } = await request(definition.formatEndpoint, {
+      const { data } = await request(target.formatEndpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/yaml",
@@ -297,7 +303,7 @@ export function mount(root, session, page = "configuration") {
         baseline?.etag !== etag ||
         data.ok !== true ||
         data.applied !== false ||
-        data.document !== definition.documentKind ||
+        data.document !== target.documentKind ||
         data.source_etag !== etag ||
         data.indentation !== 2 ||
         data.comments_preserved !== false ||
@@ -409,6 +415,7 @@ export function mount(root, session, page = "configuration") {
   function update() {
     const locked = !alive || document.hidden || active !== null;
     load.disabled = locked;
+    moduleChoice.disabled = locked;
     clear.disabled = !alive;
     editor.disabled = locked || baseline === null;
     validate.disabled =
@@ -416,7 +423,7 @@ export function mount(root, session, page = "configuration") {
     publish.disabled =
       locked ||
       !writable ||
-      baseline?.source !== "nacos" ||
+      !(baseline?.named ? target.writeAvailable : baseline?.source === "nacos") ||
       !editor.value ||
       unknown;
     progress.disabled =
@@ -454,6 +461,7 @@ export function mount(root, session, page = "configuration") {
     result.replaceChildren();
     showPosition();
     source.textContent = "尚未读取配置来源。";
+    guidance.textContent = definition.guidance;
     status.textContent =
       "配置原文已清空；已经发送的发布可能继续，请重新核对当前配置与集群状态。";
     update();
@@ -510,7 +518,8 @@ export function mount(root, session, page = "configuration") {
   function readCurrent() {
     retire();
     return run(async (signal, epoch) => {
-      const { data, headers } = await request(definition.endpoint, {
+      target = await resolveTarget(signal, epoch);
+      const { data, headers } = await request(target.endpoint, {
         signal,
       });
       current(epoch);
@@ -518,8 +527,8 @@ export function mount(root, session, page = "configuration") {
         data.ok !== true ||
         typeof data.content !== "string" ||
         !["file", "nacos"].includes(data.source) ||
-        (definition.documentKind !== "gateway" &&
-          data.document !== definition.documentKind) ||
+        (target.documentKind !== "gateway" &&
+          data.document !== target.documentKind) ||
         typeof data.etag !== "string" ||
         headers.get("etag") !== data.etag
       ) {
@@ -539,19 +548,96 @@ export function mount(root, session, page = "configuration") {
       baseline = {
         etag: data.etag,
         source: data.source,
+        named: target !== definition,
         content: data.content,
         displayedContent: editor.value,
+        crlf: data.content.includes("\r\n") && !data.content.replaceAll("\r\n", "").includes("\n"),
       };
       showPosition();
+      if (baseline.named) {
+        guidance.textContent = `编辑 ${target.documentKind}。发布时服务端校验其与其它模块和当前活动配置的关系。`;
+      }
+      publish.textContent = data.source === "nacos" ? "保存并推送集群" : "保存本地 YAML";
       source.textContent =
         data.source === "nacos"
-          ? `配置来源：Nacos · ${definition.documentKind} · 当前接入节点配置版本 ${data.version}`
-          : `配置来源：本地文件 · ${definition.documentKind} · 当前接入节点配置版本 ${data.version}`;
+          ? `配置来源：Nacos · ${target.documentKind} · 当前接入节点配置版本 ${data.version}`
+          : `配置来源：本地文件 · ${target.documentKind} · 当前接入节点配置版本 ${data.version}`;
       status.textContent =
-        data.source === "nacos"
+        baseline.named && !target.writeAvailable
+          ? "当前配置可读取。写入取决于配置来源和主体权限。"
+          : data.source === "nacos"
           ? "修改后可保存并推送集群。并发修改由整体 ETag 和 Nacos CAS 检查。"
-          : "集群发布需要启用 config_source.nacos 并配置 bundle_data_id；本页可读取和校验当前配置。";
+          : baseline.named
+            ? "保存时重新校验完整配置，并提交所选 YAML 文件。"
+            : "集群发布需要启用 config_source.nacos 并配置 bundle_data_id；本页可读取和校验当前配置。";
     });
+  }
+
+  /**
+   * 业务作用：按当前页面权限从活动目录选择原始 YAML，传统入口沿用已有 API。
+   * 参数说明：
+   * - `signal`：当前页面请求的取消信号。
+   * - `epoch`：读取开始时的页面代。
+   * 返回：所选模块或传统入口的固定请求目标；目录不可信时拒绝读取。
+   */
+  async function resolveTarget(signal, epoch) {
+    let catalog;
+    try {
+      catalog = await request("/api/config/modules", { signal });
+    } catch (error) {
+      current(epoch);
+      if (error.status !== 404) {
+        throw error;
+      }
+      modulePicker.hidden = true;
+      moduleChoice.replaceChildren();
+      return definition;
+    }
+    current(epoch);
+    if (catalog.data.ok !== true || !Array.isArray(catalog.data.documents)) {
+      throw new Error("配置目录响应不完整。");
+    }
+    const names = catalog.data.documents
+      .filter((entry) => entry.resource === definition.resource && entry.readable === true)
+      .map((entry) => entry.name);
+    if (!names.length || names.some((name) => typeof name !== "string" || !/^[A-Za-z0-9_.-]{1,128}\.ya?ml$/.test(name))) {
+      throw new Error("当前没有可读取的配置文件。");
+    }
+    const preferred = page === "proxy-configuration" ? "proxy.yml" : "naway.yml";
+    const selected = names.includes(moduleChoice.value)
+      ? moduleChoice.value
+      : names.includes(preferred)
+        ? preferred
+        : names[0];
+    moduleChoice.replaceChildren(...names.map((name) => {
+      const option = element("option", name);
+      option.value = name;
+      return option;
+    }));
+    moduleChoice.value = selected;
+    modulePicker.hidden = false;
+    const endpoint = `/api/config/modules/${selected}`;
+    return {
+      documentKind: selected,
+      writeAvailable: catalog.data.documents.some((entry) =>
+        entry.name === selected && entry.resource === definition.resource && entry.write_available === true),
+      endpoint,
+      validateEndpoint: `${endpoint}/dry-run`,
+      formatEndpoint: `${endpoint}/format`,
+    };
+  }
+
+  /**
+   * 业务作用：恢复编辑器规范化之前的统一换行约定，保证无编辑时逐字节返回原文。
+   * 参数说明：
+   * - `value`：浏览器编辑区当前显示的文本。
+   * 返回：原样文本，或按原文统一的 CRLF 约定编码的新文本。
+   */
+  function originalLineEndings(value) {
+    if (baseline?.displayedContent === value) {
+      return baseline.content;
+    }
+    return baseline?.crlf ? value.replaceAll("\n", "\r\n") : value;
   }
 
   /**
@@ -561,10 +647,7 @@ export function mount(root, session, page = "configuration") {
    */
   function candidate() {
     // textarea会规范化换行；显示内容未变时仍提交原文，避免仅打开页面就改变远端配置字节。
-    const value =
-      baseline?.displayedContent === editor.value
-        ? baseline.content
-        : editor.value;
+    const value = originalLineEndings(editor.value);
     if (!value.trim() || new TextEncoder().encode(value).length > capacity) {
       throw new Error("候选为空或超过管理入口容量。");
     }
@@ -582,7 +665,7 @@ export function mount(root, session, page = "configuration") {
     }
     return run(async (signal, epoch) => {
       const body = candidate();
-      const { data } = await request(definition.validateEndpoint, {
+      const { data } = await request(target.validateEndpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/yaml",
@@ -607,7 +690,7 @@ export function mount(root, session, page = "configuration") {
    * 返回：明确受理后保存原 rollout 身份；冲突和未知结果须先重新读取核对，页面不自动重发。
    */
   function publishCandidate() {
-    if (!writable || baseline?.source !== "nacos" || unknown) {
+    if (!writable || !(baseline?.named ? target.writeAvailable : baseline?.source === "nacos") || unknown) {
       return;
     }
     return run(async (signal, epoch) => {
@@ -617,7 +700,7 @@ export function mount(root, session, page = "configuration") {
       unknown = true;
       try {
         const { data, status: responseStatus } = await request(
-          definition.endpoint,
+          target.endpoint,
           {
             method: "PUT",
             headers: {
@@ -632,7 +715,19 @@ export function mount(root, session, page = "configuration") {
         if (data.ok !== true) {
           throw new Error("发布没有返回明确受理结果。");
         }
-        if (
+        if (baseline.named && ["committed", "applied", "pending"].includes(data.status)) {
+          baseline = null;
+          unknown = false;
+          if (data.source === "nacos") {
+            status.textContent = data.local_applied
+              ? "已写入 Nacos，本机已生效。请在集群监控核对其余节点。"
+              : "已写入 Nacos，等待节点应用。请在集群监控核对。";
+          } else {
+            status.textContent = data.local_applied
+              ? "文件已保存，本机已生效。"
+              : "文件已保存，等待本机应用。";
+          }
+        } else if (
           responseStatus === 202 &&
           data.status === "awaiting_approval" &&
           typeof data.change_id === "string" &&
@@ -781,6 +876,7 @@ export function mount(root, session, page = "configuration") {
   }
 
   load.addEventListener("click", readCurrent);
+  moduleChoice.addEventListener("change", readCurrent);
   validate.addEventListener("click", validateCandidate);
   publish.addEventListener("click", publishCandidate);
   progress.addEventListener("click", readProgress);

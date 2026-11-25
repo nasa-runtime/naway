@@ -30,6 +30,72 @@ impl Receipt {
 }
 
 impl ConfigHistory {
+    /// 业务作用：在统一文件事务内以活动集合为基线替换一个具名模块。
+    /// 参数说明：
+    /// - `active`：完整候选校验所用的本节点活动配置。
+    /// - `module`：活动清单授予的唯一文件目标。
+    /// - `content`：已通过完整候选校验的新原文。
+    /// - `snapshot`：唯一配置发布者的实时指针，用于紧邻写入复验活动版本。
+    /// 返回：给出此次持久替换的精确补偿收据，基线冲突时不写，异常显式返回。
+    pub(crate) fn compare_and_publish_named(
+        &self,
+        active: &GatewaySnapshot,
+        module: &crate::config::ActiveDocument,
+        content: &[u8],
+        snapshot: &arc_swap::ArcSwap<GatewaySnapshot>,
+    ) -> Result<Option<DocumentPublication>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let baseline = module
+            .content
+            .as_deref()
+            .context("named baseline unavailable")?;
+        let entry = &active.source_config_path;
+        self.with_exclusive_local_files(|| {
+            #[cfg(feature = "node-journal")]
+            if let Some(journal) = self.node_journal.get() {
+                // 既有持久协议只覆盖三文档。启用后必须保留该协议的失败保护。
+                anyhow::ensure!(
+                    !journal.durable_local_files()?,
+                    "node journal does not cover named module publication"
+                );
+            }
+            // 活动配置、关联依赖或受管原文任一变化，就不能消费之前的写入权限。
+            if snapshot.load().version != active.version
+                || config_fingerprint(entry).ok() != active.config_fingerprint
+            {
+                return Ok(None);
+            }
+            let metadata = std::fs::symlink_metadata(&module.path)?;
+            anyhow::ensure!(
+                metadata.is_file() && metadata.nlink() == 1,
+                "named module requires a file with one path for publication"
+            );
+            let Some(files) = files::publish(
+                &[(&module.path, baseline.as_bytes())],
+                &[(&module.path, content)],
+            )?
+            else {
+                return Ok(None);
+            };
+            match config_fingerprint(entry) {
+                Ok(fingerprint) => Ok(Some(DocumentPublication {
+                    fingerprint,
+                    files: Receipt::Memory(files),
+                })),
+                Err(error) => {
+                    // 此时替换已经发生，只能凭本次文件收据恢复，防止覆盖后来者。
+                    if files.restore()? {
+                        Err(error)
+                    } else {
+                        Err(error)
+                            .context("named module compensation conflicts with another writer")
+                    }
+                }
+            }
+        })
+    }
+
     /// 业务作用：将已经通过完整候选校验的归档原文恢复到当前本地配置文件位置。
     ///
     /// 参数说明：

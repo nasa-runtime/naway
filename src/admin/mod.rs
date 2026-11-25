@@ -636,6 +636,9 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
     if req.method() == Method::POST && req.uri().path() == "/api/explain" {
         return explain_route_request(req, state).await;
     }
+    if let Some(action) = configuration::named::Action::for_request(req.method(), req.uri().path()) {
+        return configuration::named::handle(req, state, action).await;
+    }
     if req.method() == Method::POST
         && req.uri().path().starts_with("/api/config/")
         && req.uri().path().ends_with("/diff")

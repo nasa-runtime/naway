@@ -1,5 +1,7 @@
 //! 独立配置文档与完整配置集共享发布、校验和原文格式化合同。
 
+pub(super) mod named;
+
 use super::{
     approval_required, build_cluster_candidate_snapshot, collect_bounded_admin_body, config_etag,
     finish_config_write, json, plain, prepare_config_action, prepare_config_write,
@@ -53,9 +55,16 @@ pub(super) async fn read_modules(
             .iter()
             .filter(|document| identity.allows(module_resource(document.domain), AdminAction::Read))
             .map(|document| {
+                let resource = module_resource(document.domain);
+                let write_available = identity.allows(resource, AdminAction::Write)
+                    && snapshot.config_bundle_digest.is_none()
+                    && !(snapshot.admin_approval.enabled
+                        && snapshot.admin_approval.resources.contains(&resource));
                 serde_json::json!({
                     "name": document.name,
+                    "resource": super::admin_resource_name(resource),
                     "readable": document.content.is_some(),
+                    "write_available": write_available && document.content.is_some(),
                 })
             })
             .collect::<Vec<_>>();

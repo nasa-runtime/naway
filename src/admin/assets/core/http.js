@@ -51,6 +51,10 @@ export async function request(path, options = {}) {
   }
   const epoch = generation;
   const method = (options.method ?? "GET").toUpperCase();
+  const modulePath = /^\/api\/config\/modules\/[A-Za-z0-9_.-]+\.ya?ml(?:\/(?:format|dry-run))?$/;
+  const writesModule = method === "PUT" && modulePath.test(target.pathname);
+  const readsModuleText = modulePath.test(target.pathname) &&
+    (method === "GET" || (method === "POST" && target.pathname.endsWith("/format")));
   const impact =
     /^\/api\/certificate-proposals\/[0-9a-f]{32}\/impact(?:\/review|\/resolve)?$/.test(
       target.pathname,
@@ -83,7 +87,11 @@ export async function request(path, options = {}) {
   // 原材料预检与完整影响读取有独立有界窗口；普通管理请求仍保持短期限。
   const timer = setTimeout(
     cancel,
-    materialWrite || (method === "GET" && (impact || execution)) ? 26000 : 5000,
+    writesModule
+      ? 50000
+      : materialWrite || (method === "GET" && (impact || execution))
+        ? 26000
+        : 5000,
   );
   const headers = new Headers(options.headers);
   if (authorization) {
@@ -124,7 +132,7 @@ export async function request(path, options = {}) {
     // 来源正文原生预算为4MiB，导出外壳另留有界余量；路径与方法共同决定该额度。
     // 配置原文与格式化预览允许16MiB输入，JSON转义另有有界外壳预算；不扩大普通管理响应。
     const configCapacity =
-      (method === "GET" &&
+      readsModuleText || (method === "GET" &&
         [
           "/api/config/current",
           "/api/sentinel",

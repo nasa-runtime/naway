@@ -10,6 +10,7 @@ mod node_policy;
 mod workspace;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -105,6 +106,82 @@ pub(super) async fn build_main(
     }
     let permit = state.candidate_builds.acquire()?;
     build_owned(state, permit, Input::Main(bytes)).await
+}
+
+/// 业务作用：用与普通发布共用的有限构建槽，独立验证某个具名模块及完整依赖。
+/// 参数说明：
+/// - `state`：共享文件事务、候选预算及活动事实。
+/// - `active`：请求授权和 If-Match 使用的快照。
+/// - `module_index`：由活动配置目录选取的目标，不接受请求中的路径。
+/// - `bytes`：待写的精确原文。
+/// 返回：候选语义与启动条件全部通过时成功，异常时保持活动文件和快照。
+pub(super) async fn build_named(
+    state: &AdminState,
+    active: Arc<GatewaySnapshot>,
+    module_index: usize,
+    bytes: Bytes,
+) -> Result<(), BuildError> {
+    let permit = state.candidate_builds.acquire()?;
+    let history = state.config_history.clone();
+    permit
+        .spawn(move |permit| {
+            let entry = &active.source_config_path;
+            let mut workspace =
+                Workspace::create(entry, permit).map_err(|_| BuildError::Workspace)?;
+            workspace
+                .write_main(&bytes)
+                .map_err(|_| BuildError::Workspace)?;
+            let module = &active.named_documents[module_index];
+            let built = history.with_stable_local_files(|| {
+                crate::config::candidate::load_named_module(
+                    &active,
+                    module,
+                    workspace.main_document().gateway,
+                )
+            });
+            workspace.cleanup().map_err(|_| BuildError::Workspace)?;
+            let built = built.map_err(|error| BuildError::Invalid(error.to_string()))?;
+            validate_named_transition(&active, &built, &history)
+                .map_err(|error| BuildError::Invalid(error.to_string()))
+        })
+        .await
+        .map_err(|_| BuildError::Worker)?
+}
+
+/// 业务作用：在接触事实源前拒绝候选切换永久节点或进程常驻的依赖。
+/// 参数说明：
+/// - `active`：当前配置和启动依赖。
+/// - `built`：已完整构建的候选。
+/// - `history`：已有节点身份与发布限制。
+/// 返回：候选与运行时约束一致时成功。
+fn validate_named_transition(
+    active: &GatewaySnapshot,
+    built: &GatewaySnapshot,
+    history: &crate::control::history::ConfigHistory,
+) -> Result<()> {
+    history.validate_candidate(built)?;
+    if let Some(field) = crate::config::centers::restart_field(active, built) {
+        anyhow::bail!("{field} change requires restart");
+    }
+    anyhow::ensure!(
+        crate::config::operations::same_bootstrap(
+            active.admin_operations.as_deref(),
+            built.admin_operations.as_deref(),
+        ),
+        "admin.operations authority changes require restart"
+    );
+    if active.config_bundle_digest.is_some() {
+        // 发布前采用与订阅侧一致的权限边界，不能先写远端再由节点拒绝权限切换。
+        if let Some(field) = crate::control::reload::remote_bootstrap_change(active, built) {
+            anyhow::bail!("Nacos dynamic config cannot override bootstrap-layer `{field}`");
+        }
+    }
+    anyhow::ensure!(
+        active.usage_meter.signature == built.usage_meter.signature
+            && active.traffic_meter.signature == built.traffic_meter.signature,
+        "meter transport changes require restart"
+    );
+    Ok(())
 }
 
 /// 业务作用：让唯一工作单元持有输入、许可和临时文件，只有真实清理完成才能释放构建容量。

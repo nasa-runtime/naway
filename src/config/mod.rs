@@ -15,7 +15,7 @@ pub mod management;
 pub mod media;
 pub mod model;
 mod modules;
-pub(crate) use modules::DocumentDomain;
+pub(crate) use modules::{ActiveDocument, DocumentDomain};
 pub mod named_nacos;
 pub(crate) mod monitor;
 pub mod operations;
@@ -5139,7 +5139,7 @@ pub(crate) fn load_gateway_config(cfg_path: &Path) -> Result<GatewayConfig> {
 ///
 /// 返回：强类型配置和本轮实际来源同时成功时返回；失败时不暴露部分配置或部分来源。
 fn load_gateway_config_tracked(cfg_path: &Path) -> Result<LoadedYml<GatewayConfig>> {
-    load_gateway_documents(cfg_path, cfg_path)
+    load_gateway_documents(cfg_path, cfg_path, None)
 }
 
 /// 业务作用：统一在线配置和隔离候选的 YAML 装配，保持部署根、profile 与有效环境相同。
@@ -5147,9 +5147,14 @@ fn load_gateway_config_tracked(cfg_path: &Path) -> Result<LoadedYml<GatewayConfi
 /// 参数说明：
 /// - `cfg_path`：真实部署入口与相对依赖根。
 /// - `physical`：本轮主文档原文的位置。
+/// - `replacement`：单个已登记模块的隔离输入。
 ///
 /// 返回：完整强类型配置和本地来源。模块读取、表达式或业务配置不合法时拒绝候选。
-fn load_gateway_documents(cfg_path: &Path, physical: &Path) -> Result<LoadedYml<GatewayConfig>> {
+fn load_gateway_documents(
+    cfg_path: &Path,
+    physical: &Path,
+    replacement: Option<&modules::Replacement<'_>>,
+) -> Result<LoadedYml<GatewayConfig>> {
     // gateway.yml 内既允许普通配置占位符(`${GW_UPSTREAM:http://...}`),也允许 filter DSL 运行期变量
     // (`${remote_addr}` / `${request_id}`)。因此使用 naml 的宽松解析:能解析的配置占位符照常解析,
     // 未命中的运行期变量保留给 gateway 的变量系统解释。
@@ -5157,7 +5162,9 @@ fn load_gateway_documents(cfg_path: &Path, physical: &Path) -> Result<LoadedYml<
     let entry: LoadedYml<serde_json::Value> = loader
         .load_tracked()
         .with_context(|| format!("load gateway config {}", physical.display()))?;
-    let mut loaded = if let Some((overlay, sources)) = modules::load(cfg_path, physical, &entry.value)? {
+    let mut loaded = if let Some((overlay, sources)) =
+        modules::load(cfg_path, physical, &entry.value, replacement)?
+    {
         let mut loaded: LoadedYml<GatewayConfig> = loader.load_tracked_with_overlays(&[overlay])?;
         anyhow::ensure!(
             !loaded.value.config_source.nacos.enabled,
@@ -5166,6 +5173,7 @@ fn load_gateway_documents(cfg_path: &Path, physical: &Path) -> Result<LoadedYml<
         loaded.value.module_sources = Some(sources);
         loaded
     } else {
+        anyhow::ensure!(replacement.is_none(), "named configuration entry changed");
         LoadedYml {
             value: serde_json::from_value(entry.value).context("decode gateway config")?,
             sources: entry.sources,
