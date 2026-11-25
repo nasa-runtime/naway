@@ -53,6 +53,7 @@ export async function request(path, options = {}) {
   const method = (options.method ?? "GET").toUpperCase();
   const modulePath = /^\/api\/config\/modules\/[A-Za-z0-9_.-]+\.ya?ml(?:\/(?:format|dry-run))?$/;
   const writesModule = method === "PUT" && modulePath.test(target.pathname);
+  const restoresModules = method === "POST" && target.pathname === "/admin/config/rollback";
   const readsModuleText = modulePath.test(target.pathname) &&
     (method === "GET" || (method === "POST" && target.pathname.endsWith("/format")));
   const impact =
@@ -87,7 +88,7 @@ export async function request(path, options = {}) {
   // 原材料预检与完整影响读取有独立有界窗口；普通管理请求仍保持短期限。
   const timer = setTimeout(
     cancel,
-    writesModule
+    writesModule || restoresModules
       ? 50000
       : materialWrite || (method === "GET" && (impact || execution))
         ? 26000

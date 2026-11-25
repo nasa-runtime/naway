@@ -15,6 +15,7 @@ pub(super) struct Workspace<'a> {
     root: PathBuf,
     files: [PathBuf; 3],
     created: [bool; 3],
+    named: Vec<PathBuf>,
     removed: bool,
     permit: &'a super::admission::Permit,
 }
@@ -67,6 +68,7 @@ impl<'a> Workspace<'a> {
                         ],
                         root,
                         created: [false; 3],
+                        named: Vec::new(),
                         removed: false,
                         permit,
                     });
@@ -107,6 +109,24 @@ impl<'a> Workspace<'a> {
             "candidate document exceeds size limit"
         );
         self.write_document(0, bytes)
+    }
+
+    /// 业务作用：将本次整代候选的附加模块写入独占位置，避免候选解析读取另一份归档原文。
+    /// 参数说明：
+    /// - `bytes`：已计入整代预算的单个模块原文。
+    /// 返回：固定物理路径。文件创建后的失败由当前工作区统一清理。
+    pub(super) fn write_named(&mut self, bytes: &[u8]) -> Result<PathBuf> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let path = self.root.join(format!("named-{}.yml", self.named.len()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        self.named.push(path.clone());
+        file.write_all(bytes)?;
+        Ok(path)
     }
 
     /// 业务作用：只覆盖命令签名的一个领域，另外两个 base 沿用真实来源，不能夹带未签名原文。
@@ -284,6 +304,14 @@ impl<'a> Workspace<'a> {
                 Err(error) => failure = Some(error),
             }
         }
+        self.named.retain(|path| match fs::remove_file(path) {
+            Ok(()) => false,
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
+            Err(error) => {
+                failure = Some(error);
+                true
+            }
+        });
         match fs::remove_dir(&self.root) {
             Ok(()) => self.removed = true,
             Err(error) if error.kind() == ErrorKind::NotFound => self.removed = true,

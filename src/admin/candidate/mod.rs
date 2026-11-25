@@ -9,6 +9,7 @@ pub(in crate::admin) mod node;
 mod node_policy;
 mod workspace;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -143,6 +144,65 @@ pub(super) async fn build_named(
             let built = built.map_err(|error| BuildError::Invalid(error.to_string()))?;
             validate_named_transition(&active, &built, &history)
                 .map_err(|error| BuildError::Invalid(error.to_string()))
+        })
+        .await
+        .map_err(|_| BuildError::Worker)?
+}
+
+/// 业务作用：在统一构建预算内读取并验证某个已活动的具名版本，保持当前入口和规则归属。
+/// 参数说明：
+/// - `state`：具名归档、候选容量和文件事务。
+/// - `active`：权限复验与模块路径的活动基线。
+/// - `version`：本节点已归档的目标版本。
+/// 返回：通过完整候选和启动边界校验的同一份原文字典。清单变化或归档不可用时拒绝。
+pub(super) async fn build_named_rollback(
+    state: &AdminState,
+    active: Arc<GatewaySnapshot>,
+    version: u64,
+) -> Result<BTreeMap<String, String>, BuildError> {
+    use sha2::{Digest, Sha256};
+
+    let permit = state.candidate_builds.acquire()?;
+    let history = state.config_history.clone();
+    permit
+        .spawn(move |permit| {
+            let target = history
+                .read_archived_named(version)
+                .map_err(|error| BuildError::Invalid(error.to_string()))?;
+            if target.len() != active.named_documents.len()
+                || active
+                    .named_documents
+                    .iter()
+                    .any(|document| !target.contains_key(&document.name))
+            {
+                return Err(BuildError::Invalid(
+                    "named rollback requires the active module inventory".into(),
+                ));
+            }
+            let mut workspace = Workspace::create(&active.source_config_path, permit)
+                .map_err(|_| BuildError::Workspace)?;
+            let mut stored = Vec::new();
+            for module in active.named_documents.iter() {
+                let bytes = target[&module.name].as_bytes();
+                if Sha256::digest(bytes).as_slice() != module.digest {
+                    let input = workspace
+                        .write_named(bytes)
+                        .map_err(|_| BuildError::Workspace)?;
+                    stored.push((module, input));
+                }
+            }
+            let entries = stored
+                .iter()
+                .map(|(module, path)| (*module, path.as_path()))
+                .collect::<Vec<_>>();
+            let built = history.with_stable_local_files(|| {
+                crate::config::candidate::load_named_modules(&active, &entries)
+            });
+            workspace.cleanup().map_err(|_| BuildError::Workspace)?;
+            let built = built.map_err(|error| BuildError::Invalid(error.to_string()))?;
+            validate_named_transition(&active, &built, &history)
+                .map_err(|error| BuildError::Invalid(error.to_string()))?;
+            Ok(target)
         })
         .await
         .map_err(|_| BuildError::Worker)?

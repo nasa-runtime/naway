@@ -1,6 +1,7 @@
 //! 独立配置文档与完整配置集共享发布、校验和原文格式化合同。
 
 pub(super) mod named;
+pub(super) mod named_rollback;
 
 use super::{
     approval_required, build_cluster_candidate_snapshot, collect_bounded_admin_body, config_etag,
@@ -72,6 +73,18 @@ pub(super) async fn read_modules(
         if documents.is_empty() {
             return plain(StatusCode::FORBIDDEN, "forbidden\n");
         }
+        let rollback_versions = if identity.allows(AdminResource::Config, AdminAction::Rollback)
+            && !approval_required(state, AdminResource::Config)
+            && (snapshot.config_bundle_digest.is_none()
+                || state
+                    .named_nacos
+                    .get()
+                    .is_some_and(|source| source.has_revision()))
+        {
+            state.config_history.named_versions()
+        } else {
+            Vec::new()
+        };
         return json(
             StatusCode::OK,
             serde_json::json!({
@@ -80,6 +93,7 @@ pub(super) async fn read_modules(
                 "version": snapshot.version,
                 "etag": etag,
                 "documents": documents,
+                "rollback_versions": rollback_versions,
             }),
         );
     };

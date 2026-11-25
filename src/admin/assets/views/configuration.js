@@ -173,6 +173,14 @@ export function mount(root, session, page = "configuration") {
   );
   label.append(editor);
   const result = element("div", "", "configuration-progress");
+  const rollbackPanel = element("section", "", "monitor-toolbar");
+  const rollbackSelect = element("select");
+  const rollbackLabel = element("label", "恢复历史配置版本 ");
+  const rollback = element("button", "恢复所选版本的全部 YAML");
+  rollback.type = "button";
+  rollbackLabel.append(rollbackSelect);
+  rollbackPanel.append(rollbackLabel, rollback);
+  rollbackPanel.hidden = true;
   const position = element(
     "p",
     "行 1 · 字符列 1 · 两空格缩进",
@@ -216,6 +224,7 @@ export function mount(root, session, page = "configuration") {
     label,
     position,
     formatPanel,
+    rollbackPanel,
     element("p", yamlEditingHelp, "subtle"),
     result,
   );
@@ -415,6 +424,8 @@ export function mount(root, session, page = "configuration") {
   function update() {
     const locked = !alive || document.hidden || active !== null;
     load.disabled = locked;
+    rollbackSelect.disabled = locked;
+    rollback.disabled = locked || !rollbackSelect.value || unknown;
     moduleChoice.disabled = locked;
     clear.disabled = !alive;
     editor.disabled = locked || baseline === null;
@@ -452,6 +463,8 @@ export function mount(root, session, page = "configuration") {
     timer = null;
     editor.value = "";
     baseline = null;
+    rollbackPanel.hidden = true;
+    rollbackSelect.replaceChildren();
     rollout = "";
     pendingChange = "";
     formatPreview = null;
@@ -558,6 +571,14 @@ export function mount(root, session, page = "configuration") {
         guidance.textContent = `编辑 ${target.documentKind}。发布时服务端校验其与其它模块和当前活动配置的关系。`;
       }
       publish.textContent = data.source === "nacos" ? "保存并推送集群" : "保存本地 YAML";
+      const versions = target.rollbackEtag === data.etag
+        ? target.rollbackVersions.filter((version) => version !== data.version)
+        : [];
+      rollbackSelect.replaceChildren(
+        ...[element("option", "请选择历史版本"), ...versions.map((version) => element("option", String(version)))],
+      );
+      rollbackSelect.firstElementChild.value = "";
+      rollbackPanel.hidden = page !== "configuration" || versions.length === 0;
       source.textContent =
         data.source === "nacos"
           ? `配置来源：Nacos · ${target.documentKind} · 当前接入节点配置版本 ${data.version}`
@@ -619,6 +640,10 @@ export function mount(root, session, page = "configuration") {
     const endpoint = `/api/config/modules/${selected}`;
     return {
       documentKind: selected,
+      rollbackEtag: catalog.data.etag,
+      rollbackVersions: Array.isArray(catalog.data.rollback_versions)
+        ? catalog.data.rollback_versions.filter((version) => Number.isSafeInteger(version) && version > 0)
+        : [],
       writeAvailable: catalog.data.documents.some((entry) =>
         entry.name === selected && entry.resource === definition.resource && entry.write_available === true),
       endpoint,
@@ -638,6 +663,48 @@ export function mount(root, session, page = "configuration") {
       return baseline.content;
     }
     return baseline?.crlf ? value.replaceAll("\n", "\r\n") : value;
+  }
+
+  /**
+   * 业务作用：以原加载代为条件恢复选定的完整历史版本，反馈事实源和本机观察结果。
+   * 参数说明: 无。
+   * 返回：清理可能已过期的配置原文与版本列表，回执缺失时要求先核对活动配置。
+   */
+  function restoreVersion() {
+    const version = Number(rollbackSelect.value);
+    if (!baseline?.named || !target.rollbackVersions.includes(version) || rollbackPanel.hidden) {
+      return;
+    }
+    const etag = baseline.etag;
+    return run(async (signal, epoch) => {
+      let message;
+      try {
+        const { data } = await request(`/admin/config/rollback?version=${version}`, {
+          method: "POST",
+          headers: { "If-Match": etag },
+          signal,
+        });
+        current(epoch);
+        if (data.ok !== true || !["applied", "pending", "committed"].includes(data.status)) {
+          throw new Error("回滚回执无法确认，请读取当前配置和历史后核对。");
+        }
+        message = data.status === "committed"
+          ? "历史版本已写入 Nacos。请在集群监控核对各节点的应用状态。"
+          : data.status === "applied"
+            ? "历史版本已在当前节点生效。"
+            : "回滚已提交，等待当前节点应用。";
+      } catch (error) {
+        if (error.name === "AbortError" && signal.aborted) {
+          return;
+        }
+        message = error.status === 412
+          ? "配置基线已变化，请重新读取。"
+          : `回滚请求结束，请读取当前配置和历史后核对。 ${error.message}`;
+      }
+      current(epoch);
+      retire();
+      status.textContent = message;
+    });
   }
 
   /**
@@ -876,6 +943,8 @@ export function mount(root, session, page = "configuration") {
   }
 
   load.addEventListener("click", readCurrent);
+  rollbackSelect.addEventListener("change", update);
+  rollback.addEventListener("click", restoreVersion);
   moduleChoice.addEventListener("change", readCurrent);
   validate.addEventListener("click", validateCandidate);
   publish.addEventListener("click", publishCandidate);

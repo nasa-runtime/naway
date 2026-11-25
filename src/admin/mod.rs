@@ -888,7 +888,9 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
         }
         (&Method::GET, "/admin/config/history") => config_history(&state),
         (&Method::GET, "/admin/config/rejections") => config_rejections(&state),
-        (&Method::POST, "/admin/config/rollback") => rollback_config(&request, &state).await,
+        (&Method::POST, "/admin/config/rollback") => {
+            rollback_config(&request, &state, &identity).await
+        }
         // 集群配置版本收敛视图:从 Nacos 反查本网关成员,聚合各节点已注册的 gateway.version。
         (&Method::GET, "/admin/cluster/consistency") => cluster_consistency(&state).await,
         (&Method::GET, "/api/cluster/metrics") | (&Method::GET, "/admin/cluster/metrics") => {
@@ -1553,9 +1555,14 @@ fn upstream_route_refs(snap: &GatewaySnapshot) -> HashMap<String, Vec<String>> {
 /// 参数说明：
 /// - `req`: 管理面请求,使用 `version` query 参数(可选 `base_version` 见 Nacos 路径)。
 /// - `state`: 管理面共享状态。
+/// - `identity`：发起回滚的主体，用于具名配置按已变更模块复验权限。
 ///
 /// 返回：归档、完整候选或文件门拒绝时不调度；文件替换成功后返回已调度，实际生效由reload确认。
-async fn rollback_config(req: &AdminRequestParts, state: &AdminState) -> Response<BoxBody> {
+async fn rollback_config(
+    req: &AdminRequestParts,
+    state: &Arc<AdminState>,
+    identity: &AdminIdentity,
+) -> Response<BoxBody> {
     let Some(raw_version) = query_param(req.uri.query().unwrap_or_default(), "version") else {
         return json(
             StatusCode::BAD_REQUEST,
@@ -1574,11 +1581,22 @@ async fn rollback_config(req: &AdminRequestParts, state: &AdminState) -> Respons
             }),
         );
     };
-    if state.snap.load().config_source.nacos.enabled {
+    let active = state.snap.load_full();
+    if active.named_configuration {
+        // 具名入口包含独立的业务文档，不能落入旧三文档写入链或覆盖 Nacos 私有物化文件。
+        return configuration::named_rollback::restore(
+            req,
+            state,
+            identity,
+            active,
+            target_version,
+        )
+        .await;
+    }
+    if active.config_source.nacos.enabled {
         // Nacos 配置源:走 CAS 写回远端事实源,不直接改本地文件(否则会被下次 watch 覆盖、且不集群生效)。
         return rollback_config_nacos(state, target_version).await;
     }
-    let active = state.snap.load_full();
     let current_version = active.version;
     let Some(expected_fingerprint) = active.config_fingerprint else {
         return plain(

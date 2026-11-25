@@ -30,26 +30,20 @@ impl Receipt {
 }
 
 impl ConfigHistory {
-    /// 业务作用：在统一文件事务内以活动集合为基线替换一个具名模块。
+    /// 业务作用：在统一文件事务内以活动集合为基线替换具名模块。
     /// 参数说明：
     /// - `active`：完整候选校验所用的本节点活动配置。
-    /// - `module`：活动清单授予的唯一文件目标。
-    /// - `content`：已通过完整候选校验的新原文。
+    /// - `changes`：活动清单授予的文件目标及已通过完整候选校验的新原文。
     /// - `snapshot`：唯一配置发布者的实时指针，用于紧邻写入复验活动版本。
     /// 返回：给出此次持久替换的精确补偿收据，基线冲突时不写，异常显式返回。
     pub(crate) fn compare_and_publish_named(
         &self,
         active: &GatewaySnapshot,
-        module: &crate::config::ActiveDocument,
-        content: &[u8],
+        changes: &[(&crate::config::ActiveDocument, &[u8])],
         snapshot: &arc_swap::ArcSwap<GatewaySnapshot>,
     ) -> Result<Option<DocumentPublication>> {
         use std::os::unix::fs::MetadataExt;
 
-        let baseline = module
-            .content
-            .as_deref()
-            .context("named baseline unavailable")?;
         let entry = &active.source_config_path;
         self.with_exclusive_local_files(|| {
             #[cfg(feature = "node-journal")]
@@ -66,16 +60,22 @@ impl ConfigHistory {
             {
                 return Ok(None);
             }
-            let metadata = std::fs::symlink_metadata(&module.path)?;
-            anyhow::ensure!(
-                metadata.is_file() && metadata.nlink() == 1,
-                "named module requires a file with one path for publication"
-            );
-            let Some(files) = files::publish(
-                &[(&module.path, baseline.as_bytes())],
-                &[(&module.path, content)],
-            )?
-            else {
+            let mut prior = Vec::with_capacity(changes.len());
+            let mut desired = Vec::with_capacity(changes.len());
+            for (module, content) in changes {
+                let metadata = std::fs::symlink_metadata(&module.path)?;
+                anyhow::ensure!(
+                    metadata.is_file() && metadata.nlink() == 1,
+                    "named module requires a file with one path for publication"
+                );
+                let baseline = module
+                    .content
+                    .as_deref()
+                    .context("named baseline unavailable")?;
+                prior.push((module.path.as_path(), baseline.as_bytes()));
+                desired.push((module.path.as_path(), *content));
+            }
+            let Some(files) = files::publish_named(&prior, &desired)? else {
                 return Ok(None);
             };
             match config_fingerprint(entry) {

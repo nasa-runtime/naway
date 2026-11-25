@@ -134,19 +134,34 @@ pub(crate) fn load_named_module(
     module: &super::modules::ActiveDocument,
     input: &Path,
 ) -> Result<GatewaySnapshot> {
+    load_named_modules(active, &[(module, input)])
+}
+
+/// 业务作用：用一组具名原文重建完整候选，按原入口解析各模块、活动 profile 和规则。
+/// 参数说明：
+/// - `active`：授权、实际加载路径与模块清单基线。
+/// - `inputs`：从活动清单选出的文档和隔离输入，每个目标只有一份原文。
+/// 返回：所有目标和启动依赖同代时返回候选，规则归属或来源漂移时拒绝。
+pub(crate) fn load_named_modules(
+    active: &GatewaySnapshot,
+    inputs: &[(&super::modules::ActiveDocument, &Path)],
+) -> Result<GatewaySnapshot> {
     let entry = &active.source_config_path;
     let version = active
         .version
         .checked_add(1)
         .context("configuration version exhausted")?;
     let main = source_identity::Document::read(entry)?;
-    let replacement = modules::Replacement {
-        target: &module.path,
-        input,
-    };
-    let loaded = load_gateway_documents(entry, entry, Some(&replacement))?;
+    let replacements = inputs
+        .iter()
+        .map(|(module, input)| modules::Replacement {
+            target: &module.path,
+            input,
+        })
+        .collect::<Vec<_>>();
+    let loaded = load_gateway_documents(entry, entry, &replacements)?;
     let paths = Paths::new(entry, &loaded.value);
-    // 具名候选只拥有一个已授权文件，不能通过新规则路径改写其它领域。
+    // 具名候选只能覆盖已授权的原文，通过声明改写其它领域的规则路径会绕过授权。
     anyhow::ensure!(
         paths == active.document_paths,
         "named module cannot change rule sources"
@@ -155,12 +170,12 @@ pub(crate) fn load_named_module(
         guard: &paths.guard,
         sentinel: &paths.sentinel,
     };
-    let rule = match module.domain {
-        DocumentDomain::InterfaceGuard => Some(&mut sidecars.guard),
-        DocumentDomain::Sentinel => Some(&mut sidecars.sentinel),
-        DocumentDomain::Configuration => None,
-    };
-    if let Some(rule) = rule {
+    for (module, input) in inputs {
+        let rule = match module.domain {
+            DocumentDomain::InterfaceGuard => &mut sidecars.guard,
+            DocumentDomain::Sentinel => &mut sidecars.sentinel,
+            DocumentDomain::Configuration => continue,
+        };
         // 原文通过别名绑定时，替换受管文件不能保证被规则加载路径实际采用。
         anyhow::ensure!(
             std::path::absolute(*rule)? == module.path,

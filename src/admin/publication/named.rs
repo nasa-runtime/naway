@@ -1,6 +1,6 @@
 //! 单模块事实源提交、精确补偿和活动配置观察。
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use hyper::{header, Response, StatusCode};
@@ -50,21 +50,19 @@ pub(in crate::admin) async fn publish_named(
     if active.config_bundle_digest.is_some() {
         return publish_remote(state, &active, &module.name, body).await;
     }
-    publish_file(state, active, index, body).await
+    publish_files(state, active, vec![(index, body)]).await
 }
 
-/// 业务作用：提交选定的本机文件，等待唯一重载器裁决，明确拒绝时凭收据恢复原文。
+/// 业务作用：提交已验证的本机文件集合，等待唯一重载器裁决，明确拒绝时凭收据恢复原文。
 /// 参数说明：
 /// - `state`：本机文件事务和快照发布权。
 /// - `active`：已验证的活动配置和权限代。
-/// - `index`：具有写权限的模块目录索引。
-/// - `body`：完整校验过的 YAML。
+/// - `writes`：已授权的模块目录索引及完整校验过的 YAML。
 /// 返回：文件写入只确认本节点，重载拒绝时保留上一代，应用结果未观察到时明确报告等待。
-async fn publish_file(
+async fn publish_files(
     state: &Arc<AdminState>,
     active: Arc<GatewaySnapshot>,
-    index: usize,
-    body: Bytes,
+    writes: Vec<(usize, Bytes)>,
 ) -> Response<BoxBody> {
     let before = active.version;
     let path = active.source_config_path.clone();
@@ -90,7 +88,11 @@ async fn publish_file(
     let current = state.snap.clone();
     let publication = tokio::task::spawn_blocking(move || {
         let _gate = gate;
-        history.compare_and_publish_named(&active, &active.named_documents[index], &body, &current)
+        let changes = writes
+            .iter()
+            .map(|(index, body)| (&active.named_documents[*index], body.as_ref()))
+            .collect::<Vec<_>>();
+        history.compare_and_publish_named(&active, &changes, &current)
     })
     .await;
     let publication = match publication {
@@ -179,6 +181,84 @@ async fn publish_remote(
             );
         }
     };
+    commit_remote(state, active, edit.commit(content)).await
+}
+
+/// 业务作用：把已授权的历史具名配置交给当前事实源，以完整内容代观察本机恢复。
+/// 参数说明：
+/// - `state`：当前配置来源、发布许可和观察入口。
+/// - `active`：授权和恢复候选使用的活动配置代。
+/// - `target`：已整代验证的历史模块原文。
+/// 返回：已应用、已提交、待观察或明确拒绝。集群数据源确认不能当作每节点生效证据。
+pub(in crate::admin) async fn restore_named(
+    state: &Arc<AdminState>,
+    active: Arc<GatewaySnapshot>,
+    mut target: BTreeMap<String, String>,
+) -> Response<BoxBody> {
+    use sha2::{Digest, Sha256};
+
+    if target.iter().all(|(name, body)| {
+        active.named_documents.iter().any(|module| {
+            &module.name == name && module.digest == Sha256::digest(body.as_bytes()).as_slice()
+        })
+    }) {
+        let Some(fingerprint) = active.config_fingerprint else {
+            return stale();
+        };
+        if !current_config_baseline_matches(state, active.version, fingerprint).await {
+            return stale();
+        }
+        let source = if active.config_bundle_digest.is_some() {
+            "nacos"
+        } else {
+            "file"
+        };
+        return applied(active.version, fingerprint, source);
+    }
+    if active.config_bundle_digest.is_some() {
+        let Some(source) = state.named_nacos.get() else {
+            return plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "configuration authority unavailable\n",
+            );
+        };
+        let edit = match source.prepare_rollback(&active, target).await {
+            Ok(Some(edit)) => edit,
+            Ok(None) => return stale(),
+            Err(error) => {
+                tracing::warn!(%error, "Nacos named rollback preparation failed");
+                return plain(
+                    StatusCode::CONFLICT,
+                    "named Nacos rollback requires a stable committed revision\n",
+                );
+            }
+        };
+        return commit_remote(state, &active, edit.commit()).await;
+    }
+    let writes = active
+        .named_documents
+        .iter()
+        .enumerate()
+        .filter_map(|(index, module)| {
+            target
+                .remove(&module.name)
+                .map(|body| (index, Bytes::from(body)))
+        })
+        .collect();
+    publish_files(state, active, writes).await
+}
+
+/// 业务作用：紧邻远端写入复验活动授权，从提交回执中分别报告远端写入与本机观察。
+/// 参数说明：
+/// - `state`：当前活动快照、配置发布许可。
+/// - `active`：产生写入意图的冻结权限代。
+/// - `commit`：由实际配置中心提供的条件写入任务，获得权威前不执行。
+/// 返回：提交确认、条件冲突或结果未知，成功时附本机已观察的目标代。
+async fn commit_remote(
+    state: &Arc<AdminState>,
+    active: &GatewaySnapshot,
+    commit: impl Future<Output = anyhow::Result<Option<String>>>,
+) -> Response<BoxBody> {
     let gate =
         match tokio::time::timeout(Duration::from_secs(3), state.apply_coordinator.lock_owned())
             .await
@@ -198,7 +278,7 @@ async fn publish_remote(
     if !current_config_baseline_matches(state, active.version, fingerprint).await {
         return stale();
     }
-    let committed = edit.commit(content).await;
+    let committed = commit.await;
     drop(gate);
     let generation = match committed {
         Ok(Some(generation)) => generation,

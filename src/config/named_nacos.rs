@@ -20,6 +20,8 @@ use crate::config::{bootstrap::module_template, document, loader, GatewaySnapsho
 use crate::control::history::ConfigHistory;
 use crate::control::reload::{nacos_config_props, ReloadHandle};
 
+mod rollback;
+
 const READ_TIMEOUT: Duration = Duration::from_secs(12);
 const RECHECK: Duration = Duration::from_secs(2);
 const MISSING_CAS: &str = "naway-create-only";
@@ -45,13 +47,27 @@ struct Revision {
     pending: Option<PendingRevision>,
 }
 
-/// 提交标记上的写入权只允许完成已声明的单文档原文变更，不自动过期或替换。
+/// 受理意图仅能提交已经冻结的原文集合，不自动过期或替换。
+#[derive(Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+enum PendingRevision {
+    Single(PendingModule),
+    Batch(PendingBatch),
+}
+
 #[derive(Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PendingRevision {
+struct PendingModule {
     id: String,
     document: String,
     sha256: String,
+}
+
+#[derive(Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingBatch {
+    id: String,
+    replacements: BTreeMap<String, String>,
 }
 
 struct RevisionEdit {
@@ -79,6 +95,21 @@ pub(crate) struct Edit {
     md5: Option<String>,
     generation: String,
     revision: Option<RevisionEdit>,
+}
+
+/// 与单个提交标记关联的一组写操作，每条保留各自的服务端比较条件。
+pub(crate) struct Rollback {
+    client: NacosConfigClient,
+    revision: RevisionEdit,
+    generation: String,
+    writes: Vec<RollbackWrite>,
+}
+
+struct RollbackWrite {
+    name: String,
+    group: String,
+    md5: String,
+    body: String,
 }
 
 /// 用于关闭后台 Nacos 订阅及其运行线程。
@@ -129,6 +160,13 @@ impl NamedNacos {
     /// 返回：进程专属的合成入口路径。真实引导与运维 YAML 不是写回目标。
     pub fn candidate_path(&self) -> &Path {
         &self.storage.selector
+    }
+
+    /// 业务作用：报告启动时是否绑定可协调具名回滚的提交标记。
+    /// 参数说明: 无。
+    /// 返回：配置了同一命名空间内的提交标记时为真。
+    pub(crate) fn has_revision(&self) -> bool {
+        self.plan.revision.is_some()
     }
 
     /// 业务作用：为单个模块绑定同一 Nacos 权威和完整活动代，再取得 Data ID 的 CAS 条件。
@@ -401,7 +439,11 @@ impl RevisionEdit {
                         return Ok(());
                     }
                     ensure!(
-                        documents == self.head.documents,
+                        documents.len() == self.head.documents.len()
+                            && documents.iter().all(|(name, digest)| {
+                                self.head.documents.get(name) == Some(digest)
+                                    || self.next.documents.get(name) == Some(digest)
+                            }),
                         "Nacos configuration changed while the revision was pending"
                     );
                 }
@@ -670,15 +712,34 @@ async fn read_revision(
         "unsupported Nacos revision schema"
     );
     if let Some(pending) = &head.pending {
-        ensure!(
-            head.documents.contains_key(&pending.document)
-                && [&pending.id, &pending.sha256].into_iter().all(|value| {
-                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-                }),
-            "invalid Nacos pending revision"
-        );
+        let valid_digest =
+            |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let valid = match pending {
+            PendingRevision::Single(pending) => {
+                valid_digest(&pending.id)
+                    && valid_digest(&pending.sha256)
+                    && head.documents.contains_key(&pending.document)
+            }
+            PendingRevision::Batch(pending) => {
+                valid_digest(&pending.id)
+                    && !pending.replacements.is_empty()
+                    && pending.replacements.iter().all(|(name, digest)| {
+                        valid_digest(digest) && head.documents.contains_key(name)
+                    })
+            }
+        };
+        ensure!(valid, "invalid Nacos pending revision");
     }
     Ok((head, md5))
+}
+
+/// 业务作用：创建不会因原文恢复到旧值而复用的提交意图身份。
+/// 参数说明: 无。
+/// 返回：适合提交标记的随机十六进制标识，随机源失败时拒绝领取写入权。
+fn revision_intent_id() -> Result<String> {
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(format!("{:x}", Sha256::digest(nonce)))
 }
 
 /// 业务作用：按业务 Data ID 绑定完整远端原文，供提交和读取方使用同一摘要口径。
@@ -727,6 +788,9 @@ async fn prepare_revision_edit(
     };
     *prior = digest.clone();
     let claimed = if let Some(pending) = &head.pending {
+        let PendingRevision::Single(pending) = pending else {
+            return Ok(None);
+        };
         // 续办只允许提交已完整写入的候选，避免发出第二次能够在旧正文复现后迟到生效的业务写入。
         if pending.document != name || pending.sha256 != digest || actual != documents {
             return Ok(None);
@@ -754,13 +818,11 @@ async fn prepare_revision_edit(
         if actual != head.documents {
             return Ok(None);
         }
-        let mut nonce = [0u8; 16];
-        getrandom::getrandom(&mut nonce).map_err(|error| anyhow::anyhow!("{error}"))?;
-        head.pending = Some(PendingRevision {
-            id: format!("{:x}", Sha256::digest(nonce)),
+        head.pending = Some(PendingRevision::Single(PendingModule {
+            id: revision_intent_id()?,
             document: name.to_owned(),
             sha256: digest,
-        });
+        }));
         false
     };
     Ok(Some(RevisionEdit {

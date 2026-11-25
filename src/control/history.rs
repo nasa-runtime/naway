@@ -4,6 +4,7 @@
 
 mod actions;
 mod files;
+mod named;
 mod publication;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -83,10 +84,13 @@ pub struct ConfigHistoryEvent {
 }
 
 #[derive(Clone)]
-struct ArchivedConfigSet {
-    gateway: PathBuf,
-    interface_guard: PathBuf,
-    sentinel_rules: PathBuf,
+enum ArchivedConfigSet {
+    Legacy {
+        gateway: PathBuf,
+        interface_guard: PathBuf,
+        sentinel_rules: PathBuf,
+    },
+    Named(Arc<named::Archive>),
 }
 
 /// 某归档版本的三文件配置原文。
@@ -303,7 +307,7 @@ impl ConfigHistory {
                 fingerprint.is_some() && config_fingerprint(cfg_path).ok() == fingerprint,
                 "configuration changed before archive"
             );
-            let archive = self.archive_config_set(cfg_path, snap.version)?;
+            let archive = self.archive_config_set(cfg_path, snap)?;
             anyhow::ensure!(
                 config_fingerprint(cfg_path).ok() == fingerprint,
                 "configuration changed during archive"
@@ -312,7 +316,18 @@ impl ConfigHistory {
         });
         let (status, error) = match archive_result {
             Ok(archive) => {
-                self.inner.lock().archives.insert(snap.version, archive);
+                let retired = {
+                    let mut state = self.inner.lock();
+                    let bounded = matches!(&archive, ArchivedConfigSet::Named(_));
+                    state.archives.insert(snap.version, archive);
+                    if bounded && state.archives.len() > state.max_events {
+                        state.archives.pop_first()
+                    } else {
+                        None
+                    }
+                };
+                // 旧归档的文件清理由最后一个使用者在历史锁之外执行。
+                drop(retired);
                 ("applied".to_string(), None)
             }
             Err(err) => (
@@ -410,6 +425,21 @@ impl ConfigHistory {
         }
     }
 
+    /// 业务作用：为具名模块目录列出可读取的整组历史，不把旧模型的版本展示为可恢复证据。
+    /// 参数说明: 无。
+    /// 返回：按最新优先排序的具名归档身份，仅含代号。
+    pub(crate) fn named_versions(&self) -> Vec<u64> {
+        self.inner
+            .lock()
+            .archives
+            .iter()
+            .rev()
+            .filter_map(|(version, archive)| {
+                matches!(archive, ArchivedConfigSet::Named(_)).then_some(*version)
+            })
+            .collect()
+    }
+
     /// 业务作用：与本进程文件发布互斥地读取、构建或发布完整快照，避免观察三文档中间态。
     ///
     /// 参数说明：
@@ -455,14 +485,32 @@ impl ConfigHistory {
                 .cloned()
                 .with_context(|| format!("config version `{version}` is not archived"))?
         };
+        let ArchivedConfigSet::Legacy {
+            gateway,
+            interface_guard,
+            sentinel_rules,
+        } = archive
+        else {
+            anyhow::bail!("archive contains named modules");
+        };
         Ok(ArchivedDocs {
-            gateway: read_archived_text(&archive.gateway, "archived gateway")?,
-            interface_guard: read_archived_text(
-                &archive.interface_guard,
-                "archived interface guard",
-            )?,
-            sentinel_rules: read_archived_text(&archive.sentinel_rules, "archived sentinel rules")?,
+            gateway: read_archived_text(&gateway, "archived gateway")?,
+            interface_guard: read_archived_text(&interface_guard, "archived interface guard")?,
+            sentinel_rules: read_archived_text(&sentinel_rules, "archived sentinel rules")?,
         })
+    }
+
+    /// 业务作用：按归档版本读取完整的具名配置原文，供 Admin 校验同一代回滚候选。
+    /// 参数说明：
+    /// - `version`：本节点历史记录所列的归档版本。
+    /// 返回：全部归档模块的原字节。不存在、归档类型不符或读取摘要变化时拒绝。
+    pub(crate) fn read_archived_named(&self, version: u64) -> Result<BTreeMap<String, String>> {
+        let Some(ArchivedConfigSet::Named(archive)) =
+            self.inner.lock().archives.get(&version).cloned()
+        else {
+            anyhow::bail!("named configuration version is not archived");
+        };
+        archive.read()
     }
 
     /// 业务作用：在候选构建前冻结活动原文基线，快照已发布但归档尚未完成时仍可安全比较回滚。
@@ -501,13 +549,27 @@ impl ConfigHistory {
         }
     }
 
-    /// 业务作用：归档同一配置集的主文件和规则文件，为回滚保留可重建的输入。
-    fn archive_config_set(&self, cfg_path: &Path, version: u64) -> Result<ArchivedConfigSet> {
+    /// 业务作用：按活动来源归档完整原文，不将具名入口和旧三文档交叉恢复。
+    /// 参数说明：
+    /// - `cfg_path`：本轮已发布的实际配置入口。
+    /// - `snap`：用来固定代次和具名模块正文身份的快照。
+    /// 返回：存储完整且原文字节与活动代匹配时返回归档句柄。
+    fn archive_config_set(
+        &self,
+        cfg_path: &Path,
+        snap: &GatewaySnapshot,
+    ) -> Result<ArchivedConfigSet> {
+        if snap.named_configuration {
+            return Ok(ArchivedConfigSet::Named(Arc::new(named::Archive::capture(
+                &self.archive_root,
+                snap,
+            )?)));
+        }
         let cfg = load_gateway_config(cfg_path)
             .with_context(|| format!("read config set for archive {}", cfg_path.display()))?;
         let guard = resolve_relative(cfg_path, &cfg.interface_guard_file);
         let sentinel = resolve_relative(cfg_path, &cfg.sentinel_rules_file);
-        let dir = self.archive_root.join(format!("v{version}"));
+        let dir = self.archive_root.join(format!("v{}", snap.version));
         fs::create_dir_all(&dir)
             .with_context(|| format!("create config archive dir {}", dir.display()))?;
         let gateway_dst = dir.join("gateway.yml");
@@ -516,7 +578,7 @@ impl ConfigHistory {
         write_bounded_archive(cfg_path, &gateway_dst, "gateway config")?;
         write_bounded_archive(&guard, &guard_dst, "interface guard")?;
         write_bounded_archive(&sentinel, &sentinel_dst, "sentinel rules")?;
-        Ok(ArchivedConfigSet {
+        Ok(ArchivedConfigSet::Legacy {
             gateway: gateway_dst,
             interface_guard: guard_dst,
             sentinel_rules: sentinel_dst,

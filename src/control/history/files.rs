@@ -50,12 +50,45 @@ pub(crate) fn publish(
     baseline: &[(&Path, &[u8])],
     desired: &[(&Path, &[u8])],
 ) -> Result<Option<Publication>> {
+    publish_bounded(baseline, desired, 3)
+}
+
+/// 业务作用：暂存并替换同一活动清单下的具名文件，复用逐文件比较及条件补偿。
+/// 参数说明：
+/// - `baseline`：活动模块实际路径与原文。
+/// - `desired`：同一批路径对应的新原文，不允许新增配置目标。
+/// 返回：条件符合时交付整批文件收据，失败释放已暂存内容或执行条件补偿。
+pub(crate) fn publish_named(
+    baseline: &[(&Path, &[u8])],
+    desired: &[(&Path, &[u8])],
+) -> Result<Option<Publication>> {
+    ensure!(
+        baseline
+            .iter()
+            .map(|(path, _)| path)
+            .eq(desired.iter().map(|(path, _)| path)),
+        "named configuration document targets changed"
+    );
+    publish_bounded(baseline, desired, crate::config::NAMED_DOCUMENT_LIMIT)
+}
+
+/// 业务作用：限制配置事务的路径数量，再对冻结基线执行暂存、复验和提交。
+/// 参数说明：
+/// - `baseline`：现有目标与已冻结原文。
+/// - `desired`：同次语义构建给出的目标与原文。
+/// - `limit`：当前发布模型允许的最多目标数。
+/// 返回：冲突返回空，成功交付条件补偿收据。
+fn publish_bounded(
+    baseline: &[(&Path, &[u8])],
+    desired: &[(&Path, &[u8])],
+    limit: usize,
+) -> Result<Option<Publication>> {
     ensure!(
         cfg!(unix),
         "document publication requires Unix filesystem semantics"
     );
     ensure!(
-        !baseline.is_empty() && baseline.len() <= 3 && baseline.len() == desired.len(),
+        !baseline.is_empty() && baseline.len() <= limit && baseline.len() == desired.len(),
         "invalid document target count"
     );
     let mut originals = BTreeMap::new();

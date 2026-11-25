@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use super::{loader, resolve_relative, MAX_FINGERPRINT_FILE_BYTES};
 
-const MAX_DOCUMENTS: usize = 64;
+pub(crate) const NAMED_DOCUMENT_LIMIT: usize = 64;
 
 /// 已装配候选实际采用的文件及本轮必须保持缺席的可选文件。
 #[derive(Clone, Debug)]
@@ -43,7 +43,7 @@ pub(crate) struct ActiveDocument {
     pub digest: [u8; 32],
 }
 
-/// 单模块候选的物理正文，模块及其 profile 仍按真实声明定位。
+/// 具名模块候选的物理正文，模块及其 profile 仍按真实声明定位。
 pub(super) struct Replacement<'a> {
     pub(super) target: &'a Path,
     pub(super) input: &'a Path,
@@ -172,14 +172,14 @@ pub(super) fn is_manifest(path: &Path) -> bool {
 /// - `entry`：真实部署入口及相对路径根。
 /// - `physical`：本轮实际读取的入口，决定最终 naml 叠加位置。
 /// - `tree`：入口和活动 profile 已经解析出的声明。
-/// - `replacement`：可选隔离输入，仅替换一个已存在的基础文档。
+/// - `replacements`：已授权的隔离输入，仅替换已存在的基础文档。
 ///
 /// 返回：入口无导入时为空。全部导入有效时返回 naml overlay 和来源计划，否则拒绝整代。
 pub(super) fn load(
     entry: &Path,
     physical: &Path,
     tree: &Value,
-    replacement: Option<&Replacement<'_>>,
+    replacements: &[Replacement<'_>],
 ) -> Result<Option<(YmlOverlay, Arc<Sources>)>> {
     if tree.pointer("/yml/imports").is_none() {
         ensure!(
@@ -193,8 +193,8 @@ pub(super) fn load(
     let base = entry.parent().unwrap_or_else(|| Path::new("."));
     let imports = naml::strict::parse_imports_checked(tree, base).context("invalid yml.imports")?;
     ensure!(
-        (1..=MAX_DOCUMENTS).contains(&imports.len()),
-        "yml.imports requires between 1 and {MAX_DOCUMENTS} named documents"
+        (1..=NAMED_DOCUMENT_LIMIT).contains(&imports.len()),
+        "yml.imports requires between 1 and {NAMED_DOCUMENT_LIMIT} named documents"
     );
     let mut sources = Sources {
         files: Vec::new(),
@@ -208,7 +208,7 @@ pub(super) fn load(
     let mut total_bytes = 0usize;
     let guard = rule_path(tree, &entry, "interface_guard_file", "interface-guard.yml")?;
     let sentinel = rule_path(tree, &entry, "sentinel_rules_file", "sentinel-rules.yml")?;
-    let mut replaced = false;
+    let mut replaced = 0;
     for import in imports {
         // Nacos 与本地文件分别由各自的来源权威读取，避免远端入口被误解为启动时的空配置。
         let YmlImport::File {
@@ -233,8 +233,8 @@ pub(super) fn load(
             .and_then(|stem| stem.to_str())
             .context("invalid YAML filename")?;
         let profile = path.with_file_name(format!("{stem}-{{profile}}"));
-        let input = if let Some(edit) = replacement.filter(|edit| edit.target == path) {
-            replaced = true;
+        let input = if let Some(edit) = replacements.iter().find(|edit| edit.target == path) {
+            replaced += 1;
             edit.input
         } else {
             &path
@@ -345,7 +345,7 @@ pub(super) fn load(
         }
     }
     ensure!(
-        replacement.is_none() || replaced,
+        replacements.len() == replaced,
         "named configuration target is no longer declared"
     );
     ensure!(
