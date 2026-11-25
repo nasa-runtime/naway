@@ -12,7 +12,7 @@ use anyhow::{ensure, Context, Result};
 use arc_swap::ArcSwap;
 use naml::YmlImport;
 use nasa::config::nacos::{ConfigBundle, ConfigRef, NacosConfigClient};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
@@ -23,6 +23,8 @@ use crate::control::reload::{nacos_config_props, ReloadHandle};
 const READ_TIMEOUT: Duration = Duration::from_secs(12);
 const RECHECK: Duration = Duration::from_secs(2);
 const MISSING_CAS: &str = "naway-create-only";
+const MAX_REVISION_BYTES: usize = 64 * 1024;
+const REVISION_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Nacos 引导连接和已校验的业务文档清单。
 struct Plan {
@@ -34,11 +36,32 @@ struct Plan {
     revision: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Revision {
     schema_version: u32,
     documents: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending: Option<PendingRevision>,
+}
+
+/// 提交标记上的写入权只允许完成已声明的单文档原文变更，不自动过期或替换。
+#[derive(Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingRevision {
+    id: String,
+    document: String,
+    sha256: String,
+}
+
+struct RevisionEdit {
+    id: String,
+    group: String,
+    refs: Vec<ConfigRef>,
+    expected_md5: String,
+    claimed: bool,
+    head: Revision,
+    next: Revision,
 }
 
 /// 持有启动时已取到的 Nacos 配置和该进程的独占物化目录。
@@ -53,8 +76,9 @@ pub(crate) struct Edit {
     client: NacosConfigClient,
     group: String,
     name: String,
-    md5: String,
+    md5: Option<String>,
     generation: String,
+    revision: Option<RevisionEdit>,
 }
 
 /// 用于关闭后台 Nacos 订阅及其运行线程。
@@ -120,13 +144,19 @@ impl NamedNacos {
         content: &str,
     ) -> Result<Option<Edit>> {
         let plan = self.plan.current(&self.entry)?;
-        // 带提交标记的配置需要整代提交条件，不能用单文档写入制造未经提交的集群代。
-        ensure!(
-            plan.revision.is_none(),
-            "Nacos revision requires a coordinated publication"
-        );
         let client = connect(&plan).await?;
-        let mut current = fetch(&client, &plan).await?;
+        let mut current = fetch_bundle(&client, &plan.refs).await?;
+        let revision = if let Some(id) = plan.revision.clone() {
+            let Some(revision) =
+                prepare_revision_edit(&client, id, &plan, active, name, content, &mut current)
+                    .await?
+            else {
+                return Ok(None);
+            };
+            Some(revision)
+        } else {
+            None
+        };
         if self.storage.active_directory_for(active).as_ref()
             != Some(&self.storage.generation(&plan, &current))
         {
@@ -148,7 +178,13 @@ impl NamedNacos {
         let Some((baseline, md5)) = latest else {
             return Ok(None);
         };
-        if baseline != document.content {
+        let already_written = revision.as_ref().is_some_and(|revision| revision.claimed);
+        let expected = if already_written {
+            content
+        } else {
+            document.content.as_str()
+        };
+        if baseline != expected {
             return Ok(None);
         }
         document.content = content.to_owned();
@@ -163,8 +199,9 @@ impl NamedNacos {
             client,
             group,
             name: name.to_owned(),
-            md5,
+            md5: (!already_written).then_some(md5),
             generation,
+            revision,
         }))
     }
 
@@ -255,7 +292,7 @@ impl NamedNacos {
                 _ = interval.tick() => {}
             }
             let next = self.plan.current(&self.entry)?;
-            if plan.refs != next.refs || plan.revision != next.revision {
+            if plan.refs != next.refs {
                 // 先订阅新目录再释放原订阅，随后读回全量，避免切换窗口遗漏变化。
                 let watched = tokio::time::timeout(
                     READ_TIMEOUT,
@@ -289,18 +326,99 @@ impl NamedNacos {
 }
 
 impl Edit {
-    /// 业务作用：只写已经复验的 Data ID，并用服务端 CAS 防止覆盖后来者。
+    /// 业务作用：只写已经复验的 Data ID，并在启用提交标记时持有该标记的写入权。
     /// 参数说明：
     /// - `content`：构建时冻结的模块 YAML。
     /// 返回：服务端确认后返回预期生效代，冲突返回空，超时不能判定远端是否已提交。
     pub(crate) async fn commit(self, content: &str) -> Result<Option<String>> {
-        let committed = tokio::time::timeout(
-            Duration::from_secs(3),
-            self.client
-                .publish_cas(&self.name, &self.group, content, &self.md5),
-        )
-        .await??;
-        Ok(committed.then_some(self.generation))
+        let revision_md5 = match &self.revision {
+            Some(revision) => {
+                let Some(md5) = revision.claim(&self.client).await? else {
+                    return Ok(None);
+                };
+                Some(md5)
+            }
+            None => None,
+        };
+        if let Some(md5) = &self.md5 {
+            // 数据文档 CAS 在标记受理之后执行，任一迟到写者都不能覆盖不同正文。
+            let committed =
+                publish_cas(&self.client, &self.name, &self.group, content, md5).await?;
+            if !committed && self.revision.is_none() {
+                return Ok(None);
+            }
+        }
+        if let (Some(revision), Some(md5)) = (self.revision, revision_md5) {
+            revision.finish(&self.client, &md5).await?;
+        }
+        Ok(Some(self.generation))
+    }
+}
+
+impl RevisionEdit {
+    /// 业务作用：以提交标记 CAS 冻结单模块写入意图，续办时复验同一个未完成意图。
+    /// 参数说明：
+    /// - `client`：固定分组所在的命名空间客户端。
+    /// 返回：已取得的提交标记 MD5，或尚未产生写入时的并发冲突。
+    async fn claim(&self, client: &NacosConfigClient) -> Result<Option<String>> {
+        if !self.claimed {
+            let body = document::encode(&serde_json::to_value(&self.head)?, MAX_REVISION_BYTES)?;
+            if !publish_cas(client, &self.id, &self.group, &body, &self.expected_md5).await? {
+                return Ok(None);
+            }
+        }
+        // Nacos 的写入回执可能早于读取侧可见。只重试读取旧摘要，不能重发写入或接受其他意图。
+        let md5 = tokio::time::timeout(REVISION_VISIBILITY_TIMEOUT, async {
+            loop {
+                let (head, md5) = read_revision(client, &self.id, &self.group).await?;
+                if head == self.head {
+                    return Ok(md5);
+                }
+                ensure!(
+                    !self.claimed && md5 == self.expected_md5,
+                    "Nacos revision claim is no longer current"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("Nacos revision claim is not visible")??;
+        Ok(Some(md5))
+    }
+
+    /// 业务作用：仅当所有业务原文与候选集合的摘要一致时发布提交标记。
+    /// 参数说明：
+    /// - `client`：原写入所用的命名空间客户端。
+    /// - `md5`：持有的写入意图摘要，用于拒绝替代标记。
+    /// 返回：提交得到确认时成功。不匹配或响应丢失时保留待确认状态。
+    async fn finish(self, client: &NacosConfigClient, md5: &str) -> Result<()> {
+        // 同组其它文档被运维改动时保留原活动代，并留下待办供同一意图恢复。
+        tokio::time::timeout(REVISION_VISIBILITY_TIMEOUT, async {
+            loop {
+                if let Ok(bundle) = fetch_bundle(client, &self.refs).await {
+                    let documents = bundle_digests(&bundle);
+                    if documents == self.next.documents {
+                        return Ok(());
+                    }
+                    ensure!(
+                        documents == self.head.documents,
+                        "Nacos configuration changed while the revision was pending"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("Nacos revision candidate is not visible")??;
+        let body = document::encode(&serde_json::to_value(&self.next)?, MAX_REVISION_BYTES)?;
+        if !publish_cas(client, &self.id, &self.group, &body, md5).await? {
+            let (observed, _) = read_revision(client, &self.id, &self.group).await?;
+            ensure!(
+                observed == self.next,
+                "Nacos revision commit is unconfirmed"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -444,6 +562,11 @@ impl Plan {
             crate::config::centers::same_nacos_config_bootstrap(&self.connection, &next.connection),
             "Nacos connection authority changed and requires restart"
         );
+        // 运行中改用另一标记或取消标记，可能绕过原写入意图并曝光部分提交的原文。
+        ensure!(
+            self.revision == next.revision,
+            "Nacos revision authority changed and requires restart"
+        );
         Ok(next)
     }
 }
@@ -505,6 +628,156 @@ async fn connect(plan: &Plan) -> Result<NacosConfigClient> {
     .context("Nacos connection deadline exceeded")?
 }
 
+/// 业务作用：发送一份凭服务端原摘要保护的 Nacos 条件写入。
+/// 参数说明：
+/// - `client`：所属命名空间的客户端。
+/// - `name`：已验证的 Data ID。
+/// - `group`：Data ID 所属分组。
+/// - `content`：已准备的原文。
+/// - `md5`：权威端提供的比较条件。
+/// 返回：明确确认、冲突或结果未知的错误；超时后不重发写入。
+async fn publish_cas(
+    client: &NacosConfigClient,
+    name: &str,
+    group: &str,
+    content: &str,
+    md5: &str,
+) -> Result<bool> {
+    Ok(tokio::time::timeout(
+        Duration::from_secs(3),
+        client.publish_cas(name, group, content, md5),
+    )
+    .await??)
+}
+
+/// 业务作用：取得提交标记的严格结构及对应服务端 CAS 条件。
+/// 参数说明：
+/// - `client`：远端事实读取客户端。
+/// - `id`：部署配置指定的提交标记。
+/// - `group`：提交标记所在分组。
+/// 返回：有效标记和其 MD5；标记缺失、版本不受支持或读超时会拒绝。
+async fn read_revision(
+    client: &NacosConfigClient,
+    id: &str,
+    group: &str,
+) -> Result<(Revision, String)> {
+    let (raw, md5) = tokio::time::timeout(READ_TIMEOUT, client.fetch_optional_with_md5(id, group))
+        .await??
+        .context("Nacos revision is missing")?;
+    let head = document::decode::<Revision>(raw.as_bytes(), MAX_REVISION_BYTES)?;
+    ensure!(
+        head.schema_version == 1,
+        "unsupported Nacos revision schema"
+    );
+    if let Some(pending) = &head.pending {
+        ensure!(
+            head.documents.contains_key(&pending.document)
+                && [&pending.id, &pending.sha256].into_iter().all(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }),
+            "invalid Nacos pending revision"
+        );
+    }
+    Ok((head, md5))
+}
+
+/// 业务作用：按业务 Data ID 绑定完整远端原文，供提交和读取方使用同一摘要口径。
+/// 参数说明：
+/// - `bundle`：一个读回一致的业务文档集合。
+/// 返回：每份实际存在文档的 SHA-256，原文换行参与摘要。
+fn bundle_digests(bundle: &ConfigBundle) -> BTreeMap<String, String> {
+    bundle
+        .documents
+        .iter()
+        .map(|doc| {
+            (
+                doc.source.data_id.clone(),
+                format!("{:x}", Sha256::digest(doc.content.as_bytes())),
+            )
+        })
+        .collect()
+}
+
+/// 业务作用：结合已发布原文、稳定远端集合和提交标记检查是否可受理具名写入或续办。
+/// 参数说明：
+/// - `client`：固定为当前部署权威的客户端。
+/// - `id`：提交标记 Data ID。
+/// - `plan`：本机生效配置来源的清单。
+/// - `active`：仍然持有授权并完成候选校验的活动快照。
+/// - `name`：本次请求写入的模块。
+/// - `content`：完整验证过的候选原文。
+/// - `current`：稳定读回的实际集合；续办时恢复一份旧原文用于活动代复验。
+/// 返回：可按同一标记提交时返回比较条件；其它待办或原文漂移时不产生副作用。
+async fn prepare_revision_edit(
+    client: &NacosConfigClient,
+    id: String,
+    plan: &Plan,
+    active: &GatewaySnapshot,
+    name: &str,
+    content: &str,
+    current: &mut ConfigBundle,
+) -> Result<Option<RevisionEdit>> {
+    let group = &plan.connection.group;
+    let (mut head, expected_md5) = read_revision(client, &id, group).await?;
+    let actual = bundle_digests(current);
+    let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let mut documents = head.documents.clone();
+    let Some(prior) = documents.get_mut(name) else {
+        return Ok(None);
+    };
+    *prior = digest.clone();
+    let claimed = if let Some(pending) = &head.pending {
+        // 续办只允许提交已完整写入的候选，避免发出第二次能够在旧正文复现后迟到生效的业务写入。
+        if pending.document != name || pending.sha256 != digest || actual != documents {
+            return Ok(None);
+        }
+        let Some(prior) = active
+            .named_documents
+            .iter()
+            .find(|doc| doc.name == name)
+            .and_then(|doc| doc.content.as_deref())
+        else {
+            return Ok(None);
+        };
+        // 用本机旧原文核对续办者仍基于已提交代。
+        let document = current
+            .documents
+            .iter_mut()
+            .find(|doc| doc.source.data_id == name)
+            .context("pending Nacos module is missing")?;
+        document.content = prior.to_owned();
+        if bundle_digests(current) != head.documents {
+            return Ok(None);
+        }
+        true
+    } else {
+        if actual != head.documents {
+            return Ok(None);
+        }
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce).map_err(|error| anyhow::anyhow!("{error}"))?;
+        head.pending = Some(PendingRevision {
+            id: format!("{:x}", Sha256::digest(nonce)),
+            document: name.to_owned(),
+            sha256: digest,
+        });
+        false
+    };
+    Ok(Some(RevisionEdit {
+        id,
+        group: group.clone(),
+        refs: plan.refs.clone(),
+        expected_md5,
+        claimed,
+        head,
+        next: Revision {
+            schema_version: 1,
+            documents,
+            pending: None,
+        },
+    }))
+}
+
 /// 业务作用：启动前仅补齐确认为缺失的标准 Data ID，既有正文和并发运维写入保持原样。
 ///
 /// 参数说明：
@@ -560,8 +833,26 @@ async fn seed(client: &NacosConfigClient, plan: &Plan) -> Result<()> {
 ///
 /// 返回：全部必需文档完整且两个观测一致的集合。失联、并发漂移或未提交的批次拒绝。
 async fn fetch(client: &NacosConfigClient, plan: &Plan) -> Result<ConfigBundle> {
+    let bundle = fetch_bundle(client, &plan.refs).await?;
+    if let Some(id) = &plan.revision {
+        let (head, _) = read_revision(client, id, &plan.connection.group).await?;
+        // 未完成写入只保留之前已经提交的摘要集合。候选在提交标记完成前不能进活动代。
+        ensure!(
+            head.documents == bundle_digests(&bundle),
+            "Nacos configuration does not match its committed revision"
+        );
+    }
+    Ok(bundle)
+}
+
+/// 业务作用：重新读取同一业务清单并确认字节预算及两次观测的一致性。
+/// 参数说明：
+/// - `client`：该清单所属的事实权威。
+/// - `refs`：固定的业务 Data ID 与分组。
+/// 返回：两次读取一致的完整集合；缺席必需文档或观测漂移时拒绝。
+async fn fetch_bundle(client: &NacosConfigClient, refs: &[ConfigRef]) -> Result<ConfigBundle> {
     tokio::time::timeout(READ_TIMEOUT, async {
-        let first = client.fetch_many(&plan.refs).await?;
+        let first = client.fetch_many(refs).await?;
         let mut bytes = 0usize;
         for doc in &first.documents {
             bytes = bytes
@@ -572,28 +863,7 @@ async fn fetch(client: &NacosConfigClient, plan: &Plan) -> Result<ConfigBundle> 
                 "named Nacos configuration exceeds total byte limit"
             );
         }
-        if let Some(id) = &plan.revision {
-            let head = client
-                .fetch_optional_with_md5(id, &plan.connection.group)
-                .await?
-                .context("Nacos revision is missing")?;
-            let head = document::decode::<Revision>(head.0.as_bytes(), 64 * 1024)?;
-            let actual = first
-                .documents
-                .iter()
-                .map(|doc| {
-                    (
-                        doc.source.data_id.clone(),
-                        format!("{:x}", Sha256::digest(doc.content.as_bytes())),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            ensure!(
-                head.schema_version == 1 && head.documents == actual,
-                "Nacos configuration does not match its committed revision"
-            );
-        }
-        let second = client.fetch_many(&plan.refs).await?;
+        let second = client.fetch_many(refs).await?;
         ensure!(
             first == second,
             "Nacos configuration changed during the complete read"
