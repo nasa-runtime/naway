@@ -555,7 +555,6 @@ async fn apply_reload_input(
     let history = history.for_candidate(candidate_fingerprint);
     match candidate {
         Ok(new_snap) => {
-            #[cfg(feature = "admin-grpc")]
             let mut new_snap = new_snap;
             if runtime.sidecar_mode {
                 // 必须先复验部署边界，再进入候选 socket prepare；否则恶意热更可能短暂绑定公网地址。
@@ -618,6 +617,27 @@ async fn apply_reload_input(
                 return false;
             }
             let change_log = !old.process_log.same_bootstrap(&new_snap.process_log);
+            let reuse_scoped_log = new_snap.inherit_scoped_log(&old);
+            if !reuse_scoped_log {
+                // 所有私有输出先准备再参与发布，对不可写候选继续使用旧配置和旧日志。
+                let resources = match runtime.process_log.as_ref() {
+                    Some(owner) => new_snap.prepare_scoped_log(owner),
+                    None if new_snap.requires_scoped_log() => {
+                        Err(anyhow::anyhow!("scoped log owner unavailable"))
+                    }
+                    None => Ok(()),
+                };
+                if let Err(error) = resources {
+                    history.record_rejected(
+                        trigger,
+                        cfg_path,
+                        old_version,
+                        next,
+                        format!("scoped log output rejected: {error:#}"),
+                    );
+                    return false;
+                }
+            }
             // 旧三文档发布包含持久文件决定，无法协调其中途日志变更，继续走原启动配置约束。
             if change_log && (!new_snap.named_configuration || runtime.process_log.is_none()) {
                 history.record_rejected(
@@ -668,8 +688,8 @@ async fn apply_reload_input(
             // 具名 Nacos 的物化文件也能触发本地 watcher；远端来源的权限限制与触发顺序无关。
             let nacos_bootstrap_violation = (trigger == "nacos-config"
                 || (old.named_configuration && old.config_bundle_digest.is_some()))
-                .then(|| remote_bootstrap_change(old.as_ref(), &new_snap))
-                .flatten();
+            .then(|| remote_bootstrap_change(old.as_ref(), &new_snap))
+            .flatten();
             drop(old);
             if let Some(field) = nacos_bootstrap_violation {
                 tracing::error!(
@@ -1300,6 +1320,9 @@ async fn apply_reload_input(
                     .notifications
                     .apply(new_snap.acl_notifications.clone());
                 snap.store(new_snap.clone());
+                if !reuse_scoped_log {
+                    new_snap.scoped_log.activate();
+                }
                 // 新快照已经对请求可见；收据提交失败只能保留未知，不能走候选未发布的监听补偿分支。
                 if let Err(error) = history.confirm_action_publication(&new_snap) {
                     tracing::error!(%error, "node action publication result remains unresolved");
@@ -1324,9 +1347,9 @@ async fn apply_reload_input(
                     cfg_path,
                     old_version,
                     next,
-                    publication_error.as_deref().unwrap_or(
-                        "configuration authority changed during resource preparation",
-                    ),
+                    publication_error
+                        .as_deref()
+                        .unwrap_or("configuration authority changed during resource preparation"),
                 );
                 return false;
             }
@@ -1677,11 +1700,10 @@ async fn reload_worker(
             }
             Ok(hash) => {
                 // 具名 Nacos 使用同一选择器，但每代模块文件路径不同，必须同步更新依赖观察。
-                let rewatch = trigger.uses_local_watch() ||
-                    (matches!(trigger, ReloadEvent::Nacos { .. }) && source_cfg_path == cfg_path);
-                let local_watcher = rewatch
-                    .then_some(config_watcher.as_ref())
-                    .flatten();
+                let rewatch = trigger.uses_local_watch()
+                    || (matches!(trigger, ReloadEvent::Nacos { .. })
+                        && source_cfg_path == cfg_path);
+                let local_watcher = rewatch.then_some(config_watcher.as_ref()).flatten();
                 if apply_reload_with_watch(
                     &source_cfg_path,
                     &snap,

@@ -21,6 +21,7 @@ use crate::config::model::{
     NacosDiscoveryCfg,
 };
 use crate::config::GatewaySnapshot;
+use crate::observability::logging::scoped::{Module, ModuleLog};
 use crate::observability::metrics::{Metrics, RegistryBackendMetric, RegistryPollMetric};
 use crate::upstream::dynamic::ServicePublisher;
 use crate::upstream::{
@@ -34,6 +35,7 @@ pub struct NacosDiscoveryManager {
     metrics: Arc<Metrics>,
     tasks: Mutex<HashMap<String, WatchTask>>,
     registry_tasks: Mutex<HashMap<String, RegistryTask>>,
+    log: ModuleLog,
 }
 
 const MAX_REGISTRY_RESPONSE_BYTES_HARD: usize = 16 * 1024 * 1024;
@@ -692,6 +694,7 @@ impl NacosDiscoveryManager {
             metrics,
             tasks: Mutex::new(HashMap::new()),
             registry_tasks: Mutex::new(HashMap::new()),
+            log: ModuleLog::default(),
         })
     }
 
@@ -703,6 +706,7 @@ impl NacosDiscoveryManager {
     ///
     /// 返回：先撤销退休订阅的同步写权，再建立缺少的发布者；外部订阅在后台完成。
     pub fn reconcile(&self, snap: &GatewaySnapshot) {
+        self.log.update(&snap.scoped_log, Module::Upstream);
         // 配置已提交后先推进同绑定凭据权限；保留订阅不能延续旧 lease，也不能伪造一次发现确认。
         self.dynamic.reconcile_credentials(&snap.upstreams);
         let cfg = snap.discovery.nacos.clone();
@@ -738,7 +742,9 @@ impl NacosDiscoveryManager {
             return;
         }
         if cfg.server_addr.trim().is_empty() {
-            tracing::error!("Nacos discovery enabled but discovery.nacos.server_addr is empty");
+            self.log.record(|| {
+                tracing::error!("Nacos discovery enabled but discovery.nacos.server_addr is empty")
+            });
             drop(tasks);
             self.reconcile_polling_registries(snap);
             return;
@@ -753,7 +759,12 @@ impl NacosDiscoveryManager {
                 .discovery_binding(&spec.logical_service)
                 .expect("validated Nacos service has a discovery binding");
             let publisher = self.dynamic.claim_service(&spec.logical_service, binding);
-            let handle = spawn_nacos_watch(cfg.clone(), spec.clone(), publisher.clone());
+            let handle = spawn_nacos_watch(
+                cfg.clone(),
+                spec.clone(),
+                publisher.clone(),
+                self.log.clone(),
+            );
             tasks.insert(
                 spec.logical_service.clone(),
                 WatchTask {
@@ -804,11 +815,13 @@ impl NacosDiscoveryManager {
                 continue;
             }
             let Some(backend) = polling_backend(&snap.discovery, spec.kind) else {
-                tracing::error!(
-                    service = %spec.logical_service,
-                    registry = ?spec.kind,
-                    "dynamic service references a disabled registry backend"
-                );
+                self.log.record(|| {
+                    tracing::error!(
+                        service = %spec.logical_service,
+                        registry = ?spec.kind,
+                        "dynamic service references a disabled registry backend"
+                    )
+                });
                 // 没有当前来源配置就没有领取或删除权，旧 task 已按其原 owner 撤销。
                 continue;
             };
@@ -822,6 +835,7 @@ impl NacosDiscoveryManager {
                 spec.clone(),
                 publisher.clone(),
                 self.metrics.clone(),
+                self.log.clone(),
             );
             tasks.insert(
                 spec.logical_service.clone(),
@@ -912,6 +926,7 @@ fn polling_backend(cfg: &DiscoveryCfg, kind: RegistryKind) -> Option<PollingBack
 /// - `spec`：本代逻辑服务及实例转换策略。
 /// - `publisher`：只对本代服务有效的发布权。
 /// - `metrics`：接收真正获权发布和来源故障的低基数观测。
+/// - `log`：随已发布上游模块更新的文件归属。
 ///
 /// 返回：后台任务句柄；失权时结束，不再重连或发布。
 fn spawn_registry_poll(
@@ -919,12 +934,13 @@ fn spawn_registry_poll(
     spec: RegistryWatchSpec,
     publisher: ServicePublisher,
     metrics: Arc<Metrics>,
+    log: ModuleLog,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = match build_registry_http_client(&backend) {
             Ok(client) => client,
             Err(error) => {
-                tracing::error!(service = %spec.logical_service, %error, "build registry HTTP client failed");
+                log.record(|| tracing::error!(service = %spec.logical_service, %error, "build registry HTTP client failed"));
                 return;
             }
         };
@@ -946,24 +962,28 @@ fn spawn_registry_poll(
                             registry_metric_backend(spec.kind),
                             RegistryPollMetric::Success,
                         );
-                        tracing::debug!(
-                            service = %spec.logical_service,
-                            registry = ?spec.kind,
-                            instances = count,
-                            "registry upstream snapshot applied"
-                        );
+                        log.record(|| {
+                            tracing::debug!(
+                                service = %spec.logical_service,
+                                registry = ?spec.kind,
+                                instances = count,
+                                "registry upstream snapshot applied"
+                            )
+                        });
                     }
                     Err(error) => {
                         metrics.inc_registry_poll(
                             registry_metric_backend(spec.kind),
                             RegistryPollMetric::InvalidSnapshot,
                         );
-                        tracing::warn!(
-                            service = %spec.logical_service,
-                            registry = ?spec.kind,
-                            %error,
-                            "invalid registry snapshot; keeping last-known-good"
-                        );
+                        log.record(|| {
+                            tracing::warn!(
+                                service = %spec.logical_service,
+                                registry = ?spec.kind,
+                                %error,
+                                "invalid registry snapshot; keeping last-known-good"
+                            )
+                        });
                     }
                 },
                 Ok(Err(error)) => {
@@ -971,24 +991,28 @@ fn spawn_registry_poll(
                         registry_metric_backend(spec.kind),
                         RegistryPollMetric::Error,
                     );
-                    tracing::warn!(
-                        service = %spec.logical_service,
-                        registry = ?spec.kind,
-                        %error,
-                        "registry poll failed; keeping last-known-good"
-                    );
+                    log.record(|| {
+                        tracing::warn!(
+                            service = %spec.logical_service,
+                            registry = ?spec.kind,
+                            %error,
+                            "registry poll failed; keeping last-known-good"
+                        )
+                    });
                 }
                 Err(_) => {
                     metrics.inc_registry_poll(
                         registry_metric_backend(spec.kind),
                         RegistryPollMetric::Timeout,
                     );
-                    tracing::warn!(
-                        service = %spec.logical_service,
-                        registry = ?spec.kind,
-                        timeout_ms = registry_timeout_ms(&backend),
-                        "registry poll timed out; keeping last-known-good"
-                    );
+                    log.record(|| {
+                        tracing::warn!(
+                            service = %spec.logical_service,
+                            registry = ?spec.kind,
+                            timeout_ms = registry_timeout_ms(&backend),
+                            "registry poll timed out; keeping last-known-good"
+                        )
+                    });
                 }
             }
             tokio::time::sleep(interval).await;
@@ -1699,23 +1723,27 @@ fn metadata_bool_value(metadata: &HashMap<String, String>, key: &str) -> bool {
 /// - `cfg`：本代已解析的 Nacos 连接与权限配置。
 /// - `spec`：本代服务映射及实例转换策略。
 /// - `publisher`：对本代目录的唯一发布与保鲜权。
+/// - `log`：按当前已发布日志计划输出模块后台记录。
 ///
 /// 返回：后台任务句柄；连接失败按原退避重连，失权停止继续工作。
 fn spawn_nacos_watch(
     cfg: NacosDiscoveryCfg,
     spec: NacosWatchSpec,
     publisher: ServicePublisher,
+    log: ModuleLog,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let reconnect_backoff = Duration::from_millis(cfg.reconnect_backoff_ms.max(100));
         while publisher.is_current() {
-            if let Err(e) = run_nacos_watch_once(&cfg, &spec, &publisher).await {
-                tracing::warn!(
-                    service = %spec.logical_service,
-                    nacos_service = %spec.nacos_service,
-                    error = %e,
-                    "Nacos watch failed; keeping last-known-good and reconnecting"
-                );
+            if let Err(e) = run_nacos_watch_once(&cfg, &spec, &publisher, &log).await {
+                log.record(|| {
+                    tracing::warn!(
+                        service = %spec.logical_service,
+                        nacos_service = %spec.nacos_service,
+                        error = %e,
+                        "Nacos watch failed; keeping last-known-good and reconnecting"
+                    )
+                });
             }
             tokio::time::sleep(reconnect_backoff).await;
         }
@@ -1728,12 +1756,14 @@ fn spawn_nacos_watch(
 /// - `cfg`：本次连接使用的固定 Nacos 权限与预算。
 /// - `spec`：本代服务映射。
 /// - `publisher`：发布事件及续期均须复验的原 owner。
+/// - `log`：已发布的模块文件输出。
 ///
 /// 返回：失权时正常结束；连接或订阅失败返回错误，不延长最后确认事实的有效期。
 async fn run_nacos_watch_once(
     cfg: &NacosDiscoveryCfg,
     spec: &NacosWatchSpec,
     publisher: &ServicePublisher,
+    log: &ModuleLog,
 ) -> anyhow::Result<()> {
     let props = nacos_props(cfg);
     let client = nasa::discovery::nacos::NacosDiscoveryClient::connect(&props).await?;
@@ -1746,7 +1776,7 @@ async fn run_nacos_watch_once(
     let _guard = guard;
 
     let initial = rx.borrow().clone();
-    apply_discovery_snapshot(publisher, spec, &initial);
+    log.record(|| apply_discovery_snapshot(publisher, spec, &initial));
     // watch 存活期间周期性更新 last-known-good 的有效时间。Nacos 对稳定不变的服务不会重复推送,
     //   若不触活,updated_at 会停在上次【变更】时刻,超过 stale_ttl 后未变更实例也会过期 →
     //   critical readyz 无谓抖到 503、被前置 LB 摘流。触活周期取 poll 间隔;watch 一旦断
@@ -1764,7 +1794,7 @@ async fn run_nacos_watch_once(
                 // watch 关闭 → Err → 退出本次 run(由外层重连退避);停止触活,让 stale_ttl 正常计时。
                 changed?;
                 let snapshot = rx.borrow().clone();
-                apply_discovery_snapshot(publisher, spec, &snapshot);
+                log.record(|| apply_discovery_snapshot(publisher, spec, &snapshot));
             }
             _ = liveness.tick() => {
                 // watch 仍连着时也必须复验原 owner，不能为已经接管的新来源延长有效期。

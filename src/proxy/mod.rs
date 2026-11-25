@@ -186,9 +186,7 @@ impl RequestId {
     #[inline]
     fn as_str(&self) -> &str {
         // SAFETY:from_u64 只从固定 ASCII HEX 表写满全部 16 字节，始终是合法 UTF-8。
-        unsafe {
-            std::str::from_utf8_unchecked(&self.0)
-        }
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
     }
 }
 
@@ -1128,7 +1126,7 @@ impl GatewayProxy {
             downstream_proto,
             proxy_id,
             connection_client_ip_header,
-            listener_snapshot,
+            snapshot: snap,
             observation,
         } = ingress;
         let started = Instant::now();
@@ -1167,21 +1165,6 @@ impl GatewayProxy {
             None
         };
 
-        // 整条管线共用同一快照，避免在途请求混用不同配置的认证、路由和资源预算。
-        let current = self.snap.load_full();
-        // 普通 listener 删除后的旧连接可按原代排空；动态扩展入口必须仍有当前证明，不能用
-        // keep-alive 或新 H2 stream 延长已撤回的执行权威。已进入管线的请求仍持有各自快照。
-        let snap = if current.proxy(&proxy_id).is_some() {
-            current
-        } else if listener_snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .proxy(&proxy_id)
-                .is_some_and(|proxy| proxy.allows_removed_listener_drain())
-        }) {
-            listener_snapshot.expect("checked listener drain snapshot")
-        } else {
-            current
-        };
         // 关闭态在 producer 侧短路，避免先构造完整记录、写 bounded queue，再由 worker 丢弃。
         // bool 来自本请求唯一快照，reload 前后不会出现半个请求采用两套日志策略。
         let access_log_enabled = snap.access_log.enabled();
@@ -1406,14 +1389,21 @@ impl GatewayProxy {
         } else if !path_valid {
             text_status(400, "invalid path")
         } else if let Some((resp, rule_id)) = self.interface_disable.check(&parts) {
-            tracing::debug!(rule = %rule_id, path = parts.uri.path(), "interface dynamically disabled");
+            snap.scoped_log.record_module(crate::observability::logging::scoped::Module::InterfaceGuard, || {
+                tracing::debug!(rule = %rule_id, path = parts.uri.path(), "interface dynamically disabled");
+            });
             self.metrics.inc_interface_blocked();
             proxy_runtime
                 .ingress_protection
                 .reject(crate::observability::ingress_protection::Rejection::Dynamic);
             resp
         } else if let Some((resp, rule_id)) = snap.interface_guard.check(&parts) {
-            tracing::debug!(rule = rule_id, path = parts.uri.path(), "interface blocked");
+            snap.scoped_log.record_module(
+                crate::observability::logging::scoped::Module::InterfaceGuard,
+                || {
+                    tracing::debug!(rule = rule_id, path = parts.uri.path(), "interface blocked");
+                },
+            );
             self.metrics.inc_interface_blocked();
             proxy_runtime
                 .ingress_protection
@@ -1972,6 +1962,7 @@ impl GatewayProxy {
                             .as_ref()
                             .map_or(Some(0), |body| body.size_hint().upper()),
                         started,
+                        log: &snap.scoped_log,
                     },
                 )
                 .await
@@ -4266,7 +4257,7 @@ impl GatewayProxy {
                                             .max_entries()
                                             .min(fill.policy.max_candidates());
                                         let budget = fill.policy.budget().cloned();
-                                        tokio::spawn(async move {
+                                        crate::observability::logging::scoped::spawn(async move {
                                             if let Err(error) = runtime
                                                 .llm_cache_store(
                                                     scope.as_str(),
@@ -5037,7 +5028,7 @@ impl GatewayProxy {
             return;
         };
         let gateway = self.clone();
-        tokio::spawn(async move {
+        crate::observability::logging::scoped::spawn(async move {
             let Some(miss) = policy
                 .prepare_revalidation(
                     miss,
@@ -6663,7 +6654,7 @@ impl GatewayProxy {
                 .extensions
                 .get::<crate::control::ownership::admission::Permit>()
                 .cloned();
-            tokio::spawn(async move {
+            crate::observability::logging::scoped::spawn(async move {
                 let _lease = connection_lease;
                 let _workspace_permit = workspace_permit;
                 match upgrade.await {
@@ -7164,9 +7155,7 @@ impl GatewayProxy {
             }));
         }
         self.edge_relay.load_full().map(|relay| {
-            Box::pin(async move {
-                relay.broadcast_publish(tenant, group, frame).await
-            })
+            Box::pin(async move { relay.broadcast_publish(tenant, group, frame).await })
                 as futures::future::BoxFuture<'static, crate::edge::relay::PeerBroadcastSummary>
         })
     }
@@ -8346,7 +8335,7 @@ impl GatewayProxy {
             .extensions
             .get::<crate::control::ownership::admission::Permit>()
             .cloned();
-        tokio::spawn(async move {
+        crate::observability::logging::scoped::spawn(async move {
             // 200 之后 Hyper 的 HTTP future 就结束了,连接预算必须由隧道 task 持有到收尾,
             // 否则 max_connections 名额会被提前归还,指标也会与真实 socket 数脱节。
             let _connection_lease = connection_lease;
@@ -8705,7 +8694,7 @@ fn spawn_limit_conn_refresh(
     key: String,
     lease: String,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::observability::logging::scoped::spawn(async move {
         let mut tick = tokio::time::interval_at(
             tokio::time::Instant::now() + LIMIT_CONN_REFRESH_INTERVAL,
             LIMIT_CONN_REFRESH_INTERVAL,
@@ -12654,7 +12643,7 @@ fn wrap_ext_proc_body(
     finish: bool,
 ) -> BoxBody {
     let (mut sender, output) = http_body_util::channel::Channel::<Bytes, crate::BoxError>::new(1);
-    tokio::spawn(async move {
+    crate::observability::logging::scoped::spawn(async move {
         let mut input_total = 0usize;
         let mut output_total = 0usize;
         let mut pending: Option<Bytes> = None;

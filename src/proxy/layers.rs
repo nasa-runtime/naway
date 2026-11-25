@@ -167,6 +167,7 @@ impl GatewayProxy {
                             .as_ref()
                             .map_or(Some(0), |body| body.size_hint().upper()),
                         started: input.started,
+                        log: &input.snap.scoped_log,
                     },
                 )
                 .await

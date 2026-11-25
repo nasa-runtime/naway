@@ -9,7 +9,7 @@ pub(super) struct Ingress<'a> {
     pub(super) downstream_proto: &'static str,
     pub(super) proxy_id: Arc<str>,
     pub(super) connection_client_ip_header: Option<ConnectionClientIpHeader>,
-    pub(super) listener_snapshot: Option<Arc<GatewaySnapshot>>,
+    pub(super) snapshot: Arc<GatewaySnapshot>,
     pub(super) observation: &'a mut Tracker,
 }
 
@@ -46,19 +46,40 @@ impl GatewayProxy {
                 .map_err(Into::into)
                 .boxed()
         });
-        let response = self
-            .handle_inner(
+        // 普通 listener 删除后的旧连接可按原代排空。逻辑动态监听必须继续拥有当前执行权。
+        let current = self.snap.load_full();
+        let snapshot = if current.proxy(&proxy_id).is_some() {
+            current
+        } else if listener_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .proxy(&proxy_id)
+                .is_some_and(|proxy| proxy.allows_removed_listener_drain())
+        }) {
+            listener_snapshot.expect("checked listener drain snapshot")
+        } else {
+            current
+        };
+        // 输出与请求采用同一快照。HTTP/2 的独立流任务不继承接入执行器的线程上下文。
+        let output = snapshot.scoped_log.output(
+            crate::observability::logging::scoped::Module::Http,
+            Some(&proxy_id),
+        );
+        let response = crate::observability::logging::scoped::route(
+            output.clone(),
+            self.handle_inner(
                 req,
                 Ingress {
                     conn,
                     downstream_proto,
                     proxy_id,
                     connection_client_ip_header,
-                    listener_snapshot,
+                    snapshot,
                     observation: &mut tracker,
                 },
-            )
-            .await?;
-        Ok(tracker.attach(response, &method))
+            ),
+        )
+        .await?;
+        let response = tracker.attach(response, &method);
+        Ok(response.map(|body| crate::observability::logging::scoped::bind_body(output, body)))
     }
 }

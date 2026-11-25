@@ -16,8 +16,8 @@ pub mod media;
 pub mod model;
 mod modules;
 pub(crate) use modules::{ActiveDocument, DocumentDomain, NAMED_DOCUMENT_LIMIT};
-pub mod named_nacos;
 pub(crate) mod monitor;
+pub mod named_nacos;
 pub mod operations;
 pub mod providers;
 pub mod scg;
@@ -113,6 +113,9 @@ pub struct GatewaySnapshot {
     pub(crate) sentinel_requests: Arc<sentinel::request::RequestRules>,
     /// 已验证的进程日志启动声明；候选构建不打开日志文件。
     pub process_log: crate::observability::logging::LogPlan,
+    scoped_log_plan: crate::observability::logging::scoped::Plan,
+    /// 与本代业务共同采用的已准备模块及实例文件输出。
+    pub scoped_log: crate::observability::logging::scoped::Active,
     /// 具名入口随候选发布，用于约束与三文档写入协议之间的切换。
     pub(crate) named_configuration: bool,
     /// 与该代快照绑定的具名业务原文，仅用于管理面读取。
@@ -881,6 +884,45 @@ impl ProxyRuntime {
 }
 
 impl GatewaySnapshot {
+    /// 业务作用：在候选业务开放前验证该代的范围日志均可独立写入。
+    ///
+    /// 参数说明：
+    /// - `owner`：进程内的文件输出资源所有者。
+    ///
+    /// 返回：准备成功后保存本代范围目的地，失败时不切换活动配置。
+    pub fn prepare_scoped_log(
+        &mut self,
+        owner: &crate::observability::logging::ProcessLog,
+    ) -> Result<()> {
+        self.scoped_log = owner.prepare_scopes(&self.process_log, &self.scoped_log_plan)?;
+        Ok(())
+    }
+
+    /// 业务作用：仅在全局与范围策略都相同时继承当前资源，保持物理目录隔离约束。
+    ///
+    /// 参数说明：
+    /// - `active`：当前活动配置和其实际文件句柄。
+    ///
+    /// 返回：已继承活动范围资源时为真，策略变更时由调用方重新准备。
+    pub(crate) fn inherit_scoped_log(&mut self, active: &Self) -> bool {
+        if !self.process_log.same_bootstrap(&active.process_log)
+            || !self.scoped_log_plan.same_as(&active.scoped_log_plan)
+        {
+            return false;
+        }
+        self.scoped_log = active.scoped_log.clone();
+        true
+    }
+
+    /// 业务作用：识别候选是否依赖独立文件输出资源，避免没有日志所有者的进程发布私有声明。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：候选包含任一私有输出时为真。
+    pub(crate) fn requires_scoped_log(&self) -> bool {
+        !self.scoped_log_plan.is_empty()
+    }
+
     /// 业务作用：为本快照已经选择的监听器创建唯一接入观察器，旧会话不切换计数所有者。
     ///
     /// 参数说明：
@@ -1279,8 +1321,9 @@ fn build_snapshot_from_config(
     let crypto_catalog =
         crate::security::external_crypto::build_catalog(config_dir, &cfg.crypto_providers)
             .context("build external crypto providers")?;
-    let kubernetes_revision = crate::control::kubernetes::apply_generated_routes(&mut cfg, config_dir)
-        .context("merge Kubernetes generated routes")?;
+    let kubernetes_revision =
+        crate::control::kubernetes::apply_generated_routes(&mut cfg, config_dir)
+            .context("merge Kubernetes generated routes")?;
     let developer_portal =
         crate::portal::DeveloperPortalRuntime::build_and_apply(&mut cfg, config_dir)
             .context("build developer portal and generated OpenAPI routes")?;
@@ -1594,6 +1637,12 @@ fn build_snapshot_from_config(
         sentinel_rules: sentinel.rules,
         sentinel_requests: Arc::new(sentinel.requests),
         process_log,
+        scoped_log_plan: cfg
+            .module_sources
+            .as_ref()
+            .map(|sources| sources.scoped_logs.clone())
+            .unwrap_or_default(),
+        scoped_log: crate::observability::logging::scoped::Active::default(),
         named_configuration: cfg.module_sources.is_some(),
         named_documents: Arc::from([]),
         #[cfg(feature = "xds-server")]
@@ -5112,7 +5161,10 @@ fn resolve_schema_version_with_limit(raw: Option<u32>, file: &str, supported: u3
             Ok(DEFAULT_SCHEMA_VERSION)
         }
         Some(0) => {
-            tracing::warn!(file, "`schema_version: 0` invalid; assuming {DEFAULT_SCHEMA_VERSION}");
+            tracing::warn!(
+                file,
+                "`schema_version: 0` invalid; assuming {DEFAULT_SCHEMA_VERSION}"
+            );
             Ok(DEFAULT_SCHEMA_VERSION)
         }
         Some(v) if v > supported => anyhow::bail!(

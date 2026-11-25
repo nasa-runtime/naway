@@ -14,6 +14,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::{loader, resolve_relative, MAX_FINGERPRINT_FILE_BYTES};
+use crate::observability::logging::scoped;
 
 pub(crate) const NAMED_DOCUMENT_LIMIT: usize = 64;
 
@@ -24,6 +25,7 @@ pub(crate) struct Sources {
     missing: Vec<PathBuf>,
     watch: Vec<PathBuf>,
     base_documents: Vec<FileEvidence>,
+    pub(super) scoped_logs: scoped::Plan,
 }
 
 /// 归属决定 Admin 读取独立文档必须持有的业务权限。
@@ -201,10 +203,12 @@ pub(super) fn load(
         missing: Vec::new(),
         watch: Vec::new(),
         base_documents: Vec::new(),
+        scoped_logs: scoped::Plan::default(),
     };
     let policy = document_policy();
     let mut names = HashSet::new();
     let mut fields = Map::new();
+    let mut scoped_logs = scoped::Declarations::default();
     let mut total_bytes = 0usize;
     let guard = rule_path(tree, &entry, "interface_guard_file", "interface-guard.yml")?;
     let sentinel = rule_path(tree, &entry, "sentinel_rules_file", "sentinel-rules.yml")?;
@@ -278,11 +282,15 @@ pub(super) fn load(
             .find(|file| file.path() == input)
             .context("named configuration base source is missing")?;
         sources.base_documents.push(source.clone());
+        let rule_module = if is_guard {
+            Some(scoped::Module::InterfaceGuard)
+        } else if is_sentinel {
+            Some(scoped::Module::Sentinel)
+        } else {
+            None
+        };
+        scoped_logs.collect(&mut module, stem == "naway", rule_module)?;
         if is_guard || is_sentinel {
-            ensure!(
-                !module.contains_key("log"),
-                "scoped log requires a log destination for module {name}"
-            );
             continue;
         }
         ensure!(
@@ -304,37 +312,6 @@ pub(super) fn load(
                 .unwrap_or(1);
             fields.insert("schema_version".to_owned(), Value::from(number.max(floor)));
         }
-        ensure!(
-            stem == "naway" || !module.contains_key("log"),
-            "scoped log requires a log destination for module {name}"
-        );
-        // 私有日志必须先获得独立输出，否则不能让配置看似生效却把记录写进全局目录。
-        let private_http = module
-            .get("proxies")
-            .and_then(Value::as_array)
-            .is_some_and(|proxies| proxies.iter().any(|proxy| proxy.get("log").is_some()));
-        let private_stream = module
-            .get("stream")
-            .and_then(|stream| stream.get("listeners"))
-            .and_then(Value::as_array)
-            .is_some_and(|listeners| {
-                listeners
-                    .iter()
-                    .any(|listener| listener.get("log").is_some())
-            });
-        ensure!(
-            !private_http
-                && !private_stream
-                && module
-                    .get("server")
-                    .and_then(|server| server.get("log"))
-                    .is_none()
-                && module
-                    .get("admin")
-                    .and_then(|admin| admin.get("log"))
-                    .is_none(),
-            "private log output is not supported for a listener in {name}"
-        );
         for (key, value) in module {
             // 每个业务字段只有一个文件所有者，冲突时拒绝，避免依赖导入顺序默默覆盖旧配置。
             ensure!(
@@ -362,6 +339,7 @@ pub(super) fn load(
         "a local named configuration cannot enable legacy Nacos configuration"
     );
     sources.revalidate()?;
+    sources.scoped_logs = scoped_logs.resolve(tree, &fields)?;
     let overlay = YmlOverlay::required(
         "named gateway modules",
         serde_json::to_string(&fields)?,

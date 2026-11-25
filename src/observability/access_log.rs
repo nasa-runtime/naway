@@ -29,12 +29,17 @@ pub struct AccessLogger {
 }
 
 struct AccessLoggerInner {
-    tx: mpsc::Sender<AccessRecord>,
+    tx: mpsc::Sender<PendingRecord>,
     metrics: Arc<Metrics>,
     accepting: AtomicBool,
     shutdown_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     done_rx: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     shutdown_timeout: Duration,
+}
+
+struct PendingRecord {
+    record: AccessRecord,
+    output: Option<Arc<crate::observability::logging::scoped::Output>>,
 }
 
 impl AccessLogger {
@@ -80,20 +85,27 @@ impl AccessLogger {
             .map(|spec| spec.timeout.saturating_add(Duration::from_secs(1)))
             .max()
             .unwrap_or(Duration::from_secs(3));
-        let (tx, mut rx) = mpsc::channel::<AccessRecord>(queue_size.max(1));
+        let (tx, mut rx) = mpsc::channel::<PendingRecord>(queue_size.max(1));
         let worker_metrics = metrics.clone();
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let worker_snapshot = snap.clone();
         tokio::spawn(async move {
-            let process = |record: AccessRecord| {
+            let process = |pending: PendingRecord| {
+                let PendingRecord {
+                    record,
+                    output,
+                } = pending;
                 let snap = worker_snapshot.load_full();
                 let runtime = &snap.access_log;
                 if !runtime.should_log(&record) {
                     return;
                 }
                 let event = match encode_record(runtime, record) {
-                    Ok(event) => Arc::new(event),
+                    Ok(mut event) => {
+                        event.output = output;
+                        Arc::new(event)
+                    }
                     Err(error) => {
                         worker_metrics.inc_log_sink_dropped("dispatcher", 1, "encode");
                         tracing::warn!(error = %error, "access log JSON encoding failed");
@@ -165,7 +177,11 @@ impl AccessLogger {
         if !active.accepting.load(Ordering::Acquire) {
             return;
         }
-        if active.tx.try_send(record).is_err() {
+        let pending = PendingRecord {
+            record,
+            output: crate::observability::logging::scoped::current(),
+        };
+        if active.tx.try_send(pending).is_err() {
             active.metrics.inc_access_log_dropped();
         }
     }
@@ -701,6 +717,7 @@ fn encode_record(
         json: bytes::Bytes::from(json),
         unix_nanos,
         formatted: formatted.map(Arc::from),
+        output: None,
     })
 }
 

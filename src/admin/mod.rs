@@ -416,7 +416,13 @@ pub async fn serve_until(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let local = listener.local_addr().ok();
-    info!(?local, "admin plane listening (nasa::web + axum)");
+    state.snap.load().scoped_log.record_instance(
+        crate::observability::logging::scoped::Module::Admin,
+        "admin",
+        || {
+            info!(?local, "admin plane listening (nasa::web + axum)");
+        },
+    );
     monitor::start(&state);
     cluster::start(&state);
     // 注解路由先由链接期表装配，成熟的精确分发器作为 fallback；当前注解只声明
@@ -569,6 +575,21 @@ pub async fn admin_config_current_publish_mvc(
 
 /// 业务作用：管理面统一安全分发：认证 → Origin → 平面边界 → RBAC → 审计 → handler；未知路径 404。
 async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody> {
+    let output = state.snap.load().scoped_log.output(
+        crate::observability::logging::scoped::Module::Admin,
+        Some("admin"),
+    );
+    crate::observability::logging::scoped::route(output, dispatch_request(req, state)).await
+}
+
+/// 业务作用：在管理范围日志已确定之后执行完整的认证、权限和审计流水线。
+///
+/// 参数说明：
+/// - `req`：管理监听收到的请求。
+/// - `state`：提供当前管理权限、实际路由及持久事实。
+///
+/// 返回：已授权请求的业务响应，未知或越权请求按既有门禁拒绝。
+async fn dispatch_request(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody> {
     #[cfg(feature = "node-actions")]
     if req.uri().path() == "/api/certificate-conditions" {
         return Box::pin(certificates::conditions::handle(
@@ -652,7 +673,8 @@ async fn dispatch(req: AdminRequest, state: Arc<AdminState>) -> Response<BoxBody
     if req.method() == Method::POST && req.uri().path() == "/api/explain" {
         return explain_route_request(req, state).await;
     }
-    if let Some(action) = configuration::named::Action::for_request(req.method(), req.uri().path()) {
+    if let Some(action) = configuration::named::Action::for_request(req.method(), req.uri().path())
+    {
         return configuration::named::handle(req, state, action).await;
     }
     if req.method() == Method::POST

@@ -3,13 +3,15 @@
 use super::*;
 use crate::config::sentinel::request::{self, Policy, RequestRules, Rule};
 use crate::observability::http_stream::routes::{record_sentinel_rejection, SentinelRejection};
+use crate::observability::logging::scoped::{Active as ScopedLog, Module};
 use crate::routing::{CircuitBreakerPolicy, LimitConnPolicy, LimitReqPolicy};
 use crate::runtime::sentinel::queue::{self, Rejected};
 
-pub(super) struct AdmissionContext {
+pub(super) struct AdmissionContext<'a> {
     pub(super) generation: u64,
     pub(super) body_upper: Option<u64>,
     pub(super) started: Instant,
+    pub(super) log: &'a ScopedLog,
 }
 
 /// 独立请求规则冻结实际命中结果与完整分桶值；后续头部改写不重新推导身份。
@@ -117,7 +119,7 @@ impl GatewayProxy {
     /// - `route`：是已匹配路由
     /// - `client_ip`：是权威客户端地址。
     /// - `matched`：已从原始请求冻结的独立规则。
-    /// - `context`：请求冻结的配置版本、实体上界与入口时刻。
+    /// - `context`：请求冻结的配置版本、实体上界、入口时刻及日志归属。
     ///
     /// 返回：规则耗尽返回429，失权返回409，共享权威不可用返回503；全部允许为None。
     pub(super) async fn enforce_limit_req(
@@ -126,7 +128,7 @@ impl GatewayProxy {
         route: &Route,
         client_ip: IpAddr,
         matched: &MatchedRules<'_>,
-        context: AdmissionContext,
+        context: AdmissionContext<'_>,
     ) -> Option<Response<BoxBody>> {
         let generation = context.generation;
         let queue_context = route
@@ -246,6 +248,9 @@ impl GatewayProxy {
                 };
                 attempt.complete(outcome);
                 if let Err(reason) = outcome {
+                    context.log.record_module(Module::Sentinel, || {
+                        tracing::debug!(route = %route.id, ?reason, "Sentinel queue denied request");
+                    });
                     self.metrics.inc_rate_limited();
                     record_sentinel_rejection(
                         parts,
@@ -278,6 +283,9 @@ impl GatewayProxy {
                 self.rate_limiter.allow(request).await
             };
             if !decision.allowed {
+                context.log.record_module(Module::Sentinel, || {
+                    tracing::debug!(route = %route.id, "Sentinel rate denied request");
+                });
                 self.metrics.inc_rate_limited();
                 record_sentinel_rejection(parts, SentinelRejection::Rate);
                 // 租户规则的拒绝不能升级为全平台 IP 封禁；平台入口仍遵守全局自动封禁策略。

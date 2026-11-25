@@ -322,8 +322,16 @@ log:
 ```
 
 naml 先解析环境变量，再使用默认目录中的 `application.name`；可通过 `NAWAY_LOG_PATH` 指定部署目录。
-文件名为 `info.log` 与 `error.log`。`log` 属于启动配置，改动需要重启；配置热更和管理发布会拒绝
-不同的日志声明并保留当前路由。访问日志继续由独立的 `access_log` 控制。
+具名配置从 `naway.yml` 读取全局 `log`，并从 HTTP、Stream、上游、Admin、接口守卫和 Sentinel
+各自的业务 YAML 读取模块 `log`。HTTP 的 `proxies[].log` 与 Stream 的 `stream.listeners[].log`
+还可以指定监听实例的独立文件目录。生产日志按实例、模块、全局顺序选择唯一适用范围。访问日志仍由
+`access_log` 控制采样、字段和投递，启用本地 tracing 投递时使用生成该记录的业务范围。
+
+每个独立目录使用 `info.log`。开启 `split_error_file` 时另建 `error.log`，仅记录 ERROR 级别。
+独立文件支持级别、颜色、大小滚动和归档保留，使用标准 tracing 格式。自定义 `pattern` 用于全局日志。
+具名模式下可热改目录、级别和滚动策略。候选无法绑定独立文件时，现有日志和业务快照继续使用。
+同一个 HTTP 连接上的新请求使用新活动配置，进行中的请求及已有 Stream 会话保留其日志归属。
+旧式单文件入口的进程日志设置仍属于启动配置。
 
 ## 集群节点管理
 

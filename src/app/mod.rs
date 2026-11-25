@@ -78,7 +78,7 @@ pub(super) async fn run() -> Result<()> {
     let metrics = Arc::new(Metrics::default());
     let dynamic_upstreams = DynamicUpstreamStore::new();
     let discovery = NacosDiscoveryManager::with_metrics(dynamic_upstreams.clone(), metrics.clone());
-    let snapshot = node_journal
+    let mut snapshot = node_journal
         .build(|| load_snapshot_with_dynamic(&cfg_path, 1, dynamic_upstreams.clone()))
         .with_context(|| format!("load initial config from {}", cfg_path.display()))?;
     node_journal.validate(&snapshot)?;
@@ -162,6 +162,8 @@ pub(super) async fn run() -> Result<()> {
     );
     // 文件日志必须在开放路由前成功建立；守卫活到全部停机步骤结束，避免缓冲输出提前失去刷盘线程。
     let process_log = gateway::observability::logging::ProcessLog::open(&snapshot.process_log)?;
+    // 私有输出必须和全局兜底一起在开放监听前准备，避免无效路径转写到全局文件。
+    snapshot.prepare_scoped_log(&process_log)?;
     let telemetry =
         gateway::observability::telemetry::SwappableTelemetryRuntime::new(telemetry_generation);
     // reload channel 容量和去抖窗口属 bootstrap 执行参数；worker 建立后不在热更时自重建。
@@ -263,6 +265,7 @@ pub(super) async fn run() -> Result<()> {
             .context("build HTTP cache runtime")?;
     let http_cache = gateway::cache::http::SwappableHttpCacheRuntime::new(http_cache_generation);
     let snap = Arc::new(ArcSwap::from_pointee(snapshot));
+    snap.load().scoped_log.activate();
     #[cfg(feature = "telemetry-otlp")]
     telemetry
         .bind_metrics(&metrics, &snap)

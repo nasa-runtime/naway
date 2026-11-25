@@ -22,6 +22,7 @@ use tracing::{info, warn};
 
 use gateway::config::{GatewaySnapshot, StreamRouteRuntime, StreamRuntime};
 use gateway::observability::access_log::{AccessLogger, AccessMethod, AccessPath, AccessRecord};
+use gateway::observability::logging::scoped::Module;
 use gateway::observability::metrics::Metrics;
 use gateway::protocols::proxy_protocol::{encode_proxy_protocol_header, strip_proxy_protocol};
 use gateway::tls::SharedServerConfig;
@@ -115,6 +116,22 @@ pub(super) struct StreamPlaneState {
     /// Kafka listener 级连接预算；只在协议治理制品中存在。
     #[cfg(feature = "kafka-governance")]
     pub(super) kafka_connections: KafkaConnectionBudget,
+}
+
+impl StreamPlaneState {
+    /// 业务作用：将跨越配置换代的流监听生命周期事件写入当前实例归属的日志。
+    ///
+    /// 参数说明：
+    /// - `id`：实际绑定的监听实例标识。
+    /// - `record`：监听启动、接入错误或停收的日志动作。
+    ///
+    /// 返回：执行一次记录动作，不影响监听调度。
+    fn record_listener(&self, id: &str, record: impl FnOnce()) {
+        self.snap
+            .load()
+            .scoped_log
+            .record_instance(Module::Stream, id, record);
+    }
 }
 
 /// MQTT listener 连接数快照外常驻状态；热更降低上限时新连接立即按新值拒绝。
@@ -362,22 +379,28 @@ pub(super) fn spawn_stream_udp_loop(
         // listener 生命周期跨越普通配置 reload；按协议上限固定 64 KiB 的单份缓冲，运行期再用
         // 当前快照的 max_datagram_bytes 判定是否接收。每 listener 一次分配，不按报文分配。
         let mut buffer = vec![0_u8; UDP_MAX_PAYLOAD_BYTES + 1];
-        info!(stream = %bound_runtime.id, listen = ?socket.local_addr(), "stream udp listening");
+        state.record_listener(&bound_runtime.id, || {
+            info!(stream = %bound_runtime.id, listen = ?socket.local_addr(), "stream udp listening");
+        });
         loop {
             let (length, peer) = tokio::select! {
-                received = socket.recv_from(&mut buffer) => match received {
-                    Ok(value) => value,
-                    Err(error) => {
-                        warn!(stream = %bound_runtime.id, %error, "stream UDP receive failed");
-                        state.metrics.inc_stream_error();
-                        continue;
+                    received = socket.recv_from(&mut buffer) => match received {
+                        Ok(value) => value,
+                        Err(error) => {
+                            state.record_listener(&bound_runtime.id, || {
+                warn!(stream = %bound_runtime.id, %error, "stream UDP receive failed");
+            });
+                            state.metrics.inc_stream_error();
+                            continue;
+                        }
+                    },
+                    _ = shutdown.changed() => {
+                        state.record_listener(&bound_runtime.id, || {
+                info!(stream = %bound_runtime.id, "stop receiving new UDP stream datagrams (shutdown)");
+            });
+                        break;
                     }
-                },
-                _ = shutdown.changed() => {
-                    info!(stream = %bound_runtime.id, "stop receiving new UDP stream datagrams (shutdown)");
-                    break;
-                }
-            };
+                };
             let snapshot = state.snap.load_full();
             let Some(runtime) = current_stream_runtime(&snapshot, &bound_runtime.id) else {
                 // 入口已经退休时不得以旧配置新建会话；既有会话只按自己的冻结配置结束。
@@ -527,11 +550,16 @@ pub(super) fn create_udp_session(
             return;
         }
         Err(error) => {
-            warn!(stream = %runtime.id, %peer, %error, "resolve UDP stream upstream failed");
+            snapshot.scoped_log.record_instance(Module::Stream, &runtime.id, || {
+                warn!(stream = %runtime.id, %peer, %error, "resolve UDP stream upstream failed");
+            });
             record_stream_udp_drop(&state.metrics, traffic.as_ref());
             return;
         }
     };
+    let output = snapshot
+        .scoped_log
+        .output(Module::Stream, Some(&runtime.id));
     drop(snapshot);
     let receive_buffer_bytes = runtime.udp.max_datagram_bytes.saturating_add(1);
     let Ok(receive_buffer_permit) = resource_budget
@@ -561,20 +589,23 @@ pub(super) fn create_udp_session(
     if let Some(observation) = &observation {
         observation.admit();
     }
-    tokio::spawn(run_udp_session(
-        listener,
-        sessions,
-        id,
-        peer,
-        runtime,
-        route,
-        reservation,
-        receiver,
-        receive_buffer_permit,
-        workspace_permit,
-        observation,
-        connection,
-        state,
+    tokio::spawn(gateway::observability::logging::scoped::route(
+        output,
+        run_udp_session(
+            listener,
+            sessions,
+            id,
+            peer,
+            runtime,
+            route,
+            reservation,
+            receiver,
+            receive_buffer_permit,
+            workspace_permit,
+            observation,
+            connection,
+            state,
+        ),
     ));
 }
 
@@ -638,15 +669,24 @@ pub(super) async fn run_udp_session(
             } else {
                 "0.0.0.0:0"
             };
-            let upstream = UdpSocket::bind(bind).await.context("bind UDP session socket")?;
-            upstream.connect(upstream_addr).await.context("connect UDP session socket")?;
+            let upstream = UdpSocket::bind(bind)
+                .await
+                .context("bind UDP session socket")?;
+            upstream
+                .connect(upstream_addr)
+                .await
+                .context("connect UDP session socket")?;
             Ok::<_, anyhow::Error>(upstream)
         };
         let upstream = if let Some(deadline) = probe_deadline {
             // DNS 与本地 socket 建立也属于本次探测期限，不能在进入收包循环前无限持有恢复权。
-            anyhow::ensure!(deadline > std::time::Instant::now(), "UDP probe authority expired before setup");
+            anyhow::ensure!(
+                deadline > std::time::Instant::now(),
+                "UDP probe authority expired before setup"
+            );
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), setup)
-                .await.context("UDP probe setup deadline exceeded")??
+                .await
+                .context("UDP probe setup deadline exceeded")??
         } else {
             setup.await?
         };
@@ -776,21 +816,27 @@ pub(super) fn spawn_stream_accept_loop(
 ) {
     tokio::spawn(async move {
         let local = listener.local_addr().ok();
-        info!(?local, stream = %runtime.id, upstream = %runtime.upstream, "stream tcp listening");
+        state.record_listener(&runtime.id, || {
+            info!(?local, stream = %runtime.id, upstream = %runtime.upstream, "stream tcp listening");
+        });
         loop {
             let (downstream, peer) = tokio::select! {
-                accepted = listener.accept() => match accepted {
-                    Ok(x) => x,
-                    Err(e) => {
-                        warn!(stream = %runtime.id, error = %e, "stream accept failed");
-                        continue;
+                    accepted = listener.accept() => match accepted {
+                        Ok(x) => x,
+                        Err(e) => {
+                            state.record_listener(&runtime.id, || {
+                warn!(stream = %runtime.id, error = %e, "stream accept failed");
+            });
+                            continue;
+                        }
+                    },
+                    _ = shutdown.changed() => {
+                        state.record_listener(&runtime.id, || {
+                info!(stream = %runtime.id, "stop accepting new stream connections (shutdown)");
+            });
+                        break;
                     }
-                },
-                _ = shutdown.changed() => {
-                    info!(stream = %runtime.id, "stop accepting new stream connections (shutdown)");
-                    break;
-                }
-            };
+                };
             spawn_stream_connection(
                 downstream,
                 peer,
@@ -846,104 +892,351 @@ pub(super) fn spawn_stream_connection(
     if let Some(observation) = &observation {
         observation.admit();
     }
-    tokio::spawn(async move {
-        let _workspace_permit = workspace_permit;
-        let started = std::time::Instant::now();
-        let downstream_local = downstream
-            .local_addr()
-            .unwrap_or_else(|_| SocketAddr::new(peer.ip(), 0));
-        let mut log_ctx = StreamAccessLogCtx {
-            request_id: next_stream_request_id(),
-            stream_id: Arc::from(runtime.id.as_str()),
-            upstream: Arc::from(runtime.upstream.as_str()),
-            peer: peer.to_string(),
-            started,
-            observation,
-        };
-        #[cfg(feature = "mqtt-governance")]
-        let _mqtt_connection_guard = if let Some(policy) = runtime.mqtt.as_ref() {
-            // 必须先抢连接名额再做 PROXY/TLS/CONNECT preread，否则慢握手可在解析前堆积无界 task。
-            let Some(guard) = state.mqtt_connections.try_acquire(
-                &runtime.id,
-                policy.max_connections(),
-                policy.connection_buffer_reservation(),
-                policy.max_buffered_bytes(),
-            ) else {
-                warn!(stream = %runtime.id, peer = %peer, "stream MQTT connection budget exhausted");
-                state.metrics.inc_stream_mqtt_rejection(
-                    gateway::protocols::mqtt::MqttViolationKind::ResourceLimit,
-                );
-                state.metrics.inc_stream_error();
-                log_stream_access(&state.access_log, &log_ctx, 429, 0, 0);
-                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
-                return;
+    let output = snapshot
+        .scoped_log
+        .output(Module::Stream, Some(&runtime.id));
+    tokio::spawn(gateway::observability::logging::scoped::route(
+        output,
+        async move {
+            let _workspace_permit = workspace_permit;
+            let started = std::time::Instant::now();
+            let downstream_local = downstream
+                .local_addr()
+                .unwrap_or_else(|_| SocketAddr::new(peer.ip(), 0));
+            let mut log_ctx = StreamAccessLogCtx {
+                request_id: next_stream_request_id(),
+                stream_id: Arc::from(runtime.id.as_str()),
+                upstream: Arc::from(runtime.upstream.as_str()),
+                peer: peer.to_string(),
+                started,
+                observation,
             };
-            Some(guard)
-        } else {
-            None
-        };
-        #[cfg(feature = "kafka-governance")]
-        let _kafka_connection_guard = if let Some(policy) = runtime.kafka.as_ref() {
-            // 连接名额必须覆盖 PROXY/TLS 和首 frame deadline，否则攻击者可在 parser 前堆积无界 task。
-            let Some(guard) = state.kafka_connections.try_acquire(
-                &runtime.id,
-                policy.max_connections(),
-                policy.connection_buffer_reservation(),
-                policy.max_buffered_bytes(),
-            ) else {
-                warn!(stream = %runtime.id, peer = %peer, "stream Kafka connection budget exhausted");
-                state.metrics.inc_stream_kafka_rejection(
-                    gateway::protocols::kafka::KafkaViolationKind::ResourceLimit,
-                );
-                state.metrics.inc_stream_error();
-                log_stream_access(&state.access_log, &log_ctx, 429, 0, 0);
-                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
-                return;
-            };
-            Some(guard)
-        } else {
-            None
-        };
-        let (stream, conn) = match strip_proxy_protocol(downstream, peer, &runtime.proxy_protocol)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                warn!(stream = %runtime.id, peer = %peer, error = %e, "stream proxy protocol rejected");
-                state.metrics.inc_stream_error();
-                log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
-                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
-                return;
-            }
-        };
-        let peer = conn.real_peer;
-        log_ctx.peer = peer.to_string();
-        let connection = state.conn_registry.register(
-            Arc::from(format!("stream:{}", runtime.id)),
-            peer.ip(),
-            None,
-            snapshot.version,
-            gateway::runtime::connections::LongProto::Tcp,
-        );
-        // 先登记再复验真实来源，封住 PROXY 解析期间封禁已生效但未收到关闭信号的窗口。
-        if !snapshot.ip_policy.is_allowed(peer.ip()) || state.blacklist.is_blocked(peer.ip()) {
-            if state.blacklist.is_blocked(peer.ip()) {
-                state.metrics.inc_blacklist_denied();
+            #[cfg(feature = "mqtt-governance")]
+            let _mqtt_connection_guard = if let Some(policy) = runtime.mqtt.as_ref() {
+                // 必须先抢连接名额再做 PROXY/TLS/CONNECT preread，否则慢握手可在解析前堆积无界 task。
+                let Some(guard) = state.mqtt_connections.try_acquire(
+                    &runtime.id,
+                    policy.max_connections(),
+                    policy.connection_buffer_reservation(),
+                    policy.max_buffered_bytes(),
+                ) else {
+                    warn!(stream = %runtime.id, peer = %peer, "stream MQTT connection budget exhausted");
+                    state.metrics.inc_stream_mqtt_rejection(
+                        gateway::protocols::mqtt::MqttViolationKind::ResourceLimit,
+                    );
+                    state.metrics.inc_stream_error();
+                    log_stream_access(&state.access_log, &log_ctx, 429, 0, 0);
+                    finish_stream_connection(
+                        state.active_connections.clone(),
+                        state.metrics.clone(),
+                    );
+                    return;
+                };
+                Some(guard)
             } else {
-                state.metrics.inc_acl_denied();
+                None
+            };
+            #[cfg(feature = "kafka-governance")]
+            let _kafka_connection_guard = if let Some(policy) = runtime.kafka.as_ref() {
+                // 连接名额必须覆盖 PROXY/TLS 和首 frame deadline，否则攻击者可在 parser 前堆积无界 task。
+                let Some(guard) = state.kafka_connections.try_acquire(
+                    &runtime.id,
+                    policy.max_connections(),
+                    policy.connection_buffer_reservation(),
+                    policy.max_buffered_bytes(),
+                ) else {
+                    warn!(stream = %runtime.id, peer = %peer, "stream Kafka connection budget exhausted");
+                    state.metrics.inc_stream_kafka_rejection(
+                        gateway::protocols::kafka::KafkaViolationKind::ResourceLimit,
+                    );
+                    state.metrics.inc_stream_error();
+                    log_stream_access(&state.access_log, &log_ctx, 429, 0, 0);
+                    finish_stream_connection(
+                        state.active_connections.clone(),
+                        state.metrics.clone(),
+                    );
+                    return;
+                };
+                Some(guard)
+            } else {
+                None
+            };
+            let (stream, conn) = match strip_proxy_protocol(
+                downstream,
+                peer,
+                &runtime.proxy_protocol,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!(stream = %runtime.id, peer = %peer, error = %e, "stream proxy protocol rejected");
+                    state.metrics.inc_stream_error();
+                    log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                    finish_stream_connection(
+                        state.active_connections.clone(),
+                        state.metrics.clone(),
+                    );
+                    return;
+                }
+            };
+            let peer = conn.real_peer;
+            log_ctx.peer = peer.to_string();
+            let connection = state.conn_registry.register(
+                Arc::from(format!("stream:{}", runtime.id)),
+                peer.ip(),
+                None,
+                snapshot.version,
+                gateway::runtime::connections::LongProto::Tcp,
+            );
+            // 先登记再复验真实来源，封住 PROXY 解析期间封禁已生效但未收到关闭信号的窗口。
+            if !snapshot.ip_policy.is_allowed(peer.ip()) || state.blacklist.is_blocked(peer.ip()) {
+                if state.blacklist.is_blocked(peer.ip()) {
+                    state.metrics.inc_blacklist_denied();
+                } else {
+                    state.metrics.inc_acl_denied();
+                }
+                log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
+                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
+                return;
             }
-            log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
-            finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
-            return;
-        }
-        // 关闭信号覆盖 TLS、preread、业务拨号和协议转发，不能只在下一次有载荷时才撤权。
-        let serving = async {
-            let mut downstream: BoxStreamIo = match tls.as_ref() {
-                Some(config) if !runtime.preread.ssl_preread => {
-                    // 先剥可信 PROXY header，再开始 TLS；这与前置 L4 LB 的 wire 顺序一致。
-                    // acceptor 只 clone 当前 ArcSwap 证书指针，热路径不读盘/解析 PEM。
-                    let accept = TlsAcceptor::from(config.load_full()).accept(stream);
-                    match tokio::time::timeout(
+            // 关闭信号覆盖 TLS、preread、业务拨号和协议转发，不能只在下一次有载荷时才撤权。
+            let serving = async {
+                let mut downstream: BoxStreamIo = match tls.as_ref() {
+                    Some(config) if !runtime.preread.ssl_preread => {
+                        // 先剥可信 PROXY header，再开始 TLS；这与前置 L4 LB 的 wire 顺序一致。
+                        // acceptor 只 clone 当前 ArcSwap 证书指针，热路径不读盘/解析 PEM。
+                        let accept = TlsAcceptor::from(config.load_full()).accept(stream);
+                        match tokio::time::timeout(
+                            Duration::from_millis(runtime.tls_handshake_timeout_ms),
+                            accept,
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => {
+                                if let Err(error) = gateway::tls::verify_client_certificate_spiffe(
+                                    stream.get_ref().1.peer_certificates(),
+                                    runtime
+                                        .tls
+                                        .as_ref()
+                                        .and_then(|tls| tls.client_auth.as_ref()),
+                                ) {
+                                    warn!(stream = %runtime.id, peer = %peer, %error, "stream client SPIFFE identity rejected");
+                                    state.metrics.inc_stream_error();
+                                    log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
+                                    finish_stream_connection(
+                                        state.active_connections.clone(),
+                                        state.metrics.clone(),
+                                    );
+                                    return;
+                                }
+                                if let Err(error) = gateway::tls::verify_client_certificate_ocsp(
+                                    stream.get_ref().1.peer_certificates(),
+                                    runtime
+                                        .tls
+                                        .as_ref()
+                                        .and_then(|tls| tls.client_auth.as_ref()),
+                                )
+                                .await
+                                {
+                                    warn!(stream = %runtime.id, peer = %peer, %error, "stream client certificate OCSP check failed");
+                                    state.metrics.inc_stream_error();
+                                    log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
+                                    finish_stream_connection(
+                                        state.active_connections.clone(),
+                                        state.metrics.clone(),
+                                    );
+                                    return;
+                                }
+                                Box::new(stream)
+                            }
+                            Ok(Err(error)) => {
+                                warn!(stream = %runtime.id, peer = %peer, %error, "stream TLS handshake failed");
+                                state.metrics.inc_stream_error();
+                                log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                                finish_stream_connection(
+                                    state.active_connections.clone(),
+                                    state.metrics.clone(),
+                                );
+                                return;
+                            }
+                            Err(_) => {
+                                warn!(stream = %runtime.id, peer = %peer, "stream TLS handshake timeout");
+                                state.metrics.inc_stream_error();
+                                log_stream_access(&state.access_log, &log_ctx, 408, 0, 0);
+                                finish_stream_connection(
+                                    state.active_connections.clone(),
+                                    state.metrics.clone(),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    _ => Box::new(stream),
+                };
+                let mut preread = if runtime.preread.ssl_preread {
+                    match stream_preread_sni(
+                        &mut downstream,
+                        runtime.preread.timeout_ms,
+                        runtime.preread.max_bytes,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            warn!(stream = %runtime.id, peer = %peer, error = %e, "stream ssl preread failed");
+                            state.metrics.inc_stream_error();
+                            log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                            finish_stream_connection(
+                                state.active_connections.clone(),
+                                state.metrics.clone(),
+                            );
+                            return;
+                        }
+                    }
+                } else if runtime.preread.mqtt_connect {
+                    match stream_preread_mqtt_connect(
+                        &mut downstream,
+                        runtime.preread.timeout_ms,
+                        runtime.preread.max_bytes,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => {
+                            warn!(stream = %runtime.id, peer = %peer, %error, "stream MQTT CONNECT preread failed");
+                            #[cfg(feature = "mqtt-governance")]
+                            if runtime.mqtt.is_some() {
+                                state.metrics.inc_stream_mqtt_rejection(
+                                    gateway::protocols::mqtt::MqttViolationKind::Malformed,
+                                );
+                            }
+                            state.metrics.inc_stream_error();
+                            log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                            finish_stream_connection(
+                                state.active_connections.clone(),
+                                state.metrics.clone(),
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    StreamPrereadResult {
+                        sni: None,
+                        mqtt_client_id: None,
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_protocol_level: None,
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_packet_len: None,
+                        #[cfg(feature = "mqtt-governance")]
+                        mqtt_clean_start: None,
+                        bytes: Vec::new(),
+                    }
+                };
+                #[cfg(feature = "mqtt-governance")]
+                if let Some(policy) = runtime.mqtt.as_ref() {
+                    let Some(client_id) = preread.mqtt_client_id.as_deref() else {
+                        warn!(stream = %runtime.id, peer = %peer, "stream MQTT governance missing CONNECT client id");
+                        state.metrics.inc_stream_mqtt_rejection(
+                            gateway::protocols::mqtt::MqttViolationKind::Malformed,
+                        );
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    };
+                    if !policy.allows_client_id(client_id) {
+                        // client ACL 在 upstream resolve/dial 之前执行，被拒绝身份不得触达 broker 也不污染被动健康。
+                        warn!(stream = %runtime.id, peer = %peer, "stream MQTT client id rejected by ACL");
+                        state.metrics.inc_stream_mqtt_rejection(
+                            gateway::protocols::mqtt::MqttViolationKind::NotAuthorized,
+                        );
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                    if !matches!(preread.mqtt_protocol_level, Some(4 | 5)) {
+                        warn!(stream = %runtime.id, peer = %peer, level = ?preread.mqtt_protocol_level, "stream MQTT governance rejects unsupported protocol level");
+                        state.metrics.inc_stream_mqtt_rejection(
+                            gateway::protocols::mqtt::MqttViolationKind::Protocol,
+                        );
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                    if preread.mqtt_packet_len != Some(preread.bytes.len()) {
+                        // CONNECT 之后的 pipelined 字节尚未经状态机，不能随 preread buffer 整段回放绕过 ACL/QoS 门。
+                        warn!(stream = %runtime.id, peer = %peer, "stream MQTT client sent packets before CONNACK");
+                        state.metrics.inc_stream_mqtt_rejection(
+                            gateway::protocols::mqtt::MqttViolationKind::Protocol,
+                        );
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                    if preread.mqtt_clean_start != Some(true) {
+                        // 跨连接 persistent session 的订阅/QoS2 状态由 broker 持有，本地单连接硬门无法安全重建；
+                        // 治理 profile 因此只接受 Clean Session/Start，需持久会话时应显式使用透明 TCP profile。
+                        warn!(stream = %runtime.id, peer = %peer, "stream MQTT governance requires Clean Session/Start");
+                        state.metrics.inc_stream_mqtt_rejection(
+                            gateway::protocols::mqtt::MqttViolationKind::Protocol,
+                        );
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                }
+                let Some(route) = select_stream_route(
+                    &runtime,
+                    preread.sni.as_deref(),
+                    preread.mqtt_client_id.as_deref(),
+                ) else {
+                    warn!(stream = %runtime.id, peer = %peer, sni = ?preread.sni, mqtt_client_id = ?preread.mqtt_client_id, "no matching stream route");
+                    state.metrics.inc_stream_error();
+                    log_stream_access(&state.access_log, &log_ctx, 404, 0, 0);
+                    finish_stream_connection(
+                        state.active_connections.clone(),
+                        state.metrics.clone(),
+                    );
+                    return;
+                };
+                log_ctx.stream_id = Arc::from(format!("{}:{}", runtime.id, route.id));
+                if route.terminate_tls {
+                    let Some(config) = tls.as_ref() else {
+                        warn!(stream = %runtime.id, peer = %peer, "stream route TLS termination has no server identity");
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 500, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    };
+                    // ClientHello 已用于 SNI 权威选路，必须在同一连接内原样回放给 rustls 后再开放
+                    // 明文上游；直接丢弃会让握手失败，先建上游则会让未认证连接触达业务端口。
+                    let replay =
+                        ReplayStreamIo::new(std::mem::take(&mut preread.bytes), downstream);
+                    let accept = TlsAcceptor::from(config.load_full()).accept(replay);
+                    downstream = match tokio::time::timeout(
                         Duration::from_millis(runtime.tls_handshake_timeout_ms),
                         accept,
                     )
@@ -957,7 +1250,7 @@ pub(super) fn spawn_stream_connection(
                                     .as_ref()
                                     .and_then(|tls| tls.client_auth.as_ref()),
                             ) {
-                                warn!(stream = %runtime.id, peer = %peer, %error, "stream client SPIFFE identity rejected");
+                                warn!(stream = %runtime.id, peer = %peer, %error, "selected stream client SPIFFE identity rejected");
                                 state.metrics.inc_stream_error();
                                 log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
                                 finish_stream_connection(
@@ -975,7 +1268,7 @@ pub(super) fn spawn_stream_connection(
                             )
                             .await
                             {
-                                warn!(stream = %runtime.id, peer = %peer, %error, "stream client certificate OCSP check failed");
+                                warn!(stream = %runtime.id, peer = %peer, %error, "selected stream client certificate OCSP check failed");
                                 state.metrics.inc_stream_error();
                                 log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
                                 finish_stream_connection(
@@ -987,7 +1280,7 @@ pub(super) fn spawn_stream_connection(
                             Box::new(stream)
                         }
                         Ok(Err(error)) => {
-                            warn!(stream = %runtime.id, peer = %peer, %error, "stream TLS handshake failed");
+                            warn!(stream = %runtime.id, peer = %peer, %error, "stream selected-route TLS handshake failed");
                             state.metrics.inc_stream_error();
                             log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
                             finish_stream_connection(
@@ -997,7 +1290,7 @@ pub(super) fn spawn_stream_connection(
                             return;
                         }
                         Err(_) => {
-                            warn!(stream = %runtime.id, peer = %peer, "stream TLS handshake timeout");
+                            warn!(stream = %runtime.id, peer = %peer, "stream selected-route TLS handshake timeout");
                             state.metrics.inc_stream_error();
                             log_stream_access(&state.access_log, &log_ctx, 408, 0, 0);
                             finish_stream_connection(
@@ -1006,311 +1299,19 @@ pub(super) fn spawn_stream_connection(
                             );
                             return;
                         }
-                    }
+                    };
                 }
-                _ => Box::new(stream),
-            };
-            let mut preread = if runtime.preread.ssl_preread {
-                match stream_preread_sni(
-                    &mut downstream,
-                    runtime.preread.timeout_ms,
-                    runtime.preread.max_bytes,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        warn!(stream = %runtime.id, peer = %peer, error = %e, "stream ssl preread failed");
-                        state.metrics.inc_stream_error();
-                        log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
-                        finish_stream_connection(
-                            state.active_connections.clone(),
-                            state.metrics.clone(),
-                        );
-                        return;
-                    }
-                }
-            } else if runtime.preread.mqtt_connect {
-                match stream_preread_mqtt_connect(
-                    &mut downstream,
-                    runtime.preread.timeout_ms,
-                    runtime.preread.max_bytes,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        warn!(stream = %runtime.id, peer = %peer, %error, "stream MQTT CONNECT preread failed");
-                        #[cfg(feature = "mqtt-governance")]
-                        if runtime.mqtt.is_some() {
-                            state.metrics.inc_stream_mqtt_rejection(
-                                gateway::protocols::mqtt::MqttViolationKind::Malformed,
-                            );
-                        }
-                        state.metrics.inc_stream_error();
-                        log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
-                        finish_stream_connection(
-                            state.active_connections.clone(),
-                            state.metrics.clone(),
-                        );
-                        return;
-                    }
-                }
-            } else {
-                StreamPrereadResult {
-                    sni: None,
-                    mqtt_client_id: None,
-                    #[cfg(feature = "mqtt-governance")]
-                    mqtt_protocol_level: None,
-                    #[cfg(feature = "mqtt-governance")]
-                    mqtt_packet_len: None,
-                    #[cfg(feature = "mqtt-governance")]
-                    mqtt_clean_start: None,
-                    bytes: Vec::new(),
-                }
-            };
-            #[cfg(feature = "mqtt-governance")]
-            if let Some(policy) = runtime.mqtt.as_ref() {
-                let Some(client_id) = preread.mqtt_client_id.as_deref() else {
-                    warn!(stream = %runtime.id, peer = %peer, "stream MQTT governance missing CONNECT client id");
-                    state.metrics.inc_stream_mqtt_rejection(
-                        gateway::protocols::mqtt::MqttViolationKind::Malformed,
-                    );
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                };
-                if !policy.allows_client_id(client_id) {
-                    // client ACL 在 upstream resolve/dial 之前执行，被拒绝身份不得触达 broker 也不污染被动健康。
-                    warn!(stream = %runtime.id, peer = %peer, "stream MQTT client id rejected by ACL");
-                    state.metrics.inc_stream_mqtt_rejection(
-                        gateway::protocols::mqtt::MqttViolationKind::NotAuthorized,
-                    );
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                }
-                if !matches!(preread.mqtt_protocol_level, Some(4 | 5)) {
-                    warn!(stream = %runtime.id, peer = %peer, level = ?preread.mqtt_protocol_level, "stream MQTT governance rejects unsupported protocol level");
-                    state.metrics.inc_stream_mqtt_rejection(
-                        gateway::protocols::mqtt::MqttViolationKind::Protocol,
-                    );
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                }
-                if preread.mqtt_packet_len != Some(preread.bytes.len()) {
-                    // CONNECT 之后的 pipelined 字节尚未经状态机，不能随 preread buffer 整段回放绕过 ACL/QoS 门。
-                    warn!(stream = %runtime.id, peer = %peer, "stream MQTT client sent packets before CONNACK");
-                    state.metrics.inc_stream_mqtt_rejection(
-                        gateway::protocols::mqtt::MqttViolationKind::Protocol,
-                    );
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                }
-                if preread.mqtt_clean_start != Some(true) {
-                    // 跨连接 persistent session 的订阅/QoS2 状态由 broker 持有，本地单连接硬门无法安全重建；
-                    // 治理 profile 因此只接受 Clean Session/Start，需持久会话时应显式使用透明 TCP profile。
-                    warn!(stream = %runtime.id, peer = %peer, "stream MQTT governance requires Clean Session/Start");
-                    state.metrics.inc_stream_mqtt_rejection(
-                        gateway::protocols::mqtt::MqttViolationKind::Protocol,
-                    );
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                }
-            }
-            let Some(route) = select_stream_route(
-                &runtime,
-                preread.sni.as_deref(),
-                preread.mqtt_client_id.as_deref(),
-            ) else {
-                warn!(stream = %runtime.id, peer = %peer, sni = ?preread.sni, mqtt_client_id = ?preread.mqtt_client_id, "no matching stream route");
-                state.metrics.inc_stream_error();
-                log_stream_access(&state.access_log, &log_ctx, 404, 0, 0);
-                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
-                return;
-            };
-            log_ctx.stream_id = Arc::from(format!("{}:{}", runtime.id, route.id));
-            if route.terminate_tls {
-                let Some(config) = tls.as_ref() else {
-                    warn!(stream = %runtime.id, peer = %peer, "stream route TLS termination has no server identity");
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 500, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                };
-                // ClientHello 已用于 SNI 权威选路，必须在同一连接内原样回放给 rustls 后再开放
-                // 明文上游；直接丢弃会让握手失败，先建上游则会让未认证连接触达业务端口。
-                let replay = ReplayStreamIo::new(std::mem::take(&mut preread.bytes), downstream);
-                let accept = TlsAcceptor::from(config.load_full()).accept(replay);
-                downstream = match tokio::time::timeout(
-                    Duration::from_millis(runtime.tls_handshake_timeout_ms),
-                    accept,
-                )
-                .await
-                {
-                    Ok(Ok(stream)) => {
-                        if let Err(error) = gateway::tls::verify_client_certificate_spiffe(
-                            stream.get_ref().1.peer_certificates(),
-                            runtime
-                                .tls
-                                .as_ref()
-                                .and_then(|tls| tls.client_auth.as_ref()),
-                        ) {
-                            warn!(stream = %runtime.id, peer = %peer, %error, "selected stream client SPIFFE identity rejected");
-                            state.metrics.inc_stream_error();
-                            log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
-                            finish_stream_connection(
-                                state.active_connections.clone(),
-                                state.metrics.clone(),
-                            );
-                            return;
-                        }
-                        if let Err(error) = gateway::tls::verify_client_certificate_ocsp(
-                            stream.get_ref().1.peer_certificates(),
-                            runtime
-                                .tls
-                                .as_ref()
-                                .and_then(|tls| tls.client_auth.as_ref()),
-                        )
-                        .await
-                        {
-                            warn!(stream = %runtime.id, peer = %peer, %error, "selected stream client certificate OCSP check failed");
-                            state.metrics.inc_stream_error();
-                            log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
-                            finish_stream_connection(
-                                state.active_connections.clone(),
-                                state.metrics.clone(),
-                            );
-                            return;
-                        }
-                        Box::new(stream)
-                    }
-                    Ok(Err(error)) => {
-                        warn!(stream = %runtime.id, peer = %peer, %error, "stream selected-route TLS handshake failed");
-                        state.metrics.inc_stream_error();
-                        log_stream_access(&state.access_log, &log_ctx, 400, 0, 0);
-                        finish_stream_connection(
-                            state.active_connections.clone(),
-                            state.metrics.clone(),
-                        );
-                        return;
-                    }
-                    Err(_) => {
-                        warn!(stream = %runtime.id, peer = %peer, "stream selected-route TLS handshake timeout");
-                        state.metrics.inc_stream_error();
-                        log_stream_access(&state.access_log, &log_ctx, 408, 0, 0);
-                        finish_stream_connection(
-                            state.active_connections.clone(),
-                            state.metrics.clone(),
-                        );
-                        return;
-                    }
-                };
-            }
-            let current_snap = snapshot;
-            let mut reservation = match resolve_stream_upstream(
-                &current_snap,
-                route,
-                &state.lb,
-                &state.active_health,
-                peer.ip(),
-            ) {
-                Ok(reservation) => reservation,
-                Err(e) => {
-                    warn!(stream = %runtime.id, peer = %peer, upstream = %route.upstream, error = %e, "stream upstream resolve failed");
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                }
-            };
-            drop(current_snap);
-            log_ctx.upstream = reservation.log_target.clone();
-            let upstream_addr = reservation.addr.clone();
-            let outlier = reservation.outlier.take();
-            let connect = async {
-                let connect = connect_stream_upstream(&reservation);
-                if runtime.connect_timeout_ms == 0 {
-                    Ok(connect.await)
-                } else {
-                    tokio::time::timeout(Duration::from_millis(runtime.connect_timeout_ms), connect)
-                        .await
-                }
-            };
-            let observed =
-                gateway::upstream::passive::window::Attempt::observe(outlier, connect, |result| {
-                    Some(!matches!(result, Ok(Ok(_))))
-                })
-                .await;
-            let upstream = match observed {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) | Err(()) => {
-                    warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, "stream upstream connect timeout");
-                    record_stream_upstream_failure(&state, &reservation);
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 504, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                }
-            };
-            let mut upstream: BoxStreamIo = match upstream {
-                Ok(upstream) => upstream,
-                Err(e) => {
-                    warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, error = %e, "stream upstream connect failed");
-                    record_stream_upstream_failure(&state, &reservation);
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                }
-            };
-            // TCP 建连及可选上游 TLS 握手成功已经证明实例可达，应立即清除此前被动失败；后续
-            // 会话级 reset/timeout 可能由任一客户端主动关闭触发，不能摘除共享实例并放大为全局故障。
-            record_stream_upstream_success(&state, &reservation);
-            if runtime.proxy_protocol_to_upstream.enabled {
-                let header = match encode_proxy_protocol_header(
-                    peer,
-                    downstream_local,
-                    runtime.proxy_protocol_to_upstream.version,
+                let current_snap = snapshot;
+                let mut reservation = match resolve_stream_upstream(
+                    &current_snap,
+                    route,
+                    &state.lb,
+                    &state.active_health,
+                    peer.ip(),
                 ) {
-                    Ok(header) => header,
+                    Ok(reservation) => reservation,
                     Err(e) => {
-                        warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, error = %e, "stream upstream proxy protocol header build failed");
+                        warn!(stream = %runtime.id, peer = %peer, upstream = %route.upstream, error = %e, "stream upstream resolve failed");
                         state.metrics.inc_stream_error();
                         log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
                         finish_stream_connection(
@@ -1320,160 +1321,352 @@ pub(super) fn spawn_stream_connection(
                         return;
                     }
                 };
-                if let Err(e) = upstream.write_all(&header).await {
-                    warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, error = %e, "stream upstream proxy protocol header write failed");
-                    record_stream_upstream_failure(&state, &reservation);
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                }
-            }
-            // 协议建立阶段不属于转发正文；只在 TLS 与 PROXY 头处理之后按实际成功写入累计。
-            let mut downstream: BoxStreamIo = match log_ctx.observation.as_ref() {
-                Some(observation) => Box::new(observation.observe_io(
-                    downstream,
-                    gateway::observability::stream_traffic::Direction::UpstreamToDownstream,
-                )),
-                None => downstream,
-            };
-            let mut upstream: BoxStreamIo = match log_ctx.observation.as_ref() {
-                Some(observation) => Box::new(observation.observe_io(
-                    upstream,
-                    gateway::observability::stream_traffic::Direction::DownstreamToUpstream,
-                )),
-                None => upstream,
-            };
-            #[cfg(feature = "mqtt-governance")]
-            if let Some(policy) = runtime.mqtt.clone() {
-                let protocol_level = preread
-                    .mqtt_protocol_level
-                    .expect("MQTT governance preread level validated before upstream resolve");
-                // CONNECT 是唯一枚在上游建连前已解析的 packet；先精确回放它，后续字节必须全部经状态机。
-                if let Err(error) = upstream.write_all(&preread.bytes).await {
-                    warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, %error, "stream MQTT CONNECT replay failed");
-                    record_stream_upstream_failure(&state, &reservation);
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                }
-                let governed =
-                    gateway::protocols::mqtt::proxy(downstream, upstream, protocol_level, policy);
-                let result = if runtime.timeout_ms == 0 {
-                    governed.await
-                } else {
-                    match tokio::time::timeout(Duration::from_millis(runtime.timeout_ms), governed)
+                drop(current_snap);
+                log_ctx.upstream = reservation.log_target.clone();
+                let upstream_addr = reservation.addr.clone();
+                let outlier = reservation.outlier.take();
+                let connect = async {
+                    let connect = connect_stream_upstream(&reservation);
+                    if runtime.connect_timeout_ms == 0 {
+                        Ok(connect.await)
+                    } else {
+                        tokio::time::timeout(
+                            Duration::from_millis(runtime.connect_timeout_ms),
+                            connect,
+                        )
                         .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            warn!(stream = %runtime.id, peer = %peer, elapsed_ms = started.elapsed().as_millis(), "stream MQTT session timeout");
-                            state.metrics.inc_stream_mqtt_rejection(
-                                gateway::protocols::mqtt::MqttViolationKind::ResourceLimit,
-                            );
+                    }
+                };
+                let observed = gateway::upstream::passive::window::Attempt::observe(
+                    outlier,
+                    connect,
+                    |result| Some(!matches!(result, Ok(Ok(_)))),
+                )
+                .await;
+                let upstream = match observed {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) | Err(()) => {
+                        warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, "stream upstream connect timeout");
+                        record_stream_upstream_failure(&state, &reservation);
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 504, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                };
+                let mut upstream: BoxStreamIo = match upstream {
+                    Ok(upstream) => upstream,
+                    Err(e) => {
+                        warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, error = %e, "stream upstream connect failed");
+                        record_stream_upstream_failure(&state, &reservation);
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                };
+                // TCP 建连及可选上游 TLS 握手成功已经证明实例可达，应立即清除此前被动失败；后续
+                // 会话级 reset/timeout 可能由任一客户端主动关闭触发，不能摘除共享实例并放大为全局故障。
+                record_stream_upstream_success(&state, &reservation);
+                if runtime.proxy_protocol_to_upstream.enabled {
+                    let header = match encode_proxy_protocol_header(
+                        peer,
+                        downstream_local,
+                        runtime.proxy_protocol_to_upstream.version,
+                    ) {
+                        Ok(header) => header,
+                        Err(e) => {
+                            warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, error = %e, "stream upstream proxy protocol header build failed");
                             state.metrics.inc_stream_error();
-                            log_stream_access(
-                                &state.access_log,
-                                &log_ctx,
-                                504,
-                                preread.bytes.len() as u64,
-                                0,
-                            );
+                            log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
                             finish_stream_connection(
                                 state.active_connections.clone(),
                                 state.metrics.clone(),
                             );
                             return;
                         }
-                    }
-                };
-                match result {
-                    Ok(report) => {
-                        let down = report
-                            .downstream_to_upstream_bytes
-                            .saturating_add(preread.bytes.len() as u64);
-                        let up = report.upstream_to_downstream_bytes;
-                        record_stream_upstream_success(&state, &reservation);
-                        state.metrics.add_stream_bytes(down, up);
-                        state.metrics.add_stream_mqtt_packets(
-                            report.downstream_to_upstream_packets,
-                            report.upstream_to_downstream_packets,
-                        );
-                        log_stream_access(&state.access_log, &log_ctx, 200, down, up);
-                        tracing::debug!(
-                            stream = %runtime.id,
-                            peer = %peer,
-                            upstream = %upstream_addr,
-                            mqtt_packets_downstream_to_upstream = report.downstream_to_upstream_packets,
-                            mqtt_packets_upstream_to_downstream = report.upstream_to_downstream_packets,
-                            bytes_downstream_to_upstream = down,
-                            bytes_upstream_to_downstream = up,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "stream MQTT governed session closed"
-                        );
-                    }
-                    Err(error) => {
-                        let report = error.report();
-                        let down = report
-                            .downstream_to_upstream_bytes
-                            .saturating_add(preread.bytes.len() as u64);
-                        let up = report.upstream_to_downstream_bytes;
-                        if error.peer() == gateway::protocols::mqtt::MqttPeer::Broker {
-                            record_stream_upstream_failure(&state, &reservation);
-                        }
-                        let status = match error.kind() {
-                            gateway::protocols::mqtt::MqttViolationKind::NotAuthorized => 403,
-                            gateway::protocols::mqtt::MqttViolationKind::PacketTooLarge => 413,
-                            gateway::protocols::mqtt::MqttViolationKind::ResourceLimit => 429,
-                            gateway::protocols::mqtt::MqttViolationKind::Malformed
-                            | gateway::protocols::mqtt::MqttViolationKind::Protocol => 400,
-                        };
+                    };
+                    if let Err(e) = upstream.write_all(&header).await {
+                        warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, error = %e, "stream upstream proxy protocol header write failed");
+                        record_stream_upstream_failure(&state, &reservation);
                         state.metrics.inc_stream_error();
-                        state.metrics.add_stream_bytes(down, up);
-                        state.metrics.add_stream_mqtt_packets(
-                            report.downstream_to_upstream_packets,
-                            report.upstream_to_downstream_packets,
+                        log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
                         );
-                        state.metrics.inc_stream_mqtt_rejection(error.kind());
-                        log_stream_access(&state.access_log, &log_ctx, status, down, up);
-                        warn!(
-                            stream = %runtime.id,
-                            peer = %peer,
-                            upstream = %upstream_addr,
-                            mqtt_peer = ?error.peer(),
-                            mqtt_violation = %error.kind(),
-                            %error,
-                            "stream MQTT governance terminated session"
-                        );
+                        return;
                     }
                 }
-                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
-                return;
-            }
-            #[cfg(feature = "kafka-governance")]
-            if let Some(policy) = runtime.kafka.clone() {
-                // Kafka profile 禁止 preread，确保首枚 request 也必须经过 header/ACL/correlation 状态机。
-                debug_assert!(preread.bytes.is_empty());
-                let governed = gateway::protocols::kafka::proxy(downstream, upstream, policy);
+                // 协议建立阶段不属于转发正文；只在 TLS 与 PROXY 头处理之后按实际成功写入累计。
+                let mut downstream: BoxStreamIo = match log_ctx.observation.as_ref() {
+                    Some(observation) => Box::new(observation.observe_io(
+                        downstream,
+                        gateway::observability::stream_traffic::Direction::UpstreamToDownstream,
+                    )),
+                    None => downstream,
+                };
+                let mut upstream: BoxStreamIo = match log_ctx.observation.as_ref() {
+                    Some(observation) => Box::new(observation.observe_io(
+                        upstream,
+                        gateway::observability::stream_traffic::Direction::DownstreamToUpstream,
+                    )),
+                    None => upstream,
+                };
+                #[cfg(feature = "mqtt-governance")]
+                if let Some(policy) = runtime.mqtt.clone() {
+                    let protocol_level = preread
+                        .mqtt_protocol_level
+                        .expect("MQTT governance preread level validated before upstream resolve");
+                    // CONNECT 是唯一枚在上游建连前已解析的 packet；先精确回放它，后续字节必须全部经状态机。
+                    if let Err(error) = upstream.write_all(&preread.bytes).await {
+                        warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, %error, "stream MQTT CONNECT replay failed");
+                        record_stream_upstream_failure(&state, &reservation);
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                    let governed = gateway::protocols::mqtt::proxy(
+                        downstream,
+                        upstream,
+                        protocol_level,
+                        policy,
+                    );
+                    let result = if runtime.timeout_ms == 0 {
+                        governed.await
+                    } else {
+                        match tokio::time::timeout(
+                            Duration::from_millis(runtime.timeout_ms),
+                            governed,
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                warn!(stream = %runtime.id, peer = %peer, elapsed_ms = started.elapsed().as_millis(), "stream MQTT session timeout");
+                                state.metrics.inc_stream_mqtt_rejection(
+                                    gateway::protocols::mqtt::MqttViolationKind::ResourceLimit,
+                                );
+                                state.metrics.inc_stream_error();
+                                log_stream_access(
+                                    &state.access_log,
+                                    &log_ctx,
+                                    504,
+                                    preread.bytes.len() as u64,
+                                    0,
+                                );
+                                finish_stream_connection(
+                                    state.active_connections.clone(),
+                                    state.metrics.clone(),
+                                );
+                                return;
+                            }
+                        }
+                    };
+                    match result {
+                        Ok(report) => {
+                            let down = report
+                                .downstream_to_upstream_bytes
+                                .saturating_add(preread.bytes.len() as u64);
+                            let up = report.upstream_to_downstream_bytes;
+                            record_stream_upstream_success(&state, &reservation);
+                            state.metrics.add_stream_bytes(down, up);
+                            state.metrics.add_stream_mqtt_packets(
+                                report.downstream_to_upstream_packets,
+                                report.upstream_to_downstream_packets,
+                            );
+                            log_stream_access(&state.access_log, &log_ctx, 200, down, up);
+                            tracing::debug!(
+                                stream = %runtime.id,
+                                peer = %peer,
+                                upstream = %upstream_addr,
+                                mqtt_packets_downstream_to_upstream = report.downstream_to_upstream_packets,
+                                mqtt_packets_upstream_to_downstream = report.upstream_to_downstream_packets,
+                                bytes_downstream_to_upstream = down,
+                                bytes_upstream_to_downstream = up,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "stream MQTT governed session closed"
+                            );
+                        }
+                        Err(error) => {
+                            let report = error.report();
+                            let down = report
+                                .downstream_to_upstream_bytes
+                                .saturating_add(preread.bytes.len() as u64);
+                            let up = report.upstream_to_downstream_bytes;
+                            if error.peer() == gateway::protocols::mqtt::MqttPeer::Broker {
+                                record_stream_upstream_failure(&state, &reservation);
+                            }
+                            let status = match error.kind() {
+                                gateway::protocols::mqtt::MqttViolationKind::NotAuthorized => 403,
+                                gateway::protocols::mqtt::MqttViolationKind::PacketTooLarge => 413,
+                                gateway::protocols::mqtt::MqttViolationKind::ResourceLimit => 429,
+                                gateway::protocols::mqtt::MqttViolationKind::Malformed
+                                | gateway::protocols::mqtt::MqttViolationKind::Protocol => 400,
+                            };
+                            state.metrics.inc_stream_error();
+                            state.metrics.add_stream_bytes(down, up);
+                            state.metrics.add_stream_mqtt_packets(
+                                report.downstream_to_upstream_packets,
+                                report.upstream_to_downstream_packets,
+                            );
+                            state.metrics.inc_stream_mqtt_rejection(error.kind());
+                            log_stream_access(&state.access_log, &log_ctx, status, down, up);
+                            warn!(
+                                stream = %runtime.id,
+                                peer = %peer,
+                                upstream = %upstream_addr,
+                                mqtt_peer = ?error.peer(),
+                                mqtt_violation = %error.kind(),
+                                %error,
+                                "stream MQTT governance terminated session"
+                            );
+                        }
+                    }
+                    finish_stream_connection(
+                        state.active_connections.clone(),
+                        state.metrics.clone(),
+                    );
+                    return;
+                }
+                #[cfg(feature = "kafka-governance")]
+                if let Some(policy) = runtime.kafka.clone() {
+                    // Kafka profile 禁止 preread，确保首枚 request 也必须经过 header/ACL/correlation 状态机。
+                    debug_assert!(preread.bytes.is_empty());
+                    let governed = gateway::protocols::kafka::proxy(downstream, upstream, policy);
+                    let result = if runtime.timeout_ms == 0 {
+                        governed.await
+                    } else {
+                        match tokio::time::timeout(
+                            Duration::from_millis(runtime.timeout_ms),
+                            governed,
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                warn!(stream = %runtime.id, peer = %peer, elapsed_ms = started.elapsed().as_millis(), "stream Kafka session timeout");
+                                state.metrics.inc_stream_kafka_rejection(
+                                    gateway::protocols::kafka::KafkaViolationKind::ResourceLimit,
+                                );
+                                state.metrics.inc_stream_error();
+                                log_stream_access(&state.access_log, &log_ctx, 504, 0, 0);
+                                finish_stream_connection(
+                                    state.active_connections.clone(),
+                                    state.metrics.clone(),
+                                );
+                                return;
+                            }
+                        }
+                    };
+                    match result {
+                        Ok(report) => {
+                            record_stream_upstream_success(&state, &reservation);
+                            state.metrics.add_stream_bytes(
+                                report.downstream_to_upstream_bytes,
+                                report.upstream_to_downstream_bytes,
+                            );
+                            state.metrics.add_stream_kafka_frames(
+                                report.downstream_to_upstream_frames,
+                                report.upstream_to_downstream_frames,
+                            );
+                            log_stream_access(
+                                &state.access_log,
+                                &log_ctx,
+                                200,
+                                report.downstream_to_upstream_bytes,
+                                report.upstream_to_downstream_bytes,
+                            );
+                            tracing::debug!(
+                                stream = %runtime.id,
+                                peer = %peer,
+                                upstream = %upstream_addr,
+                                kafka_frames_downstream_to_upstream = report.downstream_to_upstream_frames,
+                                kafka_frames_upstream_to_downstream = report.upstream_to_downstream_frames,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "stream Kafka governed session closed"
+                            );
+                        }
+                        Err(error) => {
+                            let report = error.report();
+                            if error.peer() == gateway::protocols::kafka::KafkaPeer::Broker {
+                                record_stream_upstream_failure(&state, &reservation);
+                            }
+                            let status = match error.kind() {
+                                gateway::protocols::kafka::KafkaViolationKind::NotAuthorized => 403,
+                                gateway::protocols::kafka::KafkaViolationKind::FrameTooLarge => 413,
+                                gateway::protocols::kafka::KafkaViolationKind::ResourceLimit => 429,
+                                gateway::protocols::kafka::KafkaViolationKind::Malformed
+                                | gateway::protocols::kafka::KafkaViolationKind::Protocol => 400,
+                            };
+                            state.metrics.inc_stream_error();
+                            state.metrics.add_stream_bytes(
+                                report.downstream_to_upstream_bytes,
+                                report.upstream_to_downstream_bytes,
+                            );
+                            state.metrics.add_stream_kafka_frames(
+                                report.downstream_to_upstream_frames,
+                                report.upstream_to_downstream_frames,
+                            );
+                            state.metrics.inc_stream_kafka_rejection(error.kind());
+                            log_stream_access(
+                                &state.access_log,
+                                &log_ctx,
+                                status,
+                                report.downstream_to_upstream_bytes,
+                                report.upstream_to_downstream_bytes,
+                            );
+                            warn!(
+                                stream = %runtime.id,
+                                peer = %peer,
+                                upstream = %upstream_addr,
+                                kafka_peer = ?error.peer(),
+                                kafka_violation = %error.kind(),
+                                %error,
+                                "stream Kafka governance terminated session"
+                            );
+                        }
+                    }
+                    finish_stream_connection(
+                        state.active_connections.clone(),
+                        state.metrics.clone(),
+                    );
+                    return;
+                }
+                if !preread.bytes.is_empty() {
+                    if let Err(e) = upstream.write_all(&preread.bytes).await {
+                        warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, error = %e, "stream preread replay to upstream failed");
+                        record_stream_upstream_failure(&state, &reservation);
+                        state.metrics.inc_stream_error();
+                        log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
+                        finish_stream_connection(
+                            state.active_connections.clone(),
+                            state.metrics.clone(),
+                        );
+                        return;
+                    }
+                }
+                // WHY:L4 stream 不解析应用层协议,只搬运字节;copy_bidirectional 保持双向背压。
+                let copied = io::copy_bidirectional(&mut downstream, &mut upstream);
                 let result = if runtime.timeout_ms == 0 {
-                    governed.await
+                    copied.await
                 } else {
-                    match tokio::time::timeout(Duration::from_millis(runtime.timeout_ms), governed)
+                    match tokio::time::timeout(Duration::from_millis(runtime.timeout_ms), copied)
                         .await
                     {
                         Ok(result) => result,
                         Err(_) => {
-                            warn!(stream = %runtime.id, peer = %peer, elapsed_ms = started.elapsed().as_millis(), "stream Kafka session timeout");
-                            state.metrics.inc_stream_kafka_rejection(
-                                gateway::protocols::kafka::KafkaViolationKind::ResourceLimit,
-                            );
+                            warn!(stream = %runtime.id, peer = %peer, elapsed_ms = started.elapsed().as_millis(), "stream session timeout");
                             state.metrics.inc_stream_error();
                             log_stream_access(&state.access_log, &log_ctx, 504, 0, 0);
                             finish_stream_connection(
@@ -1485,144 +1678,41 @@ pub(super) fn spawn_stream_connection(
                     }
                 };
                 match result {
-                    Ok(report) => {
+                    Ok((down, up)) => {
+                        let down = down.saturating_add(preread.bytes.len() as u64);
                         record_stream_upstream_success(&state, &reservation);
-                        state.metrics.add_stream_bytes(
-                            report.downstream_to_upstream_bytes,
-                            report.upstream_to_downstream_bytes,
-                        );
-                        state.metrics.add_stream_kafka_frames(
-                            report.downstream_to_upstream_frames,
-                            report.upstream_to_downstream_frames,
-                        );
-                        log_stream_access(
-                            &state.access_log,
-                            &log_ctx,
-                            200,
-                            report.downstream_to_upstream_bytes,
-                            report.upstream_to_downstream_bytes,
-                        );
+                        state.metrics.add_stream_bytes(down, up);
+                        log_stream_access(&state.access_log, &log_ctx, 200, down, up);
                         tracing::debug!(
                             stream = %runtime.id,
                             peer = %peer,
                             upstream = %upstream_addr,
-                            kafka_frames_downstream_to_upstream = report.downstream_to_upstream_frames,
-                            kafka_frames_upstream_to_downstream = report.upstream_to_downstream_frames,
+                            bytes_downstream_to_upstream = down,
+                            bytes_upstream_to_downstream = up,
                             elapsed_ms = started.elapsed().as_millis(),
-                            "stream Kafka governed session closed"
+                            "stream session closed"
                         );
                     }
-                    Err(error) => {
-                        let report = error.report();
-                        if error.peer() == gateway::protocols::kafka::KafkaPeer::Broker {
-                            record_stream_upstream_failure(&state, &reservation);
-                        }
-                        let status = match error.kind() {
-                            gateway::protocols::kafka::KafkaViolationKind::NotAuthorized => 403,
-                            gateway::protocols::kafka::KafkaViolationKind::FrameTooLarge => 413,
-                            gateway::protocols::kafka::KafkaViolationKind::ResourceLimit => 429,
-                            gateway::protocols::kafka::KafkaViolationKind::Malformed
-                            | gateway::protocols::kafka::KafkaViolationKind::Protocol => 400,
-                        };
+                    Err(e) => {
+                        // 建连后的双向 relay 错误无法可靠归因于上游；客户端 reset 也会让
+                        // copy_bidirectional 返回错误，因此这里只终止当前会话，不污染实例健康状态。
                         state.metrics.inc_stream_error();
-                        state.metrics.add_stream_bytes(
-                            report.downstream_to_upstream_bytes,
-                            report.upstream_to_downstream_bytes,
-                        );
-                        state.metrics.add_stream_kafka_frames(
-                            report.downstream_to_upstream_frames,
-                            report.upstream_to_downstream_frames,
-                        );
-                        state.metrics.inc_stream_kafka_rejection(error.kind());
-                        log_stream_access(
-                            &state.access_log,
-                            &log_ctx,
-                            status,
-                            report.downstream_to_upstream_bytes,
-                            report.upstream_to_downstream_bytes,
-                        );
-                        warn!(
-                            stream = %runtime.id,
-                            peer = %peer,
-                            upstream = %upstream_addr,
-                            kafka_peer = ?error.peer(),
-                            kafka_violation = %error.kind(),
-                            %error,
-                            "stream Kafka governance terminated session"
-                        );
+                        log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
+                        tracing::debug!(stream = %runtime.id, peer = %peer, error = %e, "stream session closed with error")
                     }
                 }
                 finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
-                return;
-            }
-            if !preread.bytes.is_empty() {
-                if let Err(e) = upstream.write_all(&preread.bytes).await {
-                    warn!(stream = %runtime.id, peer = %peer, upstream = %upstream_addr, error = %e, "stream preread replay to upstream failed");
-                    record_stream_upstream_failure(&state, &reservation);
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
-                    finish_stream_connection(
-                        state.active_connections.clone(),
-                        state.metrics.clone(),
-                    );
-                    return;
-                }
-            }
-            // WHY:L4 stream 不解析应用层协议,只搬运字节;copy_bidirectional 保持双向背压。
-            let copied = io::copy_bidirectional(&mut downstream, &mut upstream);
-            let result = if runtime.timeout_ms == 0 {
-                copied.await
-            } else {
-                match tokio::time::timeout(Duration::from_millis(runtime.timeout_ms), copied).await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        warn!(stream = %runtime.id, peer = %peer, elapsed_ms = started.elapsed().as_millis(), "stream session timeout");
-                        state.metrics.inc_stream_error();
-                        log_stream_access(&state.access_log, &log_ctx, 504, 0, 0);
-                        finish_stream_connection(
-                            state.active_connections.clone(),
-                            state.metrics.clone(),
-                        );
-                        return;
-                    }
-                }
             };
-            match result {
-                Ok((down, up)) => {
-                    let down = down.saturating_add(preread.bytes.len() as u64);
-                    record_stream_upstream_success(&state, &reservation);
-                    state.metrics.add_stream_bytes(down, up);
-                    log_stream_access(&state.access_log, &log_ctx, 200, down, up);
-                    tracing::debug!(
-                        stream = %runtime.id,
-                        peer = %peer,
-                        upstream = %upstream_addr,
-                        bytes_downstream_to_upstream = down,
-                        bytes_upstream_to_downstream = up,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "stream session closed"
-                    );
+            tokio::select! {
+                biased;
+                _ = connection.closed() => {
+                    log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
+                    finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
                 }
-                Err(e) => {
-                    // 建连后的双向 relay 错误无法可靠归因于上游；客户端 reset 也会让
-                    // copy_bidirectional 返回错误，因此这里只终止当前会话，不污染实例健康状态。
-                    state.metrics.inc_stream_error();
-                    log_stream_access(&state.access_log, &log_ctx, 502, 0, 0);
-                    tracing::debug!(stream = %runtime.id, peer = %peer, error = %e, "stream session closed with error")
-                }
+                _ = serving => {}
             }
-            finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
-        };
-        tokio::select! {
-            biased;
-            _ = connection.closed() => {
-                log_stream_access(&state.access_log, &log_ctx, 403, 0, 0);
-                finish_stream_connection(state.active_connections.clone(), state.metrics.clone());
-            }
-            _ = serving => {}
-        }
-    });
+        },
+    ));
 }
 
 /// stream preread 结果。

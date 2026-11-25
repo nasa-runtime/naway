@@ -66,6 +66,23 @@ pub(super) struct DataPlaneState {
     pub(super) metrics: Arc<Metrics>,
 }
 
+impl DataPlaneState {
+    /// 业务作用：为 HTTP 监听接入及生命周期记录选择当时活动的实例日志。
+    ///
+    /// 参数说明：
+    /// - `proxy_id`：实际正在接受连接的配置身份。
+    /// - `record`：记录接入、拒绝或停收事实的日志动作。
+    ///
+    /// 返回：执行一次原动作，不改变监听的调度和错误语义。
+    fn record_listener(&self, proxy_id: &str, record: impl FnOnce()) {
+        self.snap.load().scoped_log.record_instance(
+            gateway::observability::logging::scoped::Module::Http,
+            proxy_id,
+            record,
+        );
+    }
+}
+
 /// 为下游传输增加“连续写 Pending”超时，不缓存也不复制 HTTP body。
 ///
 /// Hyper 只有在 socket 可写时才继续 poll response body；若客户端停止读取，仅给上游 body 包 idle
@@ -631,61 +648,68 @@ pub(super) fn spawn_downstream_connection<I>(
         #[cfg(feature = "http3")]
         quic: false,
     });
-    tokio::spawn(async move {
-        let io = TokioIo::new(DownstreamWriteTimeoutIo::new(
-            stream,
-            timeouts.downstream_write_timeout_ms,
-        ));
-        let proxy = state.proxy.clone();
-        let request_connection_lifetime = connection_lifetime.clone();
-        let request_client_ip_header = connection_client_ip_header;
-        let request_listener_snapshot = listener_snapshot;
-        let request_conn = conn.clone();
-        let svc = service_fn(move |mut req: hyper::Request<Incoming>| {
-            // 只有带 Upgrade 头的候选请求才 clone/分配 Extensions。普通 HTTP/1 keep-alive 与
-            // HTTP/2 热路径完全不承担 WS 生命周期维护成本；proxy::handle 仍完整校验 GET、h1、
-            // Connection: upgrade 和 websocket 值，非法 Upgrade 不会进入隧道。
-            if req.headers().contains_key(hyper::header::UPGRADE) {
-                req.extensions_mut()
-                    .insert(request_connection_lifetime.clone());
-            }
-            // Hyper 会把 service future 直接嵌进每个 H2Stream task；该请求状态机约 14KiB，若
-            // 保持内联，建流时会在栈与 task storage 间重复整块复制。这里只装箱 future 本身，
-            // 请求/响应 body 仍按 Bytes 零拷贝流转，取消时 Drop 该 Box 仍同步取消原状态机。
-            Box::pin(proxy.clone().handle_with_connection_ip_header(
-                req,
-                request_conn.clone(),
-                downstream_proto,
-                proxy_id.clone(),
-                request_client_ip_header.clone(),
-                request_listener_snapshot.clone(),
-            ))
-        });
-        // Builder 按 listener/Snapshot 共享且在 serve 阶段只读。连接 future 借用 `server`，本 task
-        // 持有 Arc 直到正常结束或 Upgrade 完成，避免任何自引用或悬空借用。
-        let connection = server.serve_connection_with_upgrades(io, svc);
-        let result = if timeouts.connection_timeout_ms == 0 {
-            connection.await
-        } else {
-            match tokio::time::timeout(
-                Duration::from_millis(timeouts.connection_timeout_ms),
-                connection,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::debug!(peer = %conn.real_peer, "connection closed by total timeout");
-                    return;
+    let output = listener_snapshot.scoped_log.output(
+        gateway::observability::logging::scoped::Module::Http,
+        Some(&proxy_id),
+    );
+    tokio::spawn(gateway::observability::logging::scoped::route(
+        output,
+        async move {
+            let io = TokioIo::new(DownstreamWriteTimeoutIo::new(
+                stream,
+                timeouts.downstream_write_timeout_ms,
+            ));
+            let proxy = state.proxy.clone();
+            let request_connection_lifetime = connection_lifetime.clone();
+            let request_client_ip_header = connection_client_ip_header;
+            let request_listener_snapshot = listener_snapshot;
+            let request_conn = conn.clone();
+            let svc = service_fn(move |mut req: hyper::Request<Incoming>| {
+                // 只有带 Upgrade 头的候选请求才 clone/分配 Extensions。普通 HTTP/1 keep-alive 与
+                // HTTP/2 热路径完全不承担 WS 生命周期维护成本；proxy::handle 仍完整校验 GET、h1、
+                // Connection: upgrade 和 websocket 值，非法 Upgrade 不会进入隧道。
+                if req.headers().contains_key(hyper::header::UPGRADE) {
+                    req.extensions_mut()
+                        .insert(request_connection_lifetime.clone());
                 }
+                // Hyper 会把 service future 直接嵌进每个 H2Stream task；该请求状态机约 14KiB，若
+                // 保持内联，建流时会在栈与 task storage 间重复整块复制。这里只装箱 future 本身，
+                // 请求/响应 body 仍按 Bytes 零拷贝流转，取消时 Drop 该 Box 仍同步取消原状态机。
+                Box::pin(proxy.clone().handle_with_connection_ip_header(
+                    req,
+                    request_conn.clone(),
+                    downstream_proto,
+                    proxy_id.clone(),
+                    request_client_ip_header.clone(),
+                    request_listener_snapshot.clone(),
+                ))
+            });
+            // Builder 按 listener/Snapshot 共享且在 serve 阶段只读。连接 future 借用 `server`，本 task
+            // 持有 Arc 直到正常结束或 Upgrade 完成，避免任何自引用或悬空借用。
+            let connection = server.serve_connection_with_upgrades(io, svc);
+            let result = if timeouts.connection_timeout_ms == 0 {
+                connection.await
+            } else {
+                match tokio::time::timeout(
+                    Duration::from_millis(timeouts.connection_timeout_ms),
+                    connection,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::debug!(peer = %conn.real_peer, "connection closed by total timeout");
+                        return;
+                    }
+                }
+            };
+            if let Err(e) = result {
+                tracing::debug!(error = %e, "connection closed with error");
             }
-        };
-        if let Err(e) = result {
-            tracing::debug!(error = %e, "connection closed with error");
-        }
-        // `connection_lifetime` 在普通 HTTP 结束时随 service/task 释放；若发生 Upgrade，隧道持有
-        // 另一个 clone，最后一个 clone Drop 才统一归还预算与两个 active counter。
-    });
+            // `connection_lifetime` 在普通 HTTP 结束时随 service/task 释放；若发生 Upgrade，隧道持有
+            // 另一个 clone，最后一个 clone Drop 才统一归还预算与两个 active counter。
+        },
+    ));
 }
 
 /// 业务作用：驱动明文监听器的连接接入，在接受请求前完成连接预算和入口协议约束。
@@ -700,7 +724,9 @@ pub(super) fn spawn_plain_accept_loop(
     let budget_entry = state.connection_budget.entry(&proxy_id);
     tokio::spawn(async move {
         let local = listener.local_addr().ok();
-        info!(?local, proxy = %proxy_id, "data plane listening");
+        state.record_listener(&proxy_id, || {
+            info!(?local, proxy = %proxy_id, "data plane listening");
+        });
         // 单 listener 单项 cache；同版建连无锁命中，reload 首条连接才重建协议 Builder。
         let mut server_cache = None;
         loop {
@@ -710,12 +736,16 @@ pub(super) fn spawn_plain_accept_loop(
                 accepted = listener.accept() => match accepted {
                     Ok(x) => x,
                     Err(e) => {
-                        warn!(error = %e, "accept failed");
+                        state.record_listener(&proxy_id, || {
+                            warn!(error = %e, "accept failed");
+                        });
                         continue;
                     }
                 },
                 _ = shutdown.changed() => {
-                    info!(proxy = %proxy_id, "stop accepting new connections (shutdown)");
+                    state.record_listener(&proxy_id, || {
+                        info!(proxy = %proxy_id, "stop accepting new connections (shutdown)");
+                    });
                     break;
                 }
             };
@@ -761,14 +791,23 @@ pub(super) fn spawn_plain_accept_loop(
             }
             let state = state.clone();
             let proxy_id = proxy_id.clone();
-            tokio::spawn(async move {
-                match strip_proxy_protocol(stream, peer, &proxy_protocol).await {
-                    Ok((stream, conn)) => spawn_downstream_connection(
-                        stream, conn, proxy_id, "http", state, downstream, slot,
-                    ),
-                    Err(e) => warn!(peer = %peer, error = %e, "proxy protocol rejected connection"),
-                }
-            });
+            let output = downstream.listener_snapshot.scoped_log.output(
+                gateway::observability::logging::scoped::Module::Http,
+                Some(&proxy_id),
+            );
+            tokio::spawn(gateway::observability::logging::scoped::route(
+                output,
+                async move {
+                    match strip_proxy_protocol(stream, peer, &proxy_protocol).await {
+                        Ok((stream, conn)) => spawn_downstream_connection(
+                            stream, conn, proxy_id, "http", state, downstream, slot,
+                        ),
+                        Err(e) => {
+                            warn!(peer = %peer, error = %e, "proxy protocol rejected connection")
+                        }
+                    }
+                },
+            ));
         }
     });
 }
@@ -786,7 +825,9 @@ pub(super) fn spawn_tls_accept_loop(
     let budget_entry = state.connection_budget.entry(&proxy_id);
     tokio::spawn(async move {
         let local = listener.local_addr().ok();
-        info!(?local, proxy = %proxy_id, "tls data plane listening");
+        state.record_listener(&proxy_id, || {
+            info!(?local, proxy = %proxy_id, "tls data plane listening");
+        });
         let mut server_cache = None;
         loop {
             // 同明文入口，SIGTERM 后停收新 TLS 连接。
@@ -794,12 +835,16 @@ pub(super) fn spawn_tls_accept_loop(
                 accepted = listener.accept() => match accepted {
                     Ok(x) => x,
                     Err(e) => {
-                        warn!(error = %e, "tls accept failed");
+                        state.record_listener(&proxy_id, || {
+                            warn!(error = %e, "tls accept failed");
+                        });
                         continue;
                     }
                 },
                 _ = shutdown.changed() => {
-                    info!(proxy = %proxy_id, "stop accepting new tls connections (shutdown)");
+                    state.record_listener(&proxy_id, || {
+                        info!(proxy = %proxy_id, "stop accepting new tls connections (shutdown)");
+                    });
                     break;
                 }
             };
@@ -832,51 +877,58 @@ pub(super) fn spawn_tls_accept_loop(
             let state = state.clone();
             let proxy_id = proxy_id.clone();
             let client_auth = client_auth.clone();
-            tokio::spawn(async move {
-                match strip_proxy_protocol(stream, peer, &proxy_protocol).await {
-                    Ok((stream, mut conn)) => match acceptor.accept(stream).await {
-                        Ok(tls_stream) => {
-                            if let Err(error) = gateway::tls::verify_client_certificate_spiffe(
-                                tls_stream.get_ref().1.peer_certificates(),
-                                client_auth.as_ref(),
-                            ) {
-                                warn!(peer = %peer, %error, "client SPIFFE identity rejected");
-                                return;
+            let output = downstream.listener_snapshot.scoped_log.output(
+                gateway::observability::logging::scoped::Module::Http,
+                Some(&proxy_id),
+            );
+            tokio::spawn(gateway::observability::logging::scoped::route(
+                output,
+                async move {
+                    match strip_proxy_protocol(stream, peer, &proxy_protocol).await {
+                        Ok((stream, mut conn)) => match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                if let Err(error) = gateway::tls::verify_client_certificate_spiffe(
+                                    tls_stream.get_ref().1.peer_certificates(),
+                                    client_auth.as_ref(),
+                                ) {
+                                    warn!(peer = %peer, %error, "client SPIFFE identity rejected");
+                                    return;
+                                }
+                                // 在线吊销证据必须在业务协议读取前完成；否则被吊销身份可能先发送一条请求。
+                                if let Err(error) = gateway::tls::verify_client_certificate_ocsp(
+                                    tls_stream.get_ref().1.peer_certificates(),
+                                    client_auth.as_ref(),
+                                )
+                                .await
+                                {
+                                    warn!(peer = %peer, %error, "client certificate OCSP check failed");
+                                    return;
+                                }
+                                // mTLS:握手成功且出示了客户端证书(已被 verifier 校验通过)→ 标记 verified,
+                                // 供数据面注入 X-Client-Cert-Verified。require 模式下无证书握手会在上面 accept 失败。
+                                conn.client_cert_verified = tls_stream
+                                    .get_ref()
+                                    .1
+                                    .peer_certificates()
+                                    .is_some_and(|certs| !certs.is_empty());
+                                // SNI 是 TLS 连接级权威证据；请求 Host 不能覆盖它。共享 HTTPS
+                                // socket 后续据此拒绝跨 Gateway listener 的 H2 连接合并。
+                                conn.tls_server_name =
+                                    tls_stream.get_ref().1.server_name().map(|name| {
+                                        Arc::from(name.trim_end_matches('.').to_ascii_lowercase())
+                                    });
+                                spawn_downstream_connection(
+                                    tls_stream, conn, proxy_id, "https", state, downstream, slot,
+                                )
                             }
-                            // 在线吊销证据必须在业务协议读取前完成；否则被吊销身份可能先发送一条请求。
-                            if let Err(error) = gateway::tls::verify_client_certificate_ocsp(
-                                tls_stream.get_ref().1.peer_certificates(),
-                                client_auth.as_ref(),
-                            )
-                            .await
-                            {
-                                warn!(peer = %peer, %error, "client certificate OCSP check failed");
-                                return;
-                            }
-                            // mTLS:握手成功且出示了客户端证书(已被 verifier 校验通过)→ 标记 verified,
-                            // 供数据面注入 X-Client-Cert-Verified。require 模式下无证书握手会在上面 accept 失败。
-                            conn.client_cert_verified = tls_stream
-                                .get_ref()
-                                .1
-                                .peer_certificates()
-                                .is_some_and(|certs| !certs.is_empty());
-                            // SNI 是 TLS 连接级权威证据；请求 Host 不能覆盖它。共享 HTTPS
-                            // socket 后续据此拒绝跨 Gateway listener 的 H2 连接合并。
-                            conn.tls_server_name =
-                                tls_stream.get_ref().1.server_name().map(|name| {
-                                    Arc::from(name.trim_end_matches('.').to_ascii_lowercase())
-                                });
-                            spawn_downstream_connection(
-                                tls_stream, conn, proxy_id, "https", state, downstream, slot,
-                            )
+                            Err(e) => warn!(peer = %peer, error = %e, "tls handshake failed"),
+                        },
+                        Err(e) => {
+                            warn!(peer = %peer, error = %e, "proxy protocol rejected tls connection")
                         }
-                        Err(e) => warn!(peer = %peer, error = %e, "tls handshake failed"),
-                    },
-                    Err(e) => {
-                        warn!(peer = %peer, error = %e, "proxy protocol rejected tls connection")
                     }
-                }
-            });
+                },
+            ));
         }
     });
 }
@@ -909,7 +961,9 @@ pub(super) fn spawn_http3_accept_loop(
     let budget_entry = state.connection_budget.entry(&proxy_id);
     tokio::spawn(async move {
         let local = endpoint.local_addr().ok();
-        info!(?local, proxy = %proxy_id, "HTTP/3 QUIC data plane listening");
+        state.record_listener(&proxy_id, || {
+            info!(?local, proxy = %proxy_id, "HTTP/3 QUIC data plane listening");
+        });
         let mut certificate_updates_open = true;
         loop {
             let incoming = tokio::select! {
@@ -922,7 +976,9 @@ pub(super) fn spawn_http3_accept_loop(
                         // 先撤销 server config，旧 generation 不再接受 Initial；已握手连接仍持有
                         // 自己的 endpoint/connection 状态，交给统一 drain 而不是粗暴 CONNECTION_CLOSE。
                         endpoint.set_server_config(None);
-                        info!(proxy = %proxy_id, "stop accepting new HTTP/3 connections (shutdown)");
+                        state.record_listener(&proxy_id, || {
+                            info!(proxy = %proxy_id, "stop accepting new HTTP/3 connections (shutdown)");
+                        });
                         break;
                     }
                     continue;
@@ -936,7 +992,9 @@ pub(super) fn spawn_http3_accept_loop(
                         certificates.publish(config.observation, || {
                             endpoint.set_server_config(Some(config.config));
                         });
-                        info!(proxy = %proxy_id, "HTTP/3 certificate reloaded for new handshakes");
+                        state.record_listener(&proxy_id, || {
+                            info!(proxy = %proxy_id, "HTTP/3 certificate reloaded for new handshakes");
+                        });
                     }
                     continue;
                 }
@@ -953,7 +1011,9 @@ pub(super) fn spawn_http3_accept_loop(
                     Ok(()) => state.metrics.inc_quic_handshake_retry(),
                     Err(error) => {
                         state.metrics.inc_quic_handshake_error();
-                        tracing::debug!(%peer, %error, "HTTP/3 Retry could not be issued");
+                        state.record_listener(&proxy_id, || {
+                            tracing::debug!(%peer, %error, "HTTP/3 Retry could not be issued");
+                        });
                     }
                 }
                 continue;
@@ -987,13 +1047,19 @@ pub(super) fn spawn_http3_accept_loop(
                 continue;
             };
             let connection_timeout_ms = proxy_runtime.timeouts.connection_timeout_ms;
+            let output = snapshot.scoped_log.output(
+                gateway::observability::logging::scoped::Module::Http,
+                Some(&proxy_id),
+            );
             drop(snapshot);
 
             let connecting = match incoming.accept() {
                 Ok(connecting) => connecting,
                 Err(error) => {
                     state.metrics.inc_quic_handshake_error();
-                    tracing::debug!(%peer, %error, "HTTP/3 QUIC Initial rejected");
+                    state.record_listener(&proxy_id, || {
+                        tracing::debug!(%peer, %error, "HTTP/3 QUIC Initial rejected");
+                    });
                     continue;
                 }
             };
@@ -1003,90 +1069,93 @@ pub(super) fn spawn_http3_accept_loop(
             let metrics = state.metrics.clone();
             let connection_runtime = runtime.clone();
             let mut connection_shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                // 从 Initial 到 connection task 完整结束都计入来源预算，握手失败/取消也由 RAII 归还。
-                let _peer_slot = peer_slot;
-                // 只有 listener 与 route 共同启用 early data 时才允许 H3 在握手确认前读取 stream；
-                // 每条流仍由 Quinn 真值标记和统一代理门禁裁决，不能因提早调度绕过鉴权或 anti-replay。
-                let early_attempt = if connection_runtime.zero_rtt {
-                    connecting
-                        .into_0rtt()
-                        .map(|(connection, established)| (connection, Some(established)))
-                } else {
-                    Err(connecting)
-                };
-                let (connection, early_established) = match early_attempt {
-                    Ok(ready) => ready,
-                    Err(connecting) => {
-                        let connection = tokio::select! {
-                            result = connecting => match result {
-                                Ok(connection) => connection,
-                                Err(error) => {
-                                    metrics.inc_quic_handshake_error();
-                                    tracing::debug!(%peer, %error, "HTTP/3 QUIC handshake failed");
+            tokio::spawn(gateway::observability::logging::scoped::route(
+                output,
+                async move {
+                    // 从 Initial 到 connection task 完整结束都计入来源预算，握手失败/取消也由 RAII 归还。
+                    let _peer_slot = peer_slot;
+                    // 只有 listener 与 route 共同启用 early data 时才允许 H3 在握手确认前读取 stream；
+                    // 每条流仍由 Quinn 真值标记和统一代理门禁裁决，不能因提早调度绕过鉴权或 anti-replay。
+                    let early_attempt = if connection_runtime.zero_rtt {
+                        connecting
+                            .into_0rtt()
+                            .map(|(connection, established)| (connection, Some(established)))
+                    } else {
+                        Err(connecting)
+                    };
+                    let (connection, early_established) = match early_attempt {
+                        Ok(ready) => ready,
+                        Err(connecting) => {
+                            let connection = tokio::select! {
+                                result = connecting => match result {
+                                    Ok(connection) => connection,
+                                    Err(error) => {
+                                        metrics.inc_quic_handshake_error();
+                                        tracing::debug!(%peer, %error, "HTTP/3 QUIC handshake failed");
+                                        return;
+                                    }
+                                },
+                                changed = connection_shutdown.changed() => {
+                                    if changed.is_err() || *connection_shutdown.borrow() {
+                                        return;
+                                    }
                                     return;
                                 }
-                            },
-                            changed = connection_shutdown.changed() => {
-                                if changed.is_err() || *connection_shutdown.borrow() {
-                                    return;
-                                }
+                            };
+                            (connection, None)
+                        }
+                    };
+                    active_connections.fetch_add(1, Ordering::Relaxed);
+                    metrics.inc_active_connection();
+                    metrics.inc_quic_connection();
+                    if let Some(established) = early_established {
+                        let handshake_metrics = metrics.clone();
+                        tokio::spawn(async move {
+                            if established.await {
+                                handshake_metrics.inc_quic_handshake_success();
+                            } else {
+                                handshake_metrics.inc_quic_handshake_error();
+                            }
+                        });
+                    } else {
+                        metrics.inc_quic_handshake_success();
+                    }
+                    let _lifetime = ConnectionLifetime {
+                        _slot: slot,
+                        active_connections,
+                        metrics: metrics.clone(),
+                        quic: true,
+                    };
+                    let serving = gateway::protocols::http3::serve_connection(
+                        connection,
+                        proxy,
+                        proxy_id,
+                        peer,
+                        connection_runtime,
+                        metrics,
+                        connection_shutdown,
+                    );
+                    let result = if connection_timeout_ms == 0 {
+                        serving.await
+                    } else {
+                        match tokio::time::timeout(
+                            Duration::from_millis(connection_timeout_ms),
+                            serving,
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                tracing::debug!(%peer, "HTTP/3 connection closed by total timeout");
                                 return;
                             }
-                        };
-                        (connection, None)
-                    }
-                };
-                active_connections.fetch_add(1, Ordering::Relaxed);
-                metrics.inc_active_connection();
-                metrics.inc_quic_connection();
-                if let Some(established) = early_established {
-                    let handshake_metrics = metrics.clone();
-                    tokio::spawn(async move {
-                        if established.await {
-                            handshake_metrics.inc_quic_handshake_success();
-                        } else {
-                            handshake_metrics.inc_quic_handshake_error();
                         }
-                    });
-                } else {
-                    metrics.inc_quic_handshake_success();
-                }
-                let _lifetime = ConnectionLifetime {
-                    _slot: slot,
-                    active_connections,
-                    metrics: metrics.clone(),
-                    quic: true,
-                };
-                let serving = gateway::protocols::http3::serve_connection(
-                    connection,
-                    proxy,
-                    proxy_id,
-                    peer,
-                    connection_runtime,
-                    metrics,
-                    connection_shutdown,
-                );
-                let result = if connection_timeout_ms == 0 {
-                    serving.await
-                } else {
-                    match tokio::time::timeout(
-                        Duration::from_millis(connection_timeout_ms),
-                        serving,
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            tracing::debug!(%peer, "HTTP/3 connection closed by total timeout");
-                            return;
-                        }
+                    };
+                    if let Err(error) = result {
+                        tracing::debug!(%peer, %error, "HTTP/3 connection closed with error");
                     }
-                };
-                if let Err(error) = result {
-                    tracing::debug!(%peer, %error, "HTTP/3 connection closed with error");
-                }
-            });
+                },
+            ));
         }
     });
 }
@@ -1205,6 +1274,7 @@ pub(super) fn spawn_deferred_tls_accept_loop(
                     let watcher_tls = shared_tls.clone();
                     let watcher_shutdown = shutdown.clone();
                     let listen = listener.local_addr().ok();
+                    let logging = state.clone();
                     // 首签期间可能已经删除或替换入口；失权不能再启动旧 accept loop。
                     if !certificates.publish(material.observation, || {
                         spawn_tls_accept_loop(
@@ -1224,7 +1294,9 @@ pub(super) fn spawn_deferred_tls_accept_loop(
                         certificates.clone(),
                         watcher_shutdown,
                     );
-                    info!(proxy = %proxy_id, ?listen, "ACME bootstrap keypair installed; TLS listener activated without restart");
+                    logging.record_listener(&proxy_id, || {
+                        info!(proxy = %proxy_id, ?listen, "ACME bootstrap keypair installed; TLS listener activated without restart");
+                    });
                     return;
                 }
                 Err(error) => {
@@ -1233,7 +1305,9 @@ pub(super) fn spawn_deferred_tls_accept_loop(
                         && tls_cfg.key_file.is_file()
                         && last_error.as_deref() != Some(message.as_str())
                     {
+                        state.record_listener(&proxy_id, || {
                         warn!(proxy = %proxy_id, error = %message, "deferred TLS keypair exists but is not usable; keeping listener inactive");
+                    });
                     }
                     last_error = Some(message);
                 }
@@ -1242,7 +1316,9 @@ pub(super) fn spawn_deferred_tls_accept_loop(
                 _ = tokio::time::sleep(Duration::from_millis(poll_ms)) => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
+                        state.record_listener(&proxy_id, || {
                         info!(proxy = %proxy_id, "stop deferred TLS activation (shutdown)");
+                    });
                         return;
                     }
                 }

@@ -5,6 +5,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use nasa::log::{LogConfig, LogContext, LogGuard};
 
+pub mod scoped;
+mod scoped_files;
+mod scoped_writer;
+
 /// 已验证的启动日志声明；省略时保留控制台与 `RUST_LOG` 的默认行为。
 #[derive(Clone, Debug)]
 pub struct LogPlan {
@@ -56,6 +60,20 @@ impl LogPlan {
         self.signature == candidate.signature
     }
 
+    /// 业务作用：为私有目录隔离返回全局文件策略的真实声明路径。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回：文件启用时给出路径，控制台模式为空。
+    fn directory(&self) -> Option<&std::path::Path> {
+        self.config
+            .as_ref()
+            .and_then(|config| config.path.as_deref())
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(std::path::Path::new)
+    }
+
     /// 业务作用：在 tracing 与 OpenTelemetry 共用的 subscriber 建立后启用 NASA 滚动文件输出。
     ///
     /// 参数说明: 无。
@@ -76,11 +94,19 @@ impl LogPlan {
 /// 唯一的进程兜底日志 owner；退役 writer 由原调用方在发布锁外刷盘。
 pub struct ProcessLog {
     state: Mutex<Active>,
+    scoped: Mutex<ScopedOwner>,
 }
 
 struct Active {
     file: Option<LogGuard>,
+    directory: Option<std::path::PathBuf>,
     closed: bool,
+}
+
+#[derive(Default)]
+struct ScopedOwner {
+    worker: Option<scoped_writer::Worker>,
+    directories: scoped::Directories,
 }
 
 impl ProcessLog {
@@ -91,12 +117,53 @@ impl ProcessLog {
     ///
     /// 返回：初始输出已经安装的 owner，打开文件失败阻止启动。
     pub fn open(plan: &LogPlan) -> Result<Arc<Self>> {
+        scoped::initialize_fallback();
         Ok(Arc::new(Self {
             state: Mutex::new(Active {
                 file: plan.start()?,
+                directory: plan.directory().and_then(|path| path.canonicalize().ok()),
                 closed: false,
             }),
+            scoped: Mutex::new(ScopedOwner::default()),
         }))
+    }
+
+    /// 业务作用：为候选准备所有范围文件，保持全局兜底和已发布范围不受候选失败影响。
+    ///
+    /// 参数说明：
+    /// - `global`：该代进程级日志声明，作为路径隔离基线。
+    /// - `scopes`：受 naml 与业务实例约束的范围日志计划。
+    ///
+    /// 返回：所有范围输出已可写或没有范围声明。配置无效时返回错误，调用方保留原代。
+    pub(crate) fn prepare_scopes(
+        &self,
+        global: &LogPlan,
+        scopes: &scoped::Plan,
+    ) -> Result<scoped::Active> {
+        let current_global = self
+            .state
+            .lock()
+            .expect("process log owner poisoned")
+            .directory
+            .clone();
+        let mut scoped = self.scoped.lock().expect("scoped log owner poisoned");
+        let ScopedOwner {
+            worker,
+            directories,
+        } = &mut *scoped;
+        directories.check_global(global.directory())?;
+        if scopes.is_empty() {
+            return Ok(scoped::Active::default());
+        }
+        if worker.is_none() {
+            *worker = Some(scoped_writer::Worker::start()?);
+        }
+        scopes.prepare(
+            worker.as_ref().expect("scoped worker initialized"),
+            global.directory(),
+            current_global.as_deref(),
+            directories,
+        )
     }
 
     /// 业务作用：在发布全局兜底配置前接管新 writer，打开失败时保留现有日志输出。
@@ -120,6 +187,7 @@ impl ProcessLog {
             &LogContext::console_only(),
         )
         .context("open candidate process log output")?;
+        active.directory = plan.directory().and_then(|path| path.canonicalize().ok());
         Ok(std::mem::replace(&mut active.file, file))
     }
 
@@ -129,6 +197,21 @@ impl ProcessLog {
     ///
     /// 返回：停止本进程文件输出后返回；可能等待后台文件写入结束。
     pub fn shutdown(&self) {
+        let worker = self
+            .scoped
+            .lock()
+            .expect("scoped log owner poisoned")
+            .worker
+            .take();
+        if let Some(worker) = worker {
+            if !worker.flush() {
+                tracing::warn!("scoped log outputs did not finish draining");
+            }
+            let missing = worker.failed_records();
+            if missing != 0 {
+                tracing::warn!(missing, "scoped log records not written");
+            }
+        }
         let mut active = self.state.lock().expect("process log owner poisoned");
         active.closed = true;
         nasa::log::disable_file_logging();
