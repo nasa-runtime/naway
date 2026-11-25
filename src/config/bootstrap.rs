@@ -8,6 +8,7 @@
 //!
 //! 只新建缺失的,**绝不覆盖已存在的**文件。
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -744,25 +745,16 @@ pub fn ensure(cfg_path: &Path) -> Result<()> {
 
     if super::modules::is_manifest(cfg_path) {
         if !cfg_path.try_exists()? {
-            // 先落盘最低业务文件，再创建入口；现有入口中的缺失声明由加载器拒绝，不替操作方填空。
-            let dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
-            for (name, content) in [
-                ("naway.yml", include_str!("../../zcf/modules/naway.yml")),
-                ("proxy.yml", include_str!("../../zcf/modules/proxy.yml")),
-                ("stream.yml", include_str!("../../zcf/modules/stream.yml")),
-                (
-                    "upstreams.yml",
-                    include_str!("../../zcf/modules/upstreams.yml"),
-                ),
-                ("admin.yml", include_str!("../../zcf/modules/admin.yml")),
-                ("interface-guard.yml", DEFAULT_INTERFACE_GUARD_YML),
-                ("sentinel-rules.yml", DEFAULT_SENTINEL_RULES_YML),
-            ] {
-                write_new(&dir.join(name), content)?;
-            }
-            write_new(cfg_path, include_str!("../../zcf/modules/application.yml"))?;
+            let entry = include_str!("../../zcf/modules/application.yml");
+            let tree =
+                super::document::parse(entry.as_bytes(), super::document::MAX_DOCUMENT_BYTES)?;
+            seed_local_modules(cfg_path, &tree)?;
+            write_new(cfg_path, entry)?;
         }
-        return Ok(());
+        let tree = super::loader(cfg_path)
+            .preserve_unresolved_placeholders(true)
+            .load_tree()?;
+        return seed_local_modules(cfg_path, &tree);
     }
 
     // 2. 主配置 gateway.yml 缺失 → 写最低运行默认。
@@ -791,21 +783,107 @@ pub fn ensure(cfg_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 业务作用：只在文件不存在时写入(create_new 语义:并发/竞态下也不会覆盖已存在文件)。
+/// 业务作用：保持本地文件和远端 Data ID 使用完全相同的默认模块 YAML。
+///
+/// 参数说明：
+/// - `name`：入口声明的确切业务文件名。
+///
+/// 返回：标准名称对应的独立 YAML，未知业务名没有可安全合成的默认正文。
+pub(crate) fn module_template(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "naway.yml" => include_str!("../../zcf/modules/naway.yml"),
+        "proxy.yml" => include_str!("../../zcf/modules/proxy.yml"),
+        "stream.yml" => include_str!("../../zcf/modules/stream.yml"),
+        "upstreams.yml" => include_str!("../../zcf/modules/upstreams.yml"),
+        "admin.yml" => include_str!("../../zcf/modules/admin.yml"),
+        "interface-guard.yml" => include_str!("../../zcf/modules/interface-guard.yml"),
+        "sentinel-rules.yml" => include_str!("../../zcf/modules/sentinel-rules.yml"),
+        _ => return None,
+    })
+}
+
+/// 业务作用：冷启动补齐缺失的必需标准模块，避免为自定义外部路径或 Nacos 来源写文件。
+///
+/// 参数说明：
+/// - `entry`：当前部署入口，限定本地默认文件的写入目录。
+/// - `tree`：本次将采用的入口清单。
+///
+/// 返回：标准模块已可读取时成功。导入不合法或默认文件写入失败时阻止启动。
+fn seed_local_modules(entry: &Path, tree: &serde_json::Value) -> Result<()> {
+    let entry = std::path::absolute(entry)?;
+    let root = entry
+        .parent()
+        .context("configuration entry needs a directory")?;
+    let imports = naml::strict::parse_imports_checked(tree, root)?;
+    if imports
+        .iter()
+        .any(|source| matches!(source, naml::YmlImport::Nacos(_)))
+    {
+        anyhow::ensure!(
+            imports
+                .iter()
+                .all(|source| matches!(source, naml::YmlImport::Nacos(_))),
+            "file and Nacos module imports cannot share an entry"
+        );
+        return Ok(());
+    }
+    for source in imports {
+        let naml::YmlImport::File {
+            path,
+            optional: false,
+        } = source
+        else {
+            continue;
+        };
+        if path.parent() == Some(root) {
+            if let Some(content) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(module_template)
+            {
+                write_new(&path, content)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 业务作用：并发冷启动只补齐缺失文件，完整写入前不能让另一个进程读到空正文。
+///
+/// 参数说明：
+/// - `path`：预定的同目录目标文件。
+/// - `content`：完整默认文档。
+///
+/// 返回：新文档已经完整出现或其它写者先占据目标时成功，其它 I/O 错误阻止启动。
 fn write_new(path: &Path, content: &str) -> Result<()> {
     use std::io::Write;
-    match std::fs::OpenOptions::new()
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut random = [0u8; 16];
+    getrandom::getrandom(&mut random).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let temporary =
+        path.with_file_name(format!(".naway-seed-{:032x}", u128::from_le_bytes(random)));
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)
-    {
-        Ok(mut f) => f
-            .write_all(content.as_bytes())
-            .with_context(|| format!("write default {}", path.display())),
-        // 竞态下别的实例刚建好了 → 视作已存在,放行。
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("create default {}", path.display())),
-    }
+        .mode(0o644)
+        .open(&temporary)?;
+    let result = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            // hard_link 原子安装新 inode，同时保留任何在准备期间出现的运维原文。
+            match std::fs::hard_link(&temporary, path) {
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                result => result,
+            }
+        });
+    let cleanup = std::fs::remove_file(&temporary);
+    result.with_context(|| format!("write default {}", path.display()))?;
+    cleanup.context("remove configuration bootstrap temporary file")
 }
 
 /// 业务作用：从已存在的主配置读取 `interface_guard_file`，失败时让启动流程使用安全默认文件名。
