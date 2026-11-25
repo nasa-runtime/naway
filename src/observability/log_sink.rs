@@ -39,6 +39,8 @@ pub(crate) struct LogEnvelope {
     pub(crate) unix_nanos: u128,
     /// 可选自定义 format，只渲染一次并与 tracing sink 共享。
     pub(crate) formatted: Option<Arc<str>>,
+    /// 本地 tracing sink 采用业务产生时的目标，远端 sink 继续使用同一结构化记录。
+    pub(crate) output: Option<Arc<crate::observability::logging::scoped::Output>>,
 }
 
 /// build-then-swap 时已校验并解析 SecretSource 的 sink bootstrap 计划。
@@ -462,7 +464,12 @@ impl LogSink for TracingLogSink {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             for event in batch {
-                log_record(event.record.as_ref(), event.formatted.as_deref());
+                let write = || log_record(event.record.as_ref(), event.formatted.as_deref());
+                if let Some(output) = &event.output {
+                    output.write(write);
+                } else {
+                    write();
+                }
             }
             Ok(())
         })
