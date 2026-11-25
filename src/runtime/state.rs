@@ -560,13 +560,20 @@ impl DynamicStore for FileDynamicStore {
     /// 参数说明：
     /// - `collection`：需要观察的合法集合名称。
     ///
-    /// 返回：有界键级提示接收器；文件观察或订阅容量不可用时返回错误，调用方保留周期对账。
+    /// 返回：有界键级提示接收器；目录或订阅容量不可用时返回错误，调用方保留周期对账。
     fn watch<'a>(
         &'a self,
         collection: &'a str,
     ) -> StoreFuture<'a, Result<Option<DynamicStoreWatcher>>> {
         Box::pin(async move {
-            self.subscriptions.watch(&self.root, collection).map(Some)
+            let subscriptions = self.subscriptions.clone();
+            let root = self.root.clone();
+            let collection = collection.to_owned();
+            // 建立观察需要读取有限目录基线，放到阻塞池以免文件系统延迟占用业务执行器。
+            tokio::task::spawn_blocking(move || subscriptions.watch(&root, &collection))
+                .await
+                .context("join dynamic file watch registration")?
+                .map(Some)
         })
     }
 }

@@ -1661,7 +1661,11 @@ token quota 与缓存的 `api_key`、`consumer` 维度只读取本地认证后�
 改写请求头不会转移额度或缓存归属。子路由可继承父层 API-Key 认证，但完整父链必须具有真实
 认证来源；仅外部授权成功不能创建 API-Key 计费身份，缺少该事实返回 401。
 
-`runtime_state.store.backend` 支持 `file|redis|nacos`。Nacos 后端需要 `nacos-sdk` feature，每个
+`runtime_state.store.backend` 支持 `file|redis|nacos`。文件后端对受管写入和删除提供键级提示，
+订阅方重新读取当前事实。本机进程共享同一物理目录时，订阅使用原生事件和有界目录对账。
+原生事件遗漏时，对账检测受管文件的原子替换和删除。
+
+Nacos 后端需要 `nacos-sdk` feature，每个
 collection 使用独立 dataId 和带 schema/revision 的有界 JSON 文档，二进制 value 以 Base64 保存；
 写入、删除和容量 admission 使用 md5 CAS，watch 把完整快照差异转换成本地增量事件。坏文档或超限
 推送不会覆盖 last-known-good。`admin.listen`、普通/TLS/QUIC listener、xDS/edge 集群传输、日志与
