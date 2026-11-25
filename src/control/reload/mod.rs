@@ -312,7 +312,7 @@ struct ReloadWorkerState {
     initial_fingerprint: Option<u64>,
 }
 
-/// 业务作用：启动唯一 reload worker，并汇聚 naml 文件观察、SIGHUP 与 Nacos 配置事件。
+/// 业务作用：为嵌入调用注册重载信号并启动唯一配置发布任务。
 ///
 /// 参数说明：
 /// - `cfg_path`：是本地 bootstrap
@@ -330,6 +330,37 @@ pub fn spawn(
     runtime: ReloadRuntime,
     history: ConfigHistory,
     cfg: ReloadCfg,
+) -> ReloadHandle {
+    let sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(signal) => Some(signal),
+        Err(error) => {
+            tracing::error!(%error, "install SIGHUP handler failed");
+            None
+        }
+    };
+    spawn_with_sighup(cfg_path, snap, version, runtime, history, cfg, sighup)
+}
+
+/// 业务作用：启动唯一 reload worker，并汇聚 naml 文件观察、SIGHUP 与 Nacos 配置事件。
+///
+/// 参数说明：
+/// - `cfg_path`：是本地 bootstrap
+/// - `snap`：是活动快照权威
+/// - `version`：是活动快照权威
+/// - `runtime`：是换代资源
+/// - `history`：记录结果
+/// - `cfg`：固定有界事件队列和去抖窗口。
+/// - `sighup`：监听开放前已注册的进程信号接收器。
+///
+/// 返回：受限触发句柄；调用方只能提交本地候选变化，不能绕过构建和发布门禁。
+pub fn spawn_with_sighup(
+    cfg_path: PathBuf,
+    snap: Arc<ArcSwap<GatewaySnapshot>>,
+    version: Arc<AtomicU64>,
+    runtime: ReloadRuntime,
+    history: ConfigHistory,
+    cfg: ReloadCfg,
+    sighup: Option<tokio::signal::unix::Signal>,
 ) -> ReloadHandle {
     let (tx, rx) = mpsc::channel::<ReloadEvent>(cfg.channel_capacity.max(1));
     let initial_snapshot = snap.load();
@@ -356,7 +387,9 @@ pub fn spawn(
             tracing::warn!(error = %error, "initial config fingerprint recheck failed; first event will still be validated")
         }
     }
-    spawn_sighup(tx.clone());
+    if let Some(signal) = sighup {
+        spawn_sighup(signal, tx.clone());
+    }
     // 使用已验证的启动快照决定是否授予订阅权，不能重新读文件把已关闭的中心悄然打开。
     if nacos_config.enabled {
         spawn_nacos_config_watch(cfg_path.clone(), nacos_config, tx.clone(), history.clone());
@@ -1879,16 +1912,13 @@ fn spawn_file_watch(
     })
 }
 
-/// 业务作用：通道②:SIGHUP(nginx `-s reload` 风格)。
-fn spawn_sighup(tx: mpsc::Sender<ReloadEvent>) {
+/// 业务作用：把进程已持有的 SIGHUP 转成唯一配置发布者可以处理的事件。
+/// 参数说明：
+/// - `hup`：开放监听前注册的信号流，保存启动阶段已经到达的请求。
+/// - `tx`：配置发布者的有界事件入口。
+/// 返回：启动信号转发任务，事件入口关闭即释放进程接收器。
+fn spawn_sighup(mut hup: tokio::signal::unix::Signal, tx: mpsc::Sender<ReloadEvent>) {
     tokio::spawn(async move {
-        let mut hup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "install SIGHUP handler failed");
-                return;
-            }
-        };
         while hup.recv().await.is_some() {
             if tx.send(ReloadEvent::Sighup).await.is_err() {
                 break;

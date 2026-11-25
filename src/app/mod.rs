@@ -146,7 +146,9 @@ pub(super) async fn run() -> Result<()> {
             .validate_sidecar_listeners()
             .context("validate sidecar listener isolation")?;
     }
-    // 监听就绪前登记停机信号。启动阶段收到的信号由接收器保留，进程仍经统一路径摘流并释放资源。
+    // 管理端可在发布任务启动前接受连接；先接管 SIGHUP，才能避免启动期间按操作系统默认行为退出。
+    let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    // 启动阶段收到的停机信号由接收器保留，进程仍经统一路径摘流并释放资源。
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
@@ -633,7 +635,7 @@ pub(super) async fn run() -> Result<()> {
 
     // listener 已进入 supervisor 后再启动唯一 reload worker；从此数据面拓扑也遵守
     // bind/build → ArcSwap publish → accept generation handoff 的同一事务边界。
-    let reload_handle = reload::spawn(
+    let reload_handle = reload::spawn_with_sighup(
         cfg_path.clone(),
         snap.clone(),
         version.clone(),
@@ -666,6 +668,7 @@ pub(super) async fn run() -> Result<()> {
         },
         config_history.clone(),
         reload_cfg,
+        Some(sighup),
     );
     let named_nacos_subscription = named_nacos
         .map(|source| source.subscribe(reload_handle.clone(), config_history.clone(), snap.clone()))
