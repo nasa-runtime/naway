@@ -8,6 +8,8 @@ const pairs = new Map([
 const enhanced = new WeakSet();
 const scalarHeaderPattern =
   /(?:^ *-\s+|:\s+)(?:(?:&\S+|!\S+)\s+)*[|>]([1-9+-]*)$/;
+const completionKeyPattern =
+  /^ *(?:-[ \t]+)?(?:"([A-Za-z_][\w.-]*)"|'([A-Za-z_][\w.-]*)'|([A-Za-z_][\w.-]*))[ \t]*:(?=[ \t\r]|$)/;
 export const yamlEditingHelp =
   "换行自动缩进；Tab 两空格，Shift+Tab 反缩进；括号与引号成对补全；Ctrl+Space 补齐唯一匹配的键名或 true/false/null，大文档仅补齐常量；按 Escape 后再按 Tab 跳出编辑区。";
 
@@ -59,19 +61,22 @@ function lineContext(line, initialQuote = "") {
 }
 
 /**
- * 业务作用：延续跨行引号的录入上下文，避免将字符串正文当作列表、键名或配对输入位置。
+ * 业务作用：沿用跨行字符串的解析上下文，只从配置结构中收集供编辑器补齐的键名。
  * 参数说明：
  * - `value`：当前编辑区原文。
- * - `lineStart`：光标所在行的起始位置。
- * 返回：当前行开始处的引号及块标量缩进状态；块正文中的引号不参与状态延续。
+ * - `limit`：当前行的起始位置，或收集文档键名时的原文长度。
+ * - `keyScan`：可选的键名集合及正在编辑的行起点，收集时跳过该行、块正文和跨行引号的后续内容。
+ * 返回：扫描边界处的引号和块标量状态，供当前行输入辅助复用。
  */
-function priorLineContext(value, lineStart) {
+function priorLineContext(value, limit, keyScan) {
   let quote = "";
   let scalar = null;
   let cursor = 0;
-  while (cursor < lineStart) {
-    const end = value.indexOf("\n", cursor);
-    const line = value.slice(cursor, end);
+  while (cursor < limit) {
+    const lineStart = cursor;
+    const nextLine = value.indexOf("\n", lineStart);
+    const end = nextLine < 0 ? limit : Math.min(nextLine, limit);
+    const line = value.slice(lineStart, end);
     cursor = end + 1;
     const width = line.match(/^ */)[0].length;
     if (scalar !== null) {
@@ -86,6 +91,12 @@ function priorLineContext(value, lineStart) {
         continue;
       }
       scalar = null;
+    }
+    if (keyScan && keyScan.lineStart !== lineStart && !quote) {
+      const key = completionKeyPattern.exec(line);
+      if (key) {
+        keyScan.candidates.add(key[1] ?? key[2] ?? key[3]);
+      }
     }
     const context = lineContext(line, quote);
     quote = context.quote;
@@ -114,16 +125,11 @@ function priorLineContext(value, lineStart) {
 /**
  * 业务作用：按块标量实际正文缩进核对当前行，避免正文触发结构补齐或吞掉其后的同级配置。
  * 参数说明：
- * - `value`：当前编辑区原文。
- * - `lineStart`：光标所在行的起始位置。
+ * - `scalar`：当前行开始时的块标量状态；没有待续正文时为 null。
  * - `indent`：当前正文行的缩进列数。
  * 返回：当前缩进仍处于块正文时为true；明确退回配置层级时为false。
  */
-function blockContent(value, lineStart, indent) {
-  if (indent === 0) {
-    return false;
-  }
-  const { scalar } = priorLineContext(value, lineStart);
+function blockContent(scalar, indent) {
   return (
     scalar !== null &&
     (scalar.contentIndent === null
@@ -154,8 +160,9 @@ export function yamlEdit(value, start, end, key, shift = false) {
   const leading = prefix.match(/^ */)[0];
   const before = value[start - 1] ?? "";
   const after = value[end] ?? "";
-  const context = lineContext(prefix, priorLineContext(value, lineStart).quote);
-  const scalar = blockContent(value, lineStart, leading.length);
+  const prior = priorLineContext(value, lineStart);
+  const context = lineContext(prefix, prior.quote);
+  const scalar = blockContent(prior.scalar, leading.length);
   /**
    * 业务作用：把一次局部变更与光标位置组成不可分割的文本编辑计划。
    * 参数说明：
@@ -296,17 +303,18 @@ export function yamlEdit(value, start, end, key, shift = false) {
  * 参数说明：
  * - `value`：当前编辑原文。
  * - `position`：当前无选区的光标位置。
- * 返回：唯一且尚未补齐时返回局部替换；歧义、引号、注释、块标量或键名扫描超限时保持原文。
+ * 返回：匹配光标前后完整文本的唯一候选及局部替换；歧义、引号、注释、块标量或扫描超限时保持原文。
  */
 export function yamlCompletion(value, position) {
   const lineStart =
     position === 0 ? 0 : value.lastIndexOf("\n", position - 1) + 1;
   const line = value.slice(lineStart, position);
-  const context = lineContext(line, priorLineContext(value, lineStart).quote);
+  const prior = priorLineContext(value, lineStart);
+  const context = lineContext(line, prior.quote);
   if (
     context.quote ||
     context.comment ||
-    blockContent(value, lineStart, line.match(/^ */)[0].length)
+    blockContent(prior.scalar, line.match(/^ */)[0].length)
   ) {
     return null;
   }
@@ -320,27 +328,26 @@ export function yamlCompletion(value, position) {
   if (key && value.length > 65536) {
     return null;
   }
-  const choices = key
-    ? [
-        ...value
-          .slice(0, 65536)
-          .matchAll(/^ *(?:- )?["']?([A-Za-z_][\w.-]*)["']?:/gm),
-      ].map((match) => match[1])
-    : ["true", "false", "null"];
-  const matches = [...new Set(choices)].filter((name) =>
-    name.startsWith(prefix),
-  );
-  if (matches.length !== 1) {
-    return null;
+  const choices = new Set();
+  if (key) {
+    priorLineContext(value, value.length, {
+      candidates: choices,
+      lineStart,
+    });
+  } else {
+    choices.add("true").add("false").add("null");
   }
-  const to = position + value.slice(position).match(/^[\w.-]*/)[0].length;
+  const suffix = value.slice(position);
+  const to = position + suffix.match(/^[\w.-]*/)[0].length;
   const from = position - prefix.length;
+  // 光标右侧未选中的文本也属于当前键名或常量，补齐只能在完整词尾追加字符。
   const token = value.slice(from, to);
-  // 光标在已有值中间时，仅补齐仍属于同一常量的未完成文本。
-  if (literal && (token === matches[0] || !matches[0].startsWith(token))) {
+  const matches = [...choices].filter((name) => name.startsWith(token));
+  if (matches.length !== 1 || (literal && token === matches[0])) {
     return null;
   }
-  const text = matches[0] + (key && value[to] !== ":" ? ": " : "");
+  const hasDelimiter = /^[ \t]*:/.test(value.slice(to));
+  const text = matches[0] + (key && !hasDelimiter ? ": " : "");
   return {
     from,
     to,
