@@ -181,11 +181,11 @@ pub(super) async fn run(owner: Weak<AdminState>) {
         let configuration =
             if snapshot.named_configuration && snapshot.config_bundle_digest.is_none() {
                 if let Some(sync) = &state.management.file_sync {
-                    if let Ok(_gate) = sync.gate.try_lock() {
-                        super::replication::Published::capture(snapshot.clone())
+                    if let Ok(gate) = sync.gate.clone().try_lock_owned() {
+                        super::replication::Published::capture(snapshot.clone(), gate)
                             .await
                             .ok()
-                            .map(Arc::new)
+                            .map(|(published, _gate)| Arc::new(published))
                     } else {
                         None
                     }

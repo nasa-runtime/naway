@@ -706,10 +706,13 @@ impl protocol::node_management_server::NodeManagement for Service {
             .as_ref()
             .expect("authorized local replication");
         // 同轮多个对端查询可以在总期限内排队，避免固定节拍让同一个节点长期失去回读机会。
-        let _gate = tokio::time::timeout(std::time::Duration::from_millis(750), sync.gate.lock())
-            .await
-            .map_err(|_| Status::unavailable("named configuration busy"))?;
-        let current = super::replication::Published::capture(state.snap.load_full())
+        let gate = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            sync.gate.clone().lock_owned(),
+        )
+        .await
+        .map_err(|_| Status::unavailable("named configuration busy"))?;
+        let (current, _gate) = super::replication::Published::capture(state.snap.load_full(), gate)
             .await
             .map_err(super::replication::unavailable)?;
         Ok(Response::new(current.head()))
@@ -749,13 +752,13 @@ impl protocol::node_management_server::NodeManagement for Service {
             .file_sync
             .as_ref()
             .expect("authorized local replication");
-        let _gate = sync
+        let gate = sync
             .gate
             .clone()
             .try_lock_owned()
             .map_err(|_| Status::unavailable("named configuration busy"))?;
         let active = state.snap.load_full();
-        let current = super::replication::Published::capture(active.clone())
+        let (current, gate) = super::replication::Published::capture(active.clone(), gate)
             .await
             .map_err(super::replication::unavailable)?;
         let received = super::replication::receive_offer(&current, offer, stream).await?;
@@ -767,13 +770,12 @@ impl protocol::node_management_server::NodeManagement for Service {
         let service = self.clone();
         // 开始持久阶段后，RPC 取消不撤销已接受的本地文件事务及其应用观察。
         let task = tokio::spawn(async move {
-            let _gate = _gate;
             let reauthorize = move || {
                 service
                     .authorize_named(&manager, &sender, identity.as_ref())
                     .map(|_| ())
             };
-            super::replication::install(&state, active, current, received, reauthorize).await
+            super::replication::install(&state, active, current, received, gate, reauthorize).await
         });
         let response = task
             .await

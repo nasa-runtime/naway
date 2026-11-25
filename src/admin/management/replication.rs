@@ -145,9 +145,18 @@ impl Published {
     /// 业务作用：读取经过 reload 发布的完整本地原文，与持久代次对齐后才提供给对端。
     /// 参数说明：
     /// - `snapshot`：已活动的本地配置快照。
-    /// 返回：冻结的原文与代次。Nacos、内容漂移或目录读取失败均关闭该轮传输。
-    pub(super) async fn capture(snapshot: Arc<GatewaySnapshot>) -> Result<Self> {
-        tokio::task::spawn_blocking(move || Self::capture_checked(&snapshot)).await?
+    /// - `gate`：本节点复制事务的独占许可，必须跟随负责磁盘变更的阻塞任务。
+    /// 返回：冻结的原文、代次及续办许可；未完成的阻塞任务即使失去 RPC 调用方也持有唯一写权。
+    pub(super) async fn capture(
+        snapshot: Arc<GatewaySnapshot>,
+        gate: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(Self, tokio::sync::OwnedMutexGuard<()>)> {
+        // Tokio 取消等待不会中止磁盘任务，许可随任务转移才能防止一次失约请求覆盖新的代次。
+        tokio::task::spawn_blocking(move || {
+            let current = Self::capture_checked(&snapshot)?;
+            Ok((current, gate))
+        })
+        .await?
     }
 
     /// 业务作用：在开启业务流量前和获得本机复制槽时使用同一完整原文判定。
@@ -261,6 +270,7 @@ pub(super) async fn receive_offer(
 /// - `active`：接收前已经冻结的活动快照，写入时还会紧邻复验。
 /// - `current`：本机经过读取验证的当前原文和代次。
 /// - `received`：经过全传输校验的对端配置集合及其生命周期链。
+/// - `gate`：接收端为本次提交持有的唯一复制许可。
 /// - `reauthorize`：紧邻持久副作用复验传输与会话权限。
 /// 返回：磁盘原字节已写入且活动快照确认为目标代才成功。
 pub(super) async fn install(
@@ -268,6 +278,7 @@ pub(super) async fn install(
     active: Arc<GatewaySnapshot>,
     mut current: Published,
     received: Received,
+    gate: tokio::sync::OwnedMutexGuard<()>,
     reauthorize: impl Fn() -> Result<(), Status> + Send + Sync + 'static,
 ) -> Result<protocol::NamedConfigHeadResponse, Status> {
     let Received {
@@ -278,7 +289,9 @@ pub(super) async fn install(
         reauthorize()?;
         // 同样原文可以是经过中间代的回滚，仍须推进复制身份以拒绝旧代重放。
         current.stage(history).map_err(unavailable)?;
-        let published = Published::capture(active).await.map_err(unavailable)?;
+        let (published, _gate) = Published::capture(active, gate)
+            .await
+            .map_err(unavailable)?;
         return Ok(published.head());
     }
     let target = Arc::new(target);
@@ -311,7 +324,7 @@ pub(super) async fn install(
     .await;
     match response.status() {
         StatusCode::OK => {
-            let published = Published::capture(state.snap.load_full())
+            let (published, _gate) = Published::capture(state.snap.load_full(), gate)
                 .await
                 .map_err(unavailable)?;
             if published.generation.digest != target.digest {
