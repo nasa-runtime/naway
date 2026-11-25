@@ -109,6 +109,12 @@ impl Prepared {
             );
             snapshot.config_bundle_digest = Some(self.identity.bundle_hex());
         }
+        if snapshot.named_configuration {
+            snapshot.config_bundle_digest = super::named_nacos::materialized_revision(
+                &self.physical.gateway,
+                &self.physical.guard,
+            );
+        }
         snapshot.document_identity = Some(self.identity);
         Ok(snapshot)
     }

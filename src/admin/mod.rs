@@ -6374,8 +6374,8 @@ async fn read_current_config(state: &AdminState) -> Response<BoxBody> {
             "config_source_enabled": snapshot.config_source.enabled,
             "change_requires_restart": true
         },
-        // 配置源是 Nacos 时本地文件只是物化产物,PUT 必须走集群 rollout(见 publish 分支)。
-        "source": if snapshot.config_source.nacos.enabled {
+        // 远端具名模式报告有实际来源摘要的活动代，避免把物化文件识别为运维原文。
+        "source": if snapshot.config_source.nacos.enabled || (snapshot.named_configuration && snapshot.config_bundle_digest.is_some()) {
             "nacos"
         } else {
             "file"

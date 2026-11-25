@@ -45,6 +45,36 @@ yml:
 冷启动会补齐入口目录中缺失的必需标准模块，并保留已有原文。自定义必需文件应提供与其业务
 声明匹配的内容。运行中删除必需文件会保留已发布配置，直到原文重新有效。
 
+### 具名 Nacos 配置
+
+以 `nacos-sdk` 构建后，在 `application.yml` 的 `nacos` 段中设置 `server_addr`、分组、
+空间和认证信息。将每个 `yml.imports` 条目的 `file` 改为 `nacos`，值为同名 YAML Data ID。
+同一入口使用一种业务配置来源。启动先读远端完整集合，只尝试创建已确认缺失的必需标准
+Data ID，现存配置由 Nacos CAS 保护。可通过占位符注入各节点自己的监听地址。
+
+```yaml
+nacos:
+  server_addr: "127.0.0.1:8848"
+  namespace: ""
+  group: NAWAY
+  username: "${NAWAY_NACOS_USERNAME}"
+  password: "${NAWAY_NACOS_PASSWORD}"
+yml:
+  imports:
+    - { nacos: naway.yml, optional: false }
+    - { nacos: proxy.yml, optional: false }
+    - { nacos: stream.yml, optional: false }
+    - { nacos: upstreams.yml, optional: false }
+    - { nacos: admin.yml, optional: false }
+    - { nacos: sentinel-rules.yml, optional: false }
+    - { nacos: interface-guard.yml, optional: false }
+```
+
+节点在 Nacos 推送后重新读回完整集合并验证候选，再按同一热更流程发布。已有节点遇到坏配置
+或远端失联时继续使用上一有效代。跨文档发布可配置 `nacos.revision_data_id`，该文档包含
+`schema_version: 1` 和按 Data ID 为键的 `documents` 原文 SHA-256 映射。先写业务原文，
+最后写提交标记，完整匹配后各节点才会发布该代。
+
 管理端的单文档与完整文档集校验直接读取候选原文，不为临时路径重编码 YAML。主配置与规则的
 profile 仍以真实部署路径派生，相对 SecretSource 与其它依赖保持真实配置根；主 profile 和
 环境覆盖不能把规则候选换回活动 base。候选工作区目录使用 `0700`、文件使用 `0600`，排他创建，

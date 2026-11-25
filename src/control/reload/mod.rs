@@ -131,6 +131,20 @@ pub trait PreparedListenerTopology: Send {
 }
 
 impl ReloadHandle {
+    /// 业务作用：由具名 Nacos 观察器提交已封装的候选，同时保留远端触发归属。
+    ///
+    /// 参数说明：
+    /// - `cfg_path`：本进程独占的原子选择器文件。
+    ///
+    /// 返回：成功进入有界重载队列时为真，任务关闭时为假。
+    pub(crate) async fn trigger_named_nacos(&self, cfg_path: &Path) -> bool {
+        self.tx
+            .send(ReloadEvent::Nacos {
+                cfg_path: cfg_path.to_path_buf(),
+            })
+            .await
+            .is_ok()
+    }
     /// 业务作用：通知唯一 worker 重新校验本地候选文件，禁止调用方绕过构建和发布门禁。
     ///
     /// 参数说明: 无。
@@ -1660,8 +1674,10 @@ async fn reload_worker(
                 continue;
             }
             Ok(hash) => {
-                let local_watcher = trigger
-                    .uses_local_watch()
+                // 具名 Nacos 使用同一选择器，但每代模块文件路径不同，必须同步更新依赖观察。
+                let rewatch = trigger.uses_local_watch() ||
+                    (matches!(trigger, ReloadEvent::Nacos { .. }) && source_cfg_path == cfg_path);
+                let local_watcher = rewatch
                     .then_some(config_watcher.as_ref())
                     .flatten();
                 if apply_reload_with_watch(

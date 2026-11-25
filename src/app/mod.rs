@@ -58,6 +58,16 @@ pub(super) async fn run() -> Result<()> {
     // 缺失则新建最低运行默认(能监听、无路由/不拦任何接口),不覆盖已存在文件。
     gateway::config::bootstrap::ensure(&cfg_path)
         .with_context(|| format!("bootstrap config dir for {}", cfg_path.display()))?;
+    let named_nacos = gateway::config::named_nacos::NamedNacos::prepare(&cfg_path).await?;
+    // 本地三文档动作持有不同的落盘权威，不能写回由 Nacos 掌管的模块。
+    anyhow::ensure!(
+        named_nacos.is_none() || args.node_journal.is_none(),
+        "named Nacos configuration cannot use the local node journal"
+    );
+    let cfg_path = named_nacos
+        .as_ref()
+        .map(|source| source.candidate_path().to_path_buf())
+        .unwrap_or(cfg_path);
 
     // 初始快照(v1)。启动期配置错误直接失败退出(不带病上线)。
     let version = Arc::new(AtomicU64::new(1));
@@ -647,6 +657,9 @@ pub(super) async fn run() -> Result<()> {
         config_history.clone(),
         reload_cfg,
     );
+    let named_nacos_subscription = named_nacos
+        .map(|source| source.subscribe(reload_handle.clone(), config_history.clone(), snap.clone()))
+        .transpose()?;
     // Kubernetes 对象只在后台编译成物化候选，并通过上面的唯一 reload worker 发布。
     gateway::control::kubernetes::spawn_controller(snap.clone(), cfg_path.clone(), reload_handle);
     // 无 seed ACME 首签期间 TLS socket 虽已绑定但尚不 accept；readiness 必须保持 503，避免 LB
@@ -768,6 +781,9 @@ pub(super) async fn run() -> Result<()> {
         warn!(%error, "OpenTelemetry shutdown/flush failed");
     }
     info!("gateway stopped");
+    if let Some(subscription) = named_nacos_subscription {
+        subscription.close().await;
+    }
     process_log.shutdown();
     Ok(())
 }

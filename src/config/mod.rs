@@ -15,6 +15,7 @@ pub mod management;
 pub mod media;
 pub mod model;
 mod modules;
+pub mod named_nacos;
 pub(crate) mod monitor;
 pub mod operations;
 pub mod providers;

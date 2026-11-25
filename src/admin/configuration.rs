@@ -117,7 +117,9 @@ pub(super) async fn read(state: &Arc<AdminState>, document: Document) -> Respons
         return plain(StatusCode::CONFLICT, "configuration changed during read\n");
     }
     let etag = config_etag(fingerprint);
-    let source = if snapshot.config_source.nacos.enabled {
+    let source = if snapshot.config_source.nacos.enabled
+        || (snapshot.named_configuration && snapshot.config_bundle_digest.is_some())
+    {
         "nacos"
     } else {
         "file"
