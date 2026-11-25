@@ -665,7 +665,9 @@ async fn apply_reload_input(
                     .cmp(&right.logical_service)
                     .then_with(|| left.cluster_name.cmp(&right.cluster_name))
             });
-            let nacos_bootstrap_violation = (trigger == "nacos-config")
+            // 具名 Nacos 的物化文件也能触发本地 watcher；远端来源的权限限制与触发顺序无关。
+            let nacos_bootstrap_violation = (trigger == "nacos-config"
+                || (old.named_configuration && old.config_bundle_digest.is_some()))
                 .then(|| remote_bootstrap_change(old.as_ref(), &new_snap))
                 .flatten();
             drop(old);

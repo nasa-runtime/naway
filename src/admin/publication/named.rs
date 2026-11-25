@@ -48,10 +48,7 @@ pub(in crate::admin) async fn publish_named(
         return applied(active.version, fingerprint, scope);
     }
     if active.config_bundle_digest.is_some() {
-        return plain(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "named Nacos write authority unavailable\n",
-        );
+        return publish_remote(state, &active, &module.name, body).await;
     }
     publish_file(state, active, index, body).await
 }
@@ -147,6 +144,93 @@ async fn publish_file(
             }
         }
     }
+}
+
+/// 业务作用：以部署时绑定的 Nacos 权威和实际 Data ID 提交 YAML，并确认本机是否经订阅采用该代。
+/// 参数说明：
+/// - `state`：活动快照、本机配置权威及发布许可。
+/// - `active`：已校验的配置与认证代。
+/// - `name`：已授权的模块名。
+/// - `body`：完整校验过的原文。
+/// 返回：Nacos 写入确认及本机观察。远端确认不足时保留结果未知，不能声称集群已生效。
+async fn publish_remote(
+    state: &Arc<AdminState>,
+    active: &GatewaySnapshot,
+    name: &str,
+    body: Bytes,
+) -> Response<BoxBody> {
+    let Some(source) = state.named_nacos.get() else {
+        return plain(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "configuration authority unavailable\n",
+        );
+    };
+    let Ok(content) = std::str::from_utf8(&body) else {
+        return plain(StatusCode::BAD_REQUEST, "YAML document must be UTF-8\n");
+    };
+    let edit = match source.prepare_edit(active, name, content).await {
+        Ok(Some(edit)) => edit,
+        Ok(None) => return stale(),
+        Err(error) => {
+            tracing::warn!(%error, "Nacos module write preparation failed");
+            return plain(
+                StatusCode::CONFLICT,
+                "cannot prepare Nacos module publication at this revision\n",
+            );
+        }
+    };
+    let gate =
+        match tokio::time::timeout(Duration::from_secs(3), state.apply_coordinator.lock_owned())
+            .await
+        {
+            Ok(gate) => gate,
+            Err(_) => {
+                return plain(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "configuration publication busy\n",
+                )
+            }
+        };
+    // 远端读取期间授权配置可能换代，必须在发出写副作用前持有原快照的决策权。
+    let Some(fingerprint) = active.config_fingerprint else {
+        return stale();
+    };
+    if !current_config_baseline_matches(state, active.version, fingerprint).await {
+        return stale();
+    }
+    let committed = edit.commit(content).await;
+    drop(gate);
+    let generation = match committed {
+        Ok(Some(generation)) => generation,
+        Ok(None) => return stale(),
+        Err(error) => {
+            tracing::warn!(%error, "Nacos module publication outcome unknown");
+            return unknown();
+        }
+    };
+    let observed = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let live = state.snap.load_full();
+            if live.config_bundle_digest.as_deref() == Some(&generation) {
+                break live;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .ok();
+    let etag = observed
+        .as_ref()
+        .and_then(|live| live.config_fingerprint)
+        .map(config_etag);
+    json(
+        StatusCode::ACCEPTED,
+        value!({
+            "ok": true, "status": "committed", "source": "nacos", "scope": "configuration-center",
+            "generation": generation, "local_applied": observed.is_some(),
+            "version": observed.as_ref().map(|live| live.version), "etag": etag,
+        }),
+    )
 }
 
 /// 业务作用：返回已观察到的活动代，同时更新用于下次编辑的 ETag。

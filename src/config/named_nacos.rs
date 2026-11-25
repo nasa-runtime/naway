@@ -48,6 +48,15 @@ pub struct NamedNacos {
     storage: Arc<Storage>,
 }
 
+/// 最近读取并复验的远端单文档比较交换条件。
+pub(crate) struct Edit {
+    client: NacosConfigClient,
+    group: String,
+    name: String,
+    md5: String,
+    generation: String,
+}
+
 /// 用于关闭后台 Nacos 订阅及其运行线程。
 pub struct Subscription {
     stop: oneshot::Sender<()>,
@@ -98,6 +107,67 @@ impl NamedNacos {
         &self.storage.selector
     }
 
+    /// 业务作用：为单个模块绑定同一 Nacos 权威和完整活动代，再取得 Data ID 的 CAS 条件。
+    /// 参数说明：
+    /// - `active`：完成本地校验和权限判断时的活动快照。
+    /// - `name`：活动清单中的具名模块，不能选额外的远端对象。
+    /// - `content`：已经完整构建验证的候选原文。
+    /// 返回：当前远端状态与校验基线一致时返回待提交条件，配置已变化时为空。
+    pub(crate) async fn prepare_edit(
+        &self,
+        active: &GatewaySnapshot,
+        name: &str,
+        content: &str,
+    ) -> Result<Option<Edit>> {
+        let plan = self.plan.current(&self.entry)?;
+        // 带提交标记的配置需要整代提交条件，不能用单文档写入制造未经提交的集群代。
+        ensure!(
+            plan.revision.is_none(),
+            "Nacos revision requires a coordinated publication"
+        );
+        let client = connect(&plan).await?;
+        let mut current = fetch(&client, &plan).await?;
+        if self.storage.active_directory_for(active).as_ref()
+            != Some(&self.storage.generation(&plan, &current))
+        {
+            return Ok(None);
+        }
+        let document = current
+            .documents
+            .iter_mut()
+            .find(|doc| doc.source.data_id == name)
+            .context("named source is no longer declared")?;
+        let group = document
+            .source
+            .group
+            .clone()
+            .context("Nacos module is missing a group")?;
+        let latest =
+            tokio::time::timeout(READ_TIMEOUT, client.fetch_optional_with_md5(name, &group))
+                .await??;
+        let Some((baseline, md5)) = latest else {
+            return Ok(None);
+        };
+        if baseline != document.content {
+            return Ok(None);
+        }
+        document.content = content.to_owned();
+        let generation = self
+            .storage
+            .generation(&plan, &current)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("invalid Nacos configuration generation")?
+            .to_owned();
+        Ok(Some(Edit {
+            client,
+            group,
+            name: name.to_owned(),
+            md5,
+            generation,
+        }))
+    }
+
     /// 业务作用：按初始引导权限开启 Nacos 订阅、记录完整候选并通知发布任务。
     ///
     /// 参数说明：
@@ -107,7 +177,7 @@ impl NamedNacos {
     ///
     /// 返回：拥有停止权的观察句柄，线程初始化失败返回错误。
     pub fn subscribe(
-        self,
+        self: Arc<Self>,
         reload: ReloadHandle,
         history: ConfigHistory,
         snapshot: Arc<ArcSwap<GatewaySnapshot>>,
@@ -141,7 +211,7 @@ impl NamedNacos {
     ///
     /// 返回：持续观察，只有上层撤销观察任务才退出。
     async fn observe(
-        self,
+        &self,
         reload: ReloadHandle,
         history: ConfigHistory,
         snapshot: Arc<ArcSwap<GatewaySnapshot>>,
@@ -215,6 +285,22 @@ impl NamedNacos {
             }
             let _ = &subscription;
         }
+    }
+}
+
+impl Edit {
+    /// 业务作用：只写已经复验的 Data ID，并用服务端 CAS 防止覆盖后来者。
+    /// 参数说明：
+    /// - `content`：构建时冻结的模块 YAML。
+    /// 返回：服务端确认后返回预期生效代，冲突返回空，超时不能判定远端是否已提交。
+    pub(crate) async fn commit(self, content: &str) -> Result<Option<String>> {
+        let committed = tokio::time::timeout(
+            Duration::from_secs(3),
+            self.client
+                .publish_cas(&self.name, &self.group, content, &self.md5),
+        )
+        .await??;
+        Ok(committed.then_some(self.generation))
     }
 }
 
@@ -647,6 +733,14 @@ impl Storage {
     /// 返回：活动配置来自本进程的物化目录时返回该目录。
     fn active_directory(&self, snapshot: &ArcSwap<GatewaySnapshot>) -> Option<PathBuf> {
         let active = snapshot.load();
+        self.active_directory_for(&active)
+    }
+
+    /// 业务作用：用冻结活动配置验证远端写入所基于的完整内容代。
+    /// 参数说明：
+    /// - `active`：只读活动配置。
+    /// 返回：快照确属此进程物化权威时为其完整代路径。
+    fn active_directory_for(&self, active: &GatewaySnapshot) -> Option<PathBuf> {
         let parent = active.document_paths.guard.parent()?;
         (parent.parent() == Some(self.home.as_path())).then(|| parent.to_path_buf())
     }

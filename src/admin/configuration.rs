@@ -57,7 +57,8 @@ pub(super) async fn read_modules(
             .map(|document| {
                 let resource = module_resource(document.domain);
                 let write_available = identity.allows(resource, AdminAction::Write)
-                    && snapshot.config_bundle_digest.is_none()
+                    && (snapshot.config_bundle_digest.is_none()
+                        || state.named_nacos.get().is_some())
                     && !(snapshot.admin_approval.enabled
                         && snapshot.admin_approval.resources.contains(&resource));
                 serde_json::json!({

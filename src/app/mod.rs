@@ -58,7 +58,9 @@ pub(super) async fn run() -> Result<()> {
     // 缺失则新建最低运行默认(能监听、无路由/不拦任何接口),不覆盖已存在文件。
     gateway::config::bootstrap::ensure(&cfg_path)
         .with_context(|| format!("bootstrap config dir for {}", cfg_path.display()))?;
-    let named_nacos = gateway::config::named_nacos::NamedNacos::prepare(&cfg_path).await?;
+    let named_nacos = gateway::config::named_nacos::NamedNacos::prepare(&cfg_path)
+        .await?
+        .map(Arc::new);
     // 本地三文档动作持有不同的落盘权威，不能写回由 Nacos 掌管的模块。
     anyhow::ensure!(
         named_nacos.is_none() || args.node_journal.is_none(),
@@ -349,6 +351,9 @@ pub(super) async fn run() -> Result<()> {
             xds_status: xds_status.clone(),
         },
     );
+    if let Some(source) = &named_nacos {
+        admin_state.attach_named_nacos(source.clone())?;
+    }
     #[cfg(feature = "node-actions")]
     admin_state.bind_node_action_boot()?;
     #[cfg(feature = "admin-grpc")]

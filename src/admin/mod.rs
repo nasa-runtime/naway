@@ -117,6 +117,8 @@ pub struct AdminState {
     apply_coordinator: Arc<crate::control::reload::SnapshotApplyCoordinator>,
     /// 候选许可覆盖实际阻塞工作与清理，所有管理入口共用同一有界容量。
     candidate_builds: candidate::Admission,
+    /// 启动期间绑定的 Nacos 具名配置权威，管理请求不能另选远端地址。
+    named_nacos: std::sync::OnceLock<Arc<crate::config::named_nacos::NamedNacos>>,
     /// 运行态动作的进程身份与受理容量；HTTP取消不会重新开放实际工作仍占用的槽。
     runtime_actions: runtime_actions::Runtime,
     /// 数据面是否已就绪(监听已绑定、可接流量);停机时置 false → /readyz 转 503,供 LB 摘流。
@@ -220,6 +222,19 @@ pub struct AdminRuntimeState {
 }
 
 impl AdminState {
+    /// 业务作用：把进程实际订阅的 Nacos 权威挂接到具名模块的 Admin 发布链。
+    /// 参数说明：
+    /// - `source`：启动完成并持有唯一物化目录的配置来源。
+    /// 返回：第一次绑定成功，已有权威时保留原绑定并返回错误。
+    pub fn attach_named_nacos(
+        &self,
+        source: Arc<crate::config::named_nacos::NamedNacos>,
+    ) -> anyhow::Result<()> {
+        self.named_nacos
+            .set(source)
+            .map_err(|_| anyhow::anyhow!("named Nacos authority is already attached"))
+    }
+
     /// 业务作用：让 listener supervisor 与集群上报共用实际 TLS 安装事实的唯一注册表。
     ///
     /// 参数说明: 无。
@@ -341,6 +356,7 @@ impl AdminState {
             config_history: runtime_state.config_history,
             apply_coordinator: runtime_state.apply_coordinator,
             candidate_builds: candidate::Admission::new(),
+            named_nacos: std::sync::OnceLock::new(),
             runtime_actions: runtime_actions::Runtime::new(),
             ready,
             #[cfg(feature = "xds-client")]
