@@ -85,6 +85,14 @@ pub(super) async fn read_modules(
         } else {
             Vec::new()
         };
+        #[cfg(feature = "admin-grpc")]
+        let synchronization = if identity.allows(AdminResource::Cluster, AdminAction::Read) {
+            state.management.file_sync_status(&snapshot)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "admin-grpc"))]
+        let synchronization: Option<serde_json::Value> = None;
         return json(
             StatusCode::OK,
             serde_json::json!({
@@ -93,6 +101,7 @@ pub(super) async fn read_modules(
                 "version": snapshot.version,
                 "etag": etag,
                 "documents": documents,
+                "synchronization": synchronization,
                 "rollback_versions": rollback_versions,
             }),
         );

@@ -6,6 +6,7 @@ mod actions;
 mod files;
 mod named;
 mod publication;
+pub(crate) use publication::DocumentPublication;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;

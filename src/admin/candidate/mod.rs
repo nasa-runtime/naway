@@ -149,6 +149,59 @@ pub(super) async fn build_named(
         .map_err(|_| BuildError::Worker)?
 }
 
+/// 业务作用：复用本机候选预算验证认证对端的完整应用入口和业务原文。
+/// 参数说明：
+/// - `state`：本机真实构建预算与配置事务。
+/// - `active`：对端必须匹配的活动配置。
+/// - `target`：已经校验内容身份的完整集群候选。
+/// 返回：完整语义、管理引导和目标路径均通过时返回本机可写目标。
+#[cfg(feature = "admin-grpc")]
+pub(super) async fn validate_replicated_named(
+    state: &AdminState,
+    active: Arc<GatewaySnapshot>,
+    target: Arc<crate::config::replication::Generation>,
+) -> Result<BTreeMap<crate::config::replication::Name, std::path::PathBuf>, BuildError> {
+    use crate::config::replication::Name;
+    let permit = state.candidate_builds.acquire()?;
+    let history = state.config_history.clone();
+    permit
+        .spawn(move |permit| {
+            let mut workspace = Workspace::create(&active.source_config_path, permit)
+                .map_err(|_| BuildError::Workspace)?;
+            workspace
+                .write_main(&target.documents[&Name::Entry].body)
+                .map_err(|_| BuildError::Workspace)?;
+            let mut inputs = BTreeMap::new();
+            for (name, document) in &target.documents {
+                if *name != Name::Entry {
+                    let temporary = workspace
+                        .write_named(&document.body)
+                        .map_err(|_| BuildError::Workspace)?;
+                    inputs.insert(name.clone(), temporary);
+                }
+            }
+            let built = history.with_stable_local_files(|| {
+                crate::config::candidate::load_replicated_named(
+                    &active,
+                    workspace.main_document().gateway,
+                    &inputs,
+                )
+            });
+            workspace.cleanup().map_err(|_| BuildError::Workspace)?;
+            let (built, paths) = built.map_err(|error| BuildError::Invalid(error.to_string()))?;
+            validate_named_transition(&active, &built, &history)
+                .map_err(|error| BuildError::Invalid(error.to_string()))?;
+            if !crate::admin::management::same_file_sync_authority(&active, &built) {
+                return Err(BuildError::Invalid(
+                    "named configuration cannot change management replication authority".into(),
+                ));
+            }
+            Ok(paths)
+        })
+        .await
+        .map_err(|_| BuildError::Worker)?
+}
+
 /// 业务作用：在统一构建预算内读取并验证某个已活动的具名版本，保持当前入口和规则归属。
 /// 参数说明：
 /// - `state`：具名归档、候选容量和文件事务。

@@ -82,6 +82,8 @@ pub(super) async fn run() -> Result<()> {
         .build(|| load_snapshot_with_dynamic(&cfg_path, 1, dynamic_upstreams.clone()))
         .with_context(|| format!("load initial config from {}", cfg_path.display()))?;
     node_journal.validate(&snapshot)?;
+    #[cfg(feature = "admin-grpc")]
+    admin::management::initialize_local_file_sync(&snapshot)?;
     if args.admin_operations_migrate
         || args.admin_operations_capacity_status
         || args.admin_operations_capacity_expected.is_some()

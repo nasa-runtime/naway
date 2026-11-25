@@ -6,6 +6,8 @@ service NodeManagement {
   rpc Open(OpenRequest) returns (OpenResponse);
   rpc AuthenticateIssuer(IssuerChallenge) returns (IssuerProof);
   rpc Report(ReportRequest) returns (ReportResponse);
+  rpc NamedConfigHead(NamedConfigSession) returns (NamedConfigHeadResponse);
+  rpc NamedConfigPush(stream NamedConfigFrame) returns (NamedConfigHeadResponse);
   rpc Catalog(CatalogRequest) returns (CatalogResponse);
   rpc Consumers(ConsumersRequest) returns (CatalogResponse);
   rpc Certificates(CertificatesRequest) returns (CatalogResponse);
@@ -21,6 +23,51 @@ service NodeManagement {
   rpc MaterialConditionsResult(MaterialConditionsResultRequest) returns (MaterialConditionsResultResponse);
   rpc MaterialPreviewData(MaterialPreviewDataRequest) returns (MaterialPreviewDataResponse);
   rpc MaterialPreviewResult(MaterialPreviewResultRequest) returns (MaterialPreviewResultResponse);
+}
+
+// 文件复制仅接受动态会话所绑定的节点，文档标识不携带接收节点的路径。
+message NamedConfigSession {
+  string node_id = 1;
+  string boot_id = 2;
+  bytes session = 3;
+}
+
+message NamedConfigHeadResponse {
+  bytes revision = 1;
+  bytes content_sha256 = 2;
+  repeated bytes recent_revisions = 3;
+}
+
+message NamedConfigFrame {
+  oneof value {
+    NamedConfigOffer offer = 1;
+    NamedConfigPart part = 2;
+  }
+}
+
+message NamedConfigOffer {
+  NamedConfigSession sender = 1;
+  repeated NamedConfigRevision lineage = 2;
+  repeated NamedConfigDocument documents = 3;
+}
+
+message NamedConfigRevision {
+  bytes id = 1;
+  bytes parent = 2;
+  bytes content_sha256 = 3;
+}
+
+message NamedConfigDocument {
+  bool entry = 1;
+  string name = 2;
+  uint32 bytes = 3;
+  bytes content_sha256 = 4;
+}
+
+message NamedConfigPart {
+  uint32 document = 1;
+  uint32 offset = 2;
+  bytes body = 3;
 }
 
 message OpenRequest {

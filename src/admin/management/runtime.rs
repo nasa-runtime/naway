@@ -17,6 +17,7 @@ pub struct Manager {
     pub(super) store: parking_lot::Mutex<receiver::Store>,
     pub(super) publication: parking_lot::RwLock<()>,
     pub(super) stopping: CancellationToken,
+    pub(super) file_sync: Option<super::replication::Local>,
     interest: parking_lot::Mutex<Option<(std::sync::Weak<GatewaySnapshot>, Instant)>>,
     pub(super) sample_memory: Arc<tokio::sync::Semaphore>,
     #[cfg(feature = "node-actions")]
@@ -207,6 +208,7 @@ impl Manager {
         mode: AdminPlaneMode,
     ) -> Arc<Self> {
         Arc::new(Self {
+            file_sync: super::replication::Local::from_env(),
             snapshots,
             interest: parking_lot::Mutex::new(None),
             sample_memory: Arc::new(tokio::sync::Semaphore::new(telemetry::STORE_BYTES)),
@@ -292,9 +294,23 @@ impl Manager {
     ///
     /// 返回：仅首次启动任务；任务等待时只保留弱引用，避免状态生命周期循环。
     pub fn start_reporter(&self, state: &Arc<AdminState>) {
+        if let Some(sync) = &self.file_sync {
+            sync.bind(state);
+        }
         self.reporter.get_or_init(|| {
             AbortOnDropHandle::new(tokio::spawn(reporter::run(Arc::downgrade(state))))
         });
+    }
+
+    /// 业务作用：提供配置管理页所需的逐节点应用和冲突状态。
+    /// 参数说明：
+    /// - `snapshot`：查询时活动的配置快照。
+    /// 返回：本地 gRPC 已启用时返回当前代的低敏确认条目。
+    pub(in crate::admin) fn file_sync_status(
+        &self,
+        snapshot: &Arc<GatewaySnapshot>,
+    ) -> Option<serde_json::Value> {
+        self.file_sync.as_ref()?.status(snapshot)
     }
 
     /// 业务作用：按当前接收授权返回完整成员集合，证书失效或监听故障不能继续显示为健康。
@@ -437,6 +453,8 @@ async fn bind(
         "Open",
         "AuthenticateIssuer",
         "Report",
+        "NamedConfigHead",
+        "NamedConfigPush",
         "Catalog",
         "Sample",
         "ActionData",

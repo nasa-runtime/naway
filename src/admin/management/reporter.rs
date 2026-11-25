@@ -28,6 +28,9 @@ struct Target {
     route_sentinel_supported: bool,
     ingress_protection_supported: bool,
     issuer: Option<Arc<super::issuer::Verifier>>,
+    configuration: Option<tokio_util::task::AbortOnDropHandle<()>>,
+    configuration_snapshot: Weak<crate::config::GatewaySnapshot>,
+    last_configuration_check: Instant,
     #[cfg(feature = "node-actions")]
     actions: super::actions::Channel,
     #[cfg(feature = "node-actions")]
@@ -52,6 +55,8 @@ struct Round<'a> {
     sequence: u64,
     metrics_enabled: bool,
     sample: Option<&'a Arc<telemetry::Upload>>,
+    configuration: Option<&'a Arc<super::replication::Published>>,
+    snapshot: &'a Arc<crate::config::GatewaySnapshot>,
 }
 
 /// 业务作用：用共享的当前事实向有限管理端点报告，配置代变化或停机撤销旧任务与连接。
@@ -122,6 +127,9 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     route_sentinel_supported: false,
                     ingress_protection_supported: false,
                     issuer: target.issuer.clone(),
+                    configuration: None,
+                    configuration_snapshot: Weak::new(),
+                    last_configuration_check: Instant::now() - Duration::from_secs(2),
                     #[cfg(feature = "node-actions")]
                     actions: super::actions::Channel::default(),
                     #[cfg(feature = "node-actions")]
@@ -170,6 +178,23 @@ pub(super) async fn run(owner: Weak<AdminState>) {
                     at,
                 })
             });
+        let configuration =
+            if snapshot.named_configuration && snapshot.config_bundle_digest.is_none() {
+                if let Some(sync) = &state.management.file_sync {
+                    if let Ok(_gate) = sync.gate.try_lock() {
+                        super::replication::Published::capture(snapshot.clone())
+                            .await
+                            .ok()
+                            .map(Arc::new)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
         let round = Round {
             state: &state,
             plan: &plan,
@@ -181,6 +206,8 @@ pub(super) async fn run(owner: Weak<AdminState>) {
             sequence,
             metrics_enabled,
             sample: sample.as_ref(),
+            configuration: configuration.as_ref(),
+            snapshot: &snapshot,
         };
         let work =
             stream::iter(targets.iter_mut()).for_each_concurrent(8, |target| send(target, &round));
@@ -272,6 +299,14 @@ async fn send(target: &mut Target, round: &Round<'_>) {
     if Instant::now() < target.next || super::runtime::unix_seconds() >= target.expires_at {
         return;
     }
+    if !target
+        .configuration_snapshot
+        .upgrade()
+        .is_some_and(|previous| Arc::ptr_eq(&previous, round.snapshot))
+    {
+        // 新的活动代撤销还未结束的旧传输，释放持有的旧原文字节和第二条 RPC。
+        target.configuration = None;
+    }
     let deadline = tokio::time::Instant::now() + RPC_TIMEOUT;
     let result = tokio::time::timeout_at(deadline, exchange(target, round, deadline)).await;
     if matches!(result, Ok(Ok(()))) {
@@ -287,6 +322,43 @@ async fn send(target: &mut Target, round: &Round<'_>) {
             // 动作或预览已经占用第二条 RPC，心跳独立继续，目录和样本不能挤占工作或突破连接预算。
             return;
         }
+        if let (Some(configuration), Some(issuer)) = (round.configuration, &target.issuer) {
+            if target
+                .configuration
+                .as_ref()
+                .is_some_and(|work| !work.is_finished())
+            {
+                // 配置正文与心跳最多共享两条在途 RPC，避免压住同一节点的身份续期。
+                return;
+            }
+            if target.last_configuration_check.elapsed() >= Duration::from_secs(4) {
+                target.last_configuration_check = Instant::now();
+                let configuration = configuration.clone();
+                let client = target.client.clone();
+                let sender = protocol::NamedConfigSession {
+                    node_id: facts.node_id.clone(),
+                    boot_id: facts.boot_id.clone(),
+                    session: target.session.clone(),
+                };
+                let peer = issuer.node().to_owned();
+                let manager = Arc::downgrade(&round.state.management);
+                let snapshot = Arc::downgrade(round.snapshot);
+                target.configuration_snapshot = snapshot.clone();
+                target.configuration = Some(tokio_util::task::AbortOnDropHandle::new(
+                    tokio::spawn(async move {
+                        let result =
+                            super::replication::share(client, sender, &configuration).await;
+                        if let Some(manager) = manager.upgrade() {
+                            if let Some(sync) = &manager.file_sync {
+                                sync.observe_peer(peer, snapshot, &result);
+                            }
+                        }
+                    }),
+                ));
+                return;
+            }
+        }
+
         // 心跳取得当前会话后，目录与当前样本共享剩余期限并发；任一故障不拖延另一类事实。
         let upload = sample
             .filter(|_| {
@@ -641,6 +713,14 @@ async fn exchange(
     if !target.consumers_supported {
         // 接收端不再支持本领域时撤销原确认偏移，恢复能力后重新交付完整事实。
         target.consumers = consumers::Upload::default();
+    }
+    if target
+        .configuration
+        .as_ref()
+        .is_some_and(|work| !work.is_finished())
+    {
+        // 已在发送配置正文，动作报价保留在发行端，心跳不能同时开启第三条流。
+        return Ok(());
     }
     #[cfg(feature = "node-actions")]
     match (

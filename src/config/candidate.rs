@@ -210,6 +210,126 @@ pub(crate) fn load_named_modules(
     identity.finish(snapshot)
 }
 
+/// 业务作用：以本地部署根构建集群候选，并从真实入口清单分配每份共享原文的目标。
+/// 参数说明：
+/// - `active`：当前活动配置，用于保留进程和节点专有引导事实。
+/// - `entry_input`：对端入口原文的隔离文件，不参与路径定位。
+/// - `inputs`：按规范名称映射到隔离文件的完整业务 YAML。
+/// 返回：完整语义候选及可写目标。越过配置根、缺文档或角色不匹配时拒绝。
+#[cfg(feature = "admin-grpc")]
+pub(crate) fn load_replicated_named(
+    active: &GatewaySnapshot,
+    entry_input: &Path,
+    inputs: &std::collections::BTreeMap<super::replication::Name, std::path::PathBuf>,
+) -> Result<(
+    GatewaySnapshot,
+    std::collections::BTreeMap<super::replication::Name, std::path::PathBuf>,
+)> {
+    use super::replication::Name;
+    use std::collections::BTreeMap;
+
+    let entry = std::path::absolute(&*active.source_config_path)?;
+    let root = entry
+        .parent()
+        .context("local named configuration root missing")?;
+    let main = source_identity::Document::read(entry_input)?;
+    let tree = loader(&entry, Some(entry_input))
+        .preserve_unresolved_placeholders(true)
+        .load_tree()?;
+    let imports = naml::strict::parse_imports_checked(&tree, root)?;
+    let mut paths = BTreeMap::new();
+    paths.insert(Name::Entry, entry.clone());
+    for import in imports {
+        let naml::YmlImport::File {
+            path,
+            optional,
+        } = import
+        else {
+            anyhow::bail!("replicated manifest requires only local YAML");
+        };
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("invalid replicated module filename")?;
+        let name = Name::new(false, filename.to_owned())?;
+        // 对端通过程序或环境给出的路径不能扩大接收节点的目录写权。
+        anyhow::ensure!(
+            path == root.join(filename),
+            "replicated module must be in the application directory"
+        );
+        if optional && !inputs.contains_key(&name) && !path.try_exists()? {
+            continue;
+        }
+        anyhow::ensure!(
+            inputs.contains_key(&name),
+            "replicated manifest document missing"
+        );
+        anyhow::ensure!(
+            paths.insert(name, path).is_none(),
+            "duplicate replicated manifest target"
+        );
+    }
+    anyhow::ensure!(
+        paths.len() == inputs.len() + 1,
+        "replicated manifest has unexpected YAML"
+    );
+    let replacements = inputs
+        .iter()
+        .map(|(name, input)| modules::Replacement {
+            target: &paths[name],
+            input,
+        })
+        .collect::<Vec<_>>();
+    let loaded = load_gateway_documents(&entry, entry_input, &replacements)?;
+    let documents = Paths::new(&entry, &loaded.value);
+    let configured_rule = |path: &Path| {
+        let normalized = std::path::absolute(path)?;
+        let name = paths
+            .iter()
+            .find(|(_, path)| **path == normalized)
+            .and_then(|(name, _)| inputs.get(name))
+            .context("replicated rule file must be declared in yml.imports")?;
+        Ok::<_, anyhow::Error>(name.as_path())
+    };
+    let physical = Documents {
+        gateway: entry_input,
+        sidecars: Some(Sidecars {
+            guard: configured_rule(&documents.guard)?,
+            sentinel: configured_rule(&documents.sentinel)?,
+        }),
+    };
+    let identity = source_identity::Prepared::new(documents, physical, main)?;
+    let sources = loaded
+        .value
+        .module_sources
+        .clone()
+        .context("named module sources unavailable")?;
+    let version = active
+        .version
+        .checked_add(1)
+        .context("configuration version exhausted")?;
+    let snapshot = build_snapshot_from_config(
+        &entry,
+        physical,
+        version,
+        DynamicUpstreamStore::new(),
+        loaded.value,
+        loaded.sources,
+        #[cfg(feature = "config-providers")]
+        crate::control::providers::Input {
+            previous: active.providers.clone(),
+            observation: None,
+        },
+    )?;
+    sources.revalidate()?;
+    let snapshot = identity.finish(snapshot)?;
+    anyhow::ensure!(
+        snapshot.config_bundle_digest.is_none(),
+        "Nacos configuration cannot be replicated"
+    );
+    Ok((snapshot, paths))
+}
+
 /// 业务作用：只替换 naml 的本次 base 输入，防止主 profile 把候选规则换回活动文件。
 ///
 /// 参数说明：

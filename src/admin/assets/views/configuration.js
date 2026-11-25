@@ -157,6 +157,9 @@ export function mount(root, session, page = "configuration") {
     "subtle",
   );
   status.setAttribute("role", "status");
+  const synchronization = element("p", "", "subtle");
+  synchronization.hidden = true;
+  synchronization.setAttribute("aria-live", "polite");
   const editor = yamlEditor(element("textarea"));
   editor.rows = 24;
   editor.spellcheck = false;
@@ -220,6 +223,7 @@ export function mount(root, session, page = "configuration") {
     modulePicker,
     toolbar,
     status,
+    synchronization,
     sections,
     label,
     position,
@@ -231,6 +235,7 @@ export function mount(root, session, page = "configuration") {
   root.append(panel);
   let alive = true;
   let generation = 0;
+  let localSync = false;
   let active = null;
   let baseline = null;
   let target = definition;
@@ -438,7 +443,7 @@ export function mount(root, session, page = "configuration") {
       !editor.value ||
       unknown;
     progress.disabled =
-      locked || (!pendingChange && (!clusterReadable || !rollout));
+      locked || (!localSync && !pendingChange && (!clusterReadable || !rollout));
     format.disabled =
       locked || !inspectable || baseline === null || !editor.value;
     complete.disabled = locked || !writable || baseline === null;
@@ -457,6 +462,9 @@ export function mount(root, session, page = "configuration") {
    */
   function retire() {
     generation += 1;
+    localSync = false;
+    synchronization.hidden = true;
+    synchronization.textContent = "";
     active?.abort();
     active = null;
     clearTimeout(timer);
@@ -570,7 +578,9 @@ export function mount(root, session, page = "configuration") {
       if (baseline.named) {
         guidance.textContent = `编辑 ${target.documentKind}。发布时服务端校验其与其它模块和当前活动配置的关系。`;
       }
-      publish.textContent = data.source === "nacos" ? "保存并推送集群" : "保存本地 YAML";
+      publish.textContent = data.source === "nacos" || localSync
+        ? "保存并推送集群"
+        : "保存本地 YAML";
       const versions = target.rollbackEtag === data.etag
         ? target.rollbackVersions.filter((version) => version !== data.version)
         : [];
@@ -618,6 +628,7 @@ export function mount(root, session, page = "configuration") {
     if (catalog.data.ok !== true || !Array.isArray(catalog.data.documents)) {
       throw new Error("配置目录响应不完整。");
     }
+    showSynchronization(catalog.data);
     const names = catalog.data.documents
       .filter((entry) => entry.resource === definition.resource && entry.readable === true)
       .map((entry) => entry.name);
@@ -793,6 +804,10 @@ export function mount(root, session, page = "configuration") {
             status.textContent = data.local_applied
               ? "文件已保存，本机已生效。"
               : "文件已保存，等待本机应用。";
+            if (localSync) {
+              synchronization.textContent = "等待 gRPC 对端确认此配置版本。";
+              timer = setTimeout(readProgress, 1500);
+            }
           }
         } else if (
           responseStatus === 202 &&
@@ -847,6 +862,33 @@ export function mount(root, session, page = "configuration") {
   }
 
   /**
+   * 业务作用：展示各节点对目录当前配置代的应用确认和分叉状态。
+   * 参数说明：
+   * - `catalog`：经已登录请求返回的当前配置目录和同步收据。
+   * 返回：有集群读取权限且开启本地复制时更新同步视图。
+   */
+  function showSynchronization(catalog) {
+    const sync = catalog.synchronization;
+    localSync = clusterReadable && sync?.mode === "grpc" && Array.isArray(sync.peers);
+    synchronization.hidden = !localSync;
+    if (!localSync) {
+      synchronization.textContent = "";
+      return;
+    }
+    const labels = {
+      applied: "已生效",
+      pending: "等待确认",
+      conflict: "配置分叉",
+      rejected: "节点校验拒绝",
+      unavailable: "无法确认",
+    };
+    const peers = sync.peers.map((peer) =>
+      `${String(peer.node).slice(0, 128)} ${labels[peer.status] ?? "状态未知"}`);
+    synchronization.textContent =
+      `gRPC 配置版本 ${catalog.version} · ${sync.converged ? "全部节点已生效" : peers.join(" · ")}`;
+  }
+
+  /**
    * 业务作用：只读取原发布身份的收敛事实，不能用远端受理或单节点成功代替全节点生效。
    * 参数说明: 无。
    * 返回：显示原发布进度；等待期间有限频率重读，失败或页面隐藏后停止读取。
@@ -856,6 +898,13 @@ export function mount(root, session, page = "configuration") {
     timer = null;
     if (pendingChange && !rollout) {
       return readApproval();
+    }
+    if (localSync && !rollout) {
+      return run(async (signal, epoch) => {
+        const { data } = await request("/api/config/modules", { signal });
+        current(epoch);
+        showSynchronization(data);
+      });
     }
     if (!clusterReadable || !rollout) {
       return;

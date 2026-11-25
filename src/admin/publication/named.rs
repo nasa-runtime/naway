@@ -64,6 +64,33 @@ async fn publish_files(
     active: Arc<GatewaySnapshot>,
     writes: Vec<(usize, Bytes)>,
 ) -> Response<BoxBody> {
+    publish_local(state, active, move |history, active, current| {
+        let changes = writes
+            .iter()
+            .map(|(index, body)| (&active.named_documents[*index], body.as_ref()))
+            .collect::<Vec<_>>();
+        history.compare_and_publish_named(active, &changes, current)
+    })
+    .await
+}
+
+/// 业务作用：在独占应用许可内执行本地原文比较和替换，并由唯一重载器裁决后续发布。
+/// 参数说明：
+/// - `state`：当前事实源、写入许可和活动代观察。
+/// - `active`：建立写意图时使用的活动基线。
+/// - `write`：待执行的精确文件条件操作。
+/// 返回：本机应用确认或明确等待、拒绝。收到拒绝时只撤销本次文件收据。
+pub(in crate::admin) async fn publish_local(
+    state: &Arc<AdminState>,
+    active: Arc<GatewaySnapshot>,
+    write: impl FnOnce(
+            &crate::control::history::ConfigHistory,
+            &GatewaySnapshot,
+            &arc_swap::ArcSwap<GatewaySnapshot>,
+        ) -> anyhow::Result<Option<crate::control::history::DocumentPublication>>
+        + Send
+        + 'static,
+) -> Response<BoxBody> {
     let before = active.version;
     let path = active.source_config_path.clone();
     let event = state
@@ -88,11 +115,7 @@ async fn publish_files(
     let current = state.snap.clone();
     let publication = tokio::task::spawn_blocking(move || {
         let _gate = gate;
-        let changes = writes
-            .iter()
-            .map(|(index, body)| (&active.named_documents[*index], body.as_ref()))
-            .collect::<Vec<_>>();
-        history.compare_and_publish_named(&active, &changes, &current)
+        write(&history, &active, &current)
     })
     .await;
     let publication = match publication {

@@ -15,6 +15,8 @@ pub mod management;
 pub mod media;
 pub mod model;
 mod modules;
+#[cfg(feature = "admin-grpc")]
+pub(crate) mod replication;
 pub(crate) use modules::{ActiveDocument, DocumentDomain, NAMED_DOCUMENT_LIMIT};
 pub(crate) mod monitor;
 pub mod named_nacos;

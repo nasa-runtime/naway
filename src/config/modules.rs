@@ -228,7 +228,8 @@ pub(super) fn load(
             "duplicate named configuration document: {name}"
         );
         sources.watch.push(path.clone());
-        if optional && !path.try_exists()? {
+        let replacement = replacements.iter().find(|edit| edit.target == path);
+        if optional && replacement.is_none() && !path.try_exists()? {
             sources.missing.push(path);
             continue;
         }
@@ -237,7 +238,7 @@ pub(super) fn load(
             .and_then(|stem| stem.to_str())
             .context("invalid YAML filename")?;
         let profile = path.with_file_name(format!("{stem}-{{profile}}"));
-        let input = if let Some(edit) = replacements.iter().find(|edit| edit.target == path) {
+        let input = if let Some(edit) = replacement {
             replaced += 1;
             edit.input
         } else {

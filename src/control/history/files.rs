@@ -50,7 +50,7 @@ pub(crate) fn publish(
     baseline: &[(&Path, &[u8])],
     desired: &[(&Path, &[u8])],
 ) -> Result<Option<Publication>> {
-    publish_bounded(baseline, desired, 3)
+    publish_bounded(baseline, desired, 3, false)
 }
 
 /// 业务作用：暂存并替换同一活动清单下的具名文件，复用逐文件比较及条件补偿。
@@ -69,7 +69,30 @@ pub(crate) fn publish_named(
             .eq(desired.iter().map(|(path, _)| path)),
         "named configuration document targets changed"
     );
-    publish_bounded(baseline, desired, crate::config::NAMED_DOCUMENT_LIMIT)
+    publish_bounded(
+        baseline,
+        desired,
+        crate::config::NAMED_DOCUMENT_LIMIT,
+        false,
+    )
+}
+
+/// 业务作用：按已验证的共享清单原子安装本地文件，允许新增受管名称并保留退出登记的文件。
+/// 参数说明：
+/// - `baseline`：本机活动入口与全部已登记文件的原字节。
+/// - `desired`：完整候选验证确定的新清单目标与原字节，业务文件排在入口前。
+/// 返回：全部文件成功时返回精确补偿收据，未受管且内容不同的文件不会被覆盖。
+#[cfg(feature = "admin-grpc")]
+pub(crate) fn publish_replication(
+    baseline: &[(&Path, &[u8])],
+    desired: &[(&Path, &[u8])],
+) -> Result<Option<Publication>> {
+    publish_bounded(
+        baseline,
+        desired,
+        crate::config::replication::MAX_TRANSFER_DOCUMENTS,
+        true,
+    )
 }
 
 /// 业务作用：限制配置事务的路径数量，再对冻结基线执行暂存、复验和提交。
@@ -77,18 +100,24 @@ pub(crate) fn publish_named(
 /// - `baseline`：现有目标与已冻结原文。
 /// - `desired`：同次语义构建给出的目标与原文。
 /// - `limit`：当前发布模型允许的最多目标数。
+/// - `allow_inventory`：允许本轮经过业务校验的目标按真实路径更换清单成员。
 /// 返回：冲突返回空，成功交付条件补偿收据。
 fn publish_bounded(
     baseline: &[(&Path, &[u8])],
     desired: &[(&Path, &[u8])],
     limit: usize,
+    allow_inventory: bool,
 ) -> Result<Option<Publication>> {
     ensure!(
         cfg!(unix),
         "document publication requires Unix filesystem semantics"
     );
     ensure!(
-        !baseline.is_empty() && baseline.len() <= limit && baseline.len() == desired.len(),
+        !baseline.is_empty()
+            && baseline.len() <= limit
+            && !desired.is_empty()
+            && desired.len() <= limit
+            && (allow_inventory || baseline.len() == desired.len()),
         "invalid document target count"
     );
     let mut originals = BTreeMap::new();
@@ -120,7 +149,7 @@ fn publish_bounded(
         let target = Target::open(path)?;
         ensure!(
             paths.insert(target.path.clone())
-                && roles.get(&target.path).is_none_or(|role| *role == index),
+                && (allow_inventory || roles.get(&target.path).is_none_or(|role| *role == index)),
             "configuration document targets overlap another role"
         );
         let original = if roles.contains_key(&target.path) {

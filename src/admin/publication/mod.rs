@@ -7,4 +7,6 @@ mod observation;
 
 pub(super) use documents::{publish_document_set, publish_scoped_document_set};
 pub(super) use main::publish_validated_config;
+#[cfg(feature = "admin-grpc")]
+pub(super) use named::publish_local;
 pub(super) use named::{publish_named, restore_named};

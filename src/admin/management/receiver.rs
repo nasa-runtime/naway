@@ -84,6 +84,7 @@ pub(in crate::admin) struct Observation {
     pub metrics_availability: &'static str,
 }
 
+#[derive(Clone)]
 pub(super) struct Service {
     pub manager: Weak<Manager>,
     pub address: SocketAddr,
@@ -602,6 +603,48 @@ impl Store {
 }
 
 impl Service {
+    /// 业务作用：在读取及提交集群文件前复验显式启用的本机文件权威与同一 mTLS 启动会话。
+    /// 参数说明：
+    /// - `manager`：接收监听的唯一管理运行态。
+    /// - `sender`：对端标识、启动身份和接收端签发的令牌。
+    /// - `identity`：TLS 传输验证后的实际节点身份。
+    /// 返回：活动的本地文件复制所有者。停机、Nacos、会话冲突或身份撤销均拒绝。
+    fn authorize_named(
+        &self,
+        manager: &Manager,
+        sender: &protocol::NamedConfigSession,
+        identity: Option<&PeerIdentity>,
+    ) -> Result<Arc<crate::admin::AdminState>, Status> {
+        let plan = self.authorize(manager, &sender.node_id, identity)?;
+        let sync = manager.file_sync.as_ref().ok_or_else(|| {
+            Status::failed_precondition("local configuration replication disabled")
+        })?;
+        let snapshot = manager.snapshots.load();
+        if !snapshot.named_configuration || snapshot.config_bundle_digest.is_some() {
+            return Err(Status::failed_precondition(
+                "local named configuration required",
+            ));
+        }
+        let mut store = manager.store.lock();
+        store.reconcile(&plan);
+        let live = store.entries.get(&sender.node_id).is_some_and(|entry| {
+            let now = Instant::now();
+            entry.boot == sender.boot_id
+                && crate::security::auth::constant_time_eq(&entry.session, &sender.session)
+                && entry.facts.is_some()
+                && now.saturating_duration_since(entry.at) <= FRESHNESS
+                && entry
+                    .conflict
+                    .is_none_or(|at| now.saturating_duration_since(at) > FRESHNESS)
+        });
+        if !live {
+            return Err(Status::failed_precondition(
+                "named configuration session changed",
+            ));
+        }
+        sync.owner()
+    }
+
     /// 业务作用：在RPC处理期间复验监听、运行模式和当前节点证书授权，旧连接不能继承新权限。
     ///
     /// 参数说明：
@@ -644,6 +687,100 @@ impl Service {
 
 #[nasa::grpc::async_trait]
 impl protocol::node_management_server::NodeManagement for Service {
+    /// 业务作用：向已登记的对端提供本机完整已应用配置身份，取消后续无意义的正文传输。
+    /// 参数说明：
+    /// - `request`：带有传输身份和当前启动会话的无正文请求。
+    /// 返回：本机确认后的代次与原文摘要；候选待写入时仍展示活动身份。
+    async fn named_config_head(
+        &self,
+        request: Request<protocol::NamedConfigSession>,
+    ) -> Result<Response<protocol::NamedConfigHeadResponse>, Status> {
+        let manager = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| Status::unavailable("receiver stopped"))?;
+        let state =
+            self.authorize_named(&manager, request.get_ref(), request.extensions().get())?;
+        let sync = manager
+            .file_sync
+            .as_ref()
+            .expect("authorized local replication");
+        // 同轮多个对端查询可以在总期限内排队，避免固定节拍让同一个节点长期失去回读机会。
+        let _gate = tokio::time::timeout(std::time::Duration::from_millis(750), sync.gate.lock())
+            .await
+            .map_err(|_| Status::unavailable("named configuration busy"))?;
+        let current = super::replication::Published::capture(state.snap.load_full())
+            .await
+            .map_err(super::replication::unavailable)?;
+        Ok(Response::new(current.head()))
+    }
+
+    /// 业务作用：以同一会话和基线接收完整业务 YAML，确认落盘和活动代后才回复成功。
+    /// 参数说明：
+    /// - `request`：首帧为代次和目录，其余帧为有界原文段。
+    /// 返回：已应用的配置身份，冲突、断流或配置不合法均无法获得成功回执。
+    async fn named_config_push(
+        &self,
+        request: Request<nasa::grpc::Streaming<protocol::NamedConfigFrame>>,
+    ) -> Result<Response<protocol::NamedConfigHeadResponse>, Status> {
+        use protocol::named_config_frame::Value;
+        let manager = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| Status::unavailable("receiver stopped"))?;
+        let identity = request.extensions().get::<PeerIdentity>().cloned();
+        let mut stream = request.into_inner();
+        let Some(Value::Offer(mut offer)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.message())
+                .await
+                .map_err(|_| Status::deadline_exceeded("named configuration offer deadline"))??
+                .and_then(|frame| frame.value)
+        else {
+            return Err(Status::invalid_argument(
+                "missing named configuration offer",
+            ));
+        };
+        let sender = offer
+            .sender
+            .take()
+            .ok_or_else(|| Status::invalid_argument("missing configuration sender"))?;
+        let state = self.authorize_named(&manager, &sender, identity.as_ref())?;
+        let sync = manager
+            .file_sync
+            .as_ref()
+            .expect("authorized local replication");
+        let _gate = sync
+            .gate
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| Status::unavailable("named configuration busy"))?;
+        let active = state.snap.load_full();
+        let current = super::replication::Published::capture(active.clone())
+            .await
+            .map_err(super::replication::unavailable)?;
+        let received = super::replication::receive_offer(&current, offer, stream).await?;
+        // 正文接收可以跨越证书撤销、节点重启或本地热更，写权必须紧邻提交重新核对。
+        self.authorize_named(&manager, &sender, identity.as_ref())?;
+        if !Arc::ptr_eq(&active, &state.snap.load_full()) {
+            return Err(Status::aborted("named configuration baseline changed"));
+        };
+        let service = self.clone();
+        // 开始持久阶段后，RPC 取消不撤销已接受的本地文件事务及其应用观察。
+        let task = tokio::spawn(async move {
+            let _gate = _gate;
+            let reauthorize = move || {
+                service
+                    .authorize_named(&manager, &sender, identity.as_ref())
+                    .map(|_| ())
+            };
+            super::replication::install(&state, active, current, received, reauthorize).await
+        });
+        let response = task
+            .await
+            .map_err(|_| Status::unavailable("named configuration worker unavailable"))??;
+        Ok(Response::new(response))
+    }
+
     /// 业务作用：为实际证书绑定的node/boot取得接收端会话，重复建立不刷新运行事实。
     ///
     /// 参数说明：

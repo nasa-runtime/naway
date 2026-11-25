@@ -112,9 +112,15 @@ impl Verifier {
     /// 参数说明: 无。
     ///
     /// 返回：本目标必须证明的集群标识，不返回公钥或会话材料。
-    #[cfg(feature = "node-journal")]
     pub(super) fn cluster(&self) -> &str {
         &self.cluster
+    }
+
+    /// 业务作用：以本机部署时校验的身份标记配置接收状态，不采用远端自报名称。
+    /// 参数说明: 无。
+    /// 返回：目标管理节点的固定标识。
+    pub(super) fn node(&self) -> &str {
+        &self.node
     }
 
     /// 业务作用：冻结特定上报端点的发行者绑定，禁止服务器自报身份决定信任范围。

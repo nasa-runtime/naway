@@ -96,6 +96,76 @@ impl ConfigHistory {
         })
     }
 
+    /// 业务作用：以本机完整文件和快照为基线，提交认证对端通过语义预检的受管业务集合。
+    /// 参数说明：
+    /// - `active`：验证时冻结的本机活动配置与路径。
+    /// - `current`：已验证活动代的完整入口及模块原字节。
+    /// - `target`：经接收身份和本机语义校验的完整目标代。
+    /// - `targets`：本机清单决定的可写目标。
+    /// - `snapshot`：唯一发布者的实时快照槽。
+    /// 返回：全部文件持久替换时返回条件补偿收据，基线或授权漂移返回空。
+    #[cfg(feature = "admin-grpc")]
+    pub(crate) fn compare_and_replicate_named(
+        &self,
+        active: &GatewaySnapshot,
+        current: &crate::config::replication::Generation,
+        target: &crate::config::replication::Generation,
+        targets: &BTreeMap<crate::config::replication::Name, PathBuf>,
+        snapshot: &arc_swap::ArcSwap<GatewaySnapshot>,
+    ) -> Result<Option<DocumentPublication>> {
+        use crate::config::replication::Name;
+        let entry = active.source_config_path.as_path();
+        self.with_exclusive_local_files(|| {
+            #[cfg(feature = "node-journal")]
+            if let Some(journal) = self.node_journal.get() {
+                anyhow::ensure!(
+                    !journal.durable_local_files()?,
+                    "node journal does not cover replicated named publication"
+                );
+            }
+            // 本地变更与候选构建可能并行，实际写入前再次校验完整活动代及依赖。
+            if snapshot.load().version != active.version
+                || config_fingerprint(entry).ok() != active.config_fingerprint
+            {
+                return Ok(None);
+            }
+            let mut baseline = Vec::with_capacity(current.documents.len());
+            for module in active.named_documents.iter() {
+                let name = Name::Module(module.name.clone());
+                baseline.push((
+                    module.path.as_path(),
+                    current.documents[&name].body.as_ref(),
+                ));
+            }
+            baseline.push((entry, current.documents[&Name::Entry].body.as_ref()));
+            let mut desired = Vec::with_capacity(target.documents.len());
+            for (name, path) in targets {
+                if *name != Name::Entry {
+                    desired.push((path.as_path(), target.documents[name].body.as_ref()));
+                }
+            }
+            // 后提交入口，保证新清单生效时其新增业务文件已经存在。
+            desired.push((entry, target.documents[&Name::Entry].body.as_ref()));
+            let Some(files) = files::publish_replication(&baseline, &desired)? else {
+                return Ok(None);
+            };
+            match config_fingerprint(entry) {
+                Ok(fingerprint) => Ok(Some(DocumentPublication {
+                    fingerprint,
+                    files: Receipt::Memory(files),
+                })),
+                Err(error) => {
+                    // 完整指纹无法读回时仅撤销持有的文件决定，保留外部后来者的写入。
+                    if files.restore()? {
+                        Err(error)
+                    } else {
+                        Err(error).context("named replication compensation conflicts")
+                    }
+                }
+            }
+        })
+    }
+
     /// 业务作用：将已经通过完整候选校验的归档原文恢复到当前本地配置文件位置。
     ///
     /// 参数说明：
