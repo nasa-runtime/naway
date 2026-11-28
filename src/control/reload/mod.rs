@@ -1759,6 +1759,15 @@ async fn reload_worker(
                     error = %e,
                     "reload rejected before build; cannot fingerprint config"
                 );
+                // 此候选未得到指纹，拒绝收据保持空指纹，避免重读并把后来到达的原文记到本次失败。
+                let active = snap.load().version;
+                history.for_candidate(None).record_rejected(
+                    trigger.as_str(),
+                    &source_cfg_path,
+                    active,
+                    active.saturating_add(1),
+                    format!("cannot fingerprint config: {e}"),
+                );
             }
         }
     }
