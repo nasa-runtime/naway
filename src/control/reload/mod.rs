@@ -10,8 +10,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{mpsc as thread_channel, Arc};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -64,10 +64,9 @@ struct ConfigWatchCommand {
 }
 
 /// 业务作用：协调本地配置 watcher 的发布前对账，并隔离 `YmlWatcher` 的单 owner 可变状态。
-#[derive(Clone)]
 struct ConfigWatchReconciler {
-    /// 发往唯一 watcher 管理任务的有界命令通道。
-    tx: mpsc::Sender<ConfigWatchCommand>,
+    /// 唯一发布任务向原生观察线程发送的有界命令。
+    tx: thread_channel::SyncSender<ConfigWatchCommand>,
 }
 
 impl ConfigWatchReconciler {
@@ -80,12 +79,11 @@ impl ConfigWatchReconciler {
     async fn reconcile(&self, plan: ConfigWatchPlan) -> Result<()> {
         let (completed, result) = oneshot::channel();
         self.tx
-            .send(ConfigWatchCommand {
+            .try_send(ConfigWatchCommand {
                 plan,
                 completed,
             })
-            .await
-            .context("local config watcher is unavailable")?;
+            .map_err(|_| anyhow::anyhow!("local config watcher is unavailable or busy"))?;
         result
             .await
             .context("local config watcher stopped during reconcile")?
@@ -1843,13 +1841,45 @@ fn spawn_file_watch(
     initial_plan: ConfigWatchPlan,
     tx: mpsc::Sender<ReloadEvent>,
 ) -> Option<ConfigWatchReconciler> {
+    let (command_tx, command_rx) = thread_channel::sync_channel(1);
+    let (ready_tx, ready_rx) = thread_channel::sync_channel(0);
+    // 原生观察器创建、对账和析构始终归独立线程。回收等待不占用 Tokio 线程，
+    // 发布任务退出后关闭命令入口，结束业务观察无需等待原生事件循环退出。
+    if let Err(error) = std::thread::Builder::new()
+        .name("gateway-config-watch".to_owned())
+        .spawn(move || run_file_watch(initial_plan, tx, command_rx, ready_tx))
+    {
+        tracing::error!(%error, "local config watcher thread unavailable; file hot reload disabled");
+        return None;
+    }
+    ready_rx.recv().ok()?;
+    Some(ConfigWatchReconciler {
+        tx: command_tx,
+    })
+}
+
+/// 业务作用：在独立线程持有原生文件观察器，并串行确认依赖变更与补发遗漏事件。
+///
+/// 参数说明：
+/// - `initial_plan`：首个活动快照的观察范围。
+/// - `tx`：接收本地配置变更的发布队列。
+/// - `commands`：发布前的观察对账请求，发送端关闭即撤销观察权。
+/// - `ready`：只有首个观察范围成功登记才通知启动方。
+///
+/// 返回：观察入口关闭或初始化失败时退出，原生资源在本线程回收。
+fn run_file_watch(
+    initial_plan: ConfigWatchPlan,
+    tx: mpsc::Sender<ReloadEvent>,
+    commands: thread_channel::Receiver<ConfigWatchCommand>,
+    ready: thread_channel::SyncSender<()>,
+) {
     // 原生监听注册期间可能错过通知，先为现有和缺失目标建立对照。
     let mut sources = FileObservations::default();
     let mut dependencies = FileObservations::default();
     sources.reconcile(initial_plan.sources().watch_files());
     dependencies.reconcile(initial_plan.dependencies().iter().map(PathBuf::as_path));
     let event_tx = tx.clone();
-    let watcher = match YmlWatcher::new(
+    let mut watcher = match YmlWatcher::new(
         initial_plan.sources(),
         initial_plan.dependencies(),
         move |event| {
@@ -1861,75 +1891,57 @@ fn spawn_file_watch(
         Ok(watcher) => watcher,
         Err(error) => {
             tracing::error!(error = %error, "local config watcher init failed; file hot reload disabled");
-            return None;
+            return;
         }
     };
-    let (command_tx, mut command_rx) = mpsc::channel::<ConfigWatchCommand>(1);
-    tokio::spawn(async move {
-        let mut watcher = watcher;
-        let mut interval = tokio::time::interval(RECHECK_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut pending = None;
-        loop {
-            tokio::select! {
-                command = command_rx.recv() => {
-                    let Some(command) = command else {
-                        return;
-                    };
-                    let ConfigWatchCommand { plan, completed } = command;
-                    // 原生 watcher 更换目录时可能同步等待系统事件循环停止和重新登记。
-                    // 该等待在阻塞线程执行，当前快照继续服务，候选仍须等完整观察回执才能发布。
-                    let update = tokio::task::spawn_blocking(move || {
-                        let result = watcher.reconcile(plan.sources(), plan.dependencies());
-                        if result.is_ok() {
-                            // 只有原生 watcher 成功切换才更新复查范围，共有路径沿用原基线。
-                            sources.reconcile(plan.sources().watch_files());
-                            dependencies.reconcile(plan.dependencies().iter().map(PathBuf::as_path));
-                        }
-                        (watcher, sources, dependencies, result)
-                    })
-                    .await;
-                    let (next_watcher, next_sources, next_dependencies, result) = match update {
-                        Ok(state) => state,
-                        Err(error) => {
-                            let _ = completed.send(Err(error).context("local config watcher task failed"));
-                            return;
-                        }
-                    };
-                    watcher = next_watcher;
-                    sources = next_sources;
-                    dependencies = next_dependencies;
-                    let _ = completed.send(result);
-                }
-                _ = interval.tick() => {
-                    let sources_changed = sources.changed();
-                    let dependencies_changed = dependencies.changed();
-                    if sources_changed {
-                        pending = Some(ReloadEvent::File);
-                    } else if dependencies_changed && pending.is_none() {
-                        pending = Some(ReloadEvent::Dependency);
-                    }
-                    if let Some(event) = pending.take() {
-                        match tx.try_send(event) {
-                            Ok(()) => {}
-                            // 复查基线已前进，保留提示直到队列有余量。
-                            Err(mpsc::error::TrySendError::Full(event)) => pending = Some(event),
-                            Err(mpsc::error::TrySendError::Closed(_)) => return,
-                        }
-                    }
-                }
-            }
-        }
-    });
     tracing::info!(
         base = %initial_plan.sources().base_file().display(),
         profile_candidates = initial_plan.sources().profile_watch_files().len(),
         dependencies = initial_plan.dependencies().len(),
         "watching naml configuration sources"
     );
-    Some(ConfigWatchReconciler {
-        tx: command_tx,
-    })
+    if ready.send(()).is_err() {
+        return;
+    }
+
+    let mut pending = None;
+    let mut next_check = Instant::now();
+    loop {
+        if Instant::now() >= next_check {
+            let sources_changed = sources.changed();
+            let dependencies_changed = dependencies.changed();
+            if sources_changed {
+                pending = Some(ReloadEvent::File);
+            } else if dependencies_changed && pending.is_none() {
+                pending = Some(ReloadEvent::Dependency);
+            }
+            if let Some(event) = pending.take() {
+                match tx.try_send(event) {
+                    Ok(()) => {}
+                    // 复查基线已前进，保留提示直到发布队列有余量。
+                    Err(mpsc::error::TrySendError::Full(event)) => pending = Some(event),
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                }
+            }
+            next_check = Instant::now() + RECHECK_INTERVAL;
+        }
+        match commands.recv_timeout(next_check.saturating_duration_since(Instant::now())) {
+            Ok(ConfigWatchCommand {
+                plan,
+                completed,
+            }) => {
+                let result = watcher.reconcile(plan.sources(), plan.dependencies());
+                if result.is_ok() {
+                    // 原生观察就绪后才推进对账基线。失败时发布者继续保留上一快照。
+                    sources.reconcile(plan.sources().watch_files());
+                    dependencies.reconcile(plan.dependencies().iter().map(PathBuf::as_path));
+                }
+                let _ = completed.send(result);
+            }
+            Err(thread_channel::RecvTimeoutError::Timeout) => {}
+            Err(thread_channel::RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 /// 业务作用：把进程已持有的 SIGHUP 转成唯一配置发布者可以处理的事件。
