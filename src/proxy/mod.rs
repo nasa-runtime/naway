@@ -1295,7 +1295,7 @@ impl GatewayProxy {
             self.metrics.inc_blacklist_denied();
             let mut resp = text_status(403, "forbidden");
             server_trace.finish(resp.status().as_u16(), None, None, 0);
-            self.finish_access(access_log_enabled, || {
+            self.finish_access(access_log_enabled, &snap.scoped_log, || {
                 let (method, path) = access_log_head.expect("enabled access log has request head");
                 AccessRecord {
                     method,
@@ -1441,7 +1441,7 @@ impl GatewayProxy {
                         text_status(404, "no matching route")
                     };
                     server_trace.finish(resp.status().as_u16(), None, None, 0);
-                    self.finish_access(access_log_enabled, || {
+                    self.finish_access(access_log_enabled, &snap.scoped_log, || {
                         let (method, path) =
                             access_log_head.expect("enabled access log has request head");
                         AccessRecord {
@@ -2941,7 +2941,7 @@ impl GatewayProxy {
         self.metrics.inc_response(status.as_u16());
         self.metrics
             .observe_request_duration_with_trace(started.elapsed(), &server_trace);
-        self.finish_access(access_log_enabled, || {
+        self.finish_access(access_log_enabled, &snap.scoped_log, || {
             let (method, path) = access_log_head.expect("enabled access log has request head");
             AccessRecord {
                 method,
@@ -5178,11 +5178,23 @@ impl GatewayProxy {
     }
 
     /// 业务作用：在请求结束时记录访问事实与资源结果，保持短路响应和上游响应的观测口径一致。
-    fn finish_access(&self, enabled: bool, build_record: impl FnOnce() -> AccessRecord) {
+    /// 参数说明：
+    /// - `enabled`：原请求快照的访问日志开关。
+    /// - `logs`：原请求快照的日志归属。
+    /// - `build_record`：启用访问日志时才生成记录。
+    /// 返回：按原快照的日志归属尝试入队，关闭时不构造记录。
+    fn finish_access(
+        &self,
+        enabled: bool,
+        logs: &crate::observability::logging::scoped::Active,
+        build_record: impl FnOnce() -> AccessRecord,
+    ) {
         // 闭包是关键：只在启用态才 materialize record。不能把 `AccessRecord` 作为参数后再判断，
         // 因为 Rust 会在调用前完成 trace-id、route/upstream 和审计字段的 clone/格式化。
         if enabled {
-            self.access_log.log(build_record());
+            let output =
+                logs.queued_output(crate::observability::logging::scoped::Module::AccessLog);
+            self.access_log.log_with_output(build_record(), output);
         }
     }
 

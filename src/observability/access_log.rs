@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::config::model::AccessLogCfg;
 use crate::config::GatewaySnapshot;
-use crate::observability::logging::scoped::Module;
+use crate::observability::logging::scoped::{Module, Output};
 use crate::observability::metrics::Metrics;
 
 /// 数据面到后台日志 worker 的非阻塞发送句柄。
@@ -40,7 +40,7 @@ struct AccessLoggerInner {
 
 struct PendingRecord {
     record: AccessRecord,
-    output: Option<Arc<crate::observability::logging::scoped::Output>>,
+    output: Option<Arc<Output>>,
 }
 
 impl AccessLogger {
@@ -183,17 +183,27 @@ impl AccessLogger {
     /// - `record`：已在请求管线收集好的低基数字段。
     /// 返回：冻结来源实例或 AccessLog 模块输出后尝试入队，队列满时只记丢弃。
     pub fn log(&self, record: AccessRecord) {
+        let output = self
+            .snapshot
+            .load()
+            .scoped_log
+            .queued_output(Module::AccessLog);
+        self.log_with_output(record, output);
+    }
+
+    /// 业务作用：将请求记录及其已确定的本地日志归属交给后台，热更不能改写该归属。
+    /// 参数说明：
+    /// - `record`：请求结束时收集的访问事实。
+    /// - `output`：请求所属快照选出的输出，空值沿用全局输出。
+    /// 返回：入队失败时增加丢弃指标，队列已停止时不再接收记录。
+    pub(crate) fn log_with_output(&self, record: AccessRecord, output: Option<Arc<Output>>) {
         let active = self.active.load_full();
         if !active.accepting.load(Ordering::Acquire) {
             return;
         }
         let pending = PendingRecord {
             record,
-            output: self
-                .snapshot
-                .load()
-                .scoped_log
-                .queued_output(Module::AccessLog),
+            output,
         };
         if active.tx.try_send(pending).is_err() {
             active.metrics.inc_access_log_dropped();
