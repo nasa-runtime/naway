@@ -2544,7 +2544,7 @@ impl GatewayProxy {
             )
         {
             if let Some(route) = matched_route.as_ref() {
-                self.invalidate_caches_after_write(proxy_runtime, route)
+                self.invalidate_caches_after_write(&snap, proxy_runtime, route)
                     .await;
             }
         }
@@ -4958,13 +4958,19 @@ impl GatewayProxy {
         crate::ai::llm::parse_embedding(body.as_ref(), cache.embedding.max_dimensions)
     }
 
-    /// 业务作用：成功写请求后的 route generation 失效。
+    /// 业务作用：成功写请求后使用原快照撤销声明的目标缓存，归属切换不能让在途写入失效另一工作区。
     ///
     /// 这里有意在返回成功 response head 前 await：否则客户端收到写成功后立刻 GET，可能仍命中旧
     /// L1/L2。Redis 失败不能把已成功的非幂等写改成 5xx（客户端重试会造成二次写），因此只记错误
     /// 并依赖原 TTL；local route 则同步清 L1。每条写 route 最多 8 个目标，构建期已有硬上限。
+    /// 参数说明：
+    /// - `snapshot`：准入本次写请求的配置和归属目录。
+    /// - `proxy`：原入口及其不可变路由计划。
+    /// - `route`：声明失效目标的写路由。
+    /// 返回：逐目标尝试失效并记录结果，已经成功的上游写入保持成功。
     async fn invalidate_caches_after_write(
         &self,
+        snapshot: &GatewaySnapshot,
         proxy: &crate::config::ProxyRuntime,
         route: &Route,
     ) {
@@ -4980,9 +4986,14 @@ impl GatewayProxy {
                 self.metrics.inc_http_cache_invalidation_error();
                 continue;
             };
+            // 目标归属随原快照冻结，不能从写入路由或后来发布的配置推断。
+            let namespace = snapshot
+                .ownership
+                .route_owner(&proxy.id, target_id)
+                .map(|owner| owner.namespace());
             match self
                 .http_cache_runtime
-                .purge_route(&proxy.id, target_id, policy.as_ref())
+                .purge_route(&proxy.id, target_id, policy.as_ref(), namespace.as_deref())
                 .await
             {
                 Ok(_) => self.metrics.inc_http_cache_invalidation_ok(),

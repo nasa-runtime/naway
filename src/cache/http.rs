@@ -102,10 +102,25 @@ enum HttpCacheBackend {
 /// route generation 广播。只传 route 身份与新代号，不传 URI/Vary，避免敏感 key 进入消息系统。
 #[cfg(feature = "redis-runtime")]
 #[derive(Serialize, Deserialize)]
-struct CacheInvalidation {
+#[serde(untagged)]
+enum CacheInvalidation {
+    Owned {
+        target: OwnedInvalidationTarget,
+        generation: u64,
+    },
+    Platform {
+        proxy: String,
+        route: String,
+        generation: u64,
+    },
+}
+
+#[cfg(feature = "redis-runtime")]
+#[derive(Serialize, Deserialize)]
+struct OwnedInvalidationTarget {
     proxy: String,
     route: String,
-    generation: u64,
+    scope: String,
 }
 
 impl HttpCacheRuntime {
@@ -368,20 +383,24 @@ impl HttpCacheRuntime {
     /// - `proxy_id`: proxy 稳定 id。
     /// - `route_id`: route 稳定 id。
     /// - `policy`: 当前快照中的 route cache。
+    /// - `namespace`：可信路由归属的隔离域，平台路由为空。
+    /// 返回：共享失效确认后的代次，Redis 失败返回错误。
     pub(crate) async fn purge_route(
         &self,
         proxy_id: &str,
         route_id: &str,
         policy: &HttpCachePolicy,
+        namespace: Option<&str>,
     ) -> Result<u64> {
         if !policy.l2_enabled {
             policy.invalidate_all();
             return Ok(policy.generation.load(Ordering::Acquire));
         }
-        let scope = cache_scope(proxy_id, route_id);
+        let scope = cache_scope(proxy_id, route_id, namespace);
         let next = self.bump_generation(&scope).await?;
         policy.apply_generation(next);
-        self.publish_invalidation(proxy_id, route_id, next).await?;
+        self.publish_invalidation(proxy_id, route_id, namespace.map(|_| scope), next)
+            .await?;
         Ok(next)
     }
 
@@ -554,14 +573,21 @@ impl HttpCacheRuntime {
     }
 
     /// 业务作用：把缓存撤销事实投递到共享失效通道，失效通知不携带响应正文。
+    /// 参数说明：
+    /// - `proxy_id`：已验证的入口 ID。
+    /// - `route_id`：该入口内失效的路由 ID。
+    /// - `owned_scope`：工作区路由的共享键摘要，平台路由为空。
+    /// - `generation`：Redis 已确认推进的代次。
+    /// 返回：完成广播时成功，发送失败由周期对账补回。
     async fn publish_invalidation(
         &self,
         proxy_id: &str,
         route_id: &str,
+        owned_scope: Option<String>,
         generation: u64,
     ) -> Result<()> {
         #[cfg(not(feature = "redis-runtime"))]
-        let _ = (proxy_id, route_id, generation);
+        let _ = (proxy_id, route_id, owned_scope, generation);
         match &self.backend {
             HttpCacheBackend::Disabled => Ok(()),
             #[cfg(feature = "redis-runtime")]
@@ -570,11 +596,23 @@ impl HttpCacheRuntime {
                 invalidation_channel,
                 ..
             } => {
-                let payload = serde_json::to_vec(&CacheInvalidation {
-                    proxy: proxy_id.to_string(),
-                    route: route_id.to_string(),
-                    generation,
-                })?;
+                // 工作区采用单独的目标形状，避免旧读者把新通知解释为平台级失效。
+                let event = match owned_scope {
+                    Some(scope) => CacheInvalidation::Owned {
+                        target: OwnedInvalidationTarget {
+                            proxy: proxy_id.to_owned(),
+                            route: route_id.to_owned(),
+                            scope,
+                        },
+                        generation,
+                    },
+                    None => CacheInvalidation::Platform {
+                        proxy: proxy_id.to_owned(),
+                        route: route_id.to_owned(),
+                        generation,
+                    },
+                };
+                let payload = serde_json::to_vec(&event)?;
                 let _ = client
                     .r#pub(invalidation_channel, payload.as_slice())
                     .await
@@ -670,6 +708,10 @@ impl HttpCacheRuntime {
     }
 
     /// 业务作用：验证并应用单条缓存失效通知，只撤销被通知路由的本地表示。
+    /// 参数说明：
+    /// - `snap`：当前已发布的路由及其归属目录。
+    /// - `payload`：共享 Redis 通道交付的失效通知原文。
+    /// 返回：只有代理、路由和隔离域均匹配时才应用代次。
     #[cfg(feature = "redis-runtime")]
     fn apply_invalidation_message(
         &self,
@@ -680,16 +722,42 @@ impl HttpCacheRuntime {
             tracing::warn!("discard malformed HTTP cache invalidation message");
             return;
         };
-        if event.proxy.len() > 256 || event.route.len() > 256 {
+        let (proxy, route, target_scope, generation) = match event {
+            CacheInvalidation::Owned {
+                target,
+                generation,
+            } => (target.proxy, target.route, Some(target.scope), generation),
+            CacheInvalidation::Platform {
+                proxy,
+                route,
+                generation,
+            } => (proxy, route, None, generation),
+        };
+        if proxy.len() > 256
+            || route.len() > 256
+            || target_scope.as_ref().is_some_and(|scope| scope.len() != 64)
+        {
             tracing::warn!("discard oversized HTTP cache invalidation identity");
             return;
         }
-        if let Some(policy) = find_cache_policy(&snap.load(), &event.proxy, &event.route) {
-            policy.apply_generation(event.generation);
+        let snapshot = snap.load();
+        let local_scope = snapshot
+            .ownership
+            .route_owner(&proxy, &route)
+            .map(|owner| cache_scope(&proxy, &route, Some(&owner.namespace())));
+        // 只凭同名路由不能授权改变本机代次。滚动时忽略旧节点缺少归属的工作区通知。
+        if target_scope != local_scope {
+            return;
+        }
+        if let Some(policy) = find_cache_policy(&snapshot, &proxy, &route) {
+            policy.apply_generation(generation);
         }
     }
 
     /// 业务作用：按共享代号对账活动缓存，弥补通知丢失或重连期间的失效空隙。
+    /// 参数说明：
+    /// - `snap`：提供本轮对账所用的同一快照与归属目录。
+    /// 返回：逐路由读取隔离域的当前代次，无法确认时失效对应本地表示。
     #[cfg(feature = "redis-runtime")]
     async fn reconcile_all_generations(&self, snap: &arc_swap::ArcSwap<GatewaySnapshot>) {
         let snapshot = snap.load_full();
@@ -699,7 +767,11 @@ impl HttpCacheRuntime {
                 else {
                     continue;
                 };
-                let scope = cache_scope(&proxy.id, &route.id);
+                let namespace = snapshot
+                    .ownership
+                    .route_owner(&proxy.id, &route.id)
+                    .map(|owner| owner.namespace());
+                let scope = cache_scope(&proxy.id, &route.id, namespace.as_deref());
                 let observed = policy.generation.load(Ordering::Acquire);
                 match self.generation(&scope).await {
                     Ok(generation) => policy.reconcile_generation(observed, generation),
@@ -905,16 +977,23 @@ impl SwappableHttpCacheRuntime {
             .await
     }
 
-    /// 业务作用：撤销指定路由的缓存表示，并推进共享代号以覆盖其它节点的本地命中。
+    /// 业务作用：通过活动缓存代撤销指定归属下的路由表示，使同一工作区的其它节点同步失效。
+    /// 参数说明：
+    /// - `proxy_id`：已通过管理授权的代理。
+    /// - `route_id`：该代理下的活动路由。
+    /// - `policy`：目标路由的缓存策略。
+    /// - `namespace`：活动配置校验得到的工作区，未分配时使用平台缓存。
+    /// 返回：失效成功后返回新代号，共享后端失败时返回错误。
     pub(crate) async fn purge_route(
         &self,
         proxy_id: &str,
         route_id: &str,
         policy: &HttpCachePolicy,
+        namespace: Option<&str>,
     ) -> Result<u64> {
         self.active
             .load_full()
-            .purge_route(proxy_id, route_id, policy)
+            .purge_route(proxy_id, route_id, policy, namespace)
             .await
     }
 }
@@ -1326,7 +1405,11 @@ impl HttpCachePolicy {
         });
         self.store
             .bind_budget(self.workspace_budget.get().and_then(Option::as_ref));
-        let scope = cache_scope(proxy_id, route_id);
+        let namespace = request
+            .extensions
+            .get::<crate::control::ownership::Owner>()
+            .map(|owner| owner.namespace());
+        let scope = cache_scope(proxy_id, route_id, namespace.as_deref());
         let generation = if self.l2_enabled {
             if !self.generation_loaded.load(Ordering::Acquire) {
                 let observed = self.generation.load(Ordering::Acquire);
@@ -2155,11 +2238,19 @@ fn query_name(pair: &str) -> &str {
     pair.split_once('=').map(|(name, _)| name).unwrap_or(pair)
 }
 
-/// 业务作用：proxy/route 身份摘要。route id 不直接进入 Redis key，限制 key 长度并避免运维命名泄露。
-fn cache_scope(proxy_id: &str, route_id: &str) -> String {
+/// 业务作用：为查找、回填锁和失效代次绑定同一个路由归属，避免同名工作区路由串扰。
+/// 参数说明：
+/// - `proxy_id`：入口的稳定 ID。
+/// - `route_id`：入口内部的路由 ID。
+/// - `namespace`：可信配置目录提供的完整工作区隔离域，平台路由为空。
+/// 返回：固定长度的共享键摘要，平台沿用已有摘要。
+fn cache_scope(proxy_id: &str, route_id: &str, namespace: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     hash_key_part(&mut hasher, proxy_id.as_bytes());
     hash_key_part(&mut hasher, route_id.as_bytes());
+    if let Some(namespace) = namespace {
+        hash_key_part(&mut hasher, namespace.as_bytes());
+    }
     hex_digest(hasher.finalize().as_slice())
 }
 

@@ -1463,12 +1463,17 @@ async fn purge_http_cache(req: &AdminRequestParts, state: &AdminState) -> Respon
             }),
         );
     }
-    let policy = {
+    let (policy, namespace) = {
         let snapshot = state.snap.load();
-        snapshot
+        let policy = snapshot
             .proxy(proxy_id)
             .and_then(|proxy| proxy.router.route_by_id(route_id))
-            .and_then(|route| route.http_cache.clone())
+            .and_then(|route| route.http_cache.clone());
+        let namespace = snapshot
+            .ownership
+            .route_owner(proxy_id, route_id)
+            .map(|owner| owner.namespace());
+        (policy, namespace)
     };
     let Some(policy) = policy else {
         return json(
@@ -1481,7 +1486,7 @@ async fn purge_http_cache(req: &AdminRequestParts, state: &AdminState) -> Respon
     };
     match state
         .http_cache
-        .purge_route(proxy_id, route_id, policy.as_ref())
+        .purge_route(proxy_id, route_id, policy.as_ref(), namespace.as_deref())
         .await
     {
         Ok(generation) => {
