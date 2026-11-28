@@ -1876,13 +1876,30 @@ fn spawn_file_watch(
                     let Some(command) = command else {
                         return;
                     };
-                    let result = watcher.reconcile(command.plan.sources(), command.plan.dependencies());
-                    if result.is_ok() {
-                        // 只有原生 watcher 成功切换才更新复查范围；共有路径沿用原基线。
-                        sources.reconcile(command.plan.sources().watch_files());
-                        dependencies.reconcile(command.plan.dependencies().iter().map(PathBuf::as_path));
-                    }
-                    let _ = command.completed.send(result);
+                    let ConfigWatchCommand { plan, completed } = command;
+                    // 原生 watcher 更换目录时可能同步等待系统事件循环停止和重新登记。
+                    // 该等待在阻塞线程执行，当前快照继续服务，候选仍须等完整观察回执才能发布。
+                    let update = tokio::task::spawn_blocking(move || {
+                        let result = watcher.reconcile(plan.sources(), plan.dependencies());
+                        if result.is_ok() {
+                            // 只有原生 watcher 成功切换才更新复查范围，共有路径沿用原基线。
+                            sources.reconcile(plan.sources().watch_files());
+                            dependencies.reconcile(plan.dependencies().iter().map(PathBuf::as_path));
+                        }
+                        (watcher, sources, dependencies, result)
+                    })
+                    .await;
+                    let (next_watcher, next_sources, next_dependencies, result) = match update {
+                        Ok(state) => state,
+                        Err(error) => {
+                            let _ = completed.send(Err(error).context("local config watcher task failed"));
+                            return;
+                        }
+                    };
+                    watcher = next_watcher;
+                    sources = next_sources;
+                    dependencies = next_dependencies;
+                    let _ = completed.send(result);
                 }
                 _ = interval.tick() => {
                     let sources_changed = sources.changed();
