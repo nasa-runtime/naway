@@ -29,6 +29,9 @@ pub enum Module {
     Upstream,
     InterfaceGuard,
     Sentinel,
+    AccessLog,
+    Telemetry,
+    Providers,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -152,6 +155,9 @@ impl Declarations {
                 (&["stream"], Module::Stream),
                 (&["admin"], Module::Admin),
                 (&["upstreams", "discovery"], Module::Upstream),
+                (&["access_log"], Module::AccessLog),
+                (&["telemetry"], Module::Telemetry),
+                (&["providers"], Module::Providers),
             ] {
                 if keys.iter().any(|key| module.contains_key(*key)) {
                     owners.insert(role);
@@ -493,6 +499,18 @@ impl Active {
         } else {
             record()
         }
+    }
+
+    /// 业务作用：为送入后台队列的子模块记录冻结真实目的地，保留监听实例的优先级。
+    /// 参数说明：
+    /// - `module`：产生该记录的子模块。
+    /// 返回：原请求的实例、子模块、原请求的模块输出依次匹配。均缺席时采用全局兜底。
+    pub(crate) fn queued_output(&self, module: Module) -> Option<Arc<Output>> {
+        let request = current();
+        if request.as_ref().is_some_and(|output| output.instance) {
+            return request;
+        }
+        self.output(module, None).or(request)
     }
 
     /// 业务作用：记录监听器接入、错误和排空等同步事实，按实际实例选择正式输出。

@@ -100,9 +100,7 @@ trait LogSink: Send + Sync {
 
     /// 业务作用：drain 完成后的 backend 关闭/flush。
     fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async {
-            Ok(())
-        })
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -348,9 +346,15 @@ fn is_forbidden_sink_header(name: &HeaderName) -> bool {
 }
 
 /// 业务作用：启动所有 sink worker。每项先完成本地 client 构造；任一配置/客户端错误会让进程启动失败。
+/// 参数说明：
+/// - `specs`：已经验证的访问日志出口计划。
+/// - `metrics`：接收队列和发送结果指标。
+/// - `snapshot`：提供后台出口的活动模块日志目的地。
+/// 返回：出口都能装配时返回发送者与任务；本地装配失败时拒绝候选。
 pub(crate) fn spawn_sink_workers(
     specs: &[LogSinkSpec],
     metrics: Arc<Metrics>,
+    snapshot: Arc<arc_swap::ArcSwap<crate::config::GatewaySnapshot>>,
 ) -> Result<SpawnedLogSinks> {
     let mut senders = Vec::with_capacity(specs.len());
     let mut workers = Vec::with_capacity(specs.len());
@@ -362,6 +366,7 @@ pub(crate) fn spawn_sink_workers(
             spec.clone(),
             backend,
             metrics.clone(),
+            snapshot.clone(),
             rx,
         )));
         senders.push(LogSinkSender {
@@ -406,12 +411,22 @@ fn build_backend(spec: &LogSinkSpec) -> Result<Arc<dyn LogSink>> {
 }
 
 /// 业务作用：消费有界日志队列并批量发送，依赖慢或失败时不阻塞业务请求线程。
+/// 参数说明：
+/// - `spec`：该出口的队列与传输预算。
+/// - `backend`：当前固定的真实出口实现。
+/// - `metrics`：记录本出口交付与错误结果。
+/// - `snapshot`：为可能涵盖多个监听的出口诊断选择模块日志。
+/// - `rx`：只能消费该出口队列中的访问记录。
+/// 返回：队列结束后排空并关停，单个出口失败只影响其交付与诊断。
 async fn run_sink_worker(
     spec: LogSinkSpec,
     backend: Arc<dyn LogSink>,
     metrics: Arc<Metrics>,
+    snapshot: Arc<arc_swap::ArcSwap<crate::config::GatewaySnapshot>>,
     mut rx: mpsc::Receiver<Arc<LogEnvelope>>,
 ) {
+    use crate::observability::logging::scoped::Module;
+
     while let Some(first) = rx.recv().await {
         let mut batch = Vec::with_capacity(spec.batch_size);
         batch.push(first);
@@ -436,12 +451,16 @@ async fn run_sink_worker(
             Ok(Err(error)) => {
                 metrics.inc_log_sink_error(spec.id.as_ref());
                 metrics.inc_log_sink_dropped(spec.id.as_ref(), batch.len() as u64, "delivery");
-                tracing::warn!(sink = %spec.id, error = %error, records = batch.len(), "access log sink delivery failed");
+                snapshot.load().scoped_log.record_module(Module::AccessLog, || {
+                    tracing::warn!(sink = %spec.id, error = %error, records = batch.len(), "access log sink delivery failed");
+                });
             }
             Err(_) => {
                 metrics.inc_log_sink_error(spec.id.as_ref());
                 metrics.inc_log_sink_dropped(spec.id.as_ref(), batch.len() as u64, "delivery");
-                tracing::warn!(sink = %spec.id, timeout_ms = spec.timeout.as_millis(), records = batch.len(), "access log sink timed out");
+                snapshot.load().scoped_log.record_module(Module::AccessLog, || {
+                    tracing::warn!(sink = %spec.id, timeout_ms = spec.timeout.as_millis(), records = batch.len(), "access log sink timed out");
+                });
             }
         }
         if channel_closed {
@@ -450,7 +469,12 @@ async fn run_sink_worker(
     }
     if let Err(error) = backend.shutdown().await {
         metrics.inc_log_sink_error(spec.id.as_ref());
-        tracing::warn!(sink = %spec.id, error = %error, "access log sink shutdown failed");
+        snapshot
+            .load()
+            .scoped_log
+            .record_module(Module::AccessLog, || {
+                tracing::warn!(sink = %spec.id, error = %error, "access log sink shutdown failed");
+            });
     }
 }
 

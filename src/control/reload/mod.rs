@@ -1423,6 +1423,9 @@ async fn apply_reload_input(
                 );
                 active.replace(candidate, drain);
             }
+            if let Some(active) = &runtime.telemetry {
+                active.bind_log(&new_snap.scoped_log);
+            }
             #[cfg(feature = "grpc-edge")]
             if let Some(prepared) = prepared_edge_relay {
                 prepared.commit().await;

@@ -18,6 +18,7 @@ use crate::control::{
     history::ConfigHistory,
     reload::{apply_provider, ReloadRuntime},
 };
+use crate::observability::logging::scoped::Module;
 
 struct Read {
     observation: Observation,
@@ -146,8 +147,11 @@ pub(crate) fn spawn(
                                 super::metrics::Outcome::Rejected
                             }
                         }
-                        Err(_)=> {
-                            tracing::warn!(source=id,"configuration provider observation unavailable");super::metrics::Outcome::Unavailable
+                        Err(_) => {
+                            active.scoped_log.record_module(Module::Providers, || {
+                                tracing::warn!(source = id, "configuration provider observation unavailable");
+                            });
+                            super::metrics::Outcome::Unavailable
                         }
                     };
                     current.plan.sources[&id].health.lock().record(outcome);

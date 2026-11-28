@@ -125,6 +125,7 @@ pub fn config_signature(cfg: &TelemetryCfg) -> String {
 pub struct TelemetryRuntime {
     provider: SdkTracerProvider,
     tracer: SdkTracer,
+    log: arc_swap::ArcSwapOption<super::logging::scoped::Output>,
     propagator: TraceContextPropagator,
     b3_compat: bool,
     /// 是否真正记录/导出 span；关闭态仍创建合法上下文以维持 W3C/B3 传播，但不构造属性。
@@ -218,6 +219,7 @@ impl TelemetryRuntime {
         let provider = provider.build();
         let tracer = provider.tracer("gateway.data-plane");
         Ok(Arc::new(Self {
+            log: arc_swap::ArcSwapOption::empty(),
             provider,
             tracer,
             propagator: TraceContextPropagator::new(),
@@ -418,6 +420,31 @@ impl SwappableTelemetryRuntime {
         })
     }
 
+    /// 业务作用：让活动遥测代使用本次已经发布的模块日志，单改日志时复用现有出口。
+    /// 参数说明：
+    /// - `logs`：本次完整发布的范围日志集合。
+    /// 返回：后续遥测记录使用新目的地，已退休的遥测代保持原有归属。
+    pub fn bind_log(&self, logs: &super::logging::scoped::Active) {
+        use super::logging::scoped::Module;
+
+        let active = self.active.load();
+        let output = logs.output(Module::Telemetry, None);
+        let previous = active.log.swap(output.clone());
+        if let Some(output) = output {
+            if previous
+                .as_ref()
+                .is_none_or(|previous| !Arc::ptr_eq(previous, &output))
+            {
+                output.write(|| {
+                    tracing::info!(
+                        recording = active.recording,
+                        "telemetry module log activated"
+                    );
+                });
+            }
+        }
+    }
+
     /// 业务作用：在首快照发布后登记共享指标目录，后续 exporter 换代复用同一事实源。
     ///
     /// 参数说明：
@@ -501,7 +528,8 @@ impl SwappableTelemetryRuntime {
                 owner.start_metrics(source.clone());
             }
         }
-        tokio::spawn(async move {
+        let output = old.log.load_full();
+        tokio::spawn(super::logging::scoped::route(output, async move {
             tokio::time::sleep(drain).await;
             let result = tokio::task::spawn_blocking(move || old.shutdown()).await;
             match result {
@@ -511,7 +539,7 @@ impl SwappableTelemetryRuntime {
                     tracing::warn!(%error, "old telemetry generation shutdown task failed")
                 }
             }
-        });
+        }));
     }
 
     /// 业务作用：进程停机时 flush 当前 exporter 代。

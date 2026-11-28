@@ -170,6 +170,7 @@ pub(super) async fn run() -> Result<()> {
     snapshot.prepare_scoped_log(&process_log)?;
     let telemetry =
         gateway::observability::telemetry::SwappableTelemetryRuntime::new(telemetry_generation);
+    telemetry.bind_log(&snapshot.scoped_log);
     // reload channel 容量和去抖窗口属 bootstrap 执行参数；worker 建立后不在热更时自重建。
     let reload_cfg = snapshot.reload.clone();
     discovery.reconcile(&snapshot);
@@ -791,7 +792,10 @@ pub(super) async fn run() -> Result<()> {
         warn!(%error, "access log sink shutdown/flush failed");
     }
     if let Err(error) = telemetry.shutdown() {
-        warn!(%error, "OpenTelemetry shutdown/flush failed");
+        snap.load().scoped_log.record_module(
+            gateway::observability::logging::scoped::Module::Telemetry,
+            || warn!(%error, "OpenTelemetry shutdown/flush failed"),
+        );
     }
     info!("gateway stopped");
     if let Some(subscription) = named_nacos_subscription {

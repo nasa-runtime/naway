@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::config::model::AccessLogCfg;
 use crate::config::GatewaySnapshot;
+use crate::observability::logging::scoped::Module;
 use crate::observability::metrics::Metrics;
 
 /// 数据面到后台日志 worker 的非阻塞发送句柄。
@@ -79,6 +80,7 @@ impl AccessLogger {
         let spawned = crate::observability::log_sink::spawn_sink_workers(
             sink_specs.as_ref(),
             metrics.clone(),
+            snap.clone(),
         )?;
         let shutdown_timeout = sink_specs
             .iter()
@@ -108,7 +110,9 @@ impl AccessLogger {
                     }
                     Err(error) => {
                         worker_metrics.inc_log_sink_dropped("dispatcher", 1, "encode");
-                        tracing::warn!(error = %error, "access log JSON encoding failed");
+                        snap.scoped_log.record_module(Module::AccessLog, || {
+                            tracing::warn!(error = %error, "access log JSON encoding failed");
+                        });
                         return;
                     }
                 };
@@ -134,7 +138,12 @@ impl AccessLogger {
             drop(spawned.senders);
             for worker in spawned.workers {
                 if let Err(error) = worker.await {
-                    tracing::warn!(%error, "access log sink worker join failed");
+                    worker_snapshot
+                        .load()
+                        .scoped_log
+                        .record_module(Module::AccessLog, || {
+                            tracing::warn!(%error, "access log sink worker join failed");
+                        });
                 }
             }
             let _ = done_tx.send(());
@@ -171,7 +180,8 @@ impl AccessLogger {
     /// 业务作用：尝试写入一条 access log 记录。
     ///
     /// 参数说明：
-    /// - `record`: 已在请求管线收集好的低基数字段。
+    /// - `record`：已在请求管线收集好的低基数字段。
+    /// 返回：冻结来源实例或 AccessLog 模块输出后尝试入队，队列满时只记丢弃。
     pub fn log(&self, record: AccessRecord) {
         let active = self.active.load_full();
         if !active.accepting.load(Ordering::Acquire) {
@@ -179,7 +189,11 @@ impl AccessLogger {
         }
         let pending = PendingRecord {
             record,
-            output: crate::observability::logging::scoped::current(),
+            output: self
+                .snapshot
+                .load()
+                .scoped_log
+                .queued_output(Module::AccessLog),
         };
         if active.tx.try_send(pending).is_err() {
             active.metrics.inc_access_log_dropped();
