@@ -1614,6 +1614,9 @@ fn build_snapshot_from_config(
         cfg_path,
     )
     .context("build upstream directory")?;
+    if cfg.module_sources.is_some() {
+        validate_named_upstream_refs(&proxies, &stream_listeners, &upstreams)?;
+    }
     #[cfg(feature = "xds-server")]
     let xds_server = crate::control::xds_server::Plan::build(
         &cfg,
@@ -1711,6 +1714,47 @@ fn build_snapshot_from_config(
         variables,
         grpc_edge_cluster,
     })
+}
+
+/// 业务作用：在具名模块候选发布前核对固定路由目标与本代上游声明。
+/// 参数说明：
+/// - `proxies`：候选 HTTP 监听及其已编译路由。
+/// - `streams`：候选流监听及其已编译路由。
+/// - `upstreams`：同一候选声明的逻辑服务目录。
+/// 返回：固定目标均已声明时成功，服务当前没有实例不影响候选校验。
+fn validate_named_upstream_refs(
+    proxies: &[ProxyRuntime],
+    streams: &[StreamRuntime],
+    upstreams: &UpstreamDirectory,
+) -> Result<()> {
+    for proxy in proxies {
+        for (service, route) in proxy.router.upstream_service_refs() {
+            anyhow::ensure!(
+                upstreams.has_service(&service),
+                "proxy `{}` route `{route}` references undeclared upstream `{service}`",
+                proxy.id
+            );
+        }
+    }
+    for stream in streams {
+        for route in stream.routes.iter() {
+            let targets = std::iter::once(route.upstream.as_str()).chain(
+                route
+                    .weighted_upstreams
+                    .iter()
+                    .map(|(target, _)| target.as_str()),
+            );
+            for service in targets.filter_map(|target| target.strip_prefix("lb://")) {
+                anyhow::ensure!(
+                    upstreams.has_service(service),
+                    "stream `{}` route `{}` references undeclared upstream `{service}`",
+                    stream.id,
+                    route.id
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 业务作用：用真实 runtime-state 配置复核 HTTP/3 0-RTT 的跨节点防重放声明，
