@@ -112,7 +112,8 @@ impl Target {
     ///
     /// 返回：固定目录同步成功，否则保留未确认提交的错误语义。
     pub(crate) fn sync(&self) -> Result<()> {
-        self.directory.try_clone()?.into_std_file().sync_all()?;
+        // Linux 的目录能力句柄可能是 O_PATH，不能执行 fsync。从原句柄打开当前目录，避免路径换代后同步到另一个目录。
+        self.directory.open(".")?.sync_all()?;
         Ok(())
     }
 }
