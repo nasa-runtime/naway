@@ -10,11 +10,12 @@ use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
 use arc_swap::ArcSwap;
+use futures::future::try_join_all;
 use naml::YmlImport;
-use nasa::config::nacos::{ConfigBundle, ConfigRef, NacosConfigClient};
+use nasa::config::nacos::{ConfigBundle, ConfigRef, NacosConfigClient, WatchGuard};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 
 use crate::config::{bootstrap::module_template, document, loader, GatewaySnapshot};
 use crate::control::history::ConfigHistory;
@@ -23,6 +24,7 @@ use crate::control::reload::{nacos_config_props, ReloadHandle};
 mod rollback;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(12);
+const SIMULTANEOUS_READS: usize = 4;
 const RECHECK: Duration = Duration::from_secs(2);
 const MISSING_CAS: &str = "naway-create-only";
 const MAX_REVISION_BYTES: usize = 64 * 1024;
@@ -313,31 +315,22 @@ impl NamedNacos {
         history: &ConfigHistory,
         snapshot: &ArcSwap<GatewaySnapshot>,
     ) -> Result<()> {
-        let reader = connect(&self.plan).await?;
-        let watcher = connect(&self.plan).await?;
+        let (reader, watcher) = tokio::try_join!(connect(&self.plan), connect(&self.plan))?;
         let mut plan = self.plan.current(&self.entry)?;
-        let (mut subscription, mut changes) = tokio::time::timeout(
-            READ_TIMEOUT,
-            watcher.watch_many_channel(plan.subscriptions()),
-        )
-        .await??;
+        let changed = Arc::new(Notify::new());
+        let mut subscriptions = watch_sources(&watcher, &plan, &changed).await?;
         let mut interval = tokio::time::interval(RECHECK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut staged = self.storage.active_directory(snapshot);
         loop {
             tokio::select! {
-                changed = changes.changed() => { changed?; }
+                _ = changed.notified() => {}
                 _ = interval.tick() => {}
             }
             let next = self.plan.current(&self.entry)?;
             if plan.refs != next.refs {
                 // 先订阅新目录再释放原订阅，随后读回全量，避免切换窗口遗漏变化。
-                let watched = tokio::time::timeout(
-                    READ_TIMEOUT,
-                    watcher.watch_many_channel(next.subscriptions()),
-                )
-                .await??;
-                (subscription, changes) = watched;
+                subscriptions = watch_sources(&watcher, &next, &changed).await?;
             }
             plan = next;
             let bundle = fetch(&reader, &plan).await?;
@@ -358,9 +351,37 @@ impl NamedNacos {
                     "reload worker stopped"
                 );
             }
-            let _ = &subscription;
+            let _ = &subscriptions;
         }
     }
+}
+
+/// 业务作用：让源文档推送直接唤醒唯一的整组读取任务，SDK 回调只提供通知。
+/// 参数说明：
+/// - `watcher`：本配置权威的订阅客户端。
+/// - `plan`：当前业务文档和提交标记清单。
+/// - `changed`：同一观察循环使用的合并通知。
+/// 返回：所有监听均登记成功时返回持有权，失败释放本次已登记的监听。
+async fn watch_sources(
+    watcher: &NacosConfigClient,
+    plan: &Plan,
+    changed: &Arc<Notify>,
+) -> Result<Vec<WatchGuard>> {
+    tokio::time::timeout(READ_TIMEOUT, async {
+        let mut guards = Vec::new();
+        for reference in plan.subscriptions() {
+            let group = reference.group.as_deref().unwrap_or(&plan.connection.group);
+            let changed = changed.clone();
+            guards.push(
+                watcher
+                    .watch(&reference.data_id, group, move |_| changed.notify_one())
+                    .await?,
+            );
+        }
+        Ok(guards)
+    })
+    .await
+    .context("Nacos configuration listener deadline exceeded")?
 }
 
 impl Edit {
@@ -914,18 +935,8 @@ async fn fetch(client: &NacosConfigClient, plan: &Plan) -> Result<ConfigBundle> 
 /// 返回：两次读取一致的完整集合；缺席必需文档或观测漂移时拒绝。
 async fn fetch_bundle(client: &NacosConfigClient, refs: &[ConfigRef]) -> Result<ConfigBundle> {
     tokio::time::timeout(READ_TIMEOUT, async {
-        let first = client.fetch_many(refs).await?;
-        let mut bytes = 0usize;
-        for doc in &first.documents {
-            bytes = bytes
-                .checked_add(doc.content.len())
-                .context("Nacos configuration byte count overflow")?;
-            ensure!(
-                bytes <= document::MAX_DOCUMENT_BYTES,
-                "named Nacos configuration exceeds total byte limit"
-            );
-        }
-        let second = client.fetch_many(refs).await?;
+        let first = read_documents(client, refs).await?;
+        let second = read_documents(client, refs).await?;
         ensure!(
             first == second,
             "Nacos configuration changed during the complete read"
@@ -934,6 +945,31 @@ async fn fetch_bundle(client: &NacosConfigClient, refs: &[ConfigRef]) -> Result<
     })
     .await
     .context("Nacos configuration read deadline exceeded")?
+}
+
+/// 业务作用：保持声明顺序和整体字节预算，同时限制单轮读取对连接和调度的占用。
+/// 参数说明：
+/// - `client`：已绑定本组配置权威的 Nacos 客户端。
+/// - `refs`：此次必须复验的原文件清单。
+/// 返回：按声明顺序收集全部文档，任一必需文档缺席、超限或远端失败时拒绝整轮。
+async fn read_documents(client: &NacosConfigClient, refs: &[ConfigRef]) -> Result<ConfigBundle> {
+    let mut result = ConfigBundle::default();
+    let mut budget = document::MAX_DOCUMENT_BYTES;
+    for chunk in refs.chunks(SIMULTANEOUS_READS) {
+        let mut reads = Vec::with_capacity(chunk.len());
+        for reference in chunk {
+            reads.push(client.fetch_many(std::slice::from_ref(reference)));
+        }
+        for read in try_join_all(reads).await? {
+            for document in read.documents {
+                budget = budget
+                    .checked_sub(document.content.len())
+                    .context("named Nacos configuration exceeds total byte limit")?;
+                result.documents.push(document);
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// 业务作用：从本机物化入口和已验证规则路径恢复远端配置代摘要，供集群读回。
