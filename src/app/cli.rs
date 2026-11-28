@@ -136,7 +136,7 @@ pub(super) const DEFAULT_CONFIG_FILE: &str = "application.yml";
 /// - `args`：提供命令行显式配置路径。
 ///
 /// 返回：依次选择 `--config`、`NAWAY_CONFIG`、`GW_CONFIG`、`NAWAY_CONFIG_DIR`、
-/// `GW_CONFIG_DIR` 或默认目录。目录选择优先使用 application.yml，已存在的旧入口可继续加载。
+/// `GW_CONFIG_DIR` 或默认目录。目录优先选用 application.yml 或补齐独立全局模块，也兼容完整旧入口。
 pub(super) fn config_path(args: &Args) -> PathBuf {
     if let Some(c) = &args.config {
         return c.into();
@@ -155,7 +155,7 @@ pub(super) fn config_path(args: &Args) -> PathBuf {
     }
     let primary = directory_config(PathBuf::from(DEFAULT_CONFIG_DIR));
     let legacy = PathBuf::from("/data/naway/naway.yml");
-    if primary.exists() || !legacy.exists() {
+    if primary.exists() || primary.with_file_name("naway.yml").exists() || !legacy.exists() {
         primary
     } else {
         legacy
@@ -167,11 +167,11 @@ pub(super) fn config_path(args: &Args) -> PathBuf {
 /// 参数说明：
 /// - `directory`：操作方显式提供的配置目录或默认目录。
 ///
-/// 返回：已存在的 application.yml 优先，其次选择已存在的 naway.yml。空目录使用 application.yml。
+/// 返回：已有 application.yml、预置全局模块或空目录选择具名入口，已有的独立旧入口选择原文件。
 fn directory_config(directory: PathBuf) -> PathBuf {
     let entry = directory.join(DEFAULT_CONFIG_FILE);
     let legacy = directory.join("naway.yml");
-    if entry.exists() || !legacy.exists() {
+    if entry.exists() || !legacy.exists() || gateway::config::bootstrap::needs_named_entry(&legacy) {
         entry
     } else {
         legacy

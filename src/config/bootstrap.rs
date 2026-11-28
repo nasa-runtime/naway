@@ -732,6 +732,38 @@ flow: []
 degrade: []
 "#;
 
+/// 业务作用：识别配置目录中尚未登记入口的全局模块，冷启动时可用标准清单补齐其余文档。
+///
+/// 参数说明：
+/// - `path`：目录中已有的 `naway.yml`，以及它可能采用的活动 profile。
+///
+/// 返回：全局模块返回真。已有入口结构、独立监听声明或无法解析的文件沿用原选择，由正常加载报告错误。
+pub fn needs_named_entry(path: &Path) -> bool {
+    super::loader(path)
+        .preserve_unresolved_placeholders(true)
+        .load_tree()
+        .is_ok_and(|tree| {
+            let Some(fields) = tree.as_object() else {
+                return false;
+            };
+            // 旧入口可能只把监听所有权交给 xDS，不能因此自动开放默认 HTTP 端口。
+            let xds_listeners = tree.pointer("/control_plane/xds/ownership/listeners");
+            !xds_listeners.is_some_and(|owner| owner.as_str() != Some("native"))
+                && ![
+                    "application",
+                    "yml",
+                    "server",
+                    "proxies",
+                    "routes",
+                    "stream",
+                    "upstreams",
+                    "admin",
+                ]
+                .iter()
+                .any(|key| fields.contains_key(*key))
+        })
+}
+
 /// 业务作用：确保配置目录与所需 yml 齐全,缺失则新建最低运行默认。在 `load_snapshot` 之前调用。
 pub fn ensure(cfg_path: &Path) -> Result<()> {
     // 1. 配置目录不存在则创建(便于「首次挂空目录 / 全新机器」直接起)。
